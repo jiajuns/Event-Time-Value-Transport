@@ -10,9 +10,10 @@ Event-Time Value Transport（ETSF）研究跨机器人本体的价值函数迁�
 | Stage 1 | 已完成 | 事件结构大体可共享，`ρ_b` 是主要迁移因素，旧事件链和 AUC 口径存在问题 |
 | Stage 2 G0–G2 | 已完成 | 事件链修复、后验认证、共享液态头及模块边界测试通过 |
 | Stage 2 G3 | **未通过** | T4 改善 Bellman 一致性和局部时长方向，但没有同时保持 AUC 与优势符号 |
-| Stage 3 开发实验 | **机制门通过、决策能力未充分验证** | 语义/时钟解耦后，Piper 与 UR5 的时长和事件 MC 误差稳定改善；原首端 AUC 门无效，匹配事件分支判别受限于无源失败监督和极少配对 |
+| Stage 3 三本体留一 | **机制门通过、失败分支出现正信号** | 第三本体失败监督和失败末帧解除事件查找表退化；留出 Piper/UR5 的同事件 AUC 达 0.612/0.792，但测试配对仍不足以确认通过 |
+| OpenVLA-OFT B0＋shadow | **单任务已跑通** | `move_can_pot`、Piper、20 个官方 seed，成功率 4/20=20%；4096→96 ETSF shadow 接线通过且不改变动作，critic 训练待完成 |
 
-当前结果不能表述为“已经完成零样本跨本体 critic 迁移”。Stage 3 已完成开发性实现和 5 种子复跑，但现有 Piper/UR5 已被用于方案诊断，且源数据没有失败轨迹，因此不会进入动作条件 critic 集成。
+当前结果不能表述为“已经完成零样本跨本体 critic 迁移”。Stage 3 已完成开发性三本体留一和 5 种子复跑；现有 Piper/UR5 已被用于方案诊断，每个留出本体只有 26–30 个同事件正负对，因此不会进入动作条件 critic 集成。
 
 ## 实际问题与方法
 
@@ -43,6 +44,7 @@ docs/
   ETSF_stage1_overnight.md
   ETSF_stage2_liquid_transport.md
   ETSF_stage3_factorized_transport.md
+  ETSF_OpenVLA_OFT_full_technical_route.md
 scripts/
   run_stage0_experiment.py
   run_gamma_sensitivity.py
@@ -56,6 +58,7 @@ scripts/
 - [Stage 1 执行文档](docs/ETSF_stage1_overnight.md)
 - [Stage 2 液态价值传输文档](docs/ETSF_stage2_liquid_transport.md)
 - [Stage 3 语义/时钟解耦文档](docs/ETSF_stage3_factorized_transport.md)
+- [OpenVLA-OFT 完整技术路线](docs/ETSF_OpenVLA_OFT_full_technical_route.md)
 - [Stage 2 正式入口](scripts/run_stage2.py)
 - [Stage 3 开发入口](scripts/run_stage3.py)
 
@@ -181,6 +184,22 @@ PYTHONPATH=scripts \
 
 Stage 3 中的 `N=5` 是每任务 5 条，即每个目标本体共使用 30 条适配 rollout。共享语义编码器、语义 successor 头和 ClockLNN 在目标端全部冻结；只推断一个 `β_b` 后验和每任务的事件可达率后验。Piper/UR5 结果只能作为开发证据。
 
+三本体留一失败感知实验使用：
+
+```bash
+PYTHONPATH=scripts \
+/home/user/anaconda3/envs/ETSF_RoboTwin/bin/python \
+  scripts/run_stage3.py \
+  --stage loeo \
+  --steps 3000 \
+  --seeds 5 \
+  --adaptation-count 5 \
+  --data-root /home/user/etsf_stage1 \
+  --output-root /home/user/etsf_stage3_loeo
+```
+
+留出 Piper 时，UR5 只向语义头提供成功/失败监督；留出 UR5 时反向使用 Piper。ClockLNN 在两折中始终只使用 Aloha、ARX-X5。失败轨迹会追加一个不含失败标签的末帧边界，沿用最后已达事件 token，使抓空、停滞等失败状态不再被事件抽取器丢弃。
+
 ## 输出
 
 默认输出目录：
@@ -257,24 +276,30 @@ T4 的 Bellman MSE 和局部方向优于 T3，但 AUC 低于 T2/T3，优势符�
 
 ### Stage 3：语义/时钟解耦开发结果
 
-Stage 3 修正版在 RTX 4090 D 上运行 3000 步、5 个配对种子。表中为后验预测相对 `β=0` 的结果。首端 AUC 只作噪声诊断；末端 AUC 因 `eK` 泄漏而排除；分支 AUC 只在同一任务、同一非终止事件内比较。
+最新 Stage 3 三本体留一版在 RTX 4090 D 上运行两折、每折 3000 步×5 个配对种子。表中为后验预测结果；分支 AUC 在同一任务、同一事件的最后观测状态内比较。事件索引查找表在这个条件下是常数，AUC 基线为 `0.5`，而不是无法超越的进度准确率 `1.0`。
 
-| 目标本体 | 时长 MAE：β=0 → 后验 | 事件 MC MSE：β=0 → 后验 | 首端 AUC（诊断） | 同事件分支 AUC / 配对数 |
+| 留出本体 | 语义失败来源 | 时长 MAE：β=0 → 后验 | 事件 MC MSE：β=0 → 后验 | 同事件分支 macro-AUC / 配对数 |
 |---|---:|---:|---:|---:|
-| Piper | 20.24 → **8.66** | 0.02644 → **0.02398** | 0.5417 | 0.4333 / 30 |
-| UR5-WSG | 20.33 → **8.59** | 0.02749 → **0.02262** | 0.5042 | 0.4361 / 26 |
+| Piper | UR5-WSG | 14.73 → **4.16** | 0.02633 → **0.02483** | **0.6119** / 30 |
+| UR5-WSG | Piper | 18.07 → **8.66** | 0.03268 → **0.02924** | **0.7917** / 26 |
 
-两个目标本体的时长 MAE 和事件 MC MSE 都在 5/5 个种子上改善，因此开发性机制门通过。首端 AUC 接近机会水平，符合“单条随机 rollout 不能代表初始状态期望价值”；同事件分支只有 30/26 个正负对，且源训练没有失败轨迹，因此代码输出 `decision_gate_passed=null`、`decision_gate_status=inconclusive_missing_source_failure_supervision`，而不是宣判失败或通过。成功轨迹进度排序为 Piper `0.9922`、UR5 `0.9795`，但事件索引基线为 `1.0`，不能据此声称模型已学会细粒度失败判断。
+两个留出本体的时长 MAE 和事件 MC MSE 都在 5/5 个种子上相对 `β=0` 改善，机制门通过。相对 success-only v3，同事件 macro-AUC 从 Piper `0.4333→0.6119`、UR5 `0.4361→0.7917`；失败末帧是主要增益来源。不过测试只有 30/26 个配对，且 Piper/UR5 已参与开发，代码仍输出 `decision_gate_passed=null`、`decision_gate_status=inconclusive_insufficient_matched_event_pairs`。这证明失败监督能解除事件计数退化，但还不是确认性 critic 迁移。
+
+### OpenVLA-OFT baseline 复现
+
+已使用 RLinf 官方 OpenVLA-OFT `move_can_pot` SFT checkpoint，在单张 RTX 4090 D 上完成 Piper `demo_randomized` 端到端评测。模型为 7.558B BF16、14 维动作、25-step chunk；20 个官方 eval seed 中成功 4 条，原始策略成功率为 **20%**。该结果是最终路线中的 B0 baseline，不是 ETSF 增益。
+
+随后已完成非控制 shadow 接入：从 OpenVLA 动作前最后隐藏状态提取 4096 维特征，输入 ETSF `4096→96` bridge、语义 successor 头和 ClockLNN；真实环境运行 8 个 action chunk、200 步，hook 前后动作逐元素一致。当前 shadow 仍是随机初始化接线测试，尚未使用 OpenVLA rollout训练，也没有用于动作排序。
 
 ## 止损与研究边界
 
 当前能够支持的结论是：
 
-> 低秩液态调制能更好地拟合局部时钟，并改善事件边界 Bellman 一致性，但这些改善尚未可靠传递到价值排序和策略更新所依赖的优势符号。
+> 隔离的 ClockLNN 能稳定迁移不同机械臂的事件时钟；在三本体留一开发协议中，混合失败监督和失败终止状态还能解除纯事件计数退化，使完全留出本体的同事件状态排序超过常数基线。
 
 当前不能支持的结论是：
 
-> 一个目标标量已经足以完成零样本跨本体 critic 迁移。
+> 一个目标标量已经足以完成零样本跨本体 critic 或在线策略迁移。
 
 共享头训练使用 Aloha 与 ARX-X5，所以 `aloha → ARX-X5` 只能作为源域时钟诊断，不能称为留出本体迁移。真正的 G3 目标是未参与共享头训练的 UR5-WSG。Piper 同样是留出目标，但不用于替代预注册主门。
 

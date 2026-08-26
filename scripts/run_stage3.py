@@ -57,7 +57,11 @@ class Posterior:
     fallback_reasons: list[str]
 
 
-def pack_stage3(records: list[s2.BoundaryRecord], device: torch.device) -> dict[str, torch.Tensor]:
+def pack_stage3(
+    records: list[s2.BoundaryRecord],
+    device: torch.device,
+    clock_bodies: set[str] | None = None,
+) -> dict[str, torch.Tensor]:
     """Pack records and add causal semantic, MC-return, and clock targets."""
     batch = s2.pack_records(records, device)
     count, length = batch["mask"].shape
@@ -70,7 +74,10 @@ def pack_stage3(records: list[s2.BoundaryRecord], device: torch.device) -> dict[
     task_ids = np.zeros(count, dtype=np.int64)
 
     for row, record in enumerate(records):
-        frames = np.asarray([frame for _, frame in record.episode.events], dtype=np.float32)
+        # Only relative elapsed time is needed for MC targets.  Reconstruct it
+        # from the record so failure-terminal pseudo-boundaries can be appended
+        # without mutating the frozen canonical event list.
+        frames = np.r_[0.0, np.cumsum(record.dts[1:])].astype(np.float32)
         size = len(record.event_ids)
         task_ids[row] = s2.TASKS.index(record.episode.task)
         for current in range(size):
@@ -81,7 +88,11 @@ def pack_stage3(records: list[s2.BoundaryRecord], device: torch.device) -> dict[
                 mc_targets[row, current, event_id] = s2.GAMMA**elapsed
             if current < len(record.durations):
                 duration = float(record.durations[current])
-                clock_mask[row, current] = math.isfinite(duration) and duration >= MIN_CLOCK_STEPS
+                clock_mask[row, current] = (
+                    math.isfinite(duration)
+                    and duration >= MIN_CLOCK_STEPS
+                    and (clock_bodies is None or record.episode.body in clock_bodies)
+                )
 
         if (
             size
@@ -89,7 +100,10 @@ def pack_stage3(records: list[s2.BoundaryRecord], device: torch.device) -> dict[
             and int(record.event_ids[-1]) != s2.MODEL_EVENTS.index("eK")
         ):
             censor_duration = float(record.episode.steps - 1 - frames[-1])
-            if censor_duration >= MIN_CLOCK_STEPS:
+            if (
+                censor_duration >= MIN_CLOCK_STEPS
+                and (clock_bodies is None or record.episode.body in clock_bodies)
+            ):
                 censor_mask[row, size - 1] = True
                 censor_durations[row, size - 1] = censor_duration
 
@@ -247,20 +261,44 @@ def normal_censor_nll(
     return -torch.log(survival)
 
 
-def pairwise_ranking_loss(
-    scores: torch.Tensor,
+def pairwise_event_ranking_loss(
+    goal_scores: torch.Tensor,
     labels: torch.Tensor,
     task_ids: torch.Tensor,
+    event_ids: torch.Tensor,
+    mask: torch.Tensor,
 ) -> tuple[torch.Tensor, int]:
     pieces = []
+    last_occurrence = torch.zeros_like(mask)
+    repeated_event = torch.zeros_like(mask)
+    for row in range(len(goal_scores)):
+        for event_id in range(len(s2.MODEL_EVENTS)):
+            columns = torch.nonzero(
+                mask[row] & (event_ids[row] == event_id), as_tuple=False
+            ).flatten()
+            if len(columns):
+                last_occurrence[row, columns[-1]] = True
+                if len(columns) > 1:
+                    repeated_event[row, columns[-1]] = True
     for task in range(len(s2.TASKS)):
-        positive = scores[(task_ids == task) & (labels == 1)]
-        negative = scores[(task_ids == task) & (labels == 0)]
-        if len(positive) and len(negative):
-            differences = positive[:, None] - negative[None, :]
-            pieces.append(F.softplus(0.10 - differences).flatten())
+        for event_id, event in enumerate(s2.MODEL_EVENTS):
+            if event == "eK":
+                continue
+            matched = (
+                last_occurrence
+                & (event_ids == event_id)
+                & (task_ids[:, None] == task)
+            )
+            positive = goal_scores[matched & (labels[:, None] == 1)]
+            negative_mask = matched & (labels[:, None] == 0)
+            if event == "e0":
+                negative_mask = negative_mask & repeated_event
+            negative = goal_scores[negative_mask]
+            if len(positive) and len(negative):
+                differences = positive[:, None] - negative[None, :]
+                pieces.append(F.softplus(0.10 - differences).flatten())
     if not pieces:
-        return scores.sum() * 0.0, 0
+        return goal_scores.sum() * 0.0, 0
     joined = torch.cat(pieces)
     return joined.mean(), int(joined.numel())
 
@@ -282,17 +320,14 @@ def compute_loss(
     ).sum(-1).mean(-1)
     semantic_loss = semantic_ce[selected["mask"]].mean()
 
-    initial_success = output["success_logits"][:, 0]
-    has_both_outcomes = bool(
-        (selected["success"] == 0).any() and (selected["success"] == 1).any()
-    )
-    success_loss = (
-        F.binary_cross_entropy_with_logits(initial_success, selected["success"].float())
-        if has_both_outcomes
-        else initial_success.sum() * 0.0
-    )
-    ranking, ranking_pairs = pairwise_ranking_loss(
-        torch.sigmoid(initial_success), selected["success"], selected["task_ids"]
+    semantic_values = decode_semantic(output["successor_logits"])
+    goal_scores = semantic_values[..., s2.MODEL_EVENTS.index("eK")]
+    ranking, ranking_pairs = pairwise_event_ranking_loss(
+        goal_scores,
+        selected["success"],
+        selected["task_ids"],
+        selected["event_ids"],
+        selected["mask"],
     )
 
     mean = select_event(output["duration_log_mean"], selected["event_ids"])
@@ -316,12 +351,10 @@ def compute_loss(
         censor_error[censor_mask].mean() if censor_mask.any() else semantic_loss * 0.0
     )
     clock_loss = observed_loss + 0.25 * censor_loss
-    total = semantic_loss + 0.10 * success_loss + 0.25 * ranking + clock_loss
+    total = semantic_loss + 0.25 * ranking + clock_loss
     metrics = {
         "total": float(total.detach()),
         "semantic": float(semantic_loss.detach()),
-        "success": float(success_loss.detach()),
-        "success_supervision_available": has_both_outcomes,
         "ranking": float(ranking.detach()),
         "ranking_pairs": ranking_pairs,
         "clock": float(clock_loss.detach()),
@@ -337,19 +370,58 @@ def train_model(
     device: torch.device,
     steps: int,
     seed: int,
+    clock_bodies: set[str] | None = None,
+    outcome_balanced: bool = False,
 ) -> tuple[FactorizedEventTransport, list[dict[str, float]]]:
     torch.manual_seed(seed)
-    train = pack_stage3(train_records, device)
-    validation = pack_stage3(validation_records, device)
+    train = pack_stage3(train_records, device, clock_bodies=clock_bodies)
+    validation = pack_stage3(validation_records, device, clock_bodies=clock_bodies)
     model = FactorizedEventTransport(train["inputs"].shape[-1]).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
     generator = torch.Generator(device=device).manual_seed(seed + 1000)
     history = []
     started = time.time()
+    positive_indices = torch.tensor(
+        [index for index, record in enumerate(train_records) if record.episode.success],
+        device=device,
+    )
+    negative_indices = torch.tensor(
+        [index for index, record in enumerate(train_records) if not record.episode.success],
+        device=device,
+    )
 
     for step in range(steps):
         size = min(64, len(train_records))
-        indices = torch.randint(len(train_records), (size,), generator=generator, device=device)
+        if outcome_balanced and len(negative_indices):
+            negative_count = size // 2
+            positive_count = size - negative_count
+            indices = torch.cat(
+                [
+                    positive_indices[
+                        torch.randint(
+                            len(positive_indices),
+                            (positive_count,),
+                            generator=generator,
+                            device=device,
+                        )
+                    ],
+                    negative_indices[
+                        torch.randint(
+                            len(negative_indices),
+                            (negative_count,),
+                            generator=generator,
+                            device=device,
+                        )
+                    ],
+                ]
+            )
+            indices = indices[
+                torch.randperm(size, generator=generator, device=device)
+            ]
+        else:
+            indices = torch.randint(
+                len(train_records), (size,), generator=generator, device=device
+            )
         warps = (
             torch.rand(size, generator=generator, device=device) * 2.0 - 1.0
         ) * SYNTHETIC_WARP_LIMIT
@@ -632,7 +704,7 @@ def boundary_diagnostics(
                 columns = np.flatnonzero(record.event_ids == event_id)
                 if len(columns):
                     event_labels.append(int(labels[row]))
-                    event_scores.append(float(values[row, int(columns[0]), goal]))
+                    event_scores.append(float(values[row, int(columns[-1]), goal]))
             conditional_groups.append((event_labels, event_scores))
     conditional_micro, conditional_macro, conditional_pairs, conditional_defined = grouped_auc(
         conditional_groups
@@ -881,6 +953,33 @@ def self_test(device: torch.device) -> list[dict[str, object]]:
             "passed": bool(micro == 1.0 and macro == 1.0 and pairs == 1 and groups == 1),
         }
     )
+    ranking_loss, ranking_pairs = pairwise_event_ranking_loss(
+        torch.tensor([[0.0, 0.8, 1.0], [0.0, 0.2, 0.0]], device=device),
+        torch.tensor([1, 0], device=device),
+        torch.tensor([0, 0], device=device),
+        torch.tensor(
+            [
+                [
+                    s2.MODEL_EVENTS.index("e0"),
+                    s2.MODEL_EVENTS.index("e12"),
+                    s2.MODEL_EVENTS.index("eK"),
+                ],
+                [
+                    s2.MODEL_EVENTS.index("e0"),
+                    s2.MODEL_EVENTS.index("e12"),
+                    s2.MODEL_EVENTS.index("eK"),
+                ],
+            ],
+            device=device,
+        ),
+        torch.ones(2, 3, dtype=torch.bool, device=device),
+    )
+    rows.append(
+        {
+            "test": "ranking_matches_nonterminal_event",
+            "passed": bool(ranking_pairs == 1 and ranking_loss > 0.0),
+        }
+    )
     if not all(row["passed"] for row in rows):
         raise RuntimeError(f"Stage-3 self test failed: {rows}")
     return rows
@@ -1016,6 +1115,324 @@ def refresh_development_gate(output_root: Path) -> dict[str, object]:
 """
         report_path.write_text(report, encoding="utf-8")
     return gate
+
+
+def count_matched_event_pairs(records: list[s2.BoundaryRecord]) -> int:
+    total = 0
+    for task in s2.TASKS:
+        for event_id, event in enumerate(s2.MODEL_EVENTS):
+            if event == "eK":
+                continue
+            positive = sum(
+                record.episode.success
+                and record.episode.task == task
+                and event_id in record.event_ids
+                for record in records
+            )
+            negative = sum(
+                not record.episode.success
+                and record.episode.task == task
+                and event_id in record.event_ids
+                for record in records
+            )
+            total += positive * negative
+    return total
+
+
+def append_failure_terminal_boundaries(
+    records: list[s2.BoundaryRecord],
+    calibration: dict[str, dict[str, object]],
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> list[s2.BoundaryRecord]:
+    """Append the final observed failure state under the last reached event token.
+
+    No failure flag is exposed to the encoder.  The repeated event token says
+    only that the rollout failed to advance beyond the last canonical event;
+    the object state itself must explain whether the branch is recoverable.
+    """
+    augmented = []
+    for record in records:
+        if record.episode.success or not record.episode.events:
+            augmented.append(record)
+            continue
+        last_event, last_frame = record.episode.events[-1]
+        terminal_frame = record.episode.steps - 1
+        if terminal_frame <= last_frame:
+            augmented.append(record)
+            continue
+        terminal_input = s2.raw_boundary_input(
+            record.episode,
+            last_event,
+            terminal_frame,
+            calibration[record.episode.task],
+        )
+        terminal_input[:14] = (terminal_input[:14] - mean) / std
+        augmented.append(
+            s2.BoundaryRecord(
+                episode=record.episode,
+                inputs=np.concatenate([record.inputs, terminal_input[None]], axis=0),
+                dts=np.r_[
+                    record.dts,
+                    np.asarray([terminal_frame - last_frame], dtype=np.float32),
+                ].astype(np.float32),
+                durations=np.r_[record.durations, np.nan].astype(np.float32),
+                event_ids=np.r_[
+                    record.event_ids,
+                    np.asarray([s2.MODEL_EVENTS.index(last_event)], dtype=np.int64),
+                ].astype(np.int64),
+                remaining=np.r_[
+                    record.remaining,
+                    np.asarray([record.remaining[-1]], dtype=np.float32),
+                ].astype(np.float32),
+            )
+        )
+    return augmented
+
+
+def aggregate_comparison(comparison: pd.DataFrame) -> pd.DataFrame:
+    return comparison[comparison.task == "__all__"].groupby(
+        ["embodiment", "mode"], as_index=False
+    ).agg(
+        event_mc_mse_mean=("event_mc_mse", "mean"),
+        event_mc_mse_std=("event_mc_mse", "std"),
+        goal_mc_mse_mean=("goal_mc_mse", "mean"),
+        start_micro_auc_diagnostic_mean=("start_micro_auc", "mean"),
+        start_macro_auc_diagnostic_mean=("start_macro_auc", "mean"),
+        same_event_micro_auc_mean=("same_event_micro_auc", "mean"),
+        same_event_macro_auc_mean=("same_event_macro_auc", "mean"),
+        same_event_auc_pairs_min=("same_event_auc_pairs", "min"),
+        success_progress_pair_accuracy_mean=("success_progress_pair_accuracy", "mean"),
+        event_index_progress_baseline=("event_index_progress_baseline", "mean"),
+        terminal_macro_auc_leaky_mean=("terminal_macro_auc_leaky", "mean"),
+        duration_mae_mean=("duration_mae", "mean"),
+    )
+
+
+def run_loeo(
+    data_root: Path,
+    output_root: Path,
+    steps: int,
+    adaptation_count: int,
+    seeds: int,
+) -> dict[str, object]:
+    """Three-body leave-one-embodiment-out development protocol.
+
+    Aloha and ARX-X5 always identify the shared clock.  In each fold, the other
+    mixed-outcome target embodiment supplies semantic failure supervision, while
+    the held-out embodiment remains frozen-adaptation/test only.
+    """
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "results").mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    tests = self_test(device)
+    pd.DataFrame(tests).to_csv(output_root / "results/self_test.csv", index=False)
+    records, specs, mean, std = load_records(data_root)
+    calibration = s2.calibrate_events([record.episode for record in records])
+    clock_train = [
+        record
+        for record in records
+        if record.episode.body in s2.SOURCE_BODIES and record.episode.index < 40
+    ]
+    clock_validation = [
+        record
+        for record in records
+        if record.episode.body in s2.SOURCE_BODIES and record.episode.index >= 40
+    ]
+    folds = [("piper", "ur5-wsg"), ("ur5-wsg", "piper")]
+    history_rows = []
+    comparison_rows = []
+    episode_rows = []
+    posterior_rows = []
+    fold_rows = []
+    model_states: dict[str, dict[str, object]] = {}
+
+    for holdout, auxiliary in folds:
+        auxiliary_train = [
+            record
+            for record in records
+            if record.episode.body == auxiliary and record.episode.index < 15
+        ]
+        auxiliary_validation = [
+            record
+            for record in records
+            if record.episode.body == auxiliary and record.episode.index >= 15
+        ]
+        auxiliary_train = append_failure_terminal_boundaries(
+            auxiliary_train, calibration, mean, std
+        )
+        auxiliary_validation = append_failure_terminal_boundaries(
+            auxiliary_validation, calibration, mean, std
+        )
+        train_records = [*clock_train, *auxiliary_train]
+        validation_records = [*clock_validation, *auxiliary_validation]
+        adaptation = [
+            record
+            for record in records
+            if record.episode.body == holdout and record.episode.index < adaptation_count
+        ]
+        test = [
+            record
+            for record in records
+            if record.episode.body == holdout and record.episode.index >= 15
+        ]
+        test = append_failure_terminal_boundaries(test, calibration, mean, std)
+        train_failures = sum(not record.episode.success for record in train_records)
+        matched_pairs = count_matched_event_pairs(train_records)
+        fold_rows.append(
+            {
+                "holdout": holdout,
+                "auxiliary_semantic_source": auxiliary,
+                "train_episodes": len(train_records),
+                "train_successes": len(train_records) - train_failures,
+                "train_failures": train_failures,
+                "matched_nonterminal_event_pairs": matched_pairs,
+                "validation_episodes": len(validation_records),
+                "adaptation_rollouts": len(adaptation),
+                "test_rollouts": len(test),
+                "clock_training_bodies": json.dumps(s2.SOURCE_BODIES),
+            }
+        )
+        model_states[holdout] = {}
+        for seed_index in range(seeds):
+            seed = s2.SEED + 100 * seed_index
+            model, history = train_model(
+                train_records,
+                validation_records,
+                device,
+                steps,
+                seed,
+                clock_bodies=set(s2.SOURCE_BODIES),
+                outcome_balanced=True,
+            )
+            for row in history:
+                history_rows.append(
+                    {
+                        "holdout": holdout,
+                        "auxiliary_semantic_source": auxiliary,
+                        "seed": seed,
+                        **row,
+                    }
+                )
+            model_states[holdout][str(seed)] = copy.deepcopy(model.state_dict())
+            posterior = infer_beta_posterior(model, adaptation, device)
+            for beta, weight in zip(posterior.grid, posterior.weights):
+                posterior_rows.append(
+                    {
+                        "holdout": holdout,
+                        "seed": seed,
+                        "beta": float(beta),
+                        "weight": float(weight),
+                    }
+                )
+            for mode in ["beta0", "map", "posterior_predictive"]:
+                rows, predictions, _ = evaluate(
+                    model,
+                    test,
+                    adaptation,
+                    train_records,
+                    specs,
+                    posterior,
+                    device,
+                    mode,
+                )
+                comparison_rows.extend(
+                    {
+                        "holdout": holdout,
+                        "auxiliary_semantic_source": auxiliary,
+                        "seed": seed,
+                        **row,
+                    }
+                    for row in rows
+                )
+                episode_rows.extend(
+                    {
+                        "holdout": holdout,
+                        "auxiliary_semantic_source": auxiliary,
+                        "seed": seed,
+                        **row,
+                    }
+                    for row in predictions
+                )
+
+    comparison = pd.DataFrame(comparison_rows)
+    aggregate = aggregate_comparison(comparison)
+    pd.DataFrame(history_rows).to_csv(
+        output_root / "results/training_history.csv", index=False
+    )
+    comparison.to_csv(output_root / "results/stage3_comparison.csv", index=False)
+    aggregate.to_csv(output_root / "results/stage3_aggregate.csv", index=False)
+    pd.DataFrame(episode_rows).to_csv(
+        output_root / "results/per_episode_predictions.csv", index=False
+    )
+    pd.DataFrame(posterior_rows).to_csv(
+        output_root / "results/beta_posterior.csv", index=False
+    )
+    pd.DataFrame(fold_rows).to_csv(output_root / "results/fold_manifest.csv", index=False)
+    np.savez(output_root / "feature_normalization.npz", mean=mean, std=std)
+    torch.save(
+        {
+            "models": model_states,
+            "input_dim": clock_train[0].inputs.shape[1],
+            "protocol": "three_body_leave_one_embodiment_out",
+        },
+        output_root / "stage3_models.pt",
+    )
+
+    total_failures = sum(int(row["train_failures"]) for row in fold_rows)
+    checks, mechanism_passed, decision_status, decision_passed = (
+        calculate_development_checks(comparison, total_failures)
+    )
+    summary = {
+        "status": "exploratory_three_body_leave_one_out",
+        "protocol": "Aloha+ARX clock; opposite mixed-outcome body for semantics; held-out body for adaptation/test",
+        "steps": steps,
+        "seeds": seeds,
+        "folds": fold_rows,
+        "aggregate": aggregate.to_dict(orient="records"),
+        "development_checks": checks,
+        "mechanism_gate_passed": mechanism_passed,
+        "decision_gate_passed": decision_passed,
+        "decision_gate_status": decision_status,
+        "stop_before_critic_integration": decision_passed is not True,
+        "event_only_same_event_auc_baseline": 0.5,
+        "limitations": [
+            "Piper and UR5-WSG have already been inspected; this is development cross-validation, not confirmation.",
+            "The auxiliary mixed-outcome embodiment supervises semantics only; the held-out embodiment is never used for shared training.",
+            "Only a new embodiment or sealed fresh rollouts can support a confirmatory transfer claim.",
+        ],
+    }
+    (output_root / "stage3_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    report = f"""# ETSF Stage 3 · Three-Body Leave-One-Embodiment-Out
+
+## Protocol
+
+Aloha and ARX-X5 identify the clock in every fold. UR5-WSG supplies mixed-outcome
+semantic supervision while Piper is held out, then Piper supplies semantic
+supervision while UR5-WSG is held out. The held-out body is used only for frozen
+N={adaptation_count} per-task adaptation and last-five testing.
+
+## Fold manifest
+
+{dataframe_markdown(pd.DataFrame(fold_rows))}
+
+## Results
+
+{dataframe_markdown(aggregate)}
+
+## Gates
+
+- Mechanism gate passed: **{mechanism_passed}**
+- Decision gate passed: **{decision_passed}**
+- Decision status: **{decision_status}**
+- Event-only same-event AUC baseline: **0.5**
+
+This run is exploratory because both target bodies were used during model development.
+"""
+    (output_root / "stage3_report.md").write_text(report, encoding="utf-8")
+    return summary
 
 
 def run_main(
@@ -1248,7 +1665,9 @@ confirmatory claims, and source failures are required before claiming decision t
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["self-test", "main", "gate"], required=True)
+    parser.add_argument(
+        "--stage", choices=["self-test", "main", "loeo", "gate"], required=True
+    )
     parser.add_argument("--data-root", type=Path, default=Path("/home/user/etsf_stage1"))
     parser.add_argument("--output-root", type=Path, default=Path("/home/user/etsf_stage3"))
     parser.add_argument("--steps", type=int, default=3000)
@@ -1263,6 +1682,16 @@ def main() -> None:
     if args.stage == "gate":
         gate = refresh_development_gate(args.output_root)
         print("DEVELOPMENT_GATE=" + json.dumps(gate, sort_keys=True), flush=True)
+        return
+    if args.stage == "loeo":
+        summary = run_loeo(
+            args.data_root,
+            args.output_root,
+            args.steps,
+            args.adaptation_count,
+            args.seeds,
+        )
+        print("STAGE3_LOEO_SUMMARY=" + json.dumps(summary, sort_keys=True), flush=True)
         return
     summary = run_main(
         args.data_root,

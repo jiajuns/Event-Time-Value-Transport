@@ -1,0 +1,85 @@
+defaults:
+  - env/robotwin_move_can_pot@env.eval
+  - model/openvla_oft@rollout.model
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env, rollout: 0
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: /home/user/etsf_openvla_baseline/results
+    project_name: etsf_openvla_baseline
+    experiment_name: move_can_pot_openvla_oft_smoke
+    logger_backends: [tensorboard]
+  max_epochs: 1
+  max_steps: -1
+  only_eval: true
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: EnvGroup
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: false
+    ignore_terminations: false
+    max_episode_steps: 200
+    max_steps_per_rollout_epoch: 200
+    group_size: 1
+    use_fixed_reset_state_ids: true
+    is_eval: true
+    assets_path: /home/user/etsf_stage0/RoboTwin
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
+    video_cfg:
+      save_video: false
+      info_on_video: false
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    enable_offload: true
+
+rollout:
+  sampling_params:
+    do_sample: false
+    temperature_train: 1.0
+    temperature_eval: -1
+    top_k: -1
+    top_p: 1.0
+    repetition_penalty: 1.0
+  group_name: RolloutGroup
+  backend: huggingface
+  enable_offload: true
+  pipeline_stage_num: 1
+  model:
+    model_path: /home/user/etsf_openvla_models/RLinf-OpenVLAOFT-RoboTwin-SFT-move_can_pot
+    model_type: openvla_oft
+    implement_version: official
+    precision: bf16
+    value_type: action_level
+    action_dim: 14
+    num_action_chunks: 25
+    use_proprio: true
+    proprio_dim: 14
+    use_film: false
+    unnorm_key: move_can_pot_1k
+    center_crop: true
+    add_value_head: false
+    is_lora: true
+    max_prompt_length: 512
+    num_images_in_input: 1
+    attn_implementation: eager
+    low_cpu_mem_usage: true
+    trust_remote_code: true
