@@ -4,16 +4,22 @@
 
 ## 当前快照
 
-- 更新时间：2026-08-26 17:20（Asia/Shanghai）
+- 更新时间：2026-08-26 17:34（Asia/Shanghai）
 - Git 分支：`main`
 - 最新实现提交：`ab9bb70a3aee968816449e7c4dac4fa543580194`
+- 最新文档提交：`bbde25b`
 - 运行服务器：`user@100.115.128.14`
 - GPU：NVIDIA GeForce RTX 4090 D，24 GB
 - 任务：RoboTwin `move_can_pot`
 - 本体：Piper 双臂，间距 0.6
 - OpenVLA-OFT checkpoint：`/home/user/etsf_openvla_models/RLinf-OpenVLAOFT-RoboTwin-SFT-move_can_pot`
 - 正式 rollout 目录：`/home/user/etsf_openvla_rollouts_move_can_pot_20260826`
-- 当前采集：92/150，成功 12、失败 80、带 canonical chain gap 7，状态 `collecting`
+- 正式采集：150/150，成功 18、失败 132、带 canonical chain gap 10，审计通过
+- OpenVLA on-policy 成功率：`18/150=12.0%`
+- 正式训练输出：`/home/user/etsf_openvla_shadow_trained_move_can_pot_20260826`
+- 本地数据备份：`/home/jj/etsf_openvla_rollouts_move_can_pot_20260826`（57 MB，150 个 HDF5）
+- 本地训练备份：`/home/jj/etsf_openvla_shadow_trained_move_can_pot_20260826`（12 MB）
+- 离线门结果：`action_ranking_authorized=false`
 - 当前控制权限：ETSF 仅 shadow；没有修改 OpenVLA 动作，也没有候选动作排序权限
 
 ## 已完成
@@ -79,6 +85,66 @@
 - 数据审计会验证 hidden、terminal hidden、动作、位姿、末帧、唯一 seed 和 `eK↔success`；任一失败则训练前止损。
 - 动态自检已通过前向、反向、缺事件链、配对计数和 episode bootstrap。
 - 实现提交并推送：`ab9bb70a3aee968816449e7c4dac4fa543580194`。
+
+### 2026-08-26：150 条正式采集与训练结果
+
+正式数据：
+
+| 项目 | 结果 |
+|---|---:|
+| rollout | 150 |
+| 成功 / 失败 | 18 / 132 |
+| OpenVLA 成功率 | 12.0% |
+| canonical chain gap | 10 |
+| HDF5 审计 | 10/10 项通过 |
+| train / validation / test | 100 / 25 / 25 |
+| 三份成功数 | 12 / 3 / 3 |
+
+最初 20-seed B0 的成功率是 20%，扩大到 150 个官方 seed 后为 12%，说明 20 条估计偏乐观。固定 test 只有 3 个成功，低于预注册的最少 4 个成功门槛；不为过门重划数据。
+
+训练 5 个初始化、每个 3000 步。validation 同事件 micro-AUC：
+
+| seed | validation 同事件 AUC | validation Clock MAE |
+|---|---:|---:|
+| 20260826 | 0.7130 | 20.34 |
+| 20260827 | 0.5278 | 23.50 |
+| 20260828 | **0.8148** | 20.14 |
+| 20260829 | 0.6481 | 24.86 |
+| 20260830 | 0.5926 | 16.43 |
+
+按 validation 选择 seed `20260828`，只在选择后评估 test：
+
+| test 指标 | ETSF | 基线 / 门槛 | 结果 |
+|---|---:|---:|---|
+| 同事件 micro-AUC | **0.8258** | 事件计数器 0.5 | 通过 |
+| 同事件配对 | 132 | ≥50 | 通过 |
+| episode bootstrap 95% 下界 | **0.7083** | >0.5 | 通过 |
+| 同事件 Brier | 0.1310 | 事件率 0.1056 | 未通过 |
+| Clock duration MAE | 16.65 | 事件中位数 12.50 | 未通过 |
+| test 成功 / 失败 | 3 / 22 | 各至少 4 | 未通过 |
+| 事件分类 accuracy | 0.9149 | 事件索引 oracle 1.0 | 诊断，不作门 |
+
+门控结论：
+
+```text
+action_ranking_authorized = false
+policy_effect_during_collection_or_shadow = false
+next_action = keep ETSF in shadow mode and do not rank OpenVLA actions
+```
+
+解释：4096→96 bridge 和共享语义头已经在严格同事件条件下学到明显分支信号，这一部分不是事件计数器；但成功概率过度自信、ClockLNN 在仅 12 条训练成功轨迹上过拟合，而且确认集正例不足。当前 checkpoint 可作为开发 shadow，不可接管候选动作选择。
+
+下一版仅能作为开发迭代，不能把已经打开的同一 test 再称为全新确认集：
+
+1. 只用 validation 做 temperature calibration，修复排序好但 Brier 差的问题；
+2. ClockLNN 改用与 MAE 对齐的 robust log-duration 损失，并保存 validation early-stop checkpoint；
+3. 增加新的 on-policy 成功轨迹或预注册新确认 seeds，保证确认集至少 4 个正例；
+4. 通过新的密封确认门之前继续禁止动作候选排序。
+
+本地校验：
+
+- `shadow_gate_summary.json` SHA-256：`addee2509acdf55d7d9afe2ff7ecfc41a9d99f9e08d489830f3436b5f720291e`
+- selected checkpoint SHA-256：`e8d5c8e9c967b6876f6570e702eca17d9e7137675840d6e2cfa178cc4e871537`
 
 ## 当前正式运行
 

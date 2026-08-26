@@ -11,7 +11,7 @@ Event-Time Value Transport（ETSF）研究跨机器人本体的价值函数迁�
 | Stage 2 G0–G2 | 已完成 | 事件链修复、后验认证、共享液态头及模块边界测试通过 |
 | Stage 2 G3 | **未通过** | T4 改善 Bellman 一致性和局部时长方向，但没有同时保持 AUC 与优势符号 |
 | Stage 3 三本体留一 | **机制门通过、失败分支出现正信号** | 第三本体失败监督和失败末帧解除事件查找表退化；留出 Piper/UR5 的同事件 AUC 达 0.612/0.792，但测试配对仍不足以确认通过 |
-| OpenVLA-OFT B0＋shadow | **单任务已跑通** | `move_can_pot`、Piper、20 个官方 seed，成功率 4/20=20%；4096→96 ETSF shadow 接线通过且不改变动作，critic 训练待完成 |
+| OpenVLA-OFT B0＋shadow | **单任务训练完成、离线门未通过** | `move_can_pot`、Piper、150 个官方 seed，成功率 18/150=12%；同事件 AUC 0.826，但校准、ClockLNN 和确认集正例数未过门，动作排序仍禁用 |
 
 当前结果不能表述为“已经完成零样本跨本体 critic 迁移”。Stage 3 已完成开发性三本体留一和 5 种子复跑；现有 Piper/UR5 已被用于方案诊断，每个留出本体只有 26–30 个同事件正负对，因此不会进入动作条件 critic 集成。
 
@@ -290,7 +290,7 @@ T4 的 Bellman MSE 和局部方向优于 T3，但 AUC 低于 T2/T3，优势符�
 
 已使用 RLinf 官方 OpenVLA-OFT `move_can_pot` SFT checkpoint，在单张 RTX 4090 D 上完成 Piper `demo_randomized` 端到端评测。模型为 7.558B BF16、14 维动作、25-step chunk；20 个官方 eval seed 中成功 4 条，原始策略成功率为 **20%**。该结果是最终路线中的 B0 baseline，不是 ETSF 增益。
 
-随后已完成非控制 shadow 接入：从 OpenVLA 动作前最后隐藏状态提取 4096 维特征，输入 ETSF `4096→96` bridge、语义 successor 头和 ClockLNN；真实环境运行 8 个 action chunk、200 步，hook 前后动作逐元素一致。当前 shadow 仍是随机初始化接线测试，尚未使用 OpenVLA rollout训练，也没有用于动作排序。
+随后从 OpenVLA 动作前最后隐藏状态提取 4096 维特征，采集了 150 条 on-policy rollout（18 成功、132 失败），并正式训练 ETSF `4096→96` bridge、语义头和 ClockLNN。选中模型的留出同事件 AUC 为 `0.8258`，episode bootstrap 95% 下界为 `0.7083`，说明语义排序超过事件计数器；但 Brier `0.1310` 差于事件率基线 `0.1056`，Clock MAE `16.65` 差于事件中位数 `12.50`，且 test 只有 3 个成功。因此 `action_ranking_authorized=false`，ETSF 仍未用于动作排序。完整过程见[持续进度日志](docs/ETSF_OpenVLA_progress_log.md)。
 
 ## 止损与研究边界
 
