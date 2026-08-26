@@ -7,7 +7,7 @@
 - 更新时间：2026-08-26 17:34（Asia/Shanghai）
 - Git 分支：`main`
 - 最新实现提交：`ab9bb70a3aee968816449e7c4dac4fa543580194`
-- 最新文档提交：`bbde25b`
+- 正式结果记录提交：`5a67786f1857bf3390e44ef37d510b40da691ea9`
 - 运行服务器：`user@100.115.128.14`
 - GPU：NVIDIA GeForce RTX 4090 D，24 GB
 - 任务：RoboTwin `move_can_pot`
