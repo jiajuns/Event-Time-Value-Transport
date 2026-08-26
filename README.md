@@ -59,6 +59,7 @@ scripts/
 - [Stage 2 液态价值传输文档](docs/ETSF_stage2_liquid_transport.md)
 - [Stage 3 语义/时钟解耦文档](docs/ETSF_stage3_factorized_transport.md)
 - [OpenVLA-OFT 完整技术路线](docs/ETSF_OpenVLA_OFT_full_technical_route.md)
+- [ETSF × OpenVLA-OFT 持续进度日志](docs/ETSF_OpenVLA_progress_log.md)
 - [Stage 2 正式入口](scripts/run_stage2.py)
 - [Stage 3 开发入口](scripts/run_stage3.py)
 
