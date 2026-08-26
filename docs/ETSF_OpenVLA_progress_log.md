@@ -200,4 +200,14 @@ OpenVLA candidate ranking = disabled
 
 - 当前 checkpoint 只覆盖 Piper `move_can_pot`，本轮只能验证 OpenVLA hidden 上的单本体 shadow critic；不能宣称 OpenVLA critic 已跨机械臂迁移。
 - 跨本体正式实验还需要其他机械臂的原生 OpenVLA-OFT policy/action adapter 与 on-policy rollout，按本体留一训练共享 critic。
-- 当前下一步：采满 150 条 → 完整性审计 → 5 初始化训练 → 冻结测试集离线门 → 根据门结果决定是否实现受保护的候选动作评分。
+- 当前下一步：保持动作排序禁用；用 validation 开发概率校准和 ClockLNN early stopping，并另行冻结包含足够成功样本的新确认集。
+
+## 2026-08-26：本地源码归档
+
+- 归档基线：Git `7de94ae47b7db3f153bf75c1b35e6774a060681a`
+- 本地文件：`/home/jj/Event-Time-Value-Transport_OpenVLA_ETSF_7de94ae.zip`
+- 大小：160 KB
+- SHA-256：`b23e624325a299de2ac0eb275c6878d187ddbacd9469593689b0690f82e2e133`
+- `unzip -t`：通过，无压缩数据错误
+- 内容：当前 Git 已跟踪源码、配置、README、技术路线、进度日志和 OpenVLA×ETSF 三个执行脚本
+- 排除：`.git`、未跟踪文件、OpenVLA checkpoint、原始 rollout 和训练模型
