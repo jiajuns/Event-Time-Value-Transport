@@ -14,6 +14,8 @@ import hashlib
 import json
 import os
 import random
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -190,6 +192,80 @@ def raw_state(task) -> np.ndarray:
     return np.asarray(task.now_obs["joint_action"]["vector"], dtype=np.float32).copy()
 
 
+def annotated_bgr_frame(
+    cv2,
+    rgb: np.ndarray,
+    episode_number: int,
+    episode_total: int,
+    seed: int,
+    step: int,
+    status: str = "RUNNING",
+) -> np.ndarray:
+    frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 34), (0, 0, 0), thickness=-1)
+    color = (90, 230, 90) if status == "SUCCESS" else ((80, 80, 255) if status == "FAILURE" else (255, 255, 255))
+    text = f"Episode {episode_number:02d}/{episode_total:02d}  seed={seed}  step={step:03d}  {status}"
+    cv2.putText(frame, text, (7, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.43, color, 1, cv2.LINE_AA)
+    return frame
+
+
+def merge_episode_videos(video_paths: list[Path], output_path: Path) -> dict[str, Any]:
+    if not video_paths:
+        raise ValueError("cannot create a combined video without episode videos")
+    missing = [str(path) for path in video_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"episode videos are missing: {missing}")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is required for --combined-video")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    concat_path = output_path.with_suffix(output_path.suffix + ".concat.txt")
+    resolved = [path.resolve() for path in video_paths]
+    if any("'" in str(path) for path in resolved):
+        raise ValueError("video paths containing apostrophes are not supported")
+    concat_path.write_text(
+        "".join(f"file '{path}'\n" for path in resolved), encoding="utf-8"
+    )
+    try:
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_path),
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            check=True,
+        )
+    finally:
+        concat_path.unlink(missing_ok=True)
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"combined video was not created: {output_path}")
+    return {
+        "path": str(output_path),
+        "episodes": len(video_paths),
+        "bytes": output_path.stat().st_size,
+        "sha256": sha256(output_path),
+        "codec": "H.264/yuv420p",
+    }
+
+
 def derive_events(
     poses: np.ndarray,
     names: list[str],
@@ -320,7 +396,15 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=150)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--video-dir", type=Path)
+    parser.add_argument("--video-fps", type=int, default=20)
+    parser.add_argument("--combined-video", type=Path)
     args = parser.parse_args()
+
+    if args.video_fps <= 0:
+        parser.error("--video-fps must be positive")
+    if args.combined_video is not None and args.video_dir is None:
+        parser.error("--combined-video requires --video-dir")
 
     random.seed(20260826)
     np.random.seed(20260826)
@@ -342,6 +426,13 @@ def main() -> None:
     seeds_path = args.rlinf_root / "rlinf/envs/robotwin/seeds/eval_seeds.json"
     seeds = load_official_seeds(seeds_path, args.limit, args.offset)
     event_spec = json.loads(args.event_spec.read_text(encoding="utf-8"))
+    cv2 = None
+    if args.video_dir is not None:
+        import cv2 as cv2_module
+
+        cv2 = cv2_module
+        cv2.setNumThreads(0)
+        args.video_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda:0")
     model = get_model(model_config(args.model_path), torch_dtype=torch.bfloat16).eval().to(device)
@@ -370,16 +461,29 @@ def main() -> None:
         "max_steps": MAX_STEPS,
         "episodes": [],
     }
+    active_video_writer = None
     try:
         for episode_index, seed in enumerate(seeds):
             path = episodes_dir / f"episode_{episode_index:03d}_seed_{seed}.hdf5"
-            if path.exists() and not args.overwrite:
+            video_path = (
+                args.video_dir / f"episode_{episode_index:03d}_seed_{seed}.mp4"
+                if args.video_dir is not None
+                else None
+            )
+            video_already_exists = video_path is None or video_path.is_file()
+            if path.exists() and not args.overwrite and video_already_exists:
                 with h5py.File(path, "r") as handle:
-                    manifest["episodes"].append(
-                        {"index": episode_index, "seed": seed, "path": path.name,
-                         "success": bool(handle.attrs["success"]), "steps": int(handle.attrs["steps"]),
-                         "status": "existing"}
-                    )
+                    existing = {
+                        "index": episode_index,
+                        "seed": seed,
+                        "path": path.name,
+                        "success": bool(handle.attrs["success"]),
+                        "steps": int(handle.attrs["steps"]),
+                        "status": "existing",
+                    }
+                if video_path is not None:
+                    existing["video"] = str(video_path)
+                manifest["episodes"].append(existing)
                 continue
 
             started = time.time()
@@ -390,6 +494,23 @@ def main() -> None:
             poses = [read_poses(objects)]
             states = [raw_state(task)]
             initial_rgb = raw_rgb(task)
+            video_writer = None
+            if cv2 is not None:
+                height, width = initial_rgb.shape[:2]
+                video_writer = cv2.VideoWriter(
+                    str(video_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    float(args.video_fps),
+                    (width, height),
+                )
+                if not video_writer.isOpened():
+                    raise RuntimeError(f"cannot open video writer: {video_path}")
+                active_video_writer = video_writer
+                video_writer.write(
+                    annotated_bgr_frame(
+                        cv2, initial_rgb, episode_index + 1, len(seeds), seed, 0
+                    )
+                )
             query_steps: list[int] = []
             hidden: list[np.ndarray] = []
             chunks: list[np.ndarray] = []
@@ -413,6 +534,17 @@ def main() -> None:
                     steps += 1
                     poses.append(read_poses(objects))
                     states.append(raw_state(task))
+                    if video_writer is not None:
+                        video_writer.write(
+                            annotated_bgr_frame(
+                                cv2,
+                                raw_rgb(task),
+                                episode_index + 1,
+                                len(seeds),
+                                seed,
+                                steps,
+                            )
+                        )
                     success_value = infos.get("success", [False])
                     success = success or scalar_bool(success_value)
                     done = scalar_bool(terminated) or scalar_bool(truncated)
@@ -420,6 +552,21 @@ def main() -> None:
                         break
 
             terminal_rgb = raw_rgb(task)
+            if video_writer is not None:
+                terminal_status = "SUCCESS" if success else "FAILURE"
+                terminal_card = annotated_bgr_frame(
+                    cv2,
+                    terminal_rgb,
+                    episode_index + 1,
+                    len(seeds),
+                    seed,
+                    steps,
+                    terminal_status,
+                )
+                for _ in range(args.video_fps):
+                    video_writer.write(terminal_card)
+                video_writer.release()
+                active_video_writer = None
             # This forward pass is observational only: its action is never sent
             # to the environment.  It gives failure supervision a representation
             # of the actual terminal frame instead of the preceding chunk start.
@@ -473,18 +620,27 @@ def main() -> None:
                 "wall_seconds": record["wall_seconds"],
                 "status": "collected",
             }
+            if video_path is not None:
+                item["video"] = str(video_path)
             manifest["episodes"].append(item)
             manifest["completed"] = len(manifest["episodes"])
             manifest["successes"] = sum(entry["success"] for entry in manifest["episodes"])
             atomic_json(args.output / "manifest.json", manifest)
             print("COLLECTED=" + json.dumps(item, sort_keys=True), flush=True)
     finally:
+        if active_video_writer is not None:
+            active_video_writer.release()
         env.venv.close(clear_cache=False)
 
     manifest["status"] = "complete"
     manifest["completed"] = len(manifest["episodes"])
     manifest["successes"] = sum(entry["success"] for entry in manifest["episodes"])
     manifest["failures"] = manifest["completed"] - manifest["successes"]
+    if args.combined_video is not None:
+        manifest["combined_video"] = merge_episode_videos(
+            [Path(entry["video"]) for entry in manifest["episodes"]],
+            args.combined_video,
+        )
     atomic_json(args.output / "manifest.json", manifest)
     print("COLLECTION_COMPLETE=" + json.dumps(
         {key: manifest[key] for key in ["completed", "successes", "failures"]}, sort_keys=True
