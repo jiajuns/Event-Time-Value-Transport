@@ -4,9 +4,9 @@
 
 ## 当前快照
 
-- 更新时间：2026-08-26 18:15（Asia/Shanghai）
+- 更新时间：2026-08-26 17:34（Asia/Shanghai）
 - Git 分支：`main`
-- 最新实现提交：`8e0cb09`
+- 最新实现提交：`ab9bb70a3aee968816449e7c4dac4fa543580194`
 - 正式结果记录提交：`5a67786f1857bf3390e44ef37d510b40da691ea9`
 - 运行服务器：`user@100.115.128.14`
 - GPU：NVIDIA GeForce RTX 4090 D，24 GB
@@ -19,7 +19,6 @@
 - 正式训练输出：`/home/user/etsf_openvla_shadow_trained_move_can_pot_20260826`
 - 本地数据备份：`/home/jj/etsf_openvla_rollouts_move_can_pot_20260826`（57 MB，150 个 HDF5）
 - 本地训练备份：`/home/jj/etsf_openvla_shadow_trained_move_can_pot_20260826`（12 MB）
-- 前 20 条完整合并视频：`/home/jj/OpenVLA_OFT_move_can_pot_first20_full.mp4`
 - 离线门结果：`action_ranking_authorized=false`
 - 当前控制权限：ETSF 仅 shadow；没有修改 OpenVLA 动作，也没有候选动作排序权限
 
@@ -234,18 +233,3 @@ OpenVLA candidate ranking = disabled
 3. 主指标为同 seed 的成功率差及配对置信区间；同时比较显存、时延、候选多样性、hidden 同事件 AUC 和失败轨迹质量。
 4. 只有 SmolVLA 的配对成功率置信下界不低于 OpenVLA-OFT，且接口/候选门通过，才把它提升为共同主 baseline；显著更好时才考虑把后续 ETSF actor 主线迁移过去。
 5. 在比较完成前，OpenVLA-OFT 保持 B0，SmolVLA 标为 `B0-small/challenger`；ETSF 动作排序仍保持禁用。
-
-## 2026-08-26：前 20 条 OpenVLA-OFT 完整视频
-
-在记录的 RTX 4090 D 服务器 `user@100.115.128.14` 上，使用正式 collector 的同一配置重新运行官方前 20 个 eval seed。策略为 RLinf 官方 OpenVLA-OFT `move_can_pot` SFT checkpoint，任务、双 Piper 本体、场景和 seed 来自 RoboTwin/RLinf；新增代码只保存、标注和合并相机帧，hidden hook 原样返回模型结果，ETSF 没有修改或排序动作。
-
-- 录制实现提交：`8e0cb09`
-- 完成：20/20；成功 3、失败 17，成功率 `15%`
-- 成功 seed：`100100005`、`100100013`、`100100022`
-- 与正式 150 条 rollout 的前 20 条逐 seed 成败和终止步数完全一致
-- 早期 RLinf eval runner 的 `4/20=20%` 未被正式 collector 和本次视频复跑重现；跨设置结论继续以 `18/150=12%` 为准
-- 单一视频：`/home/jj/OpenVLA_OFT_move_can_pot_first20_full.mp4`
-- 视频：H.264、yuv420p、320×240、20 FPS、4104 帧、205.2 秒、4,466,470 bytes
-- SHA-256：`0bca2b735d864a5b040baead974264e92400b6fda74750670e888e469771bc73`
-- 画面包含 episode、官方 seed、环境 step，以及每条末帧的 SUCCESS/FAILURE 结果卡
-- checkpoint 自带 `dataset_statistics.json` 只包含 `move_can_pot_1k`：1000 条训练轨迹、106,312 transitions；当前 20 条是独立在线评测场景，不是这 1000 条训练轨迹

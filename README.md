@@ -288,7 +288,7 @@ T4 的 Bellman MSE 和局部方向优于 T3，但 AUC 低于 T2/T3，优势符�
 
 ### OpenVLA-OFT baseline 复现
 
-已使用 RLinf 官方 OpenVLA-OFT `move_can_pot` SFT checkpoint，在单张 RTX 4090 D 上完成 Piper `demo_randomized` 端到端评测。模型为 7.558B BF16、14 维动作、25-step chunk。早期 RLinf eval runner 记录为 `4/20=20%`；随后正式 collector 的前 20 条及独立完整视频复跑均可重复得到 `3/20=15%`，150 条正式结果为 `18/150=12%`。三者都是原始策略结果，不是 ETSF 增益；跨设置时以相同 collector 的 150 条结果为主。
+已使用 RLinf 官方 OpenVLA-OFT `move_can_pot` SFT checkpoint，在单张 RTX 4090 D 上完成 Piper `demo_randomized` 端到端评测。模型为 7.558B BF16、14 维动作、25-step chunk；20 个官方 eval seed 中成功 4 条，原始策略成功率为 **20%**。该结果是最终路线中的 B0 baseline，不是 ETSF 增益。
 
 随后从 OpenVLA 动作前最后隐藏状态提取 4096 维特征，采集了 150 条 on-policy rollout（18 成功、132 失败），并正式训练 ETSF `4096→96` bridge、语义头和 ClockLNN。选中模型的留出同事件 AUC 为 `0.8258`，episode bootstrap 95% 下界为 `0.7083`，说明语义排序超过事件计数器；但 Brier `0.1310` 差于事件率基线 `0.1056`，Clock MAE `16.65` 差于事件中位数 `12.50`，且 test 只有 3 个成功。因此 `action_ranking_authorized=false`，ETSF 仍未用于动作排序。完整过程见[持续进度日志](docs/ETSF_OpenVLA_progress_log.md)。
 
