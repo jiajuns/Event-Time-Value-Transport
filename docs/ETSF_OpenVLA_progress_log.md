@@ -211,3 +211,25 @@ OpenVLA candidate ranking = disabled
 - `unzip -t`：通过，无压缩数据错误
 - 内容：当前 Git 已跟踪源码、配置、README、技术路线、进度日志和 OpenVLA×ETSF 三个执行脚本
 - 排除：`.git`、未跟踪文件、OpenVLA checkpoint、原始 rollout 和训练模型
+
+## 2026-08-26：是否把 baseline 换成 SmolVLA
+
+用户所写 `SOM-VLA` 暂按 Hugging Face/LeRobot 的 **SmolVLA** 理解；如果指另一个项目，需要按其准确链接重新判断。
+
+决策：**不直接替换 OpenVLA-OFT；保留 OpenVLA-OFT 为已经复现的主 baseline，新增 SmolVLA 为 challenger baseline。**
+
+依据：
+
+- 当前 OpenVLA-OFT 已有 RoboTwin `move_can_pot` Piper checkpoint、14 维动作契约、25-step chunk、4096 hidden hook 和 150 条 on-policy 结果，替换会使现有 actor 数据和 hidden 不可直接比较。
+- [OpenVLA-OFT 官方论文](https://arxiv.org/abs/2502.19645)采用并行连续动作、action chunk 和 L1 训练；官方报告 LIBERO 平均成功率 97.1%，并支持双臂 ALOHA 高频控制。当前 Piper 的 12% 是具体 RoboTwin checkpoint/数据分布结果，不能据此推出 OFT 架构本身劣于 SmolVLA。
+- [SmolVLA 官方文档](https://github.com/huggingface/lerobot/blob/main/docs/source/smolvla.mdx)说明其为 450M 基础模型，面向 LeRobot 数据微调，官方建议从约 50 条任务演示开始；没有发现可直接替代当前任务的官方 Piper `move_can_pot` checkpoint。
+- [SmolVLA 官方实现](https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/smolvla/modeling_smolvla.py)使用 flow matching action expert，允许通过不同 noise 生成多个连续 action chunk。这比确定性 OpenVLA-OFT 更适合作为 ETSF 候选生成器，也能在 4090 上更低成本训练和多样本推理。
+- SmolVLA 的公开强结果主要来自 LIBERO、Meta-World、SO100/SO101，不能直接外推到 RoboTwin Piper 双臂；它也不天然证明跨本体 critic 迁移。
+
+预注册比较协议：
+
+1. 使用与 OpenVLA-OFT 相同的源演示、图像、语言、14 维动作、200-step horizon 和 150 个官方 seed；失败 rollout 不进入动作模仿训练。
+2. 先做 20-seed 接口冒烟，再固定 checkpoint 跑同一 150-seed 配对测试；不能用 SmolVLA 论文的 LIBERO 数字对比本项目 RoboTwin 数字。
+3. 主指标为同 seed 的成功率差及配对置信区间；同时比较显存、时延、候选多样性、hidden 同事件 AUC 和失败轨迹质量。
+4. 只有 SmolVLA 的配对成功率置信下界不低于 OpenVLA-OFT，且接口/候选门通过，才把它提升为共同主 baseline；显著更好时才考虑把后续 ETSF actor 主线迁移过去。
+5. 在比较完成前，OpenVLA-OFT 保持 B0，SmolVLA 标为 `B0-small/challenger`；ETSF 动作排序仍保持禁用。
