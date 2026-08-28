@@ -291,7 +291,7 @@ def test_r14_constants_pin_parent_clean_collect_and_new_output() -> None:
         watcher.R14_FORBIDDEN_PRIOR_SCHEMA6_OUTPUT_ROOTS
     )
     assert watcher.R14_CODE_ROOT == Path(
-        "/home/user/etsf_smolvla_piper_schema6_code_r14_20260829"
+        "/home/user/etsf_smolvla_piper_schema6_code_r14b_20260829"
     )
     assert watcher.R14_CODE_ROOT not in watcher.R14_FORBIDDEN_PRIOR_CODE_ROOTS
     assert {value["import_name"] for value in watcher.R14_LOCAL_IMPORT_TARGETS} >= {
@@ -339,6 +339,14 @@ def test_probe_uses_isolated_no_user_site_environment_and_validates_payload(
     assert audit["environment_projection"] == projection
     assert audit["hdf5_payloads_opened"] == 0
     assert audit["test_or_label_payloads_opened"] == 0
+
+
+def test_probe_binds_environment_before_import_side_effects() -> None:
+    source = watcher._R14_PYTHON_PROBE_SOURCE
+    snapshot = "launch_environment_projection = {"
+    first_import = "packages_to_distributions = importlib.metadata.packages_distributions()"
+    assert source.index(snapshot) < source.index(first_import)
+    assert '"environment_projection": launch_environment_projection' in source
 
 
 def test_probe_rejects_wrong_omegaconf_version(tmp_path: Path) -> None:

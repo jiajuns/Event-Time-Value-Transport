@@ -133,17 +133,21 @@ R14_AUDITED_ENVIRONMENT_NAMES = (
     "VK_ICD_FILENAMES",
 )
 R14_CODE_ROOT = _R14Path(
-    "/home/user/etsf_smolvla_piper_schema6_code_r14_20260829"
+    "/home/user/etsf_smolvla_piper_schema6_code_r14b_20260829"
 )
 R14_FORBIDDEN_PRIOR_CODE_ROOTS = (
     _R14Path("/home/user/etsf_smolvla_piper_schema6_code_r6j_20260828"),
+    _R14Path("/home/user/etsf_smolvla_piper_schema6_code_r14_20260829"),
 )
 R14_SCHEMA6_OUTPUT_ROOT = _R14Path(
-    "/home/user/etsf_smolvla_piper_schema6_autonomous_r14_20260829"
+    "/home/user/etsf_smolvla_piper_schema6_autonomous_r14b_20260829"
 )
 R14_FORBIDDEN_PRIOR_SCHEMA6_OUTPUT_ROOTS = (
     _R14Path(
         "/home/user/etsf_smolvla_piper_schema6_autonomous_r13_20260829"
+    ),
+    _R14Path(
+        "/home/user/etsf_smolvla_piper_schema6_autonomous_r14_20260829"
     ),
 )
 R14_DEFAULT_PYTHON_PROBE_TIMEOUT_SECONDS = 120.0
@@ -222,6 +226,9 @@ required = tuple(json.loads(sys.argv[1]))
 environment_names = tuple(json.loads(sys.argv[2]))
 import_contract = json.loads(sys.argv[3])
 hdf5_open_attempts = 0
+launch_environment_projection = {
+    name: os.environ.get(name) for name in environment_names
+}
 
 
 def audit(event, args):
@@ -383,9 +390,10 @@ payload = {
     "simulator_or_policy_objects_instantiated": 0,
     "environment_reset_calls": 0,
     "environment_step_calls": 0,
-    "environment_projection": {
-        name: os.environ.get(name) for name in environment_names
-    },
+    # Some binary packages (notably cv2) mutate LD_LIBRARY_PATH while being
+    # imported.  The security contract binds the environment supplied to the
+    # child, not process-local mutations performed after the import boundary.
+    "environment_projection": launch_environment_projection,
     "hdf5_open_attempts": hdf5_open_attempts,
     "hdf5_payloads_opened": 0,
     "test_or_label_payloads_opened": 0,
