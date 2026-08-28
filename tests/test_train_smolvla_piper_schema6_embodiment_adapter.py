@@ -157,6 +157,229 @@ def test_adapters_are_exact_identity_and_policy_rows_stay_bit_exact() -> None:
     assert model.trainable_parameter_audit()["policy_rows_trainable"] == []
 
 
+def _provider_variant_config() -> EventWorldModelConfig:
+    return EventWorldModelConfig(
+        state_input_dim=STATE_DIM,
+        action_dim=ACTION_DIM,
+        proprio_dim=14,
+        semantic_dim=16,
+        action_hidden_dim=16,
+        transition_hidden_dim=24,
+        clock_hidden_dim=8,
+        object_delta_dim=6,
+        num_bodies=2,
+        num_policies=2,
+        structured_events=True,
+        dropout=0,
+    )
+
+
+def _provider_variant_batch(count: int = 2) -> dict[str, torch.Tensor]:
+    return {
+        "state": torch.zeros(count, STATE_DIM),
+        "actions": torch.ones(count, 2, ACTION_DIM),
+        "action_mask": torch.ones(count, 2, dtype=torch.bool),
+        "proprio": torch.zeros(count, 14),
+        "current_event_id": torch.zeros(count, dtype=torch.long),
+        "current_predicates": torch.zeros(count, 5),
+        "dt": torch.tensor([2.0] * count),
+    }
+
+
+def test_default_provider_preserves_body_conditioned_behavior_and_audit_fields() -> None:
+    model = SmolVLAPiperAdapter(
+        ActionConditionedEventWorldModel(_provider_variant_config()),
+        state_rank=3,
+        action_rank=2,
+    )
+    assert model.provider_variant == "body_conditioned_adapter"
+    assert model.prediction_body_row == 1
+    expected_trainable_names = {
+        "state_adapter.down.weight",
+        "state_adapter.up.weight",
+        "action_adapter.diagonal",
+        "action_adapter.down.weight",
+        "action_adapter.up.weight",
+        "clock_beta",
+        "clock_log_step_scale",
+        "core.action_encoder.body_embedding.weight",
+    }
+    trainable = model.trainable_parameter_audit()
+    assert set(trainable) == {
+        "names",
+        "parameter_tensor_count",
+        "optimizer_parameter_scalars",
+        "effective_target_parameter_scalars",
+        "effective_core_rows",
+        "policy_rows_trainable",
+        "only_authorized_components",
+    }
+    assert set(trainable["names"]) == expected_trainable_names
+    assert trainable["parameter_tensor_count"] == 8
+    immutable = model.enforce_and_verify_frozen_core()
+    assert set(immutable) == {
+        "all_core_tensors_except_piper_body_row_bit_exact",
+        "smolvla_policy_row_0_sha256",
+        "reserved_openvla_policy_row_1_sha256",
+        "piper_body_row_sha256",
+    }
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def forward_spy(
+        _core: ActionConditionedEventWorldModel,
+        _state: torch.Tensor,
+        _actions: torch.Tensor,
+        **kwargs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        captured.update(kwargs)
+        return {}
+
+    model.core.forward = types.MethodType(forward_spy, model.core)
+    with torch.no_grad():
+        model.clock_beta.fill_(0.25)
+        model.clock_log_step_scale.fill_(math.log(2.0))
+    batch = _provider_variant_batch()
+    model(batch)
+    assert captured["body_id"].tolist() == [1, 1]
+    assert torch.equal(captured["beta"], torch.full((2,), 0.25))
+    assert torch.equal(captured["dt"], batch["dt"] * 2.0)
+
+
+def test_body_agnostic_provider_uses_row_zero_and_freezes_core_and_clock() -> None:
+    model = SmolVLAPiperAdapter(
+        ActionConditionedEventWorldModel(_provider_variant_config()),
+        state_rank=3,
+        action_rank=2,
+        provider_variant="body_agnostic_adapter",
+    )
+    assert model.prediction_body_row == 0
+    assert model.target_body_row == 1
+    assert model.clock_beta.requires_grad is False
+    assert model.clock_log_step_scale.requires_grad is False
+    assert torch.equal(model.clock_beta, torch.zeros_like(model.clock_beta))
+    assert torch.equal(
+        model.clock_log_step_scale,
+        torch.zeros_like(model.clock_log_step_scale),
+    )
+    assert all(not parameter.requires_grad for parameter in model.core.parameters())
+    trainable = model.trainable_parameter_audit()
+    assert trainable["names"] == [
+        "action_adapter.diagonal",
+        "action_adapter.down.weight",
+        "action_adapter.up.weight",
+        "state_adapter.down.weight",
+        "state_adapter.up.weight",
+    ]
+    assert trainable["parameter_tensor_count"] == 5
+    assert trainable["effective_core_rows"] == {}
+    assert trainable["provider_variant"] == "body_agnostic_adapter"
+    assert trainable["clock_parameters_trainable"] is False
+    assert trainable["core_parameters_trainable"] is False
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def forward_spy(
+        _core: ActionConditionedEventWorldModel,
+        _state: torch.Tensor,
+        _actions: torch.Tensor,
+        **kwargs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        captured.update(kwargs)
+        return {}
+
+    model.core.forward = types.MethodType(forward_spy, model.core)
+    batch = _provider_variant_batch()
+    model(batch)
+    assert captured["body_id"].tolist() == [0, 0]
+    assert torch.equal(captured["beta"], torch.zeros(2))
+    assert torch.equal(captured["dt"], batch["dt"])
+
+    before_core = {
+        name: value.detach().clone() for name, value in model._source_state.items()
+    }
+    with torch.no_grad():
+        model.core.action_encoder.body_embedding.weight[0].add_(1.0)
+        model.core.action_encoder.body_embedding.weight[1].sub_(1.0)
+        model.core.next_event_head.weight.add_(2.0)
+    immutable = model.enforce_and_verify_frozen_core()
+    assert immutable["all_core_tensors_bit_exact"] is True
+    assert immutable["reserved_target_body_row_bit_exact"] is True
+    assert immutable["clock_beta_fixed_exact_zero"] is True
+    assert all(
+        torch.equal(value, before_core[name])
+        for name, value in model.core.state_dict().items()
+    )
+
+    optimizer_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        optimizer_parameters, lr=1e-3, weight_decay=0
+    )
+    adapter_before = model.action_adapter.diagonal.detach().clone()
+    adapter_loss = model.state_adapter(batch["state"]).sum()
+    adapter_loss = adapter_loss + model.action_adapter(batch["actions"]).sum()
+    adapter_loss.backward()
+    optimizer.step()
+    model.enforce_and_verify_frozen_core()
+    assert not torch.equal(model.action_adapter.diagonal, adapter_before)
+    assert all(
+        torch.equal(value, before_core[name])
+        for name, value in model.core.state_dict().items()
+    )
+
+    recovery = DetachedConditionalRecoveryAdapter(
+        model.core.config.semantic_dim
+    )
+    recovery_before = recovery.head.weight.detach().clone()
+    recovery_optimizer = torch.optim.AdamW(recovery.parameters(), lr=1e-3)
+    recovery(torch.ones(3, model.core.config.semantic_dim)).sum().backward()
+    recovery_optimizer.step()
+    assert not torch.equal(recovery.head.weight, recovery_before)
+
+
+def test_body_agnostic_provider_rejects_clock_drift_and_unknown_variant() -> None:
+    config = _provider_variant_config()
+    with pytest.raises(AdapterContractError, match="provider variant"):
+        SmolVLAPiperAdapter(
+            ActionConditionedEventWorldModel(config),
+            provider_variant="body_clock",
+        )
+    model = SmolVLAPiperAdapter(
+        ActionConditionedEventWorldModel(config),
+        provider_variant="body_agnostic_adapter",
+    )
+    with torch.no_grad():
+        model.clock_beta.fill_(1.0)
+    with pytest.raises(AdapterContractError, match="frozen at exact zero"):
+        model(_provider_variant_batch())
+
+
+def test_body_agnostic_artifact_format_cannot_be_loaded_as_legacy_provider() -> None:
+    assert adapter_trainer.provider_artifact_format(
+        "body_conditioned_adapter"
+    ) == adapter_trainer.FORMAT
+    agnostic_format = adapter_trainer.provider_artifact_format(
+        "body_agnostic_adapter"
+    )
+    assert agnostic_format == adapter_trainer.BODY_AGNOSTIC_FORMAT
+    assert agnostic_format != adapter_trainer.FORMAT
+    # Production runtime v1 accepts only the legacy FORMAT.  Keeping the
+    # agnostic checkpoint on a disjoint format makes that loader fail closed
+    # instead of reconstructing this state dict with the default row-one path.
+    synthetic_agnostic_checkpoint = {
+        "format": agnostic_format,
+        "provider_variant": "body_agnostic_adapter",
+    }
+    assert synthetic_agnostic_checkpoint["format"] != adapter_trainer.FORMAT
+    smoke = adapter_trainer.synthetic_smoke("body_agnostic_adapter")
+    assert smoke["provider_variant"] == "body_agnostic_adapter"
+    assert smoke["prediction_body_row"] == 0
+    assert smoke["reserved_target_body_row_bit_exact"] is True
+    assert smoke["clock_parameters_fixed_exact_zero"] is True
+
+
 def test_schema6_causal_history_is_prefix_only_padded_and_branch_isolated() -> None:
     application = schema6_causal_history_application_contract()
     assert application["max_history_steps"] == CAUSAL_HISTORY_MAX_STEPS
@@ -1311,6 +1534,42 @@ def test_formal_cli_has_no_internal_split_seed_or_fraction_override(
         [
             "trainer", "--mode", "train", "--split-seed", "7",
             "--validation-fraction", "0.2", "--test-fraction", "0.2",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        adapter_trainer.parse_args()
+
+
+def test_provider_variant_cli_uses_only_canonical_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["trainer", "--mode", "synthetic-smoke"])
+    assert adapter_trainer.parse_args().provider_variant == (
+        "body_conditioned_adapter"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "trainer",
+            "--mode",
+            "synthetic-smoke",
+            "--provider-variant",
+            "body_agnostic_adapter",
+        ],
+    )
+    assert adapter_trainer.parse_args().provider_variant == (
+        "body_agnostic_adapter"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "trainer",
+            "--mode",
+            "synthetic-smoke",
+            "--provider-variant",
+            "body_clock",
         ],
     )
     with pytest.raises(SystemExit):

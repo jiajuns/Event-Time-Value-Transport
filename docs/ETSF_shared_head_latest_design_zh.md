@@ -757,6 +757,7 @@ Git commit `94a9106612e710efc828d1ce3fef73766cc7dc0d` 的 r16 干净快照已部
 | 共享事件世界模型 | `scripts/openvla_etsf_event_world_model.py` |
 | Source 同根反事实训练 | `scripts/train_openvla_etsf_counterfactual.py` |
 | Piper 低容量跨本体 adapter | `scripts/train_smolvla_piper_schema6_embodiment_adapter.py` |
+| 双 provider 逐头选择 no-promotion schema/verifier | `scripts/verify_smolvla_per_head_body_mode_selection_v1.py` |
 | 五成员六头校准与 Formal190 root OOF | `scripts/calibrate_smolvla_piper_adapter_ensemble.py` |
 | evaluation400 identity bridge | `scripts/freeze_smolvla_piper_evaluation400_paired_identity_bridge_v2.py` |
 | evaluation400 v3 root selector | `scripts/select_smolvla_piper_evaluation400_root_candidate_v3.py` |
@@ -836,7 +837,7 @@ Source validation 上，最低合法 baseline 成功率为 `0.142857`，无门�
 | UR5 / Source-body-clock | 1.000000 | 0.811860 | 0.912458 | 0.120625 | 13.3056 | 0.052652 |
 | UR5 / body-agnostic | 1.000000 | 0.811860 | 0.919192 | 0.114909 | 12.8799 | 0.051516 |
 
-Piper 的 Source-body-clock 相对 body-agnostic 仅在 post F1（`+0.009460`）、AUROC（`+0.004087`）和 Brier（`-0.011537`）上略好，duration MAE（`+0.294048`）和 object RMSE（`+0.000295`）反而略差。UR5 上 next/post F1 不变，其余主指标除 ECE 外总体更差。更重要的是，Piper 只有 1,191 条 target-development row（success `107+/1084-`），UR5 只有 51 条（`33+/18-`，next/duration support 37），不是充分、均衡的独立任务成功证据。
+Piper 的 Source-body-clock 相对 body-agnostic 仅在 post F1（`+0.009460`）、AUROC（`+0.004087`）和 Brier（`-0.011537`）上略好，duration MAE（`+0.294048`）和 object RMSE（`+0.000295`）反而略差。UR5 上 next/post F1 不变，其余主指标除 ECE 外总体更差。更重要的是，canonical LOBO 的 `body_id` 只进入读取 `semantic.detach()` 的 isolated clock，依赖图上只允许直接改变 duration；两种变体又分别训练，并用包含 duration 的复合 validation score 选择 checkpoint。因此表中 post/next/success/object 等非 duration 差异只能视为独立训练与选步产生的数值差异，不能归因为 clock 的因果效果。Piper 只有 1,191 条 target-development row（success `107+/1084-`），UR5 只有 51 条（`33+/18-`，next/duration support 37），也不是充分、均衡的独立任务成功证据。
 
 所以截至 r13，最准确的结论是：事件空间接口确实可以在不同本体数据上运行并产生可比较预测，但 Source-body-clock 尚未表现出稳定、普遍的跨本体增益。下一版不应继续无条件共享 clock，而应把 `clock/shared event geometry/body adapter` 作为可选择消融，并由目标 calibration 的逐头门控选择；在独立组支持不足时回退 body-agnostic 或 actor baseline。
 
@@ -862,7 +863,7 @@ Schema6 r13 watcher 已正确等待 LOBO 终态，但在第一阶段 `materializ
 
 1. 用 r14 新根完成 Schema6 reset-only→authority→one-seed smoke，证明环境和运行适配器可执行；
 2. 在可信 reset-identity 来源下完成 dense260，并验证 `e3/e4/recovery` 的独立组支持确实增加；
-3. 收集不与 Formal/evaluation 重叠的 Piper development300，分别训练 body-clock 与 body-agnostic adapter；
+3. 收集不与 Formal/evaluation 重叠的 Piper development300，分别训练 `body_conditioned_adapter` 与 `body_agnostic_adapter`；Piper 的 body embedding 会经 FiLM 影响六头，因此该消融必须归因于完整本体 adapter，不能再命名为纯 clock；
 4. 用逐头 support/performance/uncertainty 门选择迁移配置，不把所有头或 clock 强制共享；
 5. 在 Formal190 冻结 selector，要求 paired success gain 的 bootstrap LCB 严格大于 0；
 6. 最后仅在完全未见的 evaluation400 上报告任务成功率、harmful-rate、coverage 和六头预测指标。
@@ -948,3 +949,48 @@ dense260 已升级到 create-once 的 v2 离线授权协议：它绑定 public i
 - **提高任务成功率**：尚未证明；必须完成 Piper development、Formal190 paired LCB 与完全未见 evaluation400。
 
 因此最新模型设计与工程链路已经更完整，但“最优、可迁移、稳定改善”的最终目标仍处于证据建设阶段，不能因 r14e smoke 成功而提前宣告完成。
+
+## 20. 双 provider 共享头：已实现边界与逐头选择协议
+
+本节是 r14e 后的最新实现更新。目标不是把一个欠证据的 body adapter 强制应用到全部预测头，而是构造可配对比较的两个 Piper provider，再让独立目标开发证据决定每个头采用哪个 provider；任何支持度、基线、校准或不确定性门失败都确定性回退。
+
+### 20.1 两个 Piper provider 的精确定义
+
+`scripts/train_smolvla_piper_schema6_embodiment_adapter.py` 现在只接受两个 canonical provider ID：
+
+| provider | 预测 body row | 可训练主参数 | clock | core 不变量 |
+|---|---:|---|---|---|
+| `body_conditioned_adapter` | Piper row 1 | state/action adapter、Piper body row、`clock_beta`、`clock_log_step_scale` | 目标本体可学习 | 除 Piper body row 外逐位冻结 |
+| `body_agnostic_adapter` | 共享 Source row 0 | 仅 state/action adapter | 两个参数精确冻结为 0，`dt` 不缩放 | 包括 Piper 预留 row 1 在内的整个 core 逐位冻结 |
+
+默认 provider 仍是 `body_conditioned_adapter`，旧 CLI 行为、旧 checkpoint `FORMAT`、默认 `adapter_config`、trainable audit 和 immutable audit 字段均不增加，因此现有单 provider 产物不会被静默改义。`body_agnostic_adapter` 使用独立格式 `etsf_smolvla_piper_schema6_body_agnostic_adapter_v1`，checkpoint/summary 显式写入 provider 身份；旧 production runtime v1 只接受旧格式，所以会 fail-closed，而不是把 row0 checkpoint 错按 row1 重建。
+
+这两个 provider 比较的是完整 Piper 本体条件 adapter 是否有用，不是纯 clock 消融。Piper 的 body embedding 在 temporal action encoder 中经 FiLM 改变 action effect，因而能影响 post/next/success/recovery/object/duration 全部头；只有 canonical LOBO 的 isolated-clock 对照才属于 `pure_clock_ablation`，且只允许 duration 进入 provider 选择。
+
+### 20.2 逐头选择不是普通验证集择优
+
+新增的离线选择合同使用三层身份：
+
+1. `semantic_reset_cluster_id` 保留跨本体同语义 reset 的聚类能力，不包含 body、policy 或 seed；
+2. 原有 `logical_group_id` 保持数据集局部身份，不静默改义；
+3. `execution_group_id` 绑定 task/instruction、body contract、actor/checkpoint contract、requested/resolved seed 和 semantic reset，用于机器验证本体与 actor 归属。
+
+两个 provider 必须具有相同的五成员 seed 配对、共享核心 lineage、sample/group/order、适用 mask 和 held-out folds。五折 OOF 以 execution group 为单位，每组恰好 held out 一次；同一 semantic reset 若跨 body/actor 复用，必须留在同一折并以 semantic-reset cluster bootstrap，不能把组内行数当作独立样本扩大置信度。
+
+每个头先分别通过独立组支持度、相对统计基线的 proper/decision loss、校准与 uncertainty/AURC 门。只有完整 body-conditioned candidate 相对 body-agnostic reference 的配对 gain bootstrap LCB 严格大于 0、harmful-rate UCB 不高于 0.10，且两者自身门均通过，才选择 body-conditioned；否则 reference 自身通过时回退 body-agnostic，reference 也失败时禁用该头并要求 actor baseline。
+
+支持度按全局及每个 body×actor context 同时计算：post/next 的每个适用事件类至少 10 个独立组，duration observed/censored 各 10，success positive/negative 各 50，recovery 只在 `regress & recovery_observed` 中 positive/negative 各 10，对象 nonzero/near-zero 各 50。右删失 recovery 不能伪装成负例。
+
+当前 `verify_smolvla_per_head_body_mode_selection_v1.py` 只重算 JSON 结构、身份、fold 覆盖、支持度和确定性 fallback，并校验外部 aggregate evidence 的内容地址；它不打开原始 prediction/label，不会从逐样本输出重算 OOF metric、uncertainty、calibration 或 bootstrap 数值。因此 receipt 中的 provider ID 只是不可执行的 provisional schema decision，不能被 runtime 当作 route。下一版可晋升 calibrator 必须把每折 checkpoint、train/held-out group、逐样本预测、适用 mask、校准参数和共享 bootstrap draws 全部内容寻址后内部重算，不能接受调用者布尔自证。
+
+### 20.3 第七条路径：动作 rank 必须独立选择
+
+六头逐头路由不能自动授权 `source_contract_rank_score`。rank 由 base、action residual、逐成员 source success temperature 和 IEEE float32 composite 共同构成，必须作为完整 provider 包在独立的 group-nested root OOF 中选择；不能让 rank 隐式跟随 success，也不能把两个 provider 的 base/residual/temperature 拼接。旧单 provider 的 source-rank aggregate SHA、root ranker、calibration、bridge、protocol、selector 和 runtime authority 都不能代表新路由。
+
+因此当前离线 plan/evidence/receipt 永久声明 `promotion_authorized=false` 与 `deployment_authorized=false`。正式接入需要新版本 production runtime、calibrator、bridge、paired-success protocol 和 selector：两套各五成员前向完成后，按冻结 route 选择同一 provider 的成对张量与校准参数，再计算 structured uncertainty；rank 尚未通过独立 whole-provider OOF 时，整个系统继续使用 actor baseline。
+
+### 20.4 当前验证与训练状态
+
+双 provider trainer、旧 production runtime 拒绝边界、目标 validation loader 和 Schema6 manifest 链的联合 CPU 回归为 57 项全部通过；no-promotion plan/evidence/receipt verifier 另有 13 项合成攻击回归，两部分联合为 70 项全部通过。全仓库验证中 1320 项直接通过，另 2 项要求解释器本身为单链接只读文件的生命周期测试在 `/tmp` 只读 Python 副本下通过。4090 服务器当前空闲，但现有可信 Piper Schema6 证据仍只有 r14e 的 1 个组；它足以证明采集生命周期，不足以训练两套五成员 provider，更不可能满足逐头支持度。
+
+所以当前可验证的新结论是：双 provider 训练接口和 fail-closed 选择合同已经落地，能够为跨本体负迁移提供明确回退路径；尚不能声称 provider 已在 Piper 上训练完成、六头预测已改善或任务成功率已经提高。下一训练动作必须先取得与 Formal190/evaluation400 不重叠、身份和 clock/body/actor contract 完整的目标开发监督数据，然后只在远端 4090 启动配对五成员训练。

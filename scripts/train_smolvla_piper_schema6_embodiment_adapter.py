@@ -54,6 +54,9 @@ from train_openvla_etsf_counterfactual import (
 
 
 FORMAT = "etsf_smolvla_piper_schema6_embodiment_adapter_v1"
+BODY_AGNOSTIC_FORMAT = (
+    "etsf_smolvla_piper_schema6_body_agnostic_adapter_v1"
+)
 MANIFEST_FORMAT = "etsf_smolvla_piper_schema6_training_manifest_v1"
 SPLIT_FORMAT = "etsf_smolvla_piper_schema6_group_split_v1"
 EXTERNAL_SPLIT_FORMAT = "etsf_smolvla_piper_schema6_external_group_split_v2"
@@ -70,6 +73,8 @@ SOURCE_BODY = "aloha-agilex"
 TARGET_BODY = "piper"
 SOURCE_POLICY = "smolvla"
 RESERVED_POLICY = "openvla"
+PROVIDER_VARIANTS = ("body_conditioned_adapter", "body_agnostic_adapter")
+DEFAULT_PROVIDER_VARIANT = "body_conditioned_adapter"
 FORBIDDEN_PATH_TOKENS = ("fresh", "confirmation")
 EXPECTED_EVENTS = ("e0", "e12", "e3", "e4", "eK")
 # ``dense_event_targets`` includes e0 only as the initial state at step zero;
@@ -107,6 +112,16 @@ SOURCE_RANK_DURATION_WEIGHT = 0.05
 
 class AdapterContractError(RuntimeError):
     """A protocol or immutable-state contract failed closed."""
+
+
+def provider_artifact_format(provider_variant: str) -> str:
+    if provider_variant == "body_conditioned_adapter":
+        return FORMAT
+    if provider_variant == "body_agnostic_adapter":
+        return BODY_AGNOSTIC_FORMAT
+    raise AdapterContractError(
+        f"provider variant must be one of {PROVIDER_VARIANTS}"
+    )
 
 
 def validate_production_source_rank_config(
@@ -651,25 +666,43 @@ class SmolVLAPiperAdapter(nn.Module):
         state_rank: int = 16,
         action_rank: int = 4,
         source_rank_contract: Mapping[str, Any] | None = None,
+        provider_variant: str = DEFAULT_PROVIDER_VARIANT,
     ) -> None:
         super().__init__()
         if core.config.state_input_dim != STATE_DIM or core.config.action_dim != ACTION_DIM:
             raise AdapterContractError("adapter requires the native 960D/14D core")
+        if provider_variant not in PROVIDER_VARIANTS:
+            raise AdapterContractError(
+                f"provider variant must be one of {PROVIDER_VARIANTS}"
+            )
+        self.provider_variant = provider_variant
         self.core = core
         self.state_adapter = ResidualLowRankStateAdapter(state_rank)
         self.action_adapter = IdentityLowRankDiagonalActionAdapter(action_rank)
         self.clock_beta = nn.Parameter(torch.zeros(()))
         self.clock_log_step_scale = nn.Parameter(torch.zeros(()))
         self.target_body_row = 1
+        self.prediction_body_row = (
+            self.target_body_row
+            if provider_variant == "body_conditioned_adapter"
+            else 0
+        )
         self.policy_row = 0
         for parameter in core.parameters():
             parameter.requires_grad_(False)
         body = core.action_encoder.body_embedding.weight
-        body.requires_grad_(True)
         mask = torch.zeros_like(body)
-        mask[self.target_body_row] = 1
+        if provider_variant == "body_conditioned_adapter":
+            body.requires_grad_(True)
+            mask[self.target_body_row] = 1
+        else:
+            self.clock_beta.requires_grad_(False)
+            self.clock_log_step_scale.requires_grad_(False)
         self.register_buffer("_body_gradient_mask", mask, persistent=False)
-        body.register_hook(lambda gradient: gradient * self._body_gradient_mask.to(gradient))
+        if provider_variant == "body_conditioned_adapter":
+            body.register_hook(
+                lambda gradient: gradient * self._body_gradient_mask.to(gradient)
+            )
         self._source_state = {name: value.detach().cpu().clone() for name, value in core.state_dict().items()}
         self._source_sha = state_dict_sha256(self._source_state)
         self._smolvla_policy_sha = tensor_sha256(self._source_state[POLICY_EMBEDDING][0])
@@ -698,6 +731,13 @@ class SmolVLAPiperAdapter(nn.Module):
         state = self.state_adapter(batch["state"])
         actions = self.action_adapter(batch["actions"])
         count = state.shape[0]
+        if self.provider_variant == "body_agnostic_adapter":
+            self._verify_body_agnostic_clock()
+            beta = state.new_zeros(count)
+            dt = batch["dt"]
+        else:
+            beta = self.clock_beta.to(state).expand(count)
+            dt = batch["dt"] * self.clock_log_step_scale.exp().to(state)
         return self.core(
             state,
             actions,
@@ -705,14 +745,32 @@ class SmolVLAPiperAdapter(nn.Module):
             action_mask=batch["action_mask"],
             action_feature_mask=torch.ones_like(actions, dtype=torch.bool),
             proprio=batch["proprio"],
-            body_id=torch.full((count,), self.target_body_row, dtype=torch.long, device=state.device),
+            body_id=torch.full((count,), self.prediction_body_row, dtype=torch.long, device=state.device),
             policy_id=torch.full((count,), self.policy_row, dtype=torch.long, device=state.device),
             current_event_id=batch["current_event_id"],
             clock_event_id=batch["current_event_id"],
             current_predicates=batch["current_predicates"],
-            beta=self.clock_beta.to(state).expand(count),
-            dt=batch["dt"] * self.clock_log_step_scale.exp().to(state),
+            beta=beta,
+            dt=dt,
         )
+
+    def _verify_body_agnostic_clock(self) -> None:
+        if self.provider_variant != "body_agnostic_adapter":
+            return
+        if (
+            self.clock_beta.requires_grad
+            or self.clock_log_step_scale.requires_grad
+            or not torch.equal(
+                self.clock_beta.detach(), torch.zeros_like(self.clock_beta)
+            )
+            or not torch.equal(
+                self.clock_log_step_scale.detach(),
+                torch.zeros_like(self.clock_log_step_scale),
+            )
+        ):
+            raise AdapterContractError(
+                "body-agnostic adapter clock parameters must remain frozen at exact zero"
+            )
 
     def predict_grouped_candidates(
         self, batch: Mapping[str, Any]
@@ -798,13 +856,21 @@ class SmolVLAPiperAdapter(nn.Module):
     @torch.no_grad()
     def enforce_and_verify_frozen_core(self) -> dict[str, Any]:
         current = self.core.state_dict()
-        learned_body = current[BODY_EMBEDDING][self.target_body_row].detach().clone()
+        learned_body = (
+            current[BODY_EMBEDDING][self.target_body_row].detach().clone()
+            if self.provider_variant == "body_conditioned_adapter"
+            else None
+        )
         for name, frozen in self._source_state.items():
             current[name].copy_(frozen.to(current[name]))
-        current[BODY_EMBEDDING][self.target_body_row].copy_(learned_body)
+        if learned_body is not None:
+            current[BODY_EMBEDDING][self.target_body_row].copy_(learned_body)
         for name, value in current.items():
             reference = self._source_state[name].to(value)
-            if name == BODY_EMBEDDING:
+            if (
+                name == BODY_EMBEDDING
+                and self.provider_variant == "body_conditioned_adapter"
+            ):
                 if not torch.equal(value[0], reference[0]):
                     raise AdapterContractError("source body row changed")
                 continue
@@ -813,12 +879,26 @@ class SmolVLAPiperAdapter(nn.Module):
         policy = current[POLICY_EMBEDDING]
         if tensor_sha256(policy[0]) != self._smolvla_policy_sha or tensor_sha256(policy[1]) != self._openvla_policy_sha:
             raise AdapterContractError("SmolVLA/OpenVLA policy rows are not bit-exact")
-        return {
+        audit = {
             "all_core_tensors_except_piper_body_row_bit_exact": True,
             "smolvla_policy_row_0_sha256": self._smolvla_policy_sha,
             "reserved_openvla_policy_row_1_sha256": self._openvla_policy_sha,
             "piper_body_row_sha256": tensor_sha256(current[BODY_EMBEDDING][1]),
         }
+        if self.provider_variant == "body_agnostic_adapter":
+            self._verify_body_agnostic_clock()
+            audit.update(
+                {
+                    "provider_variant": "body_agnostic_adapter",
+                    "prediction_body_row": 0,
+                    "reserved_target_body_row": 1,
+                    "all_core_tensors_bit_exact": True,
+                    "reserved_target_body_row_bit_exact": True,
+                    "clock_beta_fixed_exact_zero": True,
+                    "clock_log_step_scale_fixed_exact_zero": True,
+                }
+            )
+        return audit
 
     def trainable_parameter_audit(self) -> dict[str, Any]:
         named = {
@@ -832,26 +912,51 @@ class SmolVLAPiperAdapter(nn.Module):
             "action_adapter.diagonal",
             "action_adapter.down.weight",
             "action_adapter.up.weight",
-            "clock_beta",
-            "clock_log_step_scale",
-            f"core.{BODY_EMBEDDING}",
         }
+        if self.provider_variant == "body_conditioned_adapter":
+            expected.update(
+                {
+                    "clock_beta",
+                    "clock_log_step_scale",
+                    f"core.{BODY_EMBEDDING}",
+                }
+            )
         if set(named) != expected:
             raise AdapterContractError(
                 "trainable parameter set changed: "
                 f"missing={sorted(expected-set(named))}, extra={sorted(set(named)-expected)}"
             )
         count = sum(parameter.numel() for parameter in named.values())
-        effective = count - self.core.config.metadata_dim
-        return {
+        effective = (
+            count - self.core.config.metadata_dim
+            if self.provider_variant == "body_conditioned_adapter"
+            else count
+        )
+        audit = {
             "names": sorted(named),
             "parameter_tensor_count": len(named),
             "optimizer_parameter_scalars": count,
             "effective_target_parameter_scalars": effective,
-            "effective_core_rows": {BODY_EMBEDDING: [1]},
+            "effective_core_rows": (
+                {BODY_EMBEDDING: [1]}
+                if self.provider_variant == "body_conditioned_adapter"
+                else {}
+            ),
             "policy_rows_trainable": [],
             "only_authorized_components": True,
         }
+        if self.provider_variant == "body_agnostic_adapter":
+            self._verify_body_agnostic_clock()
+            audit.update(
+                {
+                    "provider_variant": "body_agnostic_adapter",
+                    "prediction_body_row": 0,
+                    "reserved_target_body_row": 1,
+                    "clock_parameters_trainable": False,
+                    "core_parameters_trainable": False,
+                }
+            )
+        return audit
 
 
 @dataclass(frozen=True)
@@ -2991,6 +3096,10 @@ def export_internal_validation_artifacts(
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
+    provider_variant = getattr(
+        args, "provider_variant", DEFAULT_PROVIDER_VARIANT
+    )
+    artifact_format = provider_artifact_format(provider_variant)
     determinism = configure_determinism(args.training_seed)
     gate = SupportGate(
         min_train_groups=args.min_train_groups,
@@ -3105,6 +3214,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         state_rank=args.state_rank,
         action_rank=args.action_rank,
         source_rank_contract=frozen_source_rank_contract,
+        provider_variant=provider_variant,
     ).to(device)
     recovery_training_support = train_support["conditional_recovery"]
     recovery_validation_support = validation_support["conditional_recovery"]
@@ -3148,6 +3258,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             schema6_causal_history_application_contract()
         ),
     }
+    if provider_variant == "body_agnostic_adapter":
+        adapter_config.update(
+            {
+                "provider_variant": "body_agnostic_adapter",
+                "prediction_body_row": 0,
+                "reserved_target_body_row": 1,
+                "shared_source_body_row_0_used": True,
+                "target_body_row_1_trainable": False,
+                "clock_beta_fixed_exact_zero": True,
+                "clock_log_step_scale_fixed_exact_zero": True,
+            }
+        )
     supervision_support = {
         "split_profile": split_profile.name,
         "required_trainer_group_counts": (
@@ -3231,8 +3353,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         key = adapter_checkpoint_selection_key(metrics, step)
         if best_key is None or key < best_key:
             best_key, best_metrics, best_step = key, metrics, step
-            atomic_torch_replace(best_path, {
-                "format": FORMAT, "model": model.state_dict(), "source_checkpoint_sha256": file_sha256(source_path),
+            checkpoint_payload = {
+                "format": artifact_format, "model": model.state_dict(), "source_checkpoint_sha256": file_sha256(source_path),
                 "source_audit": source_audit, "split_receipt": split_receipt, "trainable_parameter_audit": trainable,
                 "adapter_config": adapter_config, "supervision_support": supervision_support,
                 "immutable_core_audit": immutable, "best_step": step, "validation": metrics,
@@ -3268,7 +3390,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 },
                 "validation_selection_rule": "maximize equal_group_bootstrap_paired_success_gain_lcb; maximize paired_success_gain; maximize model_success_rate; minimize dense_validation_loss; earliest_step",
                 "test_hdf5_files_opened": 0,
-            })
+            }
+            if provider_variant == "body_agnostic_adapter":
+                checkpoint_payload["provider_variant"] = (
+                    "body_agnostic_adapter"
+                )
+            atomic_torch_replace(best_path, checkpoint_payload)
     if best_metrics is None:
         raise AdapterContractError("no validation checkpoint was selected")
     try:
@@ -3277,7 +3404,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         best_payload = torch.load(best_path, map_location=device)
     if (
         not isinstance(best_payload, Mapping)
-        or best_payload.get("format") != FORMAT
+        or best_payload.get("format") != artifact_format
         or not isinstance(best_payload.get("model"), Mapping)
     ):
         raise AdapterContractError("best adapter checkpoint cannot be reloaded")
@@ -3339,7 +3466,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         output=output,
     )
     summary = {
-        "format": FORMAT, "status": "complete", "best_checkpoint": str(best_path), "best_checkpoint_sha256": file_sha256(best_path),
+        "format": artifact_format, "status": "complete", "best_checkpoint": str(best_path), "best_checkpoint_sha256": file_sha256(best_path),
         "best_step": best_step, "best_validation": best_metrics, "train_groups": len(split["train"]), "validation_groups": len(split["validation"]),
         "split_profile": split_profile.name,
         "split_profile_version": split_profile.version,
@@ -3385,16 +3512,25 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "schema6_training_manifest_sha256": manifest["manifest_sha256"],
         "source_checkpoint_sha256": file_sha256(source_path),
     }
+    if provider_variant == "body_agnostic_adapter":
+        summary["provider_variant"] = "body_agnostic_adapter"
     summary["summary_sha256"] = canonical_sha256(summary)
     atomic_json_new(output / "training_summary.json", summary)
     return summary
 
 
-def synthetic_smoke() -> dict[str, Any]:
+def synthetic_smoke(
+    provider_variant: str = DEFAULT_PROVIDER_VARIANT,
+) -> dict[str, Any]:
     torch.manual_seed(7)
     config = EventWorldModelConfig(state_input_dim=STATE_DIM, action_dim=ACTION_DIM, proprio_dim=14, semantic_dim=96, action_hidden_dim=32, transition_hidden_dim=48, clock_hidden_dim=16, object_delta_dim=6, num_bodies=2, num_policies=2, structured_events=True, dropout=0)
     core = ActionConditionedEventWorldModel(config)
-    model = SmolVLAPiperAdapter(core, state_rank=4, action_rank=2)
+    model = SmolVLAPiperAdapter(
+        core,
+        state_rank=4,
+        action_rank=2,
+        provider_variant=provider_variant,
+    )
     root_state = torch.randn(3, STATE_DIM); actions = torch.randn(3, 5, ACTION_DIM)
     state = torch.zeros(3, CAUSAL_HISTORY_MAX_STEPS, STATE_DIM)
     state[:, 0] = root_state
@@ -3405,12 +3541,29 @@ def synthetic_smoke() -> dict[str, Any]:
     output = model(batch); loss, _ = compute_loss(output, batch, object_mean=torch.zeros(6), object_std=torch.ones(6)); loss.backward()
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3, weight_decay=0); optimizer.step()
     audit = model.enforce_and_verify_frozen_core()
-    return {"loss_finite": math.isfinite(float(loss.detach())), "identity_initialization": True, "policy_rows_bit_exact": bool(audit["all_core_tensors_except_piper_body_row_bit_exact"]), "policy_row_used": 0, "reserved_openvla_row_not_used": 1}
+    result = {"loss_finite": math.isfinite(float(loss.detach())), "identity_initialization": True, "policy_rows_bit_exact": bool(audit["all_core_tensors_except_piper_body_row_bit_exact"]), "policy_row_used": 0, "reserved_openvla_row_not_used": 1}
+    if provider_variant == "body_agnostic_adapter":
+        result.update(
+            {
+                "provider_variant": "body_agnostic_adapter",
+                "prediction_body_row": 0,
+                "reserved_target_body_row_bit_exact": audit[
+                    "reserved_target_body_row_bit_exact"
+                ],
+                "clock_parameters_fixed_exact_zero": True,
+            }
+        )
+    return result
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("train", "synthetic-smoke"), default="train")
+    parser.add_argument(
+        "--provider-variant",
+        choices=PROVIDER_VARIANTS,
+        default=DEFAULT_PROVIDER_VARIANT,
+    )
     parser.add_argument("--source-checkpoint", type=Path)
     parser.add_argument("--schema6-manifest", type=Path)
     parser.add_argument("--expected-manifest-split-receipt", type=Path)
@@ -3484,7 +3637,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    result = synthetic_smoke() if args.mode == "synthetic-smoke" else train(args)
+    result = (
+        synthetic_smoke(args.provider_variant)
+        if args.mode == "synthetic-smoke"
+        else train(args)
+    )
     print(json.dumps(result, sort_keys=True))
 
 
