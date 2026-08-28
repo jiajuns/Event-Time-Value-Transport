@@ -612,12 +612,12 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 
 还应把“privileged simulator observer”和“非特权视觉/proprio observer”分开报告。前者可以作为 world-model/ranker 上界，不能冒充真实部署结果；后者才回答在线事件状态是否能够跨本体观测。
 
-## 15. 当前实现与训练状态（2026-08-28 21:31 CST）
+## 15. 当前实现与训练状态（2026-08-28 22:32 CST）
 
 ### 15.1 远端 4090 链路
 
 - 服务器：`user@100.115.128.14`；GPU UUID `GPU-06f6e50e-5296-258f-dd86-8f838390a7d1`，RTX 4090 D。
-- 用户原有官方 OpenVLA 全量评测仍在运行。最近一次只读检查为 `402/500`、`231 successes`，GPU 利用率 98%。这不是 ETSF 训练或 ETSF 成功率结果。
+- 用户原有官方 OpenVLA 全量评测仍在运行；最近一次只读检查时 GPU 利用率约 96%、显存约 15.9 GB。这不是 ETSF 训练或 ETSF 成功率结果。
 - r12 Source watcher PID `2004304`，状态 `waiting_for_external_suite_parent_exit_before_rtx4090`。native core 初始化已完成，但五成员 Source 参数更新尚未开始。static plan SHA 为 `10ed8ceb1eb2d5374225df247fe078b220414d4994f5d970af8a0c552fa4aac4`。
 - r12 LOBO watcher PID `2005507`，状态 `waiting_for_authenticated_source63_terminal_receipt`。
 - r12 Piper watcher PID `2006249`，状态 `waiting_for_piper_then_ur5_lobo_terminal_no_hdf5_access`。该 watcher 的 `max_episode_steps=4`，只是可行性 smoke，不是 development300、Formal190 或正式 evaluation400。
@@ -635,13 +635,23 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 /home/user/etsf_smolvla_schema5_native_source_training_r12_20260828
 ```
 
+Git commit `1f9e7d1e73cb249a67a958da8b258d6f61bcca2a` 的 r13 干净快照已部署到：
+
+```text
+/home/user/etsf_shared_head_final_code_r13_20260828_223212
+```
+
+该目录包含 334 个文件，可写文件数为 0。它只是已验证代码快照；官方 OpenVLA 占用 GPU 时不会强行启动新训练。
+
 ### 15.2 已完成的实现验证
 
 - 因果历史 Source/Piper 及相邻链路：146 项 CPU 回归通过；覆盖未来隔离、padding/mask、截断、root bit-exact、branch 隔离和旧合同拒绝。
 - Formal190 selection-aware 外层 OOF、identity bridge 与 paired downstream：79 项 CPU 回归通过；bridge 独立复算每折参数、190 组唯一覆盖、固定 bootstrap draws、LCB/UCB 和泄漏字段。
-- evaluation400 v4 独立审计基础层：10 项 CPU 回归通过；覆盖一 ULP、bool 伪数、registry 篡改、recovery 重放/断链、过早解密、AAD/密钥/密文篡改和 pair-cluster 指标。
+- evaluation400 v4 已接入真实冻结 causal observer runtime：authority 加载时逐文件重算 SHA，解析 core checkpoint、actor adapter、calibration、promotion evidence 和 deployment；backend 不再能自报 event/predicate，只能交付 actor-visible hidden/proprio，由 executor 内部实际前向并生成 receipt。
+- causal observer 监督数据桥已完成：支持 Schema5/Source63 与 Schema6/Piper，按 logical reset group 划分 train/calibration/validation，导出 `[N,8,960]` 同分支因果历史、14-D proprio、当前 event/predicate 离线标签和上一已执行动作 SHA。object pose 只用于离线当前标签派生，不写入模型输入。
+- causal observer 训练器已完成：共享 GRU/core、逐 actor 低秩 adapter、actor-balanced loss、独立 group calibration、低置信拒绝、group bootstrap/Wilson 门与真实权重冻结。未过真实门或 synthetic 证据时不生成 production `authority_manifest.json`。
 - r12 Piper detached watcher 定向回归：39 项通过。
-- 最终全仓库 CPU 回归：1080 项全部通过；唯一 warning 是本机禁用 GPU 时 PyTorch 的 CUDA driver 探测，不涉及远端 4090 训练。
+- 最终全仓库 CPU 回归：1148 项全部通过；新 observer 数据/训练/runtime 联合定向回归为 36 项通过，Source63 请求冻结与自治 watcher 定向回归为 22 项通过。唯一 warning 是本机 PyTorch 的 CUDA driver 探测，不涉及远端 4090 训练。
 
 这些是代码与合成协议验证，不是模型预测精度或任务成功率。
 
@@ -649,7 +659,8 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 
 - Piper development300 虽已预注册为 80 train / 30 internal validation / 190 formal，但 `collection_authorized=false`，当前没有目标监督采集。
 - Formal190 真实 selector artifact 尚未生成；evaluation400 的 execution inventory 尚未批准，也没有执行。
-- evaluation400 v4 审计基础层尚未接入 runner/executor；当前 v3 runner 仍是 privileged simulator root 路径。
+- evaluation400 v4 的 condition query/recovery 事件已由真实冻结 observer 前向生成，但 `root_preparer` 中的根候选预提交仍是外部注入接口；现有证据还不能单独证明 root rank 的事件输入也已经由该 observer 产生。
+- Source63 只包含 `aloha-agilex / SmolVLA / move_can_pot`。Piper r12 只是 1 seed、4 step smoke，不足以训练或验证跨本体 observer。因此先行 Source-only 训练只能产生源本体预测证据，不能写成 Piper 迁移或成功率改善。
 - 现有证据不能证明跨本体任务成功率已经提高，也不能证明六头在真实 Piper 上达到目标精度。正式结论必须等待 Source → LOBO → Piper adapter → Formal190 → 完全未见 evaluation400 的顺序证据。
 
 ## 16. 主要代码入口
@@ -665,10 +676,18 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 | evaluation400 v3 condition runner | `scripts/run_smolvla_piper_evaluation400_condition_v3.py` |
 | evaluation400 v3 sealed result evaluator | `scripts/evaluate_smolvla_piper_evaluation400_results_v3.py` |
 | evaluation400 v4 独立审计基础层 | `scripts/smolvla_piper_evaluation400_audit_contract_v1.py` |
+| actor-visible causal observer | `scripts/smolvla_piper_causal_event_observer_v1.py` |
+| causal observer 监督数据桥 | `scripts/materialize_smolvla_piper_causal_event_observer_dataset_v1.py` |
+| causal observer 训练/校准/冻结 | `scripts/train_smolvla_piper_causal_event_observer_v1.py` |
+| Source63 observer 开发集请求冻结 | `scripts/freeze_smolvla_causal_observer_source63_request_v1.py` |
+| Source63 observer 4090 自治 watcher | `scripts/launch_smolvla_causal_observer_source63_autonomous_v1.py` |
+| evaluation400 v4 condition runner | `scripts/run_smolvla_piper_evaluation400_condition_v4.py` |
+| evaluation400 v4 external executor | `scripts/launch_smolvla_piper_evaluation400_external_executor_v4.py` |
+| evaluation400 v4 result evaluator | `scripts/evaluate_smolvla_piper_evaluation400_results_v4.py` |
 
 ## 17. 当前实现身份
 
-以下 SHA256 是本文对应的 r12 本地实现身份；任一文件变化后，旧 selector/runtime authority 都应失效并重新冻结：
+以下 SHA256 是本文对应的 r13 本地实现身份；任一文件变化后，旧 selector/runtime authority 都应失效并重新冻结：
 
 | 组件 | SHA256 |
 |---|---|
@@ -685,5 +704,13 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 | external executor v3 | `ab2e1ad1f0b8aea766f94a4abbb1cd94be49b775daf05a10146324addf8679ed` |
 | sealed result evaluator v3 | `68a3a95bc10fb98f4f23692eff90e8144bf2d0af98574807df9ce9264d3f7a31` |
 | evaluation400 v4 audit foundation | `e5841fa6086b8636e802b97e60618c427a24e2644e91e279721a0649166a8e10` |
+| actor-visible causal observer/runtime | `ef9f4bc4fe87e9a434c5c726a7485bac2fe41181f3f4e08d84d942e3aaa532a0` |
+| causal observer dataset materializer | `6bd767e6ca91e143596cc79d6d89fce7b4a2bc164f7807571c05c4c07f211a2e` |
+| causal observer trainer/freezer | `1211478322a9597eaf217202eead149da3d42a517da0cbd9a304a4706f9662d1` |
+| Source63 observer request freezer | `895f2dc7d72fd670e342b6727ad373cbc1297561d45644512c89eeec959ff3ca` |
+| Source63 observer autonomous watcher | `87f9acb6c3798308d615cf191f4060fa57474874ec6a802353b1bc787bf3d0e0` |
+| evaluation400 v4 condition runner | `d87da776c5fbb4757be622f900621eb1f31800f8e19fc7c76d50febdfc471914` |
+| evaluation400 v4 external executor | `93816eb4b822de01d6710e2ef4d0140f647ddf6d73d5174c2fd9ce83d2bf2648` |
+| evaluation400 v4 result evaluator | `b58e9d46b792f3a1e09df7e253bd7b9ac04838b72c215241ceae1d6453aa60c8` |
 | Piper r12 autonomous watcher | `d6ea99f26a10dfae624d1bd7a588a3ad2960c94e3be557c5150879d0ab0dff48` |
 | 200-step full-horizon runtime config | `ed03f316ab74402def8311fe71e1b3d8dd9e10d96b874f764644de288c680b68` |
