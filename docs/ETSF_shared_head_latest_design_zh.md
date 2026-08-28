@@ -612,7 +612,7 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 
 还应把“privileged simulator observer”和“非特权视觉/proprio observer”分开报告。前者可以作为 world-model/ranker 上界，不能冒充真实部署结果；后者才回答在线事件状态是否能够跨本体观测。
 
-## 15. 当前实现与训练状态（2026-08-28 22:32 CST）
+## 15. 当前实现与训练状态（2026-08-28 23:14 CST）
 
 ### 15.1 远端 4090 链路
 
@@ -621,7 +621,8 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 - r12 Source watcher PID `2004304`，状态 `waiting_for_external_suite_parent_exit_before_rtx4090`。native core 初始化已完成，但五成员 Source 参数更新尚未开始。static plan SHA 为 `10ed8ceb1eb2d5374225df247fe078b220414d4994f5d970af8a0c552fa4aac4`。
 - r12 LOBO watcher PID `2005507`，状态 `waiting_for_authenticated_source63_terminal_receipt`。
 - r12 Piper watcher PID `2006249`，状态 `waiting_for_piper_then_ur5_lobo_terminal_no_hdf5_access`。该 watcher 的 `max_episode_steps=4`，只是可行性 smoke，不是 development300、Formal190 或正式 evaluation400。
-- 三个 watcher 都是服务器端脱离进程，关闭本机不会终止。旧 r7h/r8e/r9b watcher 已在验证新链等待状态后停止；用户原有 OpenVLA 进程未被停止或修改。
+- r16 Source63 causal observer watcher PID `2016883`，static plan SHA 为 `e470fe4277c18940b05bf5667914760efb5d91043e6caaaf69da5ae8ed52c600`。请求冻结和数据物化已完成：34 个 train group / 670 行、10 个 calibration group / 199 行、14 个 validation group / 274 行；三者按 logical reset group 严格隔离。原始 5 个 test group 未解析路径、未 stat、未打开、未哈希。当前状态为 `waiting / external_exit_and_gpu_idle`，GPU 锁不存在，因此尚未开始参数更新，也未抢占原有任务。
+- 四个 watcher 都是服务器端脱离进程，关闭本机不会终止。旧 r7h/r8e/r9b watcher 已在验证新链等待状态后停止；用户原有 OpenVLA 进程未被停止或修改。
 
 远端 r12 Source 代码根为：
 
@@ -635,13 +636,17 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 /home/user/etsf_smolvla_schema5_native_source_training_r12_20260828
 ```
 
-Git commit `1f9e7d1e73cb249a67a958da8b258d6f61bcca2a` 的 r13 干净快照已部署到：
+Git commit `94a9106612e710efc828d1ce3fef73766cc7dc0d` 的 r16 干净快照已部署到：
 
 ```text
-/home/user/etsf_shared_head_final_code_r13_20260828_223212
+/home/user/etsf_shared_head_final_code_r16_20260828_231207
 ```
 
-该目录包含 334 个文件，可写文件数为 0。它只是已验证代码快照；官方 OpenVLA 占用 GPU 时不会强行启动新训练。
+该目录包含 338 个文件，可写文件数为 0。它只是已验证代码快照；官方 OpenVLA 占用 GPU 时不会强行启动新训练。r16 observer 输出根为：
+
+```text
+/home/user/etsf_smolvla_causal_observer_source63_autonomous_r16_20260828
+```
 
 ### 15.2 已完成的实现验证
 
@@ -687,7 +692,7 @@ Git commit `1f9e7d1e73cb249a67a958da8b258d6f61bcca2a` 的 r13 干净快照已部
 
 ## 17. 当前实现身份
 
-以下 SHA256 是本文对应的 r13 本地实现身份；任一文件变化后，旧 selector/runtime authority 都应失效并重新冻结：
+以下 SHA256 是本文对应的 `94a9106612e710efc828d1ce3fef73766cc7dc0d` 本地实现身份；任一文件变化后，旧 selector/runtime authority 都应失效并重新冻结：
 
 | 组件 | SHA256 |
 |---|---|
