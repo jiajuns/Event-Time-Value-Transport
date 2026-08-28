@@ -994,3 +994,42 @@ dense260 已升级到 create-once 的 v2 离线授权协议：它绑定 public i
 双 provider trainer、旧 production runtime 拒绝边界、目标 validation loader 和 Schema6 manifest 链的联合 CPU 回归为 57 项全部通过；no-promotion plan/evidence/receipt verifier 另有 13 项合成攻击回归，两部分联合为 70 项全部通过。全仓库验证中 1320 项直接通过，另 2 项要求解释器本身为单链接只读文件的生命周期测试在 `/tmp` 只读 Python 副本下通过。4090 服务器当前空闲，但现有可信 Piper Schema6 证据仍只有 r14e 的 1 个组；它足以证明采集生命周期，不足以训练两套五成员 provider，更不可能满足逐头支持度。
 
 所以当前可验证的新结论是：双 provider 训练接口和 fail-closed 选择合同已经落地，能够为跨本体负迁移提供明确回退路径；尚不能声称 provider 已在 Piper 上训练完成、六头预测已改善或任务成功率已经提高。下一训练动作必须先取得与 Formal190/evaluation400 不重叠、身份和 clock/body/actor contract 完整的目标开发监督数据，然后只在远端 4090 启动配对五成员训练。
+
+## 21. 原始逐样本重算校准器与 detached 预测路由
+
+第 20.2 节所述 verifier 只能检查调用者提交的汇总证据，不能成为可执行路由的性能权威。最新工作树增加了两个严格分层的组件：
+
+- `scripts/calibrate_smolvla_piper_dual_provider_router_v1.py` 接收同一 development 批次上的两个五成员 provider 原始预测与监督标签，在内存中重新计算嵌套 OOF 证据和逐头路由；
+- `scripts/smolvla_piper_dual_provider_prediction_router_v1.py` 只消费校准器产生的 raw-recomputed receipt，在完全相同的有序 development 批次上原子选择预测张量；它不加载模型、数据集或 checkpoint，也不是未见样本上的生产推理器。
+
+### 21.1 真正的 nested OOF 选择边界
+
+外层固定为 canonical 五折，同一 `semantic_reset_cluster_id` 下的所有本体/actor execution group 必须进入同一折；每个样本恰好作为外层 held-out 一次。每个外层训练域内部再执行完整五折 OOF，并只用 inner OOF 决定该头的 provider 与校准模式。随后在整个外层训练域重拟合参数，把已冻结的 provider/模式应用到该外层 held-out；held-out 标签不会参与本折的 provider 选择、temperature/scale 拟合或 identity fallback 决策。
+
+校准模式有三种：`fitted_parameter`、`identity_parameter_fallback` 和 `disabled`。fitted 参数在 inner OOF 上未通过 proper/secondary/coverage 门而未校准预测通过时，才允许选择 identity；两者都失败时 effective OOF 显式置为 NaN、禁止该 provider 参加路由，不能把拟合预测冒充 identity，也不能在看过 outer-heldout 标签后重新选择模式。最终 deployment parameter 仅是“全 development 重拟合并按完整 OOF 冻结模式”的开发产物，不具有对未见样本的无偏性能含义。
+
+### 21.2 指标、层级聚合与保守门控
+
+六头同时计算 proper loss 与 decision loss：事件头使用 NLL 与 multiclass Brier，二元头使用 NLL 与 Brier，duration 使用右删失感知 NLL、观测样本中央 90% 区间分数和 coverage，对象效果使用矩匹配 Gaussian 的中央 90% 区间分数和平均 marginal coverage；当前没有把它表述成 joint 3D coverage。拟合和证据都按同一层级处理：先在 execution group 内等权，再在 semantic reset cluster 内对 execution group 等权，最后只按 semantic cluster bootstrap；复制一个长轨迹的行或同一语义簇中的 execution 都不能伪造更多独立证据。
+
+uncertainty 门同时要求 AURC 相对随机排序的 gain LCB 严格为正，以及高不确定性四分位错误显著高于低四分位。完全相同的不确定性按随机次序的期望处理，因此不能借输入顺序获得虚假 AURC。coverage 不能再因“宽置信区间碰巧包含 0.90”而通过：95% bootstrap 区间相对 0.90 的最大绝对偏差必须不超过预注册的 0.10。harm 门把 proper 与 decision 分开，并对 semantic-cluster harmful proportion 使用单侧 95% Wilson UCB；例如 10 个 cluster 中零次 harm 的 UCB 仍高于 0.10，所以不会因小样本“零事故”而放行。
+
+最终 candidate 只有在自身和 reference 均通过支持度、统计基线、校准及 uncertainty 门，且 candidate 相对 reference 的 proper/decision 配对 gain LCB 都严格大于 0、两种 harmful-rate UCB 都不高于 0.10 时才获选。否则 reference 自身通过就逐头回退 reference；再失败就不导出六头 receipt。这里证明的是 nested **选择算法**的外层 OOF 表现；完整 development OOF 只负责冻结最终固定 provider，不能被表述为该固定 route 的独立泛化分数。
+
+### 21.3 内容绑定与可信输入边界
+
+calibrator 分别绑定两个 provider 的原始预测 tensor、fitted/effective/uncalibrated outer OOF 完整 array set、train-only baseline OOF、routed effective/raw OOF、标签、样本顺序、六头 mask、semantic/body/actor identity、每折 fitted/effective 参数及全数据 deployment 参数。provider manifest 内的 `prediction_tensor_sha256` 会由八套归一化原始预测数组现场重算；两个变体还必须共享 core lineage、训练 execution group/semantic cluster、五成员索引与 seed 配对，并禁止训练与 development identity 重叠。
+
+这些绑定能检测内存输入、参数、折和路由结果被换序或篡改，但当前 manifest 仍是 **trusted-input provenance**：calibrator 没有重新打开 checkpoint 做 forward，也没有密码学证明输入 tensor 必然由 manifest 声称的 checkpoint 生成。正式上游 prediction artifact 还应把 raw prediction tensor SHA、sample/mask SHA、五成员 checkpoint SHA、inference code/config SHA 一起签入；在此之前不得宣称 checkpoint-to-prediction lineage 已验证。
+
+### 21.4 detached router 的可插拔接口
+
+两个 provider bundle 必须携带完全相同且实际可重算的有序 `sample_id` 和六头 applicable mask。张量形状严格为事件 `(5,N,5)`、duration/二元 `(5,N)`、对象 `(5,N,D)`；duration 与对象的 mean/scale 必须作为一个头原子路由，不能跨 provider 拼接。router 同时绑定 provider set、raw-recomputed receipt、calibration set、provider artifact 和逐头 calibration parameter SHA；旧 provisional verifier receipt、旧单-provider rank SHA、错序 identity、mask 或维度变化都会 fail-closed。
+
+`source_contract_rank_score` 永远不从这两个 provider 读取。调用者必须显式提供 actor-baseline rank，输出也记录该来源。换言之，该模块已具备“同一 development 批次上的可插拔六头路由”，但没有授权新的动作排序，更没有授权部署或 promotion。
+
+### 21.5 当前效果结论与下一步
+
+合成监督已验证 raw calibrator receipt 可以直接经过 `build_provider_set` 进入 `route_detached_predictions`，并覆盖身份/mask/shape、canonical fold、semantic-cluster 防泄漏、校准 provenance、support、AURC、coverage、Wilson harm、provider manifest、非有限值和旧 rank authority 等失败边界。校准器终态回归为 27 项全通过，detached router 回归为 40 项全通过；对应工作树 SHA256 为：calibrator `692bbda4c20c5048714244d970e4eb936bf7e9e4880d809d451e3e2b6d34a9a5`，router `00b98618932dae819cb133848954a5bd2ffeeb55876d776b480ee628a37a15a4`。这说明共享头选择与回退实现比第 20 节的 schema-only verifier 更接近可运行系统。
+
+但这仍不是新的真实模型效果：服务器当前没有训练或采集进程，也没有满足支持门且与 Formal190/evaluation400 隔离的 Piper development300 监督集。只有先在远端 4090 训练配对的两个五成员 provider，再用真实 development prediction/label 运行本节 calibrator，最后通过 Formal190 与未见 evaluation400，才能回答“跨本体预测是否改善、任务成功率是否提高”。当前最准确的状态是：**可插拔实现与科学证据链已增强；真实跨本体增益尚未新增。**
