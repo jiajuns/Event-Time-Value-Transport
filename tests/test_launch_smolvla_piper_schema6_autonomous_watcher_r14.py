@@ -279,6 +279,9 @@ def test_r14_constants_pin_parent_clean_collect_and_new_output() -> None:
         "dc548a5a8155dfd479da521f41c033417c3bfb260011f2f54865282fd1952da1"
     )
     assert watcher.R14_REQUIRED_IMPLEMENTATION_SHA256 == {
+        "scripts/materialize_smolvla_piper_schema6_reset_contract.py": (
+            "03f05d5510bd40a7a71dd9e69db924c1aea50ea185ae2a84f60bde08f38dcf1b"
+        ),
         "scripts/collect_openvla_etsf_rollouts.py": (
             "b8a20dcf15dea31d7708cf90c208b260d410eabd681499ab6101e6cb3cf8d491"
         )
@@ -291,7 +294,7 @@ def test_r14_constants_pin_parent_clean_collect_and_new_output() -> None:
         watcher.R14_FORBIDDEN_PRIOR_SCHEMA6_OUTPUT_ROOTS
     )
     assert watcher.R14_CODE_ROOT == Path(
-        "/home/user/etsf_smolvla_piper_schema6_code_r14b_20260829"
+        "/home/user/etsf_smolvla_piper_schema6_code_r14c_20260829"
     )
     assert watcher.R14_CODE_ROOT not in watcher.R14_FORBIDDEN_PRIOR_CODE_ROOTS
     assert {value["import_name"] for value in watcher.R14_LOCAL_IMPORT_TARGETS} >= {
@@ -604,6 +607,11 @@ def test_preflight_binds_probe_and_verify_reprobes_environment(
 def test_dirty_collect_implementation_is_rejected() -> None:
     plan = {
         "implementation_files": {
+            "scripts/materialize_smolvla_piper_schema6_reset_contract.py": {
+                "sha256": watcher.R14_REQUIRED_IMPLEMENTATION_SHA256[
+                    "scripts/materialize_smolvla_piper_schema6_reset_contract.py"
+                ]
+            },
             "scripts/collect_openvla_etsf_rollouts.py": {
                 "sha256": "32f157" + "0" * 58
             }

@@ -16,6 +16,7 @@ import json
 import math
 import numbers
 import os
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -59,6 +60,9 @@ TRACKED_DEFINITIONS = (
     },
 )
 SCENE_TIMESTEP_S = 1.0 / 250.0
+SCENE_TIMESTEP_BINARY32_S = struct.unpack(
+    "!f", struct.pack("!f", SCENE_TIMESTEP_S)
+)[0]
 WORLD_AABB_M = [[-3.0, 3.0], [-1.0, 2.0], [-0.5, 3.0]]
 MAX_PHYSICS_SUBSTEPS = 1000
 MAX_STEP_TRANSLATION_M = math.sqrt(sum((upper - lower) ** 2 for lower, upper in WORLD_AABB_M))
@@ -66,6 +70,41 @@ MAX_STEP_TRANSLATION_M = math.sqrt(sum((upper - lower) ** 2 for lower, upper in 
 
 class ResetContractError(RuntimeError):
     """The reset-only simulator identity contract cannot be proven."""
+
+
+def validate_scene_timestep(value: Any) -> dict[str, Any]:
+    """Accept only the nominal 1/250 value or its exact binary32 round-trip."""
+
+    if isinstance(value, bool):
+        raise ResetContractError("scene timestep is boolean, not a finite duration")
+    try:
+        observed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ResetContractError("scene timestep is not a finite duration") from None
+    accepted = {
+        SCENE_TIMESTEP_S: "python_binary64_1_div_250",
+        SCENE_TIMESTEP_BINARY32_S: "ieee754_binary32_roundtrip_1_div_250",
+    }
+    representation = accepted.get(observed)
+    if not math.isfinite(observed) or observed <= 0.0 or representation is None:
+        observed_hex = observed.hex() if math.isfinite(observed) else repr(observed)
+        raise ResetContractError(
+            "scene timestep differs from fixed 1/250 second: "
+            f"observed={observed!r}, observed_hex={observed_hex}, "
+            f"expected_binary64_hex={SCENE_TIMESTEP_S.hex()}, "
+            f"expected_binary32_roundtrip_hex={SCENE_TIMESTEP_BINARY32_S.hex()}"
+        )
+    return {
+        "format": "etsf_schema6_scene_timestep_binary_contract_v1",
+        "nominal_seconds": SCENE_TIMESTEP_S,
+        "nominal_binary64_hex": SCENE_TIMESTEP_S.hex(),
+        "binary32_roundtrip_seconds": SCENE_TIMESTEP_BINARY32_S,
+        "binary32_roundtrip_hex": SCENE_TIMESTEP_BINARY32_S.hex(),
+        "observed_seconds": observed,
+        "observed_hex": observed.hex(),
+        "accepted_representation": representation,
+        "broad_numeric_tolerance_used": False,
+    }
 
 
 def _nonempty_text(value: Any, role: str) -> str:
@@ -323,8 +362,9 @@ def materialize_reset_contract(*, r6f_preregistration: Path, output_directory: P
             raise ResetContractError("reset instruction differs from explicit text")
         scene = getattr(task, "scene", None)
         timestep_reader = getattr(scene, "get_timestep", None)
-        if not callable(timestep_reader) or float(timestep_reader()) != SCENE_TIMESTEP_S:
-            raise ResetContractError("scene timestep differs from fixed 1/250 second")
+        if not callable(timestep_reader):
+            raise ResetContractError("scene timestep reader is unavailable")
+        scene_timestep_audit = validate_scene_timestep(timestep_reader())
         registry = build_runtime_object_registry(task)
         spec = build_pose_quality_spec(
             registry, move_can_pot_source=task_source_binding
@@ -349,6 +389,7 @@ def materialize_reset_contract(*, r6f_preregistration: Path, output_directory: P
         "policy_imported_or_forwarded": False,
         "trajectory_or_labels_read": False,
         "fresh_inputs_used": False,
+        "scene_timestep_audit": scene_timestep_audit,
         "object_registry": {
             "path": str(registry_path),
             "file_sha256": file_sha256(registry_path),

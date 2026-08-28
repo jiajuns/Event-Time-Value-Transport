@@ -15,12 +15,14 @@ import launch_smolvla_piper_schema6_development_collection as launcher  # noqa: 
 from etsf_schema6_pose_quality import registry_sha256, validate_spec  # noqa: E402
 from materialize_smolvla_piper_schema6_reset_contract import (  # noqa: E402
     MAX_PHYSICS_SUBSTEPS,
+    SCENE_TIMESTEP_BINARY32_S,
     SCENE_TIMESTEP_S,
     ResetContractError,
     assert_runtime_registry_identity,
     build_pose_quality_spec,
     build_runtime_object_registry,
     sapien_actor_name,
+    validate_scene_timestep,
 )
 from run_smolvla_piper_r6d_direct_actor_smoke import file_sha256  # noqa: E402
 
@@ -53,6 +55,27 @@ class Task:
         self.pot_id = 8
         self.ep_num = 100101000
         self.scene = Scene()
+
+
+def test_scene_timestep_accepts_only_exact_binary64_or_binary32_contract() -> None:
+    binary64 = validate_scene_timestep(SCENE_TIMESTEP_S)
+    assert binary64["accepted_representation"] == "python_binary64_1_div_250"
+    assert binary64["broad_numeric_tolerance_used"] is False
+
+    binary32 = validate_scene_timestep(np.float32(SCENE_TIMESTEP_S))
+    assert binary32["observed_seconds"] == SCENE_TIMESTEP_BINARY32_S
+    assert (
+        binary32["accepted_representation"]
+        == "ieee754_binary32_roundtrip_1_div_250"
+    )
+
+    adjacent = np.nextafter(
+        np.float32(SCENE_TIMESTEP_S), np.float32(np.inf), dtype=np.float32
+    )
+    with pytest.raises(ResetContractError, match="observed_hex"):
+        validate_scene_timestep(adjacent)
+    with pytest.raises(ResetContractError, match="boolean"):
+        validate_scene_timestep(True)
 
 
 def test_registry_is_derived_from_task_attrs_actor_names_and_model_ids() -> None:
