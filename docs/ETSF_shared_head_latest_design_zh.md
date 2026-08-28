@@ -814,3 +814,57 @@ Git commit `94a9106612e710efc828d1ce3fef73766cc7dc0d` 的 r16 干净快照已部
 | hierarchical/group-normalized observer trainer | `c033d693c19d8673d9dee824deb9e7bdd9e594b52ea5fb0ee41aa3964433c2ed` |
 | root-observed evidence contract | `fdbb2f394e289ab58c9f3c2f394b3ab7da9f8c171f63c8a87ac5163a52c8bdd1` |
 | `CompactRootPredictorV1` reference-only runtime | `ee2753c9a36ebf6c083c7678c2b6ab120d4039f64309950160f7d4bd0eacbda1` |
+
+## 18. 2026-08-29 r13 权威进度更新
+
+本节覆盖第 15、17 节中已经过时的 r12/r16 运行状态；前文的模型定义、科学门控和“不能在独立配对证据前宣称任务成功率提升”的边界仍然有效。
+
+### 18.1 Source r13 已完成，但候选替换门没有晋升
+
+Source r13 五成员均完成 3,000 step 训练，输出根、成员和终态回执均已只读冻结；训练没有读取目标本体标签，test label dataset 打开数为 0。五成员 ensemble 文件 SHA256 为 `69390f0ca724006e58c346c75c7aed115224b8c78537b738fc18820ce36d15e5`。
+
+Source validation 上，最低合法 baseline 成功率为 `0.142857`，无门控最高分候选为 `0.285714`，点估计提升 `+0.142857`；但 proposal 的 paired delta 虽为 `+0.166667`，90% LCB 只有 `-0.018176`。因此最终状态是 `no_threshold_met_conservative_validation_gate`，候选替换 guard 保持关闭。成功预测的 Brier 从 `0.1780` 改善到 `0.1601`，ECE 从 `0.1884` 改善到 `0.1464`，这支持“校准更好”的局部结论，但不能支持“任务成功率已经提高”。
+
+### 18.2 Piper/UR5 LOBO r13 的真实跨本体结果
+
+顺序 Piper→UR5 的 LOBO r13 已成功终止，两阶段均 return code 0、进程及进程组均已回收，且 `test_group_hdf5_opened=0`、`target_unused_train_payload_opened=0`、`test_labels_read=false`。LOBO checkpoint 明确 `rerank_authorized=false`，所以这些结果只用于开发诊断，不是部署授权。
+
+| 目标本体/模型 | next F1 | post F1 | success AUROC | Brier↓ | duration MAE↓ | object RMSE↓ |
+|---|---:|---:|---:|---:|---:|---:|
+| Piper / Source-body-clock | 0.501895 | 0.299168 | 0.647524 | 0.496886 | 18.4981 | 0.188935 |
+| Piper / body-agnostic | 0.501895 | 0.289709 | 0.643437 | 0.508423 | 18.2040 | 0.188640 |
+| UR5 / Source-body-clock | 1.000000 | 0.811860 | 0.912458 | 0.120625 | 13.3056 | 0.052652 |
+| UR5 / body-agnostic | 1.000000 | 0.811860 | 0.919192 | 0.114909 | 12.8799 | 0.051516 |
+
+Piper 的 Source-body-clock 相对 body-agnostic 仅在 post F1（`+0.009460`）、AUROC（`+0.004087`）和 Brier（`-0.011537`）上略好，duration MAE（`+0.294048`）和 object RMSE（`+0.000295`）反而略差。UR5 上 next/post F1 不变，其余主指标除 ECE 外总体更差。更重要的是，Piper 只有 1,191 条 target-development row（success `107+/1084-`），UR5 只有 51 条（`33+/18-`，next/duration support 37），不是充分、均衡的独立任务成功证据。
+
+所以截至 r13，最准确的结论是：事件空间接口确实可以在不同本体数据上运行并产生可比较预测，但 Source-body-clock 尚未表现出稳定、普遍的跨本体增益。下一版不应继续无条件共享 clock，而应把 `clock/shared event geometry/body adapter` 作为可选择消融，并由目标 calibration 的逐头门控选择；在独立组支持不足时回退 body-agnostic 或 actor baseline。
+
+### 18.3 生产五成员 runtime 已实现，不等于科学晋升
+
+`scripts/smolvla_piper_evaluation400_production_root_predictor_runtime_v1.py` 已替代 reference-only 小网络在生产接口上的空缺：它加载真实五成员 `ActionConditionedEventWorldModel/PiperAdaptedWorldModel` family，校验权重、校准、uncertainty、rank 数值合同和 actor-visible root 张量，再输出逐成员/ensemble 预测。当前文件 SHA256 为 `7013b521d959e8c11b8a2b890b174f91bdbc8161a2674cad61e63b18f34a3d8c`，对应提交 `fa013b2`；PyTorch 2.4 的 weights-only 兼容层对应提交 `d349546`。
+
+这里的 `production` 只表示“真实模型族运行接口”，不表示模型已经通过 Formal190/evaluation400。没有真实目标校准 artifact、冻结 selector 和 paired task-success 证据时，该 runtime 不能单独产生迁移或性能结论。
+
+### 18.4 Schema6 r13 安全失败与 r14 要求
+
+Schema6 r13 watcher 已正确等待 LOBO 终态，但在第一阶段 `materialize_reset_only_registry` 因隔离 Python 环境缺少 `omegaconf` 而 fail-closed；freeze 和 collection 均未启动，test HDF 打开数为 0。冻结失败根不能续跑，r14 必须使用全新输出根，并在 static preflight 阶段显式证明解释器、关键依赖和代码闭包，而不是等到子进程启动后才发现 import 缺失。
+
+这一阶段仍只是 one-seed、最多 4-step 的 Schema6 可行性 smoke。即使 r14 成功，也不能代替 Piper development300、Formal190 或 evaluation400。
+
+### 18.5 dense260：补足事件监督的下一条 Source 数据链
+
+旧 Source63 使用 `action_exec_steps=50`，导致短暂 `e3/e4` 在 query 位置严重漏采。新预注册合同 `schema5_aloha_source_dense260_20260829_v1` 冻结 400 个 reset-only 候选，从中按标签盲规则选择 260 个 reset-identity 唯一组并切为 train/calibration/validation=`100/80/80`；每组 8 个候选，`action_exec_steps=5`，最长 200 step，理论上限 2,080 个候选分支。
+
+实现入口为 `scripts/preregister_smolvla_schema5_source_dense260_v1.py`，当前 SHA256 为 `be43a538c58a12a6e2eeca4f4d3502b6e00e2068af72f4b95ffd573c9872b9a9`，对应提交 `127a749`。它只冻结 reset identity 和不相交合同，输出始终 `collection_authorized=false`；真实 reset-only manifest、六份 aggregate attestation 及可信签发者/不可变来源还没有生成。因此 dense260 目前是已测试的监督扩展设计，不是已经采集的数据集，更不是训练结果。
+
+### 18.6 当前最短证据路径
+
+1. 用 r14 新根完成 Schema6 reset-only→authority→one-seed smoke，证明环境和运行适配器可执行；
+2. 在可信 reset-identity 来源下完成 dense260，并验证 `e3/e4/recovery` 的独立组支持确实增加；
+3. 收集不与 Formal/evaluation 重叠的 Piper development300，分别训练 body-clock 与 body-agnostic adapter；
+4. 用逐头 support/performance/uncertainty 门选择迁移配置，不把所有头或 clock 强制共享；
+5. 在 Formal190 冻结 selector，要求 paired success gain 的 bootstrap LCB 严格大于 0；
+6. 最后仅在完全未见的 evaluation400 上报告任务成功率、harmful-rate、coverage 和六头预测指标。
+
+在第 5、6 步完成以前，项目可以声明“可训练、接口可插拔、已完成两种目标本体的 LOBO 诊断”，不能声明“已得到最优模型”或“已经稳定提高跨本体任务成功率”。
