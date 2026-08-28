@@ -8,6 +8,7 @@ import importlib
 import json
 import math
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -53,6 +54,7 @@ EXIT_ROOT_INSUFFICIENT = 20
 EXIT_FAILURE = 21
 RECEIPT_FORMAT = "smolvla_piper_schema6_development_collection_receipt_v1"
 MANIFEST_FORMAT = "smolvla_piper_schema6_development_collection_manifest_v1"
+_PROCESS_HARD_EXIT = os._exit
 
 
 class LauncherContractError(RuntimeError):
@@ -406,6 +408,208 @@ def _write_manifest_and_receipt(
     }
 
 
+def _fsync_regular_file(path: Path) -> None:
+    """Durably flush one already-created, non-symlink regular file."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise LauncherContractError(f"durability target is not a regular file: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably flush a directory entry set without following symlinks."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise LauncherContractError(f"durability target is not a directory: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _flush_regular_stream(stream: Any, *, role: str) -> None:
+    """Flush and fsync a watcher-owned regular-file stream."""
+
+    stream.flush()
+    descriptor = int(stream.fileno())
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        raise LauncherContractError(f"{role} is not a regular-file watcher log")
+    os.fsync(descriptor)
+
+
+def _best_effort_terminal_diagnostic(error: BaseException) -> None:
+    """Emit a bounded terminalization failure without ever unwinding."""
+
+    try:
+        message = json.dumps(
+            {
+                "status": "failed_closed_before_native_hard_exit",
+                "exit_code": EXIT_FAILURE,
+                "error_type": type(error).__name__,
+                "error": str(error)[:2000],
+            },
+            sort_keys=True,
+        )
+        sys.stderr.write(message + "\n")
+        _flush_regular_stream(sys.stderr, role="stderr")
+    except BaseException:
+        try:
+            sys.stderr.flush()
+        except BaseException:
+            pass
+
+
+def _terminate_after_durable_result(
+    result: Mapping[str, Any], *, runtime_release_succeeded: bool
+) -> None:
+    """Commit the CLI result, then bypass unsafe native interpreter teardown.
+
+    The SAPIEN/Vulkan/PyTorch stack can segfault while Python decrements the
+    final simulator objects even after their explicit public cleanup methods
+    have returned.  This path is reached only after runtime release and after
+    the collection function has atomically written its receipt.  Revalidate
+    and fsync every committed artifact before emitting the result and using
+    ``os._exit`` so a successful collection cannot later be changed into a
+    spurious SIGSEGV by third-party interpreter finalizers.
+    """
+
+    terminal_exit_code = EXIT_FAILURE
+    try:
+        required = {
+            "manifest_path",
+            "manifest_file_sha256",
+            "receipt_path",
+            "receipt_file_sha256",
+            "receipt_logical_sha256",
+            "exit_code",
+            "status",
+        }
+        if set(result) != required:
+            raise LauncherContractError(
+                "CLI result fields differ from the durable commit contract"
+            )
+        exit_code = result["exit_code"]
+        if isinstance(exit_code, bool) or int(exit_code) != exit_code:
+            raise LauncherContractError("CLI result exit code is not an integer")
+        exit_code = int(exit_code)
+        status_contract = {
+            "completed_one_seed_schema6_development_collection": EXIT_SUCCESS,
+            "completed_root_fewer_than_two_legal_no_group": EXIT_ROOT_INSUFFICIENT,
+            "failed_closed_schema6_development_collection": EXIT_FAILURE,
+        }
+        if status_contract.get(result["status"]) != exit_code:
+            raise LauncherContractError("CLI status and exit code do not match")
+        if exit_code in (EXIT_SUCCESS, EXIT_ROOT_INSUFFICIENT) and not (
+            runtime_release_succeeded is True
+        ):
+            raise LauncherContractError(
+                "successful CLI result requires completed runtime release"
+            )
+
+        manifest_path = Path(str(result["manifest_path"]))
+        receipt_path = Path(str(result["receipt_path"]))
+        for role, path, expected_sha256 in (
+            ("manifest", manifest_path, result["manifest_file_sha256"]),
+            ("receipt", receipt_path, result["receipt_file_sha256"]),
+        ):
+            if path.is_symlink() or not path.is_file():
+                raise LauncherContractError(
+                    f"durable {role} is not a materialized regular file"
+                )
+            if file_sha256(path) != expected_sha256:
+                raise LauncherContractError(
+                    f"durable {role} changed before process termination"
+                )
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt_base = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_logical_sha256"
+        }
+        if (
+            manifest.get("status") != result["status"]
+            or receipt.get("status") != result["status"]
+            or receipt.get("exit_code") != exit_code
+            or receipt.get("receipt_logical_sha256")
+            != result["receipt_logical_sha256"]
+            or canonical_sha256(receipt_base)
+            != result["receipt_logical_sha256"]
+            or receipt.get("manifest")
+            != {
+                "path": str(manifest_path),
+                "file_sha256": result["manifest_file_sha256"],
+            }
+            or manifest.get("group") != receipt.get("group")
+        ):
+            raise LauncherContractError(
+                "durable manifest/receipt content is internally inconsistent"
+            )
+
+        group = receipt.get("group")
+        completed_groups = manifest.get("completed_groups")
+        failure = receipt.get("failure")
+        if exit_code == EXIT_SUCCESS and (
+            not isinstance(group, dict)
+            or completed_groups != 1
+            or failure is not None
+        ):
+            raise LauncherContractError("successful receipt lacks exactly one group")
+        if exit_code == EXIT_ROOT_INSUFFICIENT and (
+            group is not None or completed_groups != 0 or failure is not None
+        ):
+            raise LauncherContractError("root-insufficient receipt has invalid semantics")
+        if exit_code == EXIT_FAILURE and (
+            not isinstance(failure, dict) or failure.get("fail_closed") is not True
+        ):
+            raise LauncherContractError("failure receipt lacks a fail-closed error")
+
+        durable_files = [manifest_path, receipt_path]
+        if group is not None:
+            group_path = Path(str(group.get("path", "")))
+            if group_path.is_symlink() or not group_path.is_file():
+                raise LauncherContractError(
+                    "durable collection group is not a regular file"
+                )
+            if file_sha256(group_path) != group.get("file_sha256"):
+                raise LauncherContractError(
+                    "durable collection group changed before termination"
+                )
+            durable_files.append(group_path)
+        for path in durable_files:
+            _fsync_regular_file(path)
+        durable_directories = {
+            directory
+            for path in durable_files
+            for directory in (path.parent, path.parent.parent)
+        }
+        for directory in sorted(durable_directories, key=str):
+            _fsync_directory(directory)
+
+        sys.stdout.write(json.dumps(dict(result), sort_keys=True) + "\n")
+        _flush_regular_stream(sys.stdout, role="stdout")
+        sys.stderr.flush()
+        terminal_exit_code = exit_code
+    except BaseException as exc:
+        _best_effort_terminal_diagnostic(exc)
+
+    _PROCESS_HARD_EXIT(terminal_exit_code)
+    raise LauncherContractError("os._exit unexpectedly returned")
+
+
 def _release_collection_runtime(
     *, runtime_adapter: RoboTwinCollectionRuntime | None, capture: Any,
     env: Any | None, policy: Any, torch_module: Any,
@@ -413,6 +617,11 @@ def _release_collection_runtime(
     """Attempt every release and report cleanup failure as a closed contract."""
 
     failures: list[BaseException] = []
+    try:
+        if torch_module.cuda.is_available():
+            torch_module.cuda.synchronize()
+    except BaseException as exc:
+        failures.append(exc)
     if runtime_adapter is not None:
         try:
             runtime_adapter.close()
@@ -428,13 +637,21 @@ def _release_collection_runtime(
                 torch_module.cuda.empty_cache()
     except BaseException as exc:
         failures.append(exc)
+    try:
+        if torch_module.cuda.is_available():
+            torch_module.cuda.empty_cache()
+            torch_module.cuda.synchronize()
+    except BaseException as exc:
+        failures.append(exc)
     if failures:
         raise LauncherContractError(
             f"collection runtime release failed in {len(failures)} operation(s)"
         ) from failures[0]
 
 
-def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
+def run_authorized_collection(
+    authority_path: Path, *, terminate_after_durable_result: bool = False
+) -> dict[str, Any]:
     """Validate all content before output creation, then collect exactly one seed."""
 
     authority, r6f, r6e, r6c, r6d, seed = validate_collection_authority(authority_path)
@@ -515,6 +732,7 @@ def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
     env = None
     runtime_adapter = None
     resources_released = False
+    runtime_release_succeeded = False
     output.mkdir(parents=False, exist_ok=False)
     group_path = Path(authority["output_contract"]["group"])
     try:
@@ -563,9 +781,10 @@ def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
                     runtime_adapter=runtime_adapter, capture=capture, env=env,
                     policy=policy, torch_module=torch,
                 )
+                runtime_release_succeeded = True
             finally:
                 resources_released = True
-            return _write_manifest_and_receipt(
+            result = _write_manifest_and_receipt(
                 authority=authority, authority_path=authority_path, output=output,
                 status="completed_root_fewer_than_two_legal_no_group",
                 exit_code=EXIT_ROOT_INSUFFICIENT, group_path=None, audit=None,
@@ -573,6 +792,12 @@ def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
                 identity_validation_count=runtime_adapter.identity_validation_count,
                 error=None, clock_contracts=clock_contracts,
             )
+            if terminate_after_durable_result:
+                _terminate_after_durable_result(
+                    result,
+                    runtime_release_succeeded=runtime_release_succeeded,
+                )
+            return result
         save_schema6_group(group_path, record)
         audit = validate_schema6_group_file(group_path)
         audit = {
@@ -590,9 +815,10 @@ def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
                 runtime_adapter=runtime_adapter, capture=capture, env=env,
                 policy=policy, torch_module=torch,
             )
+            runtime_release_succeeded = True
         finally:
             resources_released = True
-        return _write_manifest_and_receipt(
+        result = _write_manifest_and_receipt(
             authority=authority, authority_path=authority_path, output=output,
             status="completed_one_seed_schema6_development_collection",
             exit_code=EXIT_SUCCESS, group_path=group_path, audit=audit,
@@ -600,6 +826,12 @@ def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
             identity_validation_count=runtime_adapter.identity_validation_count,
             error=None, clock_contracts=clock_contracts,
         )
+        if terminate_after_durable_result:
+            _terminate_after_durable_result(
+                result,
+                runtime_release_succeeded=runtime_release_succeeded,
+            )
+        return result
     except BaseException as exc:
         env_steps = 0 if runtime_adapter is None else runtime_adapter.env_steps
         clock_contracts = [] if runtime_adapter is None else [
@@ -612,13 +844,14 @@ def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
                     runtime_adapter=runtime_adapter, capture=capture, env=env,
                     policy=policy, torch_module=torch,
                 )
+                runtime_release_succeeded = True
             except BaseException as cleanup_exc:
                 failure = LauncherContractError(
                     f"{type(exc).__name__}: {exc}; runtime cleanup also failed: {cleanup_exc}"
                 )
             resources_released = True
         if not Path(authority["output_contract"]["receipt"]).exists():
-            return _write_manifest_and_receipt(
+            result = _write_manifest_and_receipt(
                 authority=authority, authority_path=authority_path, output=output,
                 status="failed_closed_schema6_development_collection",
                 exit_code=EXIT_FAILURE,
@@ -631,6 +864,12 @@ def run_authorized_collection(authority_path: Path) -> dict[str, Any]:
                 ),
                 clock_contracts=clock_contracts,
             )
+            if terminate_after_durable_result:
+                _terminate_after_durable_result(
+                    result,
+                    runtime_release_succeeded=runtime_release_succeeded,
+                )
+            return result
         raise
     finally:
         if not resources_released:
@@ -644,9 +883,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preregistration", type=Path, required=True)
     args = parser.parse_args()
-    result = run_authorized_collection(args.preregistration)
-    print(json.dumps(result, sort_keys=True))
-    raise SystemExit(int(result["exit_code"]))
+    result = run_authorized_collection(
+        args.preregistration, terminate_after_durable_result=True
+    )
+    raise LauncherContractError(
+        f"durable CLI termination unexpectedly returned: {result['status']}"
+    )
 
 
 if __name__ == "__main__":

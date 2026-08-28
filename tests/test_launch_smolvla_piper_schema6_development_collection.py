@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from etsf_schema6_pose_quality import REGISTRY_FORMAT  # noqa: E402
 import freeze_smolvla_piper_schema6_development_collection as freezer  # noqa: E402
+import launch_smolvla_piper_schema6_development_collection as launcher  # noqa: E402
 from freeze_smolvla_piper_schema6_development_collection import (  # noqa: E402
     CollectionAuthorityError,
     _project_signed_development_seed,
@@ -26,6 +28,7 @@ from launch_smolvla_piper_schema6_development_collection import (  # noqa: E402
     DecisionTelemetryClock,
     LauncherContractError,
     RoboTwinCollectionRuntime,
+    _terminate_after_durable_result,
     _write_manifest_and_receipt,
 )
 from materialize_smolvla_piper_schema6_reset_contract import build_pose_quality_spec  # noqa: E402
@@ -480,3 +483,181 @@ def test_manifest_receipt_bind_hashes_status_and_exit(tmp_path: Path) -> None:
     assert logical == canonical_sha256(receipt)
     assert receipt["failure"]["fail_closed"] is True
     assert receipt["performance_evaluation_authorized"] is False
+
+
+def test_cli_hard_exit_occurs_only_after_durable_receipt_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_path, authority, _, output = _authority_fixture(tmp_path)
+    output.mkdir()
+    result = _write_manifest_and_receipt(
+        authority=authority,
+        authority_path=authority_path,
+        output=output,
+        status="completed_root_fewer_than_two_legal_no_group",
+        exit_code=20,
+        group_path=None,
+        audit=None,
+        env_steps=0,
+        identity_validation_count=1,
+        error=None,
+        clock_contracts=[],
+    )
+    exits: list[int] = []
+
+    class HardExitObserved(BaseException):
+        pass
+
+    def fake_hard_exit(code: int) -> None:
+        exits.append(code)
+        raise HardExitObserved
+
+    terminal_log = tmp_path / "watcher.log"
+    with terminal_log.open("w", encoding="utf-8") as stream:
+        with monkeypatch.context() as isolated:
+            isolated.setattr(launcher, "_PROCESS_HARD_EXIT", fake_hard_exit)
+            isolated.setattr(launcher.sys, "stdout", stream)
+            with pytest.raises(HardExitObserved):
+                _terminate_after_durable_result(
+                    result, runtime_release_succeeded=True
+                )
+    assert exits == [20]
+    assert json.loads(terminal_log.read_text(encoding="utf-8")) == result
+
+
+def test_cli_hard_exit_rejects_receipt_changed_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority_path, authority, _, output = _authority_fixture(tmp_path)
+    output.mkdir()
+    result = _write_manifest_and_receipt(
+        authority=authority,
+        authority_path=authority_path,
+        output=output,
+        status="failed_closed_schema6_development_collection",
+        exit_code=EXIT_FAILURE,
+        group_path=None,
+        audit=None,
+        env_steps=0,
+        identity_validation_count=0,
+        error=LauncherContractError("synthetic failure"),
+        clock_contracts=[],
+    )
+    receipt_path = Path(result["receipt_path"])
+    receipt_path.chmod(0o644)
+    receipt_path.write_text(
+        receipt_path.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+    )
+    exits: list[int] = []
+
+    class HardExitObserved(BaseException):
+        pass
+
+    def fake_hard_exit(code: int) -> None:
+        exits.append(code)
+        raise HardExitObserved
+
+    monkeypatch.setattr(launcher, "_PROCESS_HARD_EXIT", fake_hard_exit)
+    with pytest.raises(HardExitObserved):
+        _terminate_after_durable_result(
+            result, runtime_release_succeeded=False
+        )
+    assert exits == [EXIT_FAILURE]
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value", "release_succeeded"),
+    [
+        ("status", "completed_one_seed_schema6_development_collection", True),
+        (None, None, False),
+    ],
+)
+def test_cli_success_contract_violation_hard_exits_failure_without_unwind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str | None,
+    changed_value: object,
+    release_succeeded: bool,
+) -> None:
+    authority_path, authority, _, output = _authority_fixture(tmp_path)
+    output.mkdir()
+    result = _write_manifest_and_receipt(
+        authority=authority,
+        authority_path=authority_path,
+        output=output,
+        status="completed_root_fewer_than_two_legal_no_group",
+        exit_code=20,
+        group_path=None,
+        audit=None,
+        env_steps=0,
+        identity_validation_count=1,
+        error=None,
+        clock_contracts=[],
+    )
+    if changed_field is not None:
+        result[changed_field] = changed_value
+    exits: list[int] = []
+
+    class HardExitObserved(BaseException):
+        pass
+
+    def fake_hard_exit(code: int) -> None:
+        exits.append(code)
+        raise HardExitObserved
+
+    monkeypatch.setattr(launcher, "_PROCESS_HARD_EXIT", fake_hard_exit)
+    with pytest.raises(HardExitObserved):
+        _terminate_after_durable_result(
+            result, runtime_release_succeeded=release_succeeded
+        )
+    assert exits == [EXIT_FAILURE]
+
+
+def test_real_hard_exit_bypasses_python_finalizers_after_fsync(
+    tmp_path: Path,
+) -> None:
+    authority_path, authority, _, output = _authority_fixture(tmp_path)
+    output.mkdir()
+    result = _write_manifest_and_receipt(
+        authority=authority,
+        authority_path=authority_path,
+        output=output,
+        status="completed_root_fewer_than_two_legal_no_group",
+        exit_code=20,
+        group_path=None,
+        audit=None,
+        env_steps=0,
+        identity_validation_count=1,
+        error=None,
+        clock_contracts=[],
+    )
+    terminal_log = tmp_path / "hard_exit.log"
+    destructor_marker = tmp_path / "destructor_ran"
+    source = f"""
+import sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT / 'scripts')!r})
+import launch_smolvla_piper_schema6_development_collection as launcher
+marker = Path({str(destructor_marker)!r})
+class NativeFinalizerSentinel:
+    def __del__(self):
+        marker.write_text('unexpected interpreter finalizer', encoding='utf-8')
+sentinel = NativeFinalizerSentinel()
+with Path({str(terminal_log)!r}).open('w', encoding='utf-8') as stream:
+    sys.stdout = stream
+    launcher._terminate_after_durable_result(
+        {result!r}, runtime_release_succeeded=True
+    )
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 20, completed.stderr
+    assert not destructor_marker.exists()
+    assert json.loads(terminal_log.read_text(encoding="utf-8")) == result

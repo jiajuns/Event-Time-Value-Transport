@@ -1247,6 +1247,51 @@ def test_subprocess_nonzero_exit_has_atomic_receipt_and_log_sha(tmp_path: Path) 
     )
 
 
+def test_sigsegv_is_rejected_even_when_child_wrote_success_receipt(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    state_path = output / "state.json"
+    child_receipt = output / "child_success_receipt.json"
+    script = (
+        "import json,os,signal; "
+        f"open({str(child_receipt)!r},'w').write(json.dumps({{'exit_code':0,'status':'complete'}})); "
+        "os.kill(os.getpid(), signal.SIGSEGV)"
+    )
+    argv = [sys.executable, "-c", script]
+    stage = {
+        "stage": "segv_after_receipt_smoke",
+        "argv": argv,
+        "argv_sha256": watcher.canonical_sha256(argv),
+        "accepted_returncodes": [0, 20],
+    }
+    validator_calls: list[int] = []
+    lifecycle: dict[str, object] = {}
+    with pytest.raises(watcher.WatcherContractError, match="exit -11"):
+        watcher.run_stage(
+            stage,
+            output_root=output,
+            environment=os.environ,
+            state={},
+            state_path=state_path,
+            poll_seconds=0.01,
+            timeout_seconds=5,
+            environment_audit_sha256="d" * 64,
+            validator=lambda _log, code: validator_calls.append(code) or {},
+            lifecycle=lifecycle,
+        )
+    assert child_receipt.is_file()
+    assert validator_calls == []
+    assert lifecycle["returncode"] == -signal.SIGSEGV
+    stage_receipt = json.loads(
+        (output / "stage_receipts/segv_after_receipt_smoke.json").read_text()
+    )
+    assert stage_receipt["status"] == "failed_closed"
+    assert stage_receipt["returncode"] == -signal.SIGSEGV
+    assert "artifact_audit" not in stage_receipt
+
+
 def test_run_stage_timeout_reaps_parent_and_child_process_group(tmp_path: Path) -> None:
     output = tmp_path / "output"
     output.mkdir()

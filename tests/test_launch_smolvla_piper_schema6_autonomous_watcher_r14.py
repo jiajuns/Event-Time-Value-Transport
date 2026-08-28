@@ -280,7 +280,7 @@ def test_r14_constants_pin_parent_clean_collect_and_new_output() -> None:
     )
     assert watcher.R14_REQUIRED_IMPLEMENTATION_SHA256 == {
         "scripts/launch_smolvla_piper_schema6_development_collection.py": (
-            "6903fb0d44c49878bfb56c05c463a264640cf8c12f000cb7f068a5cba8037c4e"
+            "7d9300bdc1a08484b0d4c9311e51a4ca177d1fb38c002ff9328d4d7d9708e62d"
         ),
         "scripts/materialize_smolvla_piper_schema6_reset_contract.py": (
             "03f05d5510bd40a7a71dd9e69db924c1aea50ea185ae2a84f60bde08f38dcf1b"
@@ -297,7 +297,7 @@ def test_r14_constants_pin_parent_clean_collect_and_new_output() -> None:
         watcher.R14_FORBIDDEN_PRIOR_SCHEMA6_OUTPUT_ROOTS
     )
     assert watcher.R14_CODE_ROOT == Path(
-        "/home/user/etsf_smolvla_piper_schema6_code_r14d_20260829"
+        "/home/user/etsf_smolvla_piper_schema6_code_r14e_20260829"
     )
     assert watcher.R14_CODE_ROOT not in watcher.R14_FORBIDDEN_PRIOR_CODE_ROOTS
     assert {value["import_name"] for value in watcher.R14_LOCAL_IMPORT_TARGETS} >= {
