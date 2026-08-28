@@ -1,0 +1,111 @@
+{
+  "access_contract": {
+    "fresh_inputs_allowed": false,
+    "gpu_allowed": false,
+    "outcome_fields_used_for_thresholds_or_integrity_decisions": false,
+    "simulator_import_or_execution_allowed": false,
+    "training_allowed": false
+  },
+  "body": "piper_piper_0.6",
+  "expected_candidates": 4,
+  "expected_groups": 250,
+  "expected_object_names": [
+    "can",
+    "cluttered_obj",
+    "pot",
+    "table",
+    "wall"
+  ],
+  "format": "etsf_schema5_object_pose_integrity_spec_v1",
+  "materialized_object_names": [
+    "can"
+  ],
+  "pose_layout": {
+    "frame": "simulator_world",
+    "quaternion_indices": [
+      3,
+      4,
+      5,
+      6
+    ],
+    "quaternion_order": "wxyz",
+    "shape_suffix": [
+      7
+    ],
+    "translation_indices": [
+      0,
+      1,
+      2
+    ],
+    "translation_unit": "metre"
+  },
+  "schema_version": 5,
+  "source_artifacts": {
+    "base_task_engine": {
+      "path": "/home/user/etsf_stage0/RoboTwin_RLinf_support/envs/_base_task.py",
+      "sha256": "aa9d717ad214b9d68c6eeb83ed03f2491db6addc98deaa988a48a3c074178bdd"
+    },
+    "collection_manifest": {
+      "path": "/home/user/etsf_openvla_event_branches_v7_development250_20260827/manifest.json",
+      "sha256": "b611d6604ecd323e90dea15c1bfb6bed6fb22bf974cf77b52e8eb02c0409ef23"
+    },
+    "event_spec": {
+      "path": "/home/user/etsf_stage2_run_20260825/event_spec.json",
+      "sha256": "8b1ff070ee7f9519707f45c42209b266a515b45c95d14f13bb4a95f283f2bff5"
+    },
+    "pose_discovery_collector": {
+      "path": "/home/user/etsf_event_world_model_v8_code_r3_20260827/scripts/collect_openvla_etsf_rollouts.py",
+      "sha256": "32f1574be5a15dcc78ec89d9ff68c40aa630f6a4c7f598b3e7479aa19283fbb0"
+    },
+    "r3_materialization_manifest": {
+      "path": "/home/user/etsf_openvla_v8_adaptive_d250_r3_20260827/materialized_oof/materialization_manifest.json",
+      "sha256": "4f9479d017a3c2bf9538accf1e5089bdc989bcc504bcd0f5a48e6413235ac76a"
+    },
+    "schema5_branch_collector": {
+      "path": "/home/user/etsf_event_world_model_v8_code_r3_20260827/scripts/collect_openvla_etsf_event_branches.py",
+      "sha256": "d89f70317e811b4d2b5866003296e60f4f1d1aee40c7586507c85d0a07279cb1"
+    },
+    "task_definition": {
+      "path": "/home/user/etsf_stage0/RoboTwin_RLinf_support/envs/move_can_pot.py",
+      "sha256": "9ffe67cf41d450bc177c07c8a72411c3e5f3c5fbaa2c4dc8051a7b8d43a063bd"
+    }
+  },
+  "task": "move_can_pot",
+  "threshold_basis": {
+    "max_step_rotation_basis": "unit_quaternion_geodesic_upper_bound_pi",
+    "max_step_translation_basis": "world_aabb_diagonal_not_empirical_quantile",
+    "note": "audit bounds are code-derived conservative integrity limits, not simulator hard limits",
+    "static_object_basis": "base_task_create_table_and_wall_is_static_true",
+    "thresholds_fit_from_pose_data": false,
+    "world_aabb_basis": "conservative_envelope_from_base_task_static_wall_and_table_geometry"
+  },
+  "thresholds": {
+    "candidate_reset_match_atol": 0.0,
+    "endpoint_match_atol": 0.0,
+    "materialized_delta_match_atol": 1e-05,
+    "max_step_rotation_rad": 3.141592653589793,
+    "max_step_translation_m": 7.566372975210778,
+    "quaternion_norm_abs_tolerance": 0.001,
+    "static_object_max_step_rotation_rad": 1e-06,
+    "static_object_max_step_translation_m": 1e-06,
+    "static_object_names": [
+      "table",
+      "wall"
+    ],
+    "world_aabb_m": [
+      [
+        -3.0,
+        3.0
+      ],
+      [
+        -1.0,
+        2.0
+      ],
+      [
+        -0.5,
+        3.0
+      ]
+    ]
+  },
+  "timing_scope": "adaptive_development_audit_frozen_before_full_d250_pose_scan"
+}

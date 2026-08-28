@@ -1,0 +1,37 @@
+{
+  "runtime_roots": {
+    "rlinf_root": "/home/user/etsf_stage0/RLinf",
+    "robotwin_root": "/home/user/etsf_stage0/RoboTwin",
+    "robotwin_code": "/home/user/etsf_stage0/RoboTwin_RLinf_support",
+    "lerobot_root": "/home/user/etsf_stage0/lerobot",
+    "model_path": "/home/user/etsf_smolvla_models/smolvla_robotwin_967623a0",
+    "vlm_metadata_path": "/home/user/etsf_stage0/offline_assets/smolvlm2_500m_metadata"
+  },
+  "runtime_source_paths": {
+    "rlinf_robotwin_env": "/home/user/etsf_stage0/RLinf/rlinf/envs/robotwin/robotwin_env.py",
+    "robotwin_vector_env": "/home/user/etsf_stage0/RoboTwin_RLinf_support/robotwin/envs/vector_env.py",
+    "robotwin_base_task": "/home/user/etsf_stage0/RoboTwin_RLinf_support/envs/_base_task.py",
+    "robotwin_robot_controller": "/home/user/etsf_stage0/RoboTwin_RLinf_support/envs/robot/robot.py",
+    "robotwin_move_can_pot": "/home/user/etsf_stage0/RoboTwin_RLinf_support/envs/move_can_pot.py"
+  },
+  "eval_seed_registry_path": "/home/user/etsf_stage0/RLinf/rlinf/envs/robotwin/seeds/eval_seeds.json",
+  "gpu_index": 0,
+  "max_episode_steps": 4,
+  "piper_action_bounds": [
+    [-2.618, 2.618],
+    [0.0, 3.14],
+    [-2.697, 2.697],
+    [-1.832, 1.832],
+    [-1.22, 1.22],
+    [-3.14, 3.14],
+    [0.0, 1.0],
+    [-2.618, 2.618],
+    [0.0, 3.14],
+    [-2.697, 2.697],
+    [-1.832, 1.832],
+    [-1.22, 1.22],
+    [-3.14, 3.14],
+    [0.0, 1.0]
+  ],
+  "reset_scratch_path": "/home/user/etsf_smolvla_piper_schema6_target_reset_v2_20260828"
+}
