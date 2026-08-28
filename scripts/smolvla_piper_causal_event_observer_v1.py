@@ -28,7 +28,7 @@ TRAINING_SUPERVISION_FORMAT = "etsf_causal_event_observer_supervision_v1"
 ADAPTER_CONTRACT_FORMAT = "etsf_causal_event_observer_actor_adapter_v1"
 CALIBRATION_FORMAT = "etsf_causal_event_observer_calibration_v1"
 DEPLOYMENT_FORMAT = "etsf_causal_event_observer_deployment_v1"
-PROMOTION_EVIDENCE_FORMAT = "etsf_causal_event_observer_promotion_evidence_v1"
+PROMOTION_EVIDENCE_FORMAT = "etsf_causal_event_observer_promotion_evidence_v2"
 IMAGE_RECEIPT_FORMAT = "etsf_actor_visible_image_feature_receipt_v1"
 EXECUTION_RECEIPT_FORMAT = "etsf_actor_visible_execution_receipt_v1"
 HISTORY_FORMAT = "etsf_actor_visible_960d_same_branch_causal_history_v1"
@@ -56,10 +56,15 @@ PROPRIO_SOURCE = "actor_visible_processed_robot_state_at_query"
 HISTORY_PADDING = "right_zero_padding_with_false_mask"
 HISTORY_TRUNCATION = "left_truncate_keep_most_recent"
 
-MIN_PROMOTION_GROUPS = 50
+# With a preregistered 95% Wilson upper bound of 0.05, even zero observed
+# false accepts require at least 73 independent groups:
+# z^2 / (n + z^2) <= 0.05 for z=1.959963984540054.
+MIN_PROMOTION_GROUPS = 73
 MIN_PROMOTION_GROUPS_PER_ACTOR = 10
 MIN_EVENT_ACCURACY_LCB95 = 0.70
+MIN_EVENT_MACRO_F1_LCB95 = 0.70
 MIN_PREDICATE_F1_LCB95 = 0.65
+MIN_EVENT_PREDICATE_CONSISTENCY = 0.95
 MAX_CALIBRATION_ECE = 0.10
 MAX_LOW_CONFIDENCE_FALSE_ACCEPT_UCB95 = 0.05
 
@@ -464,7 +469,10 @@ def validate_promotion_evidence(
         "calibration_sha256", "independent_calibration_split_sha256",
         "independent_validation_split_sha256", "actor_names",
         "independent_validation_groups", "per_actor_validation_groups",
-        "event_macro_accuracy_lcb95", "predicate_macro_f1_lcb95",
+        "event_macro_accuracy_lcb95", "event_macro_f1_lcb95",
+        "predicate_macro_f1_lcb95", "event_predicate_ontology_consistency",
+        "event_macro_f1_gain_over_train_frequency_lcb95",
+        "predicate_macro_f1_gain_over_train_constant_lcb95",
         "maximum_event_ece", "maximum_predicate_ece",
         "low_confidence_false_accept_ucb95",
         "future_feature_perturbation_invariant",
@@ -502,8 +510,21 @@ def validate_promotion_evidence(
         )
         or not _finite_number(item["event_macro_accuracy_lcb95"])
         or float(item["event_macro_accuracy_lcb95"]) < MIN_EVENT_ACCURACY_LCB95
+        or not _finite_number(item["event_macro_f1_lcb95"])
+        or float(item["event_macro_f1_lcb95"]) < MIN_EVENT_MACRO_F1_LCB95
         or not _finite_number(item["predicate_macro_f1_lcb95"])
         or float(item["predicate_macro_f1_lcb95"]) < MIN_PREDICATE_F1_LCB95
+        or not _finite_number(item["event_predicate_ontology_consistency"])
+        or float(item["event_predicate_ontology_consistency"])
+        < MIN_EVENT_PREDICATE_CONSISTENCY
+        or not _finite_number(
+            item["event_macro_f1_gain_over_train_frequency_lcb95"]
+        )
+        or float(item["event_macro_f1_gain_over_train_frequency_lcb95"]) <= 0.0
+        or not _finite_number(
+            item["predicate_macro_f1_gain_over_train_constant_lcb95"]
+        )
+        or float(item["predicate_macro_f1_gain_over_train_constant_lcb95"]) <= 0.0
         or not _finite_number(item["maximum_event_ece"])
         or not 0 <= float(item["maximum_event_ece"]) <= MAX_CALIBRATION_ECE
         or not _finite_number(item["maximum_predicate_ece"])
@@ -1187,8 +1208,15 @@ class ActorVisibleCausalEventObserverV1(nn.Module):
         )
         predicates = (predicate_probability >= thresholds).to(torch.float32)
         event_confidence = event_probability.amax(dim=-1)
-        predicate_confidence = torch.maximum(
-            predicate_probability, 1.0 - predicate_probability
+        # Predicate thresholds are fitted independently and need not equal
+        # 0.5.  Confidence must therefore be the calibrated probability of
+        # the decision actually emitted, rather than max(p, 1-p), which can
+        # overstate confidence whenever the fitted threshold differs from
+        # 0.5.
+        predicate_confidence = torch.where(
+            predicates.bool(),
+            predicate_probability,
+            1.0 - predicate_probability,
         ).amin(dim=-1)
         confidence = torch.minimum(event_confidence, predicate_confidence)
         confident = (

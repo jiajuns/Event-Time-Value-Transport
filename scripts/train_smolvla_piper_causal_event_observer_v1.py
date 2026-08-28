@@ -46,6 +46,8 @@ from smolvla_piper_causal_event_observer_v1 import (
     MAX_HISTORY_STEPS,
     MAX_LOW_CONFIDENCE_FALSE_ACCEPT_UCB95,
     MIN_EVENT_ACCURACY_LCB95,
+    MIN_EVENT_MACRO_F1_LCB95,
+    MIN_EVENT_PREDICATE_CONSISTENCY,
     MIN_PREDICATE_F1_LCB95,
     MIN_PROMOTION_GROUPS,
     MIN_PROMOTION_GROUPS_PER_ACTOR,
@@ -80,6 +82,31 @@ DATASET_SPLITS = ("train", "calibration", "validation")
 METRICS_FORMAT = "etsf_causal_event_observer_independent_validation_v1"
 CALIBRATION_FIT_FORMAT = "etsf_causal_event_observer_group_calibration_fit_v1"
 TRAINING_RECEIPT_FORMAT = "etsf_causal_event_observer_training_receipt_v1"
+PRODUCTION_DATASET_STATUS = (
+    "complete_actor_visible_causal_supervision_content_addressed"
+)
+PROMOTION_GATE_NAMES = frozenset(
+    {
+        "independent_validation_groups",
+        "per_actor_validation_groups",
+        "event_macro_accuracy_lcb95",
+        "event_macro_f1_lcb95",
+        "predicate_macro_f1_lcb95",
+        "event_macro_f1_gain_over_train_frequency_lcb95",
+        "predicate_macro_f1_gain_over_train_constant_lcb95",
+        "maximum_event_ece",
+        "maximum_predicate_ece",
+        "low_confidence_false_accept_ucb95",
+        "canonical_label_support",
+        "event_predicate_ontology_consistency",
+        "future_feature_perturbation_invariant",
+        "cross_branch_isolation_passed",
+        "privileged_input_static_audit_passed",
+        "calibration_group_disjoint",
+        "calibration_support",
+        "calibration_low_confidence_false_accept_fit",
+    }
+)
 
 PROPRIO_DIM = 14
 ARRAY_FIELDS = {
@@ -125,10 +152,13 @@ class TrainingConfig:
     weight_decay: float = 1.0e-4
     event_loss_weight: float = 1.0
     predicate_loss_weight: float = 1.0
+    event_predicate_consistency_loss_weight: float = 0.25
+    class_balance_beta: float = 0.99
+    maximum_class_weight: float = 5.0
     bootstrap_samples: int = 2_000
     confidence_level: float = 0.95
     calibration_grid_size: int = 121
-    minimum_calibration_accepts: int = 20
+    minimum_calibration_accepts: int = MIN_PROMOTION_GROUPS
     seed: int = 20260828
     device: str = "cpu"
 
@@ -142,6 +172,9 @@ class TrainingConfig:
             or self.weight_decay < 0.0
             or self.event_loss_weight <= 0.0
             or self.predicate_loss_weight <= 0.0
+            or self.event_predicate_consistency_loss_weight < 0.0
+            or not 0.0 <= self.class_balance_beta < 1.0
+            or self.maximum_class_weight < 1.0
             or self.bootstrap_samples < 100
             or not 0.5 < self.confidence_level < 1.0
             or self.calibration_grid_size < 11
@@ -159,6 +192,123 @@ class LoadedDataset:
     splits: dict[str, dict[str, np.ndarray]]
     actor_names: tuple[str, ...]
     actor_records: tuple[dict[str, Any], ...]
+
+
+def _label_support_audit(dataset: LoadedDataset) -> dict[str, Any]:
+    """Describe label support without exposing labels as online inputs.
+
+    Promotion metrics are meaningless when a canonical event or either side of
+    a predicate has no independent-group support.  The audit is content
+    addressed and travels with the training receipt so that a row-heavy split
+    cannot hide sparse group coverage.
+    """
+
+    split_records: dict[str, Any] = {}
+    all_train_actor_support = True
+    for split_name in DATASET_SPLITS:
+        arrays = dataset.splits[split_name]
+        groups = arrays["logical_group_id"]
+        unique_groups, group_counts = np.unique(groups, return_counts=True)
+        root_rows = np.flatnonzero(arrays["current_query_index"] == 0)
+        root_fingerprints = {
+            hashlib.sha256(
+                arrays["history"][row].tobytes(order="C")
+                + arrays["history_mask"][row].tobytes(order="C")
+                + arrays["proprio"][row].tobytes(order="C")
+            ).hexdigest()
+            for row in root_rows
+        }
+        actor_records: dict[str, Any] = {}
+        for actor_index, actor_name in enumerate(dataset.actor_names):
+            actor_rows = arrays["actor_index"] == actor_index
+            event_support: dict[str, Any] = {}
+            for event_index, event_name in enumerate(EXPECTED_EVENTS):
+                selected = actor_rows & (arrays["event_label"] == event_index)
+                event_support[event_name] = {
+                    "rows": int(selected.sum()),
+                    "independent_groups": int(len(np.unique(groups[selected]))),
+                }
+            predicate_support: dict[str, Any] = {}
+            for predicate_index, predicate_name in enumerate(EXPECTED_PREDICATES):
+                positive = actor_rows & (
+                    arrays["predicate_label"][:, predicate_index] == 1.0
+                )
+                negative = actor_rows & (
+                    arrays["predicate_label"][:, predicate_index] == 0.0
+                )
+                predicate_support[predicate_name] = {
+                    "positive_rows": int(positive.sum()),
+                    "positive_independent_groups": int(
+                        len(np.unique(groups[positive]))
+                    ),
+                    "negative_rows": int(negative.sum()),
+                    "negative_independent_groups": int(
+                        len(np.unique(groups[negative]))
+                    ),
+                }
+            canonical_support = bool(
+                all(row["rows"] > 0 and row["independent_groups"] > 0
+                    for row in event_support.values())
+                and all(
+                    row["positive_rows"] > 0
+                    and row["positive_independent_groups"] > 0
+                    and row["negative_rows"] > 0
+                    and row["negative_independent_groups"] > 0
+                    for row in predicate_support.values()
+                )
+            )
+            if split_name == "train":
+                all_train_actor_support = all_train_actor_support and canonical_support
+            actor_records[actor_name] = {
+                "rows": int(actor_rows.sum()),
+                "independent_groups": int(len(np.unique(groups[actor_rows]))),
+                "event": event_support,
+                "predicate": predicate_support,
+                "canonical_binary_and_event_support_present": canonical_support,
+            }
+        branch_values, branch_counts = np.unique(
+            arrays["branch_id"], return_counts=True
+        )
+        split_records[split_name] = {
+            "logical_sha256": dataset.manifest["splits"][split_name][
+                "logical_sha256"
+            ],
+            "rows": int(len(groups)),
+            "independent_groups": int(len(unique_groups)),
+            "rows_per_group": {
+                "minimum": int(group_counts.min()),
+                "median": float(np.median(group_counts)),
+                "maximum": int(group_counts.max()),
+            },
+            "branches": {
+                str(name): int(count)
+                for name, count in zip(branch_values.tolist(), branch_counts.tolist(), strict=True)
+            },
+            "root_rows": int(len(root_rows)),
+            "root_unique_actor_visible_input_fingerprints": int(
+                len(root_fingerprints)
+            ),
+            "root_duplicate_fraction": (
+                0.0
+                if len(root_rows) == 0
+                else float(1.0 - len(root_fingerprints) / len(root_rows))
+            ),
+            "terminal_success_rows": int(
+                np.sum(arrays["predicate_label"][:, EXPECTED_PREDICATES.index("success")] == 1.0)
+            ),
+            "actors": actor_records,
+        }
+    base = {
+        "format": "etsf_causal_event_observer_label_support_audit_v1",
+        "status": "complete_offline_labels_never_available_to_online_model_inputs",
+        "dataset_manifest_sha256": dataset.manifest["manifest_sha256"],
+        "split_unit": "logical_reset_group",
+        "splits": split_records,
+        "all_train_actors_have_canonical_label_support": bool(
+            all_train_actor_support
+        ),
+    }
+    return _signed(base, "label_support_audit_sha256")
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -595,6 +745,141 @@ def _balanced_epoch_indices(
     return sampled.T.reshape(-1)
 
 
+def _effective_number_class_weights(
+    counts: np.ndarray, *, beta: float, maximum: float
+) -> np.ndarray:
+    """Return capped weights with unit expected row weight."""
+
+    values = np.asarray(counts, dtype=np.float64)
+    present = values > 0
+    result = np.zeros_like(values)
+    if not np.any(present):
+        return result
+    if beta == 0.0:
+        raw = np.ones(int(present.sum()), dtype=np.float64)
+    else:
+        raw = (1.0 - beta) / np.maximum(1.0 - np.power(beta, values[present]), 1.0e-12)
+    raw *= values[present].sum() / np.sum(values[present] * raw)
+    raw = np.clip(raw, 1.0 / maximum, maximum)
+    raw *= values[present].sum() / np.sum(values[present] * raw)
+    result[present] = raw
+    return result
+
+
+def _class_balance_contract(
+    arrays: Mapping[str, np.ndarray], actor_count: int, config: TrainingConfig
+) -> dict[str, np.ndarray]:
+    event_weights = np.zeros((actor_count, len(EXPECTED_EVENTS)), dtype=np.float64)
+    predicate_positive_weights = np.ones(
+        (actor_count, len(EXPECTED_PREDICATES)), dtype=np.float64
+    )
+    predicate_normalizers = np.ones_like(predicate_positive_weights)
+    for actor in range(actor_count):
+        rows = arrays["actor_index"] == actor
+        event_counts = np.bincount(
+            arrays["event_label"][rows], minlength=len(EXPECTED_EVENTS)
+        )
+        event_weights[actor] = _effective_number_class_weights(
+            event_counts,
+            beta=config.class_balance_beta,
+            maximum=config.maximum_class_weight,
+        )
+        for predicate in range(len(EXPECTED_PREDICATES)):
+            positive = float(np.sum(arrays["predicate_label"][rows, predicate] == 1.0))
+            negative = float(np.sum(arrays["predicate_label"][rows, predicate] == 0.0))
+            if positive > 0.0 and negative > 0.0:
+                if config.class_balance_beta == 0.0:
+                    effective_positive = positive
+                    effective_negative = negative
+                else:
+                    effective_positive = (
+                        1.0 - config.class_balance_beta ** positive
+                    ) / (1.0 - config.class_balance_beta)
+                    effective_negative = (
+                        1.0 - config.class_balance_beta ** negative
+                    ) / (1.0 - config.class_balance_beta)
+                weight = math.sqrt(effective_negative / effective_positive)
+                weight = min(
+                    config.maximum_class_weight,
+                    max(1.0 / config.maximum_class_weight, weight),
+                )
+                predicate_positive_weights[actor, predicate] = weight
+                predicate_normalizers[actor, predicate] = (
+                    negative + positive * weight
+                ) / (negative + positive)
+    return {
+        "event": event_weights.astype(np.float32),
+        "predicate_positive": predicate_positive_weights.astype(np.float32),
+        "predicate_normalizer": predicate_normalizers.astype(np.float32),
+    }
+
+
+def _hierarchical_epoch_indices(
+    arrays: Mapping[str, np.ndarray],
+    actor_count: int,
+    generator: np.random.Generator,
+    balance: Mapping[str, np.ndarray],
+) -> np.ndarray:
+    """Sample actor -> logical group -> rarity-weighted row."""
+
+    actor_rows = [
+        np.flatnonzero(arrays["actor_index"] == actor)
+        for actor in range(actor_count)
+    ]
+    if any(len(rows) == 0 for rows in actor_rows):
+        raise ObserverTrainingError("hierarchical sampler encountered unsupported actor")
+    target = max(len(rows) for rows in actor_rows)
+    sampled_by_actor: list[np.ndarray] = []
+    for actor, rows in enumerate(actor_rows):
+        groups = np.unique(arrays["logical_group_id"][rows])
+        by_group = {
+            group: rows[arrays["logical_group_id"][rows] == group]
+            for group in groups
+        }
+        selected_groups = generator.choice(groups, size=target, replace=True)
+        selected_rows: list[int] = []
+        for group in selected_groups:
+            candidates = by_group[group]
+            event_rarity = balance["event"][
+                actor, arrays["event_label"][candidates]
+            ].astype(np.float64)
+            positive = arrays["predicate_label"][candidates] == 1.0
+            predicate_rarity = np.where(
+                positive,
+                balance["predicate_positive"][actor][None, :],
+                1.0,
+            ).max(axis=1)
+            rarity = np.sqrt(np.maximum(event_rarity, 1.0e-6) * predicate_rarity)
+            rarity = np.clip(rarity, 1.0 / 5.0, 5.0)
+            probability = rarity / rarity.sum()
+            selected_rows.append(int(generator.choice(candidates, p=probability)))
+        sampled_by_actor.append(np.asarray(selected_rows, dtype=np.int64))
+    sampled = np.stack(sampled_by_actor)
+    generator.shuffle(sampled, axis=1)
+    return sampled.T.reshape(-1)
+
+
+def _structured_event_probability_torch(
+    predicate_logits: torch.Tensor,
+) -> torch.Tensor:
+    probability = torch.sigmoid(predicate_logits)
+    moved, lifted, near_goal, stationary, success = probability.unbind(dim=-1)
+    not_success = 1.0 - success
+    not_stationary = 1.0 - stationary
+    not_near = 1.0 - near_goal
+    not_moved_or_lifted = (1.0 - moved) * (1.0 - lifted)
+    return torch.stack(
+        [
+            not_success * not_stationary * not_near * not_moved_or_lifted,
+            not_success * not_stationary * not_near * (1.0 - not_moved_or_lifted),
+            not_success * not_stationary * near_goal,
+            not_success * stationary,
+            success,
+        ],
+        dim=-1,
+    ).clamp_min(1.0e-8)
+
+
 def _balanced_loss(
     output: Mapping[str, torch.Tensor],
     event_target: torch.Tensor,
@@ -602,27 +887,84 @@ def _balanced_loss(
     actor_target: torch.Tensor,
     actor_count: int,
     config: TrainingConfig,
-) -> tuple[torch.Tensor, float, float]:
-    event_rows = F.cross_entropy(output["event_logits"], event_target, reduction="none")
-    predicate_rows = F.binary_cross_entropy_with_logits(
+    *,
+    group_target: torch.Tensor | None = None,
+    class_balance: Mapping[str, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, float, float, float]:
+    if group_target is None:
+        group_target = torch.arange(len(event_target), device=event_target.device)
+    if class_balance is None:
+        event_class_weight = torch.ones(
+            (actor_count, len(EXPECTED_EVENTS)), device=event_target.device
+        )
+        predicate_positive_weight = torch.ones(
+            (actor_count, len(EXPECTED_PREDICATES)), device=event_target.device
+        )
+        predicate_normalizer = torch.ones_like(predicate_positive_weight)
+    else:
+        event_class_weight = class_balance["event"]
+        predicate_positive_weight = class_balance["predicate_positive"]
+        predicate_normalizer = class_balance["predicate_normalizer"]
+    event_rows = -torch.log_softmax(output["event_logits"], dim=-1).gather(
+        1, event_target[:, None]
+    ).squeeze(1)
+    event_rows = event_rows * event_class_weight[actor_target, event_target]
+    predicate_entries = F.binary_cross_entropy_with_logits(
         output["predicate_logits"], predicate_target, reduction="none"
-    ).mean(dim=1)
+    )
+    positive_weight = predicate_positive_weight[actor_target]
+    normalizer = predicate_normalizer[actor_target]
+    predicate_entries = predicate_entries * torch.where(
+        predicate_target == 1.0, positive_weight, torch.ones_like(positive_weight)
+    ) / normalizer
+    predicate_rows = predicate_entries.mean(dim=1)
+    event_probability = torch.softmax(output["event_logits"], dim=-1).clamp_min(1.0e-8)
+    structured_probability = _structured_event_probability_torch(
+        output["predicate_logits"]
+    )
+    mixture = (0.5 * (event_probability + structured_probability)).clamp_min(1.0e-8)
+    consistency_rows = 0.5 * (
+        (event_probability * (event_probability.log() - mixture.log())).sum(dim=-1)
+        + (
+            structured_probability
+            * (structured_probability.log() - mixture.log())
+        ).sum(dim=-1)
+    )
     event_actor: list[torch.Tensor] = []
     predicate_actor: list[torch.Tensor] = []
+    consistency_actor: list[torch.Tensor] = []
     for actor in range(actor_count):
         rows = actor_target == actor
         if bool(rows.any()):
-            event_actor.append(event_rows[rows].mean())
-            predicate_actor.append(predicate_rows[rows].mean())
+            actor_groups = torch.unique(group_target[rows])
+            event_actor.append(torch.stack([
+                event_rows[rows & (group_target == group)].mean()
+                for group in actor_groups
+            ]).mean())
+            predicate_actor.append(torch.stack([
+                predicate_rows[rows & (group_target == group)].mean()
+                for group in actor_groups
+            ]).mean())
+            consistency_actor.append(torch.stack([
+                consistency_rows[rows & (group_target == group)].mean()
+                for group in actor_groups
+            ]).mean())
     if len(event_actor) != actor_count:
         raise ObserverTrainingError("batch omitted an actor; balanced loss cannot proceed")
     event_loss = torch.stack(event_actor).mean()
     predicate_loss = torch.stack(predicate_actor).mean()
+    consistency_loss = torch.stack(consistency_actor).mean()
     total = (
         config.event_loss_weight * event_loss
         + config.predicate_loss_weight * predicate_loss
+        + config.event_predicate_consistency_loss_weight * consistency_loss
     )
-    return total, float(event_loss.detach()), float(predicate_loss.detach())
+    return (
+        total,
+        float(event_loss.detach()),
+        float(predicate_loss.detach()),
+        float(consistency_loss.detach()),
+    )
 
 
 def train_model(
@@ -652,11 +994,23 @@ def train_model(
     epoch_records: list[dict[str, Any]] = []
     actor_count = len(dataset.actor_names)
     batch_size = config.batch_size_per_actor * actor_count
+    balance_numpy = _class_balance_contract(arrays, actor_count, config)
+    balance_torch = {
+        name: torch.from_numpy(value).to(device)
+        for name, value in balance_numpy.items()
+    }
+    _, group_index = np.unique(
+        arrays["logical_group_id"], return_inverse=True
+    )
+    label_support = _label_support_audit(dataset)
     for epoch in range(config.epochs):
-        order = _balanced_epoch_indices(arrays["actor_index"], actor_count, generator)
+        order = _hierarchical_epoch_indices(
+            arrays, actor_count, generator, balance_numpy
+        )
         losses: list[float] = []
         event_losses: list[float] = []
         predicate_losses: list[float] = []
+        consistency_losses: list[float] = []
         # Interleaving makes every full batch contain the same number per actor.
         for start in range(0, len(order), batch_size):
             indices = order[start : start + batch_size]
@@ -668,8 +1022,16 @@ def train_model(
                 arrays["predicate_label"][indices]
             ).to(device)
             actor_target = torch.from_numpy(arrays["actor_index"][indices]).to(device)
-            loss, event_loss, predicate_loss = _balanced_loss(
-                output, event_target, predicate_target, actor_target, actor_count, config
+            group_target = torch.from_numpy(group_index[indices]).to(device)
+            loss, event_loss, predicate_loss, consistency_loss = _balanced_loss(
+                output,
+                event_target,
+                predicate_target,
+                actor_target,
+                actor_count,
+                config,
+                group_target=group_target,
+                class_balance=balance_torch,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -678,6 +1040,7 @@ def train_model(
             losses.append(float(loss.detach()))
             event_losses.append(event_loss)
             predicate_losses.append(predicate_loss)
+            consistency_losses.append(consistency_loss)
         if not losses:
             raise ObserverTrainingError("training produced no optimizer step")
         epoch_records.append(
@@ -687,6 +1050,7 @@ def train_model(
                 "loss": float(np.mean(losses)),
                 "event_ce": float(np.mean(event_losses)),
                 "predicate_bce": float(np.mean(predicate_losses)),
+                "event_predicate_js": float(np.mean(consistency_losses)),
             }
         )
     model.eval()
@@ -699,8 +1063,23 @@ def train_model(
             "training_config": asdict(config),
             "actor_balanced_sampling": True,
             "actor_balanced_loss": True,
-            "event_objective": "equal_actor_mean_cross_entropy",
-            "predicate_objective": "equal_actor_mean_binary_cross_entropy",
+            "logical_group_balanced_sampling": True,
+            "logical_group_normalized_loss": True,
+            "rare_class_balanced_sampling": True,
+            "event_objective": (
+                "equal_actor_equal_group_effective_number_weighted_cross_entropy"
+            ),
+            "predicate_objective": (
+                "equal_actor_equal_group_capped_effective_number_binary_cross_entropy"
+            ),
+            "event_predicate_consistency_objective": (
+                "priority_ontology_jensen_shannon_divergence"
+            ),
+            "class_balance": {
+                name: value.astype(np.float64).tolist()
+                for name, value in balance_numpy.items()
+            },
+            "label_support_audit": label_support,
             "train_split_logical_sha256": dataset.manifest["splits"]["train"][
                 "logical_sha256"
             ],
@@ -758,6 +1137,18 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
         1.0 / (1.0 + np.exp(-logits)),
         np.exp(logits) / (1.0 + np.exp(logits)),
     )
+
+
+def _predicate_decision_confidence(
+    probability: np.ndarray, thresholds: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(probability, dtype=np.float64)
+    threshold_values = np.asarray(thresholds, dtype=np.float64)
+    if values.ndim != 2 or threshold_values.shape != (values.shape[1],):
+        raise ObserverTrainingError("predicate confidence tensors are misaligned")
+    decisions = values >= threshold_values[None, :]
+    confidence = np.where(decisions, values, 1.0 - values)
+    return decisions, confidence
 
 
 def _temperature_grid(size: int) -> np.ndarray:
@@ -849,15 +1240,42 @@ def _select_joint_confidence(
     confidence: float,
 ) -> tuple[float, dict[str, Any]]:
     event_confidence = event_probability.max(axis=1)
-    predicate_confidence = np.maximum(
-        predicate_probability, 1.0 - predicate_probability
-    ).min(axis=1)
+    predicate_predictions, predicate_decision_confidence = (
+        _predicate_decision_confidence(
+            predicate_probability, predicate_thresholds
+        )
+    )
+    return _select_joint_confidence_from_oof(
+        event_confidence=event_confidence,
+        predicate_decision_confidence=predicate_decision_confidence,
+        event_predictions=event_probability.argmax(axis=1),
+        predicate_predictions=predicate_predictions,
+        event_labels=event_labels,
+        predicate_labels=predicate_labels,
+        group_ids=group_ids,
+        minimum_accepts=minimum_accepts,
+        confidence=confidence,
+    )
+
+
+def _select_joint_confidence_from_oof(
+    *,
+    event_confidence: np.ndarray,
+    predicate_decision_confidence: np.ndarray,
+    event_predictions: np.ndarray,
+    predicate_predictions: np.ndarray,
+    event_labels: np.ndarray,
+    predicate_labels: np.ndarray,
+    group_ids: np.ndarray,
+    minimum_accepts: int,
+    confidence: float,
+) -> tuple[float, dict[str, Any]]:
+    predicate_confidence = predicate_decision_confidence.min(axis=1)
     joint = np.minimum(event_confidence, predicate_confidence)
     correct = (
-        (event_probability.argmax(axis=1) == event_labels)
+        (event_predictions == event_labels)
         & np.all(
-            (predicate_probability >= predicate_thresholds[None, :])
-            == predicate_labels.astype(bool),
+            predicate_predictions == predicate_labels.astype(bool),
             axis=1,
         )
     )
@@ -909,6 +1327,132 @@ def _select_joint_confidence(
     }
 
 
+def _group_oof_calibration_predictions(
+    *,
+    event_logits: np.ndarray,
+    predicate_logits: np.ndarray,
+    event_labels: np.ndarray,
+    predicate_labels: np.ndarray,
+    group_ids: np.ndarray,
+    config: TrainingConfig,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Cross-fit all head calibration before fitting the risk-control gate."""
+
+    unique_groups = np.unique(group_ids)
+    fold_count = min(5, len(unique_groups))
+    if fold_count < 2:
+        raise ObserverTrainingError("group-OOF calibration requires at least two groups")
+    shuffled = unique_groups.copy()
+    np.random.default_rng(config.seed + 4099).shuffle(shuffled)
+    group_to_fold = {
+        group: index % fold_count for index, group in enumerate(shuffled)
+    }
+    row_fold = np.asarray([group_to_fold[group] for group in group_ids], dtype=np.int64)
+    event_confidence = np.full(len(group_ids), np.nan, dtype=np.float64)
+    event_predictions = np.full(len(group_ids), -1, dtype=np.int64)
+    predicate_decision_confidence = np.full(
+        predicate_labels.shape, np.nan, dtype=np.float64
+    )
+    predicate_predictions = np.zeros(predicate_labels.shape, dtype=np.bool_)
+    fold_records: list[dict[str, Any]] = []
+    all_fit_support_complete = True
+    for fold in range(fold_count):
+        heldout = row_fold == fold
+        fit = ~heldout
+        fit_weights = _equal_group_weights(group_ids[fit])
+        event_temperature = _fit_event_temperature(
+            event_logits[fit], event_labels[fit], fit_weights,
+            config.calibration_grid_size,
+        )
+        predicate_temperatures = np.asarray([
+            _fit_predicate_temperature(
+                predicate_logits[fit, index],
+                predicate_labels[fit, index],
+                fit_weights,
+                config.calibration_grid_size,
+            )
+            for index in range(len(EXPECTED_PREDICATES))
+        ], dtype=np.float64)
+        fit_predicate_probability = _sigmoid(
+            predicate_logits[fit] / predicate_temperatures[None, :]
+        )
+        predicate_thresholds = np.asarray([
+            _fit_threshold(
+                fit_predicate_probability[:, index],
+                predicate_labels[fit, index],
+                fit_weights,
+            )
+            for index in range(len(EXPECTED_PREDICATES))
+        ], dtype=np.float64)
+        heldout_event_probability = _softmax(
+            event_logits[heldout] / event_temperature
+        )
+        heldout_predicate_probability = _sigmoid(
+            predicate_logits[heldout] / predicate_temperatures[None, :]
+        )
+        heldout_predicate_prediction, heldout_predicate_confidence = (
+            _predicate_decision_confidence(
+                heldout_predicate_probability, predicate_thresholds
+            )
+        )
+        event_confidence[heldout] = heldout_event_probability.max(axis=1)
+        event_predictions[heldout] = heldout_event_probability.argmax(axis=1)
+        predicate_decision_confidence[heldout] = heldout_predicate_confidence
+        predicate_predictions[heldout] = heldout_predicate_prediction
+        fit_event_support = [
+            int(np.sum(event_labels[fit] == index))
+            for index in range(len(EXPECTED_EVENTS))
+        ]
+        fit_predicate_support = [
+            {
+                "positive": int(np.sum(predicate_labels[fit, index] == 1.0)),
+                "negative": int(np.sum(predicate_labels[fit, index] == 0.0)),
+            }
+            for index in range(len(EXPECTED_PREDICATES))
+        ]
+        support_complete = bool(
+            all(value > 0 for value in fit_event_support)
+            and all(
+                value["positive"] > 0 and value["negative"] > 0
+                for value in fit_predicate_support
+            )
+        )
+        all_fit_support_complete = all_fit_support_complete and support_complete
+        fit_groups = sorted(set(group_ids[fit].tolist()))
+        heldout_groups = sorted(set(group_ids[heldout].tolist()))
+        fold_records.append({
+            "fold": fold,
+            "fit_group_count": len(fit_groups),
+            "heldout_group_count": len(heldout_groups),
+            "fit_group_set_sha256": canonical_sha256(fit_groups),
+            "heldout_group_set_sha256": canonical_sha256(heldout_groups),
+            "fit_heldout_group_disjoint": not bool(set(fit_groups) & set(heldout_groups)),
+            "fit_canonical_label_support_complete": support_complete,
+        })
+    if (
+        not np.isfinite(event_confidence).all()
+        or np.any(event_predictions < 0)
+        or not np.isfinite(predicate_decision_confidence).all()
+    ):
+        raise ObserverTrainingError("group-OOF calibration did not cover every row")
+    receipt = {
+        "fold_count": fold_count,
+        "assignment_seed": config.seed + 4099,
+        "assignment_unit": "logical_reset_group",
+        "every_row_predicted_exactly_once": True,
+        "all_fit_partitions_have_canonical_label_support": bool(
+            all_fit_support_complete
+        ),
+        "folds": fold_records,
+    }
+    return {
+        "event_confidence": event_confidence,
+        "event_predictions": event_predictions,
+        "predicate_decision_confidence": predicate_decision_confidence,
+        "predicate_predictions": predicate_predictions,
+    }, receipt
+
+
 def fit_group_calibration(
     model: ActorVisibleCausalEventObserverV1,
     dataset: LoadedDataset,
@@ -933,7 +1477,6 @@ def fit_group_calibration(
         ],
         dtype=np.float64,
     )
-    event_probability = _softmax(output["event_logits"] / event_temperature)
     predicate_probability = _sigmoid(
         output["predicate_logits"] / predicate_temperatures[None, :]
     )
@@ -948,15 +1491,26 @@ def fit_group_calibration(
         ],
         dtype=np.float64,
     )
-    minimum_confidence, reject_fit = _select_joint_confidence(
-        event_probability,
-        predicate_probability,
-        arrays["event_label"],
-        arrays["predicate_label"],
-        predicate_thresholds,
-        arrays["logical_group_id"],
-        config.minimum_calibration_accepts,
-        config.confidence_level,
+    oof, oof_receipt = _group_oof_calibration_predictions(
+        event_logits=output["event_logits"],
+        predicate_logits=output["predicate_logits"],
+        event_labels=arrays["event_label"],
+        predicate_labels=arrays["predicate_label"],
+        group_ids=arrays["logical_group_id"],
+        config=config,
+    )
+    minimum_confidence, reject_fit = _select_joint_confidence_from_oof(
+        event_confidence=oof["event_confidence"],
+        predicate_decision_confidence=oof[
+            "predicate_decision_confidence"
+        ],
+        event_predictions=oof["event_predictions"],
+        predicate_predictions=oof["predicate_predictions"],
+        event_labels=arrays["event_label"],
+        predicate_labels=arrays["predicate_label"],
+        group_ids=arrays["logical_group_id"],
+        minimum_accepts=config.minimum_calibration_accepts,
+        confidence=config.confidence_level,
     )
     reject_all = (
         reject_fit["status"]
@@ -980,6 +1534,8 @@ def fit_group_calibration(
         for actor_index, actor_name in enumerate(dataset.actor_names)
     }
     calibration_group_count = len(set(arrays["logical_group_id"].tolist()))
+    label_support = _label_support_audit(dataset)
+    calibration_actor_support = label_support["splits"]["calibration"]["actors"]
     fit_receipt = _signed(
         {
             "format": CALIBRATION_FIT_FORMAT,
@@ -995,8 +1551,31 @@ def fit_group_calibration(
                     value >= MIN_PROMOTION_GROUPS_PER_ACTOR
                     for value in per_actor_calibration_groups.values()
                 )
+                and all(
+                    row["canonical_binary_and_event_support_present"] is True
+                    for row in calibration_actor_support.values()
+                )
+                and oof_receipt[
+                    "all_fit_partitions_have_canonical_label_support"
+                ] is True
             ),
+            "minimum_risk_control_accepted_groups": max(
+                config.minimum_calibration_accepts, MIN_PROMOTION_GROUPS
+            ),
+            "wilson_zero_error_minimum_group_derivation": {
+                "confidence": config.confidence_level,
+                "maximum_false_accept_ucb95": (
+                    MAX_LOW_CONFIDENCE_FALSE_ACCEPT_UCB95
+                ),
+                "minimum_independent_groups": MIN_PROMOTION_GROUPS,
+            },
+            "calibration_actor_label_support": calibration_actor_support,
+            "label_support_audit_sha256": label_support[
+                "label_support_audit_sha256"
+            ],
             "equal_group_weighting": True,
+            "risk_control_predictions": "group_oof_head_calibration",
+            "group_oof_calibration": oof_receipt,
             "world_model_formal_or_evaluation_data_used": False,
             "temperature_grid": {
                 "minimum": 0.05,
@@ -1017,10 +1596,28 @@ def fit_group_calibration(
     return calibration, fit_receipt
 
 
-def _ece(confidence: np.ndarray, correct: np.ndarray, bins: int = 10) -> float:
+def _ece(
+    confidence: np.ndarray,
+    correct: np.ndarray,
+    bins: int = 10,
+    weights: np.ndarray | None = None,
+) -> float:
     if len(confidence) == 0:
         return 1.0
-    total = len(confidence)
+    if weights is None:
+        normalized_weights = np.full(
+            len(confidence), 1.0 / len(confidence), dtype=np.float64
+        )
+    else:
+        normalized_weights = np.asarray(weights, dtype=np.float64)
+        if (
+            normalized_weights.shape != (len(confidence),)
+            or not np.isfinite(normalized_weights).all()
+            or np.any(normalized_weights < 0.0)
+            or normalized_weights.sum() <= 0.0
+        ):
+            raise ObserverTrainingError("ECE weights are invalid")
+        normalized_weights = normalized_weights / normalized_weights.sum()
     result = 0.0
     edges = np.linspace(0.0, 1.0, bins + 1)
     for index in range(bins):
@@ -1030,8 +1627,10 @@ def _ece(confidence: np.ndarray, correct: np.ndarray, bins: int = 10) -> float:
             else confidence < edges[index + 1]
         )
         if np.any(rows):
-            result += float(rows.sum()) / total * abs(
-                float(np.mean(confidence[rows])) - float(np.mean(correct[rows]))
+            mass = float(normalized_weights[rows].sum())
+            result += mass * abs(
+                float(np.average(confidence[rows], weights=normalized_weights[rows]))
+                - float(np.average(correct[rows], weights=normalized_weights[rows]))
             )
     return result
 
@@ -1047,6 +1646,19 @@ def _event_macro_accuracy(labels: np.ndarray, predictions: np.ndarray) -> float:
     return 0.0 if not scores else float(np.mean(scores))
 
 
+def _event_macro_f1(labels: np.ndarray, predictions: np.ndarray) -> float:
+    scores: list[float] = []
+    for item in range(len(EXPECTED_EVENTS)):
+        true_positive = int(np.sum((labels == item) & (predictions == item)))
+        false_positive = int(np.sum((labels != item) & (predictions == item)))
+        false_negative = int(np.sum((labels == item) & (predictions != item)))
+        denominator = 2 * true_positive + false_positive + false_negative
+        scores.append(
+            0.0 if denominator == 0 else 2.0 * true_positive / denominator
+        )
+    return float(np.mean(scores))
+
+
 def _predicate_macro_f1(labels: np.ndarray, predictions: np.ndarray) -> float:
     scores = []
     unit = np.full(len(labels), 1.0 / max(1, len(labels)), dtype=np.float64)
@@ -1055,20 +1667,110 @@ def _predicate_macro_f1(labels: np.ndarray, predictions: np.ndarray) -> float:
     return float(np.mean(scores))
 
 
-def _group_bootstrap_bounds(
-    *, groups: np.ndarray, event_labels: np.ndarray, event_predictions: np.ndarray,
-    predicate_labels: np.ndarray, predicate_predictions: np.ndarray,
-    samples: int, confidence: float, seed: int,
+def _train_frequency_baselines(
+    dataset: LoadedDataset,
+    validation_arrays: Mapping[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    train = dataset.splits["train"]
+    event_prediction = np.empty(
+        len(validation_arrays["event_label"]), dtype=np.int64
+    )
+    predicate_prediction = np.empty(
+        validation_arrays["predicate_label"].shape, dtype=np.bool_
+    )
+    actor_contracts: dict[str, Any] = {}
+    for actor_index, actor_name in enumerate(dataset.actor_names):
+        train_rows = train["actor_index"] == actor_index
+        validation_rows = validation_arrays["actor_index"] == actor_index
+        weights = _equal_group_weights(train["logical_group_id"][train_rows])
+        event_frequency = np.asarray([
+            float(np.sum(weights * (train["event_label"][train_rows] == event)))
+            for event in range(len(EXPECTED_EVENTS))
+        ])
+        majority_event = int(np.argmax(event_frequency))
+        predicate_prevalence = np.asarray([
+            float(np.sum(
+                weights * train["predicate_label"][train_rows, predicate]
+            ))
+            for predicate in range(len(EXPECTED_PREDICATES))
+        ])
+        constant_predicates = predicate_prevalence >= 0.5
+        event_prediction[validation_rows] = majority_event
+        predicate_prediction[validation_rows] = constant_predicates
+        actor_contracts[actor_name] = {
+            "train_equal_group_event_frequency": event_frequency.tolist(),
+            "majority_event": EXPECTED_EVENTS[majority_event],
+            "train_equal_group_predicate_prevalence": (
+                predicate_prevalence.tolist()
+            ),
+            "constant_predicates": {
+                name: bool(constant_predicates[index])
+                for index, name in enumerate(EXPECTED_PREDICATES)
+            },
+        }
+    return event_prediction, predicate_prediction, actor_contracts
+
+
+def _group_bootstrap_gain_bounds(
+    *,
+    groups: np.ndarray,
+    event_labels: np.ndarray,
+    event_predictions: np.ndarray,
+    baseline_event_predictions: np.ndarray,
+    predicate_labels: np.ndarray,
+    predicate_predictions: np.ndarray,
+    baseline_predicate_predictions: np.ndarray,
+    samples: int,
+    confidence: float,
+    seed: int,
 ) -> tuple[float, float]:
     unique = np.unique(groups)
     by_group = {group: np.flatnonzero(groups == group) for group in unique}
     generator = np.random.default_rng(seed)
+    event_gain = np.empty(samples, dtype=np.float64)
+    predicate_gain = np.empty(samples, dtype=np.float64)
+    for index in range(samples):
+        drawn = generator.choice(unique, size=len(unique), replace=True)
+        rows = np.concatenate([by_group[group] for group in drawn])
+        event_gain[index] = (
+            _event_macro_f1(event_labels[rows], event_predictions[rows])
+            - _event_macro_f1(
+                event_labels[rows], baseline_event_predictions[rows]
+            )
+        )
+        predicate_gain[index] = (
+            _predicate_macro_f1(
+                predicate_labels[rows], predicate_predictions[rows]
+            )
+            - _predicate_macro_f1(
+                predicate_labels[rows], baseline_predicate_predictions[rows]
+            )
+        )
+    alpha = (1.0 - confidence) / 2.0
+    return (
+        float(np.quantile(event_gain, alpha, method="lower")),
+        float(np.quantile(predicate_gain, alpha, method="lower")),
+    )
+
+
+def _group_bootstrap_bounds(
+    *, groups: np.ndarray, event_labels: np.ndarray, event_predictions: np.ndarray,
+    predicate_labels: np.ndarray, predicate_predictions: np.ndarray,
+    samples: int, confidence: float, seed: int,
+) -> tuple[float, float, float]:
+    unique = np.unique(groups)
+    by_group = {group: np.flatnonzero(groups == group) for group in unique}
+    generator = np.random.default_rng(seed)
     event_scores = np.empty(samples, dtype=np.float64)
+    event_f1_scores = np.empty(samples, dtype=np.float64)
     predicate_scores = np.empty(samples, dtype=np.float64)
     for index in range(samples):
         drawn = generator.choice(unique, size=len(unique), replace=True)
         rows = np.concatenate([by_group[group] for group in drawn])
         event_scores[index] = _event_macro_accuracy(
+            event_labels[rows], event_predictions[rows]
+        )
+        event_f1_scores[index] = _event_macro_f1(
             event_labels[rows], event_predictions[rows]
         )
         predicate_scores[index] = _predicate_macro_f1(
@@ -1077,6 +1779,7 @@ def _group_bootstrap_bounds(
     alpha = (1.0 - confidence) / 2.0
     return (
         float(np.quantile(event_scores, alpha, method="lower")),
+        float(np.quantile(event_f1_scores, alpha, method="lower")),
         float(np.quantile(predicate_scores, alpha, method="lower")),
     )
 
@@ -1215,12 +1918,17 @@ def evaluate_independent_validation(
     )
     thresholds = np.asarray(calibration["predicate_thresholds"], dtype=np.float64)
     event_predictions = event_probability.argmax(axis=1)
-    predicate_predictions = predicate_probability >= thresholds[None, :]
+    predicate_predictions, predicate_decision_confidence = (
+        _predicate_decision_confidence(predicate_probability, thresholds)
+    )
     event_point = _event_macro_accuracy(arrays["event_label"], event_predictions)
+    event_f1_point = _event_macro_f1(
+        arrays["event_label"], event_predictions
+    )
     predicate_point = _predicate_macro_f1(
         arrays["predicate_label"], predicate_predictions
     )
-    event_lcb, predicate_lcb = _group_bootstrap_bounds(
+    event_lcb, event_f1_lcb, predicate_lcb = _group_bootstrap_bounds(
         groups=arrays["logical_group_id"],
         event_labels=arrays["event_label"],
         event_predictions=event_predictions,
@@ -1230,25 +1938,61 @@ def evaluate_independent_validation(
         confidence=config.confidence_level,
         seed=config.seed + 1009,
     )
+    (
+        baseline_event_predictions,
+        baseline_predicate_predictions,
+        baseline_contracts,
+    ) = _train_frequency_baselines(dataset, arrays)
+    baseline_event_f1 = _event_macro_f1(
+        arrays["event_label"], baseline_event_predictions
+    )
+    baseline_predicate_f1 = _predicate_macro_f1(
+        arrays["predicate_label"], baseline_predicate_predictions
+    )
+    pooled_event_gain_lcb, pooled_predicate_gain_lcb = (
+        _group_bootstrap_gain_bounds(
+            groups=arrays["logical_group_id"],
+            event_labels=arrays["event_label"],
+            event_predictions=event_predictions,
+            baseline_event_predictions=baseline_event_predictions,
+            predicate_labels=arrays["predicate_label"],
+            predicate_predictions=predicate_predictions,
+            baseline_predicate_predictions=baseline_predicate_predictions,
+            samples=config.bootstrap_samples,
+            confidence=config.confidence_level,
+            seed=config.seed + 1511,
+        )
+    )
     event_confidence = event_probability.max(axis=1)
     event_correct = event_predictions == arrays["event_label"]
     event_ece_by_actor: dict[str, float] = {}
     predicate_ece_by_actor: dict[str, float] = {}
     event_lcb_by_actor: dict[str, float] = {}
+    event_f1_lcb_by_actor: dict[str, float] = {}
     predicate_lcb_by_actor: dict[str, float] = {}
+    event_gain_lcb_by_actor: dict[str, float] = {}
+    predicate_gain_lcb_by_actor: dict[str, float] = {}
     per_actor_groups: dict[str, int] = {}
     for actor_index, actor_name in enumerate(dataset.actor_names):
         rows = arrays["actor_index"] == actor_index
+        actor_group_weights = _equal_group_weights(
+            arrays["logical_group_id"][rows]
+        )
         per_actor_groups[actor_name] = len(set(arrays["logical_group_id"][rows].tolist()))
-        event_ece_by_actor[actor_name] = _ece(event_confidence[rows], event_correct[rows])
+        event_ece_by_actor[actor_name] = _ece(
+            event_confidence[rows], event_correct[rows],
+            weights=actor_group_weights,
+        )
         predicate_ece_by_actor[actor_name] = max(
             _ece(
-                np.maximum(predicate_probability[rows, index], 1.0 - predicate_probability[rows, index]),
+                predicate_decision_confidence[rows, index],
                 predicate_predictions[rows, index] == arrays["predicate_label"][rows, index],
+                weights=actor_group_weights,
             )
             for index in range(len(EXPECTED_PREDICATES))
         )
-        actor_event_lcb, actor_predicate_lcb = _group_bootstrap_bounds(
+        actor_event_lcb, actor_event_f1_lcb, actor_predicate_lcb = (
+            _group_bootstrap_bounds(
             groups=arrays["logical_group_id"][rows],
             event_labels=arrays["event_label"][rows],
             event_predictions=event_predictions[rows],
@@ -1257,12 +2001,30 @@ def evaluate_independent_validation(
             samples=config.bootstrap_samples,
             confidence=config.confidence_level,
             seed=config.seed + 2003 + actor_index,
+            )
         )
         event_lcb_by_actor[actor_name] = actor_event_lcb
+        event_f1_lcb_by_actor[actor_name] = actor_event_f1_lcb
         predicate_lcb_by_actor[actor_name] = actor_predicate_lcb
-    predicate_binary_confidence = np.maximum(
-        predicate_probability, 1.0 - predicate_probability
-    ).min(axis=1)
+        actor_event_gain_lcb, actor_predicate_gain_lcb = (
+            _group_bootstrap_gain_bounds(
+                groups=arrays["logical_group_id"][rows],
+                event_labels=arrays["event_label"][rows],
+                event_predictions=event_predictions[rows],
+                baseline_event_predictions=baseline_event_predictions[rows],
+                predicate_labels=arrays["predicate_label"][rows],
+                predicate_predictions=predicate_predictions[rows],
+                baseline_predicate_predictions=(
+                    baseline_predicate_predictions[rows]
+                ),
+                samples=config.bootstrap_samples,
+                confidence=config.confidence_level,
+                seed=config.seed + 3011 + actor_index,
+            )
+        )
+        event_gain_lcb_by_actor[actor_name] = actor_event_gain_lcb
+        predicate_gain_lcb_by_actor[actor_name] = actor_predicate_gain_lcb
+    predicate_binary_confidence = predicate_decision_confidence.min(axis=1)
     joint_confidence = np.minimum(event_confidence, predicate_binary_confidence)
     accepted = joint_confidence >= float(calibration["minimum_joint_confidence"])
     joint_correct = event_correct & np.all(
@@ -1296,18 +2058,63 @@ def evaluate_independent_validation(
     maximum_event_ece = max(event_ece_by_actor.values())
     maximum_predicate_ece = max(predicate_ece_by_actor.values())
     conservative_event_lcb = min(event_lcb_by_actor.values())
+    conservative_event_f1_lcb = min(event_f1_lcb_by_actor.values())
     conservative_predicate_lcb = min(predicate_lcb_by_actor.values())
+    conservative_event_gain_lcb = min(event_gain_lcb_by_actor.values())
+    conservative_predicate_gain_lcb = min(predicate_gain_lcb_by_actor.values())
+    ontology_event_predictions = np.where(
+        predicate_predictions[:, EXPECTED_PREDICATES.index("success")],
+        EXPECTED_EVENTS.index("eK"),
+        np.where(
+            predicate_predictions[:, EXPECTED_PREDICATES.index("stationary")],
+            EXPECTED_EVENTS.index("e4"),
+            np.where(
+                predicate_predictions[:, EXPECTED_PREDICATES.index("near_goal")],
+                EXPECTED_EVENTS.index("e3"),
+                np.where(
+                    predicate_predictions[:, EXPECTED_PREDICATES.index("moved")]
+                    | predicate_predictions[:, EXPECTED_PREDICATES.index("lifted")],
+                    EXPECTED_EVENTS.index("e12"),
+                    EXPECTED_EVENTS.index("e0"),
+                ),
+            ),
+        ),
+    )
+    validation_group_weights = _equal_group_weights(arrays["logical_group_id"])
+    event_predicate_consistency = float(np.sum(
+        validation_group_weights
+        * (event_predictions == ontology_event_predictions).astype(np.float64)
+    ))
     event_support = {
-        name: int(np.sum(arrays["event_label"] == index))
+        name: {
+            "rows": int(np.sum(arrays["event_label"] == index)),
+            "independent_groups": int(len(np.unique(
+                arrays["logical_group_id"][arrays["event_label"] == index]
+            ))),
+        }
         for index, name in enumerate(EXPECTED_EVENTS)
     }
     predicate_support = {
         name: {
             "positive": int(np.sum(arrays["predicate_label"][:, index] == 1.0)),
             "negative": int(np.sum(arrays["predicate_label"][:, index] == 0.0)),
+            "positive_independent_groups": int(len(np.unique(
+                arrays["logical_group_id"][
+                    arrays["predicate_label"][:, index] == 1.0
+                ]
+            ))),
+            "negative_independent_groups": int(len(np.unique(
+                arrays["logical_group_id"][
+                    arrays["predicate_label"][:, index] == 0.0
+                ]
+            ))),
         }
         for index, name in enumerate(EXPECTED_PREDICATES)
     }
+    label_support_audit = _label_support_audit(dataset)
+    validation_actor_label_support = label_support_audit["splits"][
+        "validation"
+    ]["actors"]
     gates = {
         "independent_validation_groups": validation_group_count >= MIN_PROMOTION_GROUPS,
         "per_actor_validation_groups": all(
@@ -1317,8 +2124,17 @@ def evaluate_independent_validation(
         "event_macro_accuracy_lcb95": (
             conservative_event_lcb >= MIN_EVENT_ACCURACY_LCB95
         ),
+        "event_macro_f1_lcb95": (
+            conservative_event_f1_lcb >= MIN_EVENT_MACRO_F1_LCB95
+        ),
         "predicate_macro_f1_lcb95": (
             conservative_predicate_lcb >= MIN_PREDICATE_F1_LCB95
+        ),
+        "event_macro_f1_gain_over_train_frequency_lcb95": (
+            conservative_event_gain_lcb > 0.0
+        ),
+        "predicate_macro_f1_gain_over_train_constant_lcb95": (
+            conservative_predicate_gain_lcb > 0.0
         ),
         "maximum_event_ece": maximum_event_ece <= MAX_CALIBRATION_ECE,
         "maximum_predicate_ece": maximum_predicate_ece <= MAX_CALIBRATION_ECE,
@@ -1327,11 +2143,24 @@ def evaluate_independent_validation(
             and accepted_group_count > 0
         ),
         "canonical_label_support": (
-            all(value > 0 for value in event_support.values())
+            all(
+                value["rows"] > 0 and value["independent_groups"] > 0
+                for value in event_support.values()
+            )
             and all(
-                counts["positive"] > 0 and counts["negative"] > 0
+                counts["positive"] > 0
+                and counts["negative"] > 0
+                and counts["positive_independent_groups"] > 0
+                and counts["negative_independent_groups"] > 0
                 for counts in predicate_support.values()
             )
+            and all(
+                row["canonical_binary_and_event_support_present"] is True
+                for row in validation_actor_label_support.values()
+            )
+        ),
+        "event_predicate_ontology_consistency": (
+            event_predicate_consistency >= MIN_EVENT_PREDICATE_CONSISTENCY
         ),
         "future_feature_perturbation_invariant": future["passed"],
         "cross_branch_isolation_passed": branch["passed"],
@@ -1376,6 +2205,13 @@ def evaluate_independent_validation(
             "group_bootstrap_lcb95": conservative_event_lcb,
             "promotion_aggregation": "minimum_per_actor_lcb95",
         },
+        "event_macro_f1": {
+            "point": event_f1_point,
+            "pooled_group_bootstrap_lcb95": event_f1_lcb,
+            "per_actor_group_bootstrap_lcb95": event_f1_lcb_by_actor,
+            "group_bootstrap_lcb95": conservative_event_f1_lcb,
+            "promotion_aggregation": "minimum_per_actor_lcb95",
+        },
         "predicate_macro_f1": {
             "point": predicate_point,
             "pooled_group_bootstrap_lcb95": predicate_lcb,
@@ -1383,10 +2219,34 @@ def evaluate_independent_validation(
             "group_bootstrap_lcb95": conservative_predicate_lcb,
             "promotion_aggregation": "minimum_per_actor_lcb95",
         },
+        "train_only_frequency_and_constant_baselines": {
+            "fit_split": "train",
+            "fit_weighting": "equal_logical_group_within_actor",
+            "validation_labels_used_to_fit_baseline": False,
+            "actor_contracts": baseline_contracts,
+            "event_macro_f1": baseline_event_f1,
+            "predicate_macro_f1": baseline_predicate_f1,
+            "event_macro_f1_gain_group_bootstrap_lcb95": {
+                "pooled": pooled_event_gain_lcb,
+                "per_actor": event_gain_lcb_by_actor,
+                "promotion_aggregation": conservative_event_gain_lcb,
+            },
+            "predicate_macro_f1_gain_group_bootstrap_lcb95": {
+                "pooled": pooled_predicate_gain_lcb,
+                "per_actor": predicate_gain_lcb_by_actor,
+                "promotion_aggregation": conservative_predicate_gain_lcb,
+            },
+        },
         "event_ece_by_actor": event_ece_by_actor,
         "predicate_ece_by_actor": predicate_ece_by_actor,
+        "ece_weighting": "equal_logical_group_within_actor",
         "maximum_event_ece": maximum_event_ece,
         "maximum_predicate_ece": maximum_predicate_ece,
+        "event_predicate_ontology_consistency": {
+            "equal_group_agreement": event_predicate_consistency,
+            "minimum_for_promotion": MIN_EVENT_PREDICATE_CONSISTENCY,
+            "event_priority": ["success", "stationary", "near_goal", "moved_or_lifted", "none"],
+        },
         "confidence_reject": {
             "minimum_joint_confidence": float(
                 calibration["minimum_joint_confidence"]
@@ -1400,6 +2260,10 @@ def evaluate_independent_validation(
         },
         "canonical_event_row_support": event_support,
         "canonical_predicate_row_support": predicate_support,
+        "validation_actor_label_support": validation_actor_label_support,
+        "label_support_audit_sha256": label_support_audit[
+            "label_support_audit_sha256"
+        ],
         "independent_validation_groups": validation_group_count,
         "per_actor_validation_groups": per_actor_groups,
         "future_feature_perturbation": future,
@@ -1410,17 +2274,169 @@ def evaluate_independent_validation(
             "minimum_independent_validation_groups": MIN_PROMOTION_GROUPS,
             "minimum_groups_per_actor": MIN_PROMOTION_GROUPS_PER_ACTOR,
             "minimum_event_macro_accuracy_lcb95": MIN_EVENT_ACCURACY_LCB95,
+            "minimum_event_macro_f1_lcb95": MIN_EVENT_MACRO_F1_LCB95,
             "minimum_predicate_macro_f1_lcb95": MIN_PREDICATE_F1_LCB95,
+            "minimum_event_macro_f1_gain_over_train_frequency_lcb95": 0.0,
+            "minimum_predicate_macro_f1_gain_over_train_constant_lcb95": 0.0,
+            "gain_comparison": "strict_greater_than_zero",
             "maximum_ece": MAX_CALIBRATION_ECE,
             "maximum_low_confidence_false_accept_ucb95": (
                 MAX_LOW_CONFIDENCE_FALSE_ACCEPT_UCB95
             ),
+            "minimum_event_predicate_ontology_consistency": (
+                MIN_EVENT_PREDICATE_CONSISTENCY
+            ),
         },
         "gates": gates,
         "all_promotion_gates_passed": all(gates.values()),
-        "synthetic_or_test_evidence": False,
+        "synthetic_or_test_evidence": (
+            dataset.manifest.get("status") != PRODUCTION_DATASET_STATUS
+        ),
     }
     return _signed(base, "validation_receipt_sha256")
+
+
+def _validate_training_receipt_for_freeze(
+    receipt: Mapping[str, Any], *, dataset: LoadedDataset, config: TrainingConfig,
+) -> None:
+    fields = {
+        "format", "status", "seed", "device", "training_config",
+        "actor_balanced_sampling", "actor_balanced_loss",
+        "logical_group_balanced_sampling", "logical_group_normalized_loss",
+        "rare_class_balanced_sampling", "event_objective",
+        "predicate_objective", "event_predicate_consistency_objective",
+        "class_balance", "label_support_audit", "train_split_logical_sha256",
+        "calibration_or_validation_used_by_optimizer", "epochs",
+        "training_receipt_sha256",
+    }
+    if not isinstance(receipt, Mapping) or set(receipt) != fields:
+        raise ObserverTrainingError("training receipt fields changed before freeze")
+    logical = dict(receipt)
+    digest = logical.pop("training_receipt_sha256", None)
+    expected_support = _label_support_audit(dataset)
+    expected_balance = {
+        name: value.astype(np.float64).tolist()
+        for name, value in _class_balance_contract(
+            dataset.splits["train"], len(dataset.actor_names), config
+        ).items()
+    }
+    epochs = receipt.get("epochs")
+    epoch_fields = {
+        "epoch", "balanced_rows", "loss", "event_ce", "predicate_bce",
+        "event_predicate_js",
+    }
+    epoch_valid = (
+        isinstance(epochs, list)
+        and len(epochs) == config.epochs
+        and all(
+            isinstance(row, Mapping)
+            and set(row) == epoch_fields
+            and row.get("epoch") == index
+            and type(row.get("epoch")) is int
+            and type(row.get("balanced_rows")) is int
+            and row["balanced_rows"] > 0
+            and all(
+                not isinstance(row.get(name), bool)
+                and isinstance(row.get(name), (int, float))
+                and math.isfinite(float(row[name]))
+                for name in ("loss", "event_ce", "predicate_bce", "event_predicate_js")
+            )
+            for index, row in enumerate(epochs)
+        )
+    )
+    if (
+        digest != canonical_sha256(logical)
+        or receipt.get("format") != TRAINING_RECEIPT_FORMAT
+        or receipt.get("status") != "optimizer_complete_train_split_only"
+        or receipt.get("seed") != config.seed
+        or type(receipt.get("seed")) is not int
+        or receipt.get("device") != config.device
+        or receipt.get("training_config") != asdict(config)
+        or receipt.get("actor_balanced_sampling") is not True
+        or receipt.get("actor_balanced_loss") is not True
+        or receipt.get("logical_group_balanced_sampling") is not True
+        or receipt.get("logical_group_normalized_loss") is not True
+        or receipt.get("rare_class_balanced_sampling") is not True
+        or receipt.get("calibration_or_validation_used_by_optimizer") is not False
+        or receipt.get("train_split_logical_sha256")
+        != dataset.manifest["splits"]["train"]["logical_sha256"]
+        or receipt.get("label_support_audit") != expected_support
+        or receipt.get("class_balance") != expected_balance
+        or not epoch_valid
+    ):
+        raise ObserverTrainingError(
+            "training receipt is not self-signed and content-bound"
+        )
+
+
+def _recompute_and_validate_freeze_receipts(
+    *, model: ActorVisibleCausalEventObserverV1, dataset: LoadedDataset,
+    calibration: Mapping[str, Any], calibration_fit: Mapping[str, Any],
+    validation: Mapping[str, Any], config: TrainingConfig,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Rebuild every promotion-bearing receipt from frozen in-memory content."""
+
+    if not all(
+        isinstance(value, Mapping)
+        for value in (calibration, calibration_fit, validation)
+    ):
+        raise ObserverTrainingError("freeze promotion receipts must be mappings")
+    if model.training:
+        raise ObserverTrainingError("observer must be in eval mode before freeze")
+    expected_calibration, expected_fit = fit_group_calibration(
+        model, dataset, config
+    )
+    if dict(calibration) != expected_calibration:
+        raise ObserverTrainingError(
+            "calibration differs from internally recomputed calibration content"
+        )
+    if dict(calibration_fit) != expected_fit:
+        raise ObserverTrainingError(
+            "calibration fit receipt differs from internally recomputed content"
+        )
+    expected_validation = evaluate_independent_validation(
+        model, dataset, expected_calibration, expected_fit, config
+    )
+    if dict(validation) != expected_validation:
+        raise ObserverTrainingError(
+            "validation receipt differs from internally recomputed content"
+        )
+    return expected_calibration, expected_fit, expected_validation
+
+
+def _validate_promotion_validation_receipt(
+    validation: Mapping[str, Any], *, synthetic_evidence: bool,
+) -> bool:
+    if not isinstance(validation, Mapping):
+        raise ObserverTrainingError("promotion validation receipt is missing")
+    logical = dict(validation)
+    digest = logical.pop("validation_receipt_sha256", None)
+    gates = validation.get("gates")
+    if (
+        digest != canonical_sha256(logical)
+        or validation.get("format") != METRICS_FORMAT
+        or not isinstance(gates, Mapping)
+        or set(gates) != PROMOTION_GATE_NAMES
+        or any(type(value) is not bool for value in gates.values())
+        or validation.get("all_promotion_gates_passed") is not all(gates.values())
+        or type(validation.get("synthetic_or_test_evidence")) is not bool
+    ):
+        raise ObserverTrainingError(
+            "promotion validation receipt is not complete and self-consistent"
+        )
+    gates_passed = all(gates.values())
+    expected_status = (
+        "independent_validation_passed_all_gates"
+        if gates_passed
+        else "monitor_only_one_or_more_real_promotion_gates_failed"
+    )
+    if validation.get("status") != expected_status:
+        raise ObserverTrainingError("promotion validation status contradicts its gates")
+    return (
+        gates_passed
+        and not synthetic_evidence
+        and validation["synthetic_or_test_evidence"] is False
+    )
 
 
 def _promotion_decision(
@@ -1430,8 +2446,11 @@ def _promotion_decision(
     observer_config_sha: str, actor_adapter_set_sha: str,
     actor_adapter_checkpoint_set_sha: str, calibration_sha: str,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    gates_passed = validation.get("all_promotion_gates_passed") is True
-    promoted = gates_passed and not synthetic_evidence
+    if type(synthetic_evidence) is not bool:
+        raise ObserverTrainingError("synthetic evidence marker must be exact boolean")
+    promoted = _validate_promotion_validation_receipt(
+        validation, synthetic_evidence=synthetic_evidence
+    )
     status = (
         "promoted_real_independent_validation_passed_all_gates"
         if promoted
@@ -1486,9 +2505,21 @@ def _promotion_decision(
         "event_macro_accuracy_lcb95": validation["event_macro_accuracy"][
             "group_bootstrap_lcb95"
         ],
+        "event_macro_f1_lcb95": validation["event_macro_f1"][
+            "group_bootstrap_lcb95"
+        ],
         "predicate_macro_f1_lcb95": validation["predicate_macro_f1"][
             "group_bootstrap_lcb95"
         ],
+        "event_predicate_ontology_consistency": validation[
+            "event_predicate_ontology_consistency"
+        ]["equal_group_agreement"],
+        "event_macro_f1_gain_over_train_frequency_lcb95": validation[
+            "train_only_frequency_and_constant_baselines"
+        ]["event_macro_f1_gain_group_bootstrap_lcb95"]["promotion_aggregation"],
+        "predicate_macro_f1_gain_over_train_constant_lcb95": validation[
+            "train_only_frequency_and_constant_baselines"
+        ]["predicate_macro_f1_gain_group_bootstrap_lcb95"]["promotion_aggregation"],
         "maximum_event_ece": validation["maximum_event_ece"],
         "maximum_predicate_ece": validation["maximum_predicate_ece"],
         "low_confidence_false_accept_ucb95": validation["confidence_reject"][
@@ -1534,6 +2565,29 @@ def freeze_bundle(
 ) -> dict[str, Any]:
     """Freeze exact tensors/files and issue monitor or promoted authority."""
 
+    if type(synthetic_evidence) is not bool:
+        raise ObserverTrainingError("synthetic evidence marker must be exact boolean")
+    effective_synthetic_evidence = (
+        synthetic_evidence
+        or dataset.manifest.get("status") != PRODUCTION_DATASET_STATUS
+    )
+    if model.training_contract.get("dataset_manifest_sha256") != dataset.manifest.get(
+        "manifest_sha256"
+    ):
+        raise ObserverTrainingError("observer training contract changed dataset authority")
+    _validate_training_receipt_for_freeze(
+        training_receipt, dataset=dataset, config=config
+    )
+    calibration, calibration_fit, validation = (
+        _recompute_and_validate_freeze_receipts(
+            model=model,
+            dataset=dataset,
+            calibration=calibration,
+            calibration_fit=calibration_fit,
+            validation=validation,
+            config=config,
+        )
+    )
     unresolved_output = Path(output_directory)
     if unresolved_output.is_symlink():
         raise ObserverTrainingError("freeze output directory cannot be a symlink")
@@ -1558,6 +2612,23 @@ def freeze_bundle(
     _atomic_json(training_contract_path, training_contract)
     training_receipt_path = output / "training_receipt.json"
     _atomic_json(training_receipt_path, training_receipt)
+    label_support = training_receipt.get("label_support_audit")
+    if not isinstance(label_support, Mapping):
+        raise ObserverTrainingError("training receipt lacks label support audit")
+    label_support_logical = dict(label_support)
+    label_support_digest = label_support_logical.pop(
+        "label_support_audit_sha256", None
+    )
+    if (
+        label_support.get("format")
+        != "etsf_causal_event_observer_label_support_audit_v1"
+        or label_support.get("dataset_manifest_sha256")
+        != dataset.manifest["manifest_sha256"]
+        or label_support_digest != canonical_sha256(label_support_logical)
+    ):
+        raise ObserverTrainingError("label support audit binding is invalid")
+    label_support_path = output / "label_support_audit.json"
+    _atomic_json(label_support_path, label_support)
 
     core_tensor_sha = tensor_bundle_sha256(core_state)
     core_path = output / "observer_core_state.pt"
@@ -1646,12 +2717,6 @@ def freeze_bundle(
     _atomic_json(calibration_fit_path, calibration_fit)
     validation_path = output / "independent_validation.json"
     validation_document = dict(validation)
-    validation_document["synthetic_or_test_evidence"] = bool(synthetic_evidence)
-    unsigned_validation = dict(validation_document)
-    unsigned_validation.pop("validation_receipt_sha256")
-    validation_document["validation_receipt_sha256"] = canonical_sha256(
-        unsigned_validation
-    )
     _atomic_json(validation_path, validation_document)
 
     decision, promotion_evidence = _promotion_decision(
@@ -1659,7 +2724,7 @@ def freeze_bundle(
         core_file_sha=observer_core_file_sha,
         training_contract_sha=training_contract["contract_sha256"],
         actor_names=dataset.actor_names,
-        synthetic_evidence=synthetic_evidence,
+        synthetic_evidence=effective_synthetic_evidence,
         observer_checkpoint_file_sha=observer_checkpoint_file_sha,
         observer_config_sha=config_document["config_sha256"],
         actor_adapter_set_sha=actor_adapter_set_sha,
@@ -1744,6 +2809,7 @@ def freeze_bundle(
             "validation_receipt_sha256": validation_document[
                 "validation_receipt_sha256"
             ],
+            "label_support_audit_sha256": label_support_digest,
             "promotion_decision_sha256": decision["promotion_decision_sha256"],
             "deployment_sha256": deployment["deployment_sha256"],
             "promotion_evidence_sha256": (
@@ -1752,7 +2818,7 @@ def freeze_bundle(
             ),
         },
         "artifacts_excluding_this_manifest": artifacts,
-        "synthetic_or_test_evidence": synthetic_evidence,
+        "synthetic_or_test_evidence": effective_synthetic_evidence,
         "real_task_success_or_cross_embodiment_improvement_claimed": False,
     }
     monitor_freeze = _signed(monitor_base, "freeze_manifest_sha256")
@@ -1863,6 +2929,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size-per-actor", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-4)
+    parser.add_argument(
+        "--event-predicate-consistency-loss-weight", type=float, default=0.25
+    )
+    parser.add_argument("--class-balance-beta", type=float, default=0.99)
+    parser.add_argument("--maximum-class-weight", type=float, default=5.0)
+    parser.add_argument(
+        "--minimum-calibration-accepts", type=int, default=MIN_PROMOTION_GROUPS
+    )
     parser.add_argument("--bootstrap-samples", type=int, default=2_000)
     parser.add_argument("--seed", type=int, default=20260828)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
@@ -1886,6 +2960,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size_per_actor=args.batch_size_per_actor,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
+            event_predicate_consistency_loss_weight=(
+                args.event_predicate_consistency_loss_weight
+            ),
+            class_balance_beta=args.class_balance_beta,
+            maximum_class_weight=args.maximum_class_weight,
+            minimum_calibration_accepts=args.minimum_calibration_accepts,
             bootstrap_samples=args.bootstrap_samples,
             seed=args.seed,
             device=args.device,

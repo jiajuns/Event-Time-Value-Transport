@@ -1,8 +1,8 @@
 # ETSF 跨本体共享头：最新设计、训练监督、迁移与证据协议
 
-> 版本：2026-08-28 r12 设计与实现对齐版。本文以当前 Source63 因果历史训练器、Piper embodiment adapter、Formal190 完整外层嵌套选择、严格 rank 数值合同和 evaluation400 v4 独立审计基础层为准。本文严格区分“代码已经实现并通过合成回归”“已经挂到远端但尚未开始参数更新”“仍只是协议基础、尚未接入 runner”和“尚未获得的真实成功率结论”。
+> 版本：2026-08-28 r16 数据审计与 post-r16 P0 设计对齐版。本文以当前 Source63 因果历史训练器、Piper embodiment adapter、Formal190 完整外层嵌套选择、严格 rank 数值合同、actor-visible causal observer 和 evaluation400 v4 root-observed 证据合同为准。本文严格区分“r16 已冻结并物化的真实源数据”“post-r16 P0 代码已经实现并通过定向回归”“仅供合同测试的 reference predictor”“尚未部署的新代码”和“尚未获得的真实成功率结论”。
 
-当前结论先写在前面：共享头已经是一个可训练、可迁移、接口上可插拔的动作条件事件模型，但“跨本体后提高任务成功率”仍是待验证假设，不是已经得到的实验结论。Source63 尚未开始 GPU 参数更新，Piper 目标 development300 尚未获准采集，Formal190 与 evaluation400 也尚未执行。
+当前结论先写在前面：共享头已经是一个可训练、可迁移、接口上可插拔的动作条件事件模型，但“跨本体后提高任务成功率”仍是待验证假设，不是已经得到的实验结论。r16 causal-observer 数据已经物化，却存在严重类别不平衡和结构性缺类；其 calibration/validation 分别只有 10/14 个独立组，远低于风险控制所需的 73 组，因此当前数据无论训练 loss 多低都不能晋升。远端 r16 尚未开始 GPU 参数更新，post-r16 P0 训练与 root-observed 改动也尚未重新冻结部署；Piper 目标 development300 尚未获准采集，Formal190 与 evaluation400 均未执行。
 
 ## 1. 一句话定义
 
@@ -308,11 +308,42 @@ Piper 对该合同的应用声明另外绑定：输入使用 Schema6 同分支�
 
 ### 7.1 消除轨迹长度偏置
 
-最新训练不再把所有 transition 行直接 shuffle。那种做法会让长轨迹获得更多 optimizer 权重，也会重复放大每行相同的 terminal success 标签。
+最新训练不再把所有 transition 行直接 shuffle。那种做法会让长轨迹获得更多 optimizer 权重，也会重复放大同一 logical reset group 中高度相关的标签。r16 的 670 个 train row 还暴露了更严重的问题：`e0/e12/e3/e4/eK = 309/342/2/0/17`，仅靠行级 shuffle 会让两个主类几乎完全主导梯度。
 
-现在 dense sampler 每个 epoch 对每个 logical group 恰好抽取一个 transition，组内按固定 seed 的循环排列逐步覆盖不同 transition。因此长轨迹能提供更多状态多样性，但每个 epoch 的组权重与短轨迹完全相同。validation、recovery prior 和 recovery validation 也按 logical group 等权；duration/object/recovery 的行级 observation mask 保持不变。
+post-r16 P0 使用三级分层 sampler：
 
-候选 ranking loss 同样先在组内计算，再对 logical group 等权平均，不把同一组的候选对当作独立样本。
+```text
+先等权选择 actor
+  → 在该 actor 内等概率、有放回选择 logical group
+    → 在组内按 rare-class 权重选择一行
+```
+
+事件权重使用 effective-number class balance（默认 `beta=0.99`），谓词正例使用正负 effective-number 比的平方根；最终 rare-row 权重取事件稀有度与正谓词稀有度的几何平均，并截断到 `[1/5, 5]`。多 actor 时，每个 actor 每个 epoch 产生同样数量的样本，并交错组成 batch，避免大本体/长轨迹垄断 optimizer。它只重加权已有监督，绝不会把不存在的 `e4` 或 stationary 正例伪造成训练证据。
+
+采样平衡不能代替损失平衡。每个 batch 的 event CE、predicate BCE 和 consistency loss 都先在同一 logical group 内取均值，再在 actor 内对 group 等权，最后对 actor 等权；事件类权重和谓词正例权重也受到上限 5 的约束。训练 receipt 必须显式记录：
+
+```text
+actor_balanced_sampling = true
+logical_group_balanced_sampling = true
+rare_class_balanced_sampling = true
+logical_group_normalized_loss = true
+```
+
+候选 ranking、validation、recovery prior 和 recovery validation 同样以 logical group 为统计单位，不把同组的候选对或 transition 行当作独立证据。
+
+### 7.2 事件—谓词本体一致性不是事后规则
+
+五个谓词按固定优先级映射回事件：
+
+```text
+success → eK
+else stationary → e4
+else near_goal → e3
+else moved or lifted → e12
+else → e0
+```
+
+P0 在训练时最小化 event softmax 与上述 predicate-derived event distribution 的 Jensen–Shannon divergence，默认权重为 `0.25`；它与 event CE、predicate BCE 一起按 actor/group 归一化。独立 validation 还要求等组权重的离散本体一致率至少 `0.95`。这避免 event head 与 predicate head 各自看似准确、在线却给出互相矛盾的状态；但它仍只是内部结构约束，不能弥补 r16 中缺失的类别支持。
 
 ## 8. 五成员 ensemble 与六头校准
 
@@ -326,6 +357,14 @@ Piper 对该合同的应用声明另外绑定：输入使用 Schema6 同分支�
 
 当前最低独立组阈值为：post/next/duration/recovery 每侧 10 组，success 每类 50 组，object nonzero/near-zero 每侧 50 组。任一正式头失败，则“六头主路径”整体不授权。
 
+actor-visible causal observer 使用更严格、单独冻结的 P0 晋升门。低置信接受错误的统计单位是“一个 logical reset group 内是否出现过任一 false accept”，而不是 row。若观测到 0 个错误，95% Wilson 上界为
+
+\[
+\operatorname{UCB}_{95}(0,n)=\frac{z^2}{n+z^2},\qquad z=1.959963984540054.
+\]
+
+要使该上界不超过 `0.05`，至少需要 `n=73` 个独立接受组；72 组仍不够。因此 P0 同时要求：calibration 总组数至少 73、risk-control threshold 接受至少 73 组、independent validation 至少 73 组，并保留每 actor 至少 10 组的下限。r16 只有 10 个 calibration group 和 14 个 validation group，按合同必然 `reject_all/monitor_only`，不能因为 199/274 个相关 row 看起来很多而绕过。
+
 校准方式为：
 
 - post/next-event：五折 temperature scaling；
@@ -336,7 +375,18 @@ Piper 对该合同的应用声明另外绑定：输入使用 Schema6 同分支�
 
 这里的 success 校准只使用 factual base `success_logit`；动作排序使用 `source_contract_rank_score`。两条路径必须在 schema、命名和 SHA 上完全分离。
 
-### 8.1 两层 cross-fit 不能混为一谈
+causal observer 的 confidence gate 不能用在同一 calibration 行上拟合出的温度/阈值再评价自身。P0 先按 logical group 做最多五折 OOF：每折只在其他组拟合 event temperature、五个 predicate temperature 和五个 predicate threshold，再对该折 heldout group 生成 confidence/prediction；每行恰好成为 heldout 一次。只有拼接后的 OOF prediction 才能搜索 joint-confidence threshold。任何 fold 缺少规范事件类或谓词正/负支持，都会关闭 calibration support gate。
+
+### 8.1 绝对指标之外必须超过简单基线
+
+高 accuracy 在 r16 这类极不平衡数据上可能只是复现多数类。P0 因此新增两个严格增益门：
+
+- event macro-F1 相对“仅用 train、按 actor/组等权拟合的事件频率基线”的 group-bootstrap 95% LCB 必须严格大于 0；
+- predicate macro-F1 相对“仅用 train 拟合的逐谓词常量基线”的 group-bootstrap 95% LCB 必须严格大于 0。
+
+validation 标签不能用于拟合基线；报告 pooled 值的同时，晋升取各 actor LCB 的最小值。除此之外，event macro-accuracy LCB、event macro-F1 LCB、predicate macro-F1 LCB、最大 ECE、73 组 Wilson false-accept UCB、规范标签支持和事件—谓词一致性必须全部通过。重新签名一个缺少任一字段的旧 promotion receipt 也会被 v2 validator 拒绝。
+
+### 8.2 两层 cross-fit 不能混为一谈
 
 当前协议有两个统计层次：
 
@@ -469,7 +519,7 @@ decision = frozen_selector.select(
 
 ### 10.2 当前在线观察器的真实边界
 
-目前训练数据里的事件/谓词监督来自 simulator object pose 和 proprio 轨迹。当前 evaluation400 v3 runner 的根语义是固定 `e0`，并使用 runtime snapshot 的 object pose 重建谓词；这是一条 simulator privileged-state 上界路径，不是已经完成的视觉在线观察器。当前 root-only 候选协议与 `e0` 自洽，但它不能证明多步、非特权、真实机器人事件跟踪。
+目前训练数据里的事件/谓词标签仍由离线 simulator object pose 和 proprio 轨迹派生；pose 不进入导出的模型输入。evaluation400 v3 的根语义固定为 `e0`，并用 runtime snapshot 的 object pose 重建谓词，这仍是一条 privileged-state 上界路径。v4 的 condition query/recovery 已能调用冻结的 actor-visible observer，但这不自动证明 root rank 输入也来自同一个 observer，更不证明真实机器人视觉事件跟踪成立。
 
 面向真实部署的下一版观察器应只读取 actor 可见信息：图像/VLM state、proprio、历史预测与执行回执，输出
 
@@ -477,9 +527,29 @@ decision = frozen_selector.select(
 p(e_t), p(predicates_t), observer_confidence, applicability_mask
 ```
 
-并维护同分支因果 hidden 队列。置信度不足、事件分布矛盾或 observer 合同不匹配时必须回退 baseline。这个 observer 还没有接入当前在线 runner，因此论文现阶段应把“跨本体共享世界模型”和“非特权在线事件识别”作为两个独立实验问题。
+并维护同分支因果 hidden 队列。置信度不足、事件—谓词分布矛盾或 observer 合同不匹配时必须回退 baseline。论文现阶段仍应把“跨本体共享世界模型”和“非特权在线事件识别”作为两个独立实验问题：接口接通或合成 receipt 通过不等于目标本体预测准确。
 
-### 10.3 evaluation400 v4 的四条件归因设计
+### 10.3 Root-observed 合同与 reference predictor 边界
+
+post-r16 P0 新增纯合同 `smolvla_piper_evaluation400_root_observed_contract_v1.py`，把 root rank 从“外部注入一组预测”收紧为可重算的先观察、后推理链：
+
+1. root reset、actor policy query 和 observer query 各恰好一次；此时 world-model member call、simulator step、condition start 和 target read 都必须为 0；
+2. 输入必须是原始 C-contiguous float32 `[8,960]` history、精确首位 True 的 mask、14-D proprio 和可选的当前 RGB feature；root 有效历史严格为一步，其余 7 行全零；
+3. observer input/output receipt 必须绑定 actor、policy、state-feature source、adapter、authority、calibration、event/predicate、confidence 和 applicability，并明确 `object_pose=false`、`privileged_state=false`、`future=false`、`hardcoded_fallback=false`；
+4. 同一 pre-action snapshot 的有序合法候选、最低合法 baseline 和 mapped action tensor 先提交；随后五个冻结成员各调用一次，对全部合法候选向量化推理；
+5. 原生六头 tensor、calibrated success、composite rank 和 structured uncertainty 的原数组及逐 tensor SHA 都必须可独立重建，全部完成后才允许进入任何 condition。
+
+这解决的是 root 证据的来源、时序和内容寻址问题，不是一个新的已验证生产模型。当前 `smolvla_piper_evaluation400_frozen_root_predictor_runtime_v1.py` 中的 `CompactRootPredictorV1` 明确标记为：
+
+```text
+model_family = CompactRootPredictorV1_reference_test_only
+promotion_eligible = false
+production_compatibility_status = must_not_replace_ActionConditionedEventWorldModel_or_PiperAdaptedWorldModel
+```
+
+该 reference runtime 只用于证明“五成员 artifact 加载 → actor-visible root commitment → 原生/派生 tensor 重算”的集成合同。checkpoint、runtime authority 和公开属性都重复强制不可晋升；它产生的合成预测、校准或 condition 结果不能生成 production authority，也不能作为任务成功率、六头精度或跨本体迁移证据。生产路径仍需为真实 `ActionConditionedEventWorldModel/PiperAdaptedWorldModel` 实现单独的、同等严格的 loader，并用真实独立监督通过全部 P0 门。
+
+### 10.4 evaluation400 v4 的四条件归因设计
 
 为区分“多采样”“success head”“复合 rank”和“完整安全门”的贡献，v4 计划对每个 pair 固定执行四个条件：
 
@@ -490,9 +560,9 @@ p(e_t), p(predicates_t), observer_confidence, applicability_mask
 | composite_rank_ungated | 按复合 rank，总是接受最高分 | 检验 rank 信号及无 guard 风险 |
 | etsf | 复合 rank + margin + uncertainty + 全局门 | 完整方法 |
 
-400 个 pair 对应严格 1600 个 condition rollout。primary comparison 为 `etsf - baseline`；其他比较用于归因并做多重比较校正。当前 v3 runner 只覆盖 baseline/ETSF 主路径，四条件 v4 尚未接入 simulator runner 或 external executor。
+400 个 pair 对应严格 1600 个 condition rollout。primary comparison 为 `etsf - baseline`；其他比较用于归因并做多重比较校正。v4 condition runner、external executor 和 result evaluator 的四条件协议已经实现，但真实 execution inventory 尚未批准，生产 root predictor authority 也尚未生成，因此 1600 个 rollout 仍为 0。
 
-### 10.4 六头预测的“先承诺、后解封”审计基础层
+### 10.5 六头预测的“先承诺、后解封”审计基础层
 
 r12 新增了独立纯模块 `smolvla_piper_evaluation400_audit_contract_v1.py`，用于防止跑完以后依据真值重写预测：
 
@@ -504,7 +574,7 @@ r12 新增了独立纯模块 `smolvla_piper_evaluation400_audit_contract_v1.py`�
 6. 只有 `1600 conditions + 400 pairs + 0 retry + 0 incomplete + 0 exclusion` 全部满足后才允许解封；
 7. 六头指标先在 pair 内等权，再以 `pair_id` 为 cluster bootstrap 单元，显式报告 applicable、observed、censored/missing 与 insufficient support。
 
-这一模块当前只是 v4 的 schema、密码与统计基础层：它不能启动 simulator、不能写 WORM ledger、不能执行 selector，也尚未与 v3 runner/executor 集成。因此“审计合同测试通过”不等于“evaluation400 已经执行”。
+该纯模块本身只负责 v4 的 schema、密码与统计合同，不能独立启动 simulator、写外部 WORM ledger 或执行 selector；v4 runner/executor 已调用其合同，但尚无获批 inventory 和真实 rollout。因此“审计合同接入并测试通过”仍不等于“evaluation400 已经执行”。
 
 ## 11. 训练数据和监督是否必要
 
@@ -528,7 +598,17 @@ Source63 为 Aloha-AgileX + SmolVLA + `move_can_pot` 的 63 个 logical group，
 
 普通成功/失败终局标签只能训练 success 和一部分 ranking，不能完整训练 duration、recovery、object effect 与 action-conditioned event transition。六头完整监督至少需要时间序列、事件/谓词派生所需的对象状态、动作候选身份、删失标志和分支终局结果。
 
-Source63 的 63 个 logical group 对六头世界模型仍然很小，所以当前设计用四种方式控制过拟合：共享核心参数量受限、同根相对残差消除场景难度、按 logical group 等权采样/切分、五成员 OOF 与目标本体低容量 adapter。它们只能降低风险，不能把小数据自动变成充分证据。是否数据不足要由每头 support gate、学习曲线和扩量后的 OOF 指标判断，而不能仅凭训练 loss。
+Source63 的 63 个 logical group 对六头世界模型仍然很小，所以当前设计用共享核心限容、同根相对残差、actor/group 分层采样、group-normalized loss、group-OOF 和目标本体低容量 adapter 控制过拟合。它们只能降低风险，不能把小数据自动变成充分证据。是否数据不足要由每头 support gate、学习曲线和扩量后的 OOF 指标判断，而不能仅凭训练 loss。
+
+r16 物化结果已经给出直接证据：不仅总组数小，规范事件和谓词还严重失衡。
+
+| split | groups / rows | e0 | e12 | e3 | e4 | eK | near_goal 正例 | stationary 正例 | success 正例 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| train | 34 / 670 | 309 | 342 | 2 | **0** | 17 | 6 | 2 | 17 |
+| calibration | 10 / 199 | 91 | 100 | 1 | **0** | 7 | 2 | **0** | 7 |
+| validation | 14 / 274 | 118 | 146 | **0** | 1 | 9 | 4 | 4 | 9 |
+
+按独立组看同样不足：train 中 `e3` 只覆盖 2 组、`e4` 为 0 组；calibration 的 `e3` 仅 1 组且 `e4/stationary` 均为 0；validation 的 `e3` 为 0 组、`e4` 仅 1 组。hierarchical rare sampling 和 class-balanced loss 能阻止稀有的已有行被主类吞没，却不能对 0-support 类产生统计证据。因而 r16 必须作为“可训练的 source-only monitor 数据”而不是可晋升数据；需要新增开发组并重新冻结 calibration/validation，直到规范类支持、73 组风险门和独立 baseline 增益门都可被真实检验。
 
 Piper 的最新 development300 方案是目标监督适配与 selector 校准数据；预注册已经冻结，但当前 `collection_authorized=false`，尚未采集。最终 evaluation400 在所有模型、校准和 selector 冻结后才可读取，用于回答“是否真实提升任务成功率”。
 
@@ -612,16 +692,16 @@ Piper 的最新 development300 方案是目标监督适配与 selector 校准数
 
 还应把“privileged simulator observer”和“非特权视觉/proprio observer”分开报告。前者可以作为 world-model/ranker 上界，不能冒充真实部署结果；后者才回答在线事件状态是否能够跨本体观测。
 
-## 15. 当前实现与训练状态（2026-08-28 23:14 CST）
+## 15. 当前实现与训练状态（2026-08-28 23:20 CST）
 
 ### 15.1 远端 4090 链路
 
 - 服务器：`user@100.115.128.14`；GPU UUID `GPU-06f6e50e-5296-258f-dd86-8f838390a7d1`，RTX 4090 D。
-- 用户原有官方 OpenVLA 全量评测仍在运行；最近一次只读检查时 GPU 利用率约 96%、显存约 15.9 GB。这不是 ETSF 训练或 ETSF 成功率结果。
+- 用户原有官方 OpenVLA 全量评测仍在运行；最近一次只读检查为 479/500 episodes、254 successes（53.0%），GPU 显存约 15.7 GB。这是原 actor 的官方评测进度，不是 ETSF 训练或 ETSF 增益结果。
 - r12 Source watcher PID `2004304`，状态 `waiting_for_external_suite_parent_exit_before_rtx4090`。native core 初始化已完成，但五成员 Source 参数更新尚未开始。static plan SHA 为 `10ed8ceb1eb2d5374225df247fe078b220414d4994f5d970af8a0c552fa4aac4`。
 - r12 LOBO watcher PID `2005507`，状态 `waiting_for_authenticated_source63_terminal_receipt`。
 - r12 Piper watcher PID `2006249`，状态 `waiting_for_piper_then_ur5_lobo_terminal_no_hdf5_access`。该 watcher 的 `max_episode_steps=4`，只是可行性 smoke，不是 development300、Formal190 或正式 evaluation400。
-- r16 Source63 causal observer watcher PID `2016883`，static plan SHA 为 `e470fe4277c18940b05bf5667914760efb5d91043e6caaaf69da5ae8ed52c600`。请求冻结和数据物化已完成：34 个 train group / 670 行、10 个 calibration group / 199 行、14 个 validation group / 274 行；三者按 logical reset group 严格隔离。原始 5 个 test group 未解析路径、未 stat、未打开、未哈希。当前状态为 `waiting / external_exit_and_gpu_idle`，GPU 锁不存在，因此尚未开始参数更新，也未抢占原有任务。
+- r16 Source63 causal observer watcher PID `2016883`，static plan SHA 为 `e470fe4277c18940b05bf5667914760efb5d91043e6caaaf69da5ae8ed52c600`。请求冻结和数据物化已完成：34 个 train group / 670 行、10 个 calibration group / 199 行、14 个 validation group / 274 行；三者按 logical reset group 严格隔离，全部 manifest/NPZ SHA 已只读复算一致。原始 5 个 test group 未解析路径、未 stat、未打开、未哈希。当前状态为 `waiting / external_exit_and_gpu_idle`，GPU 锁不存在，因此尚未开始参数更新，也未抢占原有任务。该 watcher 绑定的是 commit `94a9106` 的 r16 只读代码闭包，不包含本节所述 post-r16 P0 训练门；如果要用 P0 训练，必须生成新的内容寻址代码根和 static plan，不能原地替换 r16 文件。
 - 四个 watcher 都是服务器端脱离进程，关闭本机不会终止。旧 r7h/r8e/r9b watcher 已在验证新链等待状态后停止；用户原有 OpenVLA 进程未被停止或修改。
 
 远端 r12 Source 代码根为：
@@ -654,17 +734,19 @@ Git commit `94a9106612e710efc828d1ce3fef73766cc7dc0d` 的 r16 干净快照已部
 - Formal190 selection-aware 外层 OOF、identity bridge 与 paired downstream：79 项 CPU 回归通过；bridge 独立复算每折参数、190 组唯一覆盖、固定 bootstrap draws、LCB/UCB 和泄漏字段。
 - evaluation400 v4 已接入真实冻结 causal observer runtime：authority 加载时逐文件重算 SHA，解析 core checkpoint、actor adapter、calibration、promotion evidence 和 deployment；backend 不再能自报 event/predicate，只能交付 actor-visible hidden/proprio，由 executor 内部实际前向并生成 receipt。
 - causal observer 监督数据桥已完成：支持 Schema5/Source63 与 Schema6/Piper，按 logical reset group 划分 train/calibration/validation，导出 `[N,8,960]` 同分支因果历史、14-D proprio、当前 event/predicate 离线标签和上一已执行动作 SHA。object pose 只用于离线当前标签派生，不写入模型输入。
-- causal observer 训练器已完成：共享 GRU/core、逐 actor 低秩 adapter、actor-balanced loss、独立 group calibration、低置信拒绝、group bootstrap/Wilson 门与真实权重冻结。未过真实门或 synthetic 证据时不生成 production `authority_manifest.json`。
+- post-r16 P0 causal observer 训练器已完成：actor→group→rare-row 分层采样、effective-number/capped class balance、equal-actor/equal-group normalized loss、event–predicate JS consistency、group-OOF calibration、73 独立组 Wilson risk gate、train-only frequency/constant baseline 的严格正增益 LCB 门和 v2 promotion evidence。Freeze 会在写输出前内部重算 calibration、calibration-fit 和 validation 并要求逐字段一致，同时重算训练 receipt 的 config/split/label-support/class-balance 绑定；外部重签“全门通过”回执、伪造训练回执或把 synthetic 数据自报为真实证据均只能失败或保持 monitor-only。未过任一真实门时不生成 production `authority_manifest.json`。这些改动尚未进入远端 r16 静态计划。
+- root-observed P0 合同与 `CompactRootPredictorV1` reference runtime 已实现：前者绑定 root actor-visible 原数组、observer receipts、具体 actor adapter contract、候选 registry、五成员调用时序和原生/派生 tensor SHA，并要求调用方外部钉住 predictor authority、calibration、rank-contract set、uncertainty contract 和 derivation implementation；后者在 checkpoint、authority 和 runtime 三层强制 `promotion_eligible=false`，只验证集成合同，不能替代真实生产 world model。
 - r12 Piper detached watcher 定向回归：39 项通过。
-- 最终全仓库 CPU 回归：1150 项全部通过；新 observer 数据/训练/runtime 联合定向回归为 36 项通过，Source63 请求冻结与自治 watcher 定向回归为 23 项通过。唯一 warning 是本机 PyTorch 的 CUDA driver 探测，不涉及远端 4090 训练。
+- post-r16 P0 当前实现的最终全仓库 CPU 回归为 **1209 项全部通过**；其中 observer model/trainer、root-observed contract 和 reference runtime 最新联合定向为 73 项通过，v4 integration 为 11 项通过。唯一 warning 是本机 PyTorch 的 CUDA driver 探测，不涉及远端 4090 训练。
 
 这些是代码与合成协议验证，不是模型预测精度或任务成功率。
 
 ### 15.3 尚未完成、因此不能声称的结论
 
+- r16 calibration/validation 只有 10/14 个独立组，且 calibration 缺 `e4/stationary`、validation 缺 `e3`；它不可能通过 73 组 Wilson 门和规范标签支持门。P0 的价值是让这种不足 fail-closed，不是把当前数据变成已经准确的模型。
 - Piper development300 虽已预注册为 80 train / 30 internal validation / 190 formal，但 `collection_authorized=false`，当前没有目标监督采集。
 - Formal190 真实 selector artifact 尚未生成；evaluation400 的 execution inventory 尚未批准，也没有执行。
-- evaluation400 v4 的 condition query/recovery 事件已由真实冻结 observer 前向生成，但 `root_preparer` 中的根候选预提交仍是外部注入接口；现有证据还不能单独证明 root rank 的事件输入也已经由该 observer 产生。
+- evaluation400 v4 的 condition query/recovery 事件已有冻结 observer 前向接口；新的 root-observed contract 已能验证 root 输入和推理时序，但生产 `ActionConditionedEventWorldModel/PiperAdaptedWorldModel` loader 尚未接入并生成真实 authority。`CompactRootPredictorV1` 只是不可晋升 reference，不能填补这项证据。
 - Source63 只包含 `aloha-agilex / SmolVLA / move_can_pot`。Piper r12 只是 1 seed、4 step smoke，不足以训练或验证跨本体 observer。因此先行 Source-only 训练只能产生源本体预测证据，不能写成 Piper 迁移或成功率改善。
 - 现有证据不能证明跨本体任务成功率已经提高，也不能证明六头在真实 Piper 上达到目标精度。正式结论必须等待 Source → LOBO → Piper adapter → Formal190 → 完全未见 evaluation400 的顺序证据。
 
@@ -686,6 +768,8 @@ Git commit `94a9106612e710efc828d1ce3fef73766cc7dc0d` 的 r16 干净快照已部
 | causal observer 训练/校准/冻结 | `scripts/train_smolvla_piper_causal_event_observer_v1.py` |
 | Source63 observer 开发集请求冻结 | `scripts/freeze_smolvla_causal_observer_source63_request_v1.py` |
 | Source63 observer 4090 自治 watcher | `scripts/launch_smolvla_causal_observer_source63_autonomous_v1.py` |
+| evaluation400 root-observed 原数组/时序合同 | `scripts/smolvla_piper_evaluation400_root_observed_contract_v1.py` |
+| evaluation400 reference-only 五成员 root runtime | `scripts/smolvla_piper_evaluation400_frozen_root_predictor_runtime_v1.py` |
 | evaluation400 v4 condition runner | `scripts/run_smolvla_piper_evaluation400_condition_v4.py` |
 | evaluation400 v4 external executor | `scripts/launch_smolvla_piper_evaluation400_external_executor_v4.py` |
 | evaluation400 v4 result evaluator | `scripts/evaluate_smolvla_piper_evaluation400_results_v4.py` |
@@ -719,3 +803,14 @@ Git commit `94a9106612e710efc828d1ce3fef73766cc7dc0d` 的 r16 干净快照已部
 | evaluation400 v4 result evaluator | `b58e9d46b792f3a1e09df7e253bd7b9ac04838b72c215241ceae1d6453aa60c8` |
 | Piper r12 autonomous watcher | `d6ea99f26a10dfae624d1bd7a588a3ad2960c94e3be557c5150879d0ab0dff48` |
 | 200-step full-horizon runtime config | `ed03f316ab74402def8311fe71e1b3d8dd9e10d96b874f764644de288c680b68` |
+
+### 17.1 本次 post-r16 P0 实现身份
+
+下列 SHA 是本文对应的 P0 文件身份，不属于上面的 commit `94a9106`，也不属于远端 r16 closure `17877a76401f66a683c84deac37d62b20dd19472a3062dec31bf041de518bcdd`。继续修改任一文件后必须重新计算，且不能让旧 r16 authority 引用这些新身份：
+
+| P0 组件 | 当前工作树 SHA256 |
+|---|---|
+| actor-visible causal observer / promotion v2 validator | `90fbbe17f9a25b2bc8acf05fb74c82eb3fe8580352b56b0b0630b7e3f42b2951` |
+| hierarchical/group-normalized observer trainer | `c033d693c19d8673d9dee824deb9e7bdd9e594b52ea5fb0ee41aa3964433c2ed` |
+| root-observed evidence contract | `fdbb2f394e289ab58c9f3c2f394b3ab7da9f8c171f63c8a87ac5163a52c8bdd1` |
+| `CompactRootPredictorV1` reference-only runtime | `ee2753c9a36ebf6c083c7678c2b6ab120d4039f64309950160f7d4bd0eacbda1` |

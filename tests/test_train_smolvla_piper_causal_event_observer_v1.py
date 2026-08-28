@@ -27,8 +27,6 @@ from smolvla_piper_causal_event_observer_v1 import (  # noqa: E402
     MAX_HISTORY_STEPS,
     STATE_DIM,
     causal_history_contract,
-    canonical_sha256,
-    load_frozen_causal_observer_runtime,
     tensor_bundle_sha256,
 )
 from test_materialize_smolvla_piper_causal_event_observer_dataset_v1 import (  # noqa: E402
@@ -192,6 +190,7 @@ def _config() -> trainer.TrainingConfig:
         bootstrap_samples=100,
         calibration_grid_size=21,
         minimum_calibration_accepts=2,
+        event_predicate_consistency_loss_weight=0.0,
         seed=101,
         device="cpu",
     )
@@ -258,7 +257,7 @@ def test_balanced_sampler_and_loss_give_each_actor_equal_weight() -> None:
         ),
         "predicate_logits": torch.zeros(3, 5),
     }
-    loss, _, _ = trainer._balanced_loss(
+    loss, _, _, _ = trainer._balanced_loss(
         output,
         torch.tensor([0, 0, 0]),
         torch.zeros(3, 5),
@@ -279,6 +278,75 @@ def test_balanced_sampler_and_loss_give_each_actor_equal_weight() -> None:
         )).mean()
     )
     assert torch.allclose(loss, expected)
+
+
+def test_group_hierarchical_sampling_rare_balance_and_ontology_loss() -> None:
+    arrays = {
+        "actor_index": np.array([0, 0, 0, 0, 1, 1], dtype=np.int64),
+        "logical_group_id": np.array(["long", "long", "long", "rare", "b0", "b1"]),
+        "event_label": np.array([0, 0, 0, 4, 0, 1], dtype=np.int64),
+        "predicate_label": np.array([
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1],
+            [0, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+        ], dtype=np.float32),
+    }
+    config = _config()
+    balance = trainer._class_balance_contract(arrays, 2, config)
+    first = trainer._hierarchical_epoch_indices(
+        arrays, 2, np.random.default_rng(23), balance
+    )
+    second = trainer._hierarchical_epoch_indices(
+        arrays, 2, np.random.default_rng(23), balance
+    )
+    assert np.array_equal(first, second)
+    assert np.bincount(arrays["actor_index"][first], minlength=2).tolist() == [4, 4]
+    assert balance["event"][0, 4] > balance["event"][0, 0]
+
+    output = {
+        "event_logits": torch.tensor([[8.0, 0, 0, 0, 0]], requires_grad=True),
+        "predicate_logits": torch.tensor([[8.0] * 5], requires_grad=True),
+    }
+    consistency_config = trainer.TrainingConfig(
+        hidden_dim=16,
+        adapter_rank=2,
+        epochs=1,
+        batch_size_per_actor=1,
+        bootstrap_samples=100,
+        calibration_grid_size=11,
+        minimum_calibration_accepts=2,
+        event_loss_weight=1.0e-6,
+        predicate_loss_weight=1.0e-6,
+        event_predicate_consistency_loss_weight=1.0,
+        seed=31,
+    )
+    loss, _, _, consistency = trainer._balanced_loss(
+        output,
+        torch.tensor([0]),
+        torch.ones(1, 5),
+        torch.tensor([0]),
+        1,
+        consistency_config,
+    )
+    assert consistency > 0.1
+    loss.backward()
+    assert output["event_logits"].grad is not None
+    assert output["predicate_logits"].grad is not None
+
+
+def test_threshold_relative_confidence_and_wilson_minimum_are_matched() -> None:
+    decision, confidence = trainer._predicate_decision_confidence(
+        np.array([[0.60, 0.90]], dtype=np.float64),
+        np.array([0.80, 0.80], dtype=np.float64),
+    )
+    assert decision.tolist() == [[False, True]]
+    assert np.allclose(confidence, np.array([[0.40, 0.90]]))
+    assert trainer._wilson_interval(0, 72, 0.95)[1] > 0.05
+    assert trainer._wilson_interval(0, 73, 0.95)[1] <= 0.05
+    assert trainer.MIN_PROMOTION_GROUPS == 73
 
 
 def test_cpu_training_is_deterministic_and_uses_only_train_optimizer_split(
@@ -311,7 +379,26 @@ def test_group_calibration_validation_and_synthetic_freeze_are_fail_closed(
         model, dataset, calibration, calibration_fit, config
     )
     assert calibration_fit["equal_group_weighting"] is True
+    assert calibration_fit["risk_control_predictions"] == (
+        "group_oof_head_calibration"
+    )
+    assert calibration_fit["group_oof_calibration"][
+        "every_row_predicted_exactly_once"
+    ] is True
+    assert calibration_fit["minimum_risk_control_accepted_groups"] == 73
+    assert training_receipt["logical_group_balanced_sampling"] is True
+    assert training_receipt["rare_class_balanced_sampling"] is True
+    assert training_receipt["label_support_audit"]["split_unit"] == (
+        "logical_reset_group"
+    )
     assert validation["bootstrap"]["unit"] == "logical_reset_group"
+    assert validation["ece_weighting"] == "equal_logical_group_within_actor"
+    assert validation["train_only_frequency_and_constant_baselines"][
+        "validation_labels_used_to_fit_baseline"
+    ] is False
+    assert set(validation["event_macro_f1"]["per_actor_group_bootstrap_lcb95"]) == {
+        "piper", "cross_body"
+    }
     assert validation["confidence_reject"]["wilson_unit"] == (
         "logical_reset_group_any_false_accept"
     )
@@ -339,6 +426,12 @@ def test_group_calibration_validation_and_synthetic_freeze_are_fail_closed(
     assert not (output / "authority_manifest.json").exists()
     assert not (output / "promotion_evidence.json").exists()
     assert (output / "monitor_freeze_manifest.json").is_file()
+    frozen_label_support = json.loads(
+        (output / "label_support_audit.json").read_text(encoding="utf-8")
+    )
+    assert frozen_label_support["label_support_audit_sha256"] == (
+        training_receipt["label_support_audit"]["label_support_audit_sha256"]
+    )
 
     core_path = output / "observer_core_state.pt"
     core = torch.load(core_path, map_location="cpu", weights_only=True)
@@ -376,58 +469,73 @@ def test_static_audit_detects_no_privileged_online_model_argument() -> None:
     assert "object_poses" not in result["forward_parameter_names"]
 
 
-def test_test_only_forced_gate_fixture_matches_frozen_v4_runtime_loader(
+def test_resigned_calibration_fit_or_validation_cannot_promote(
     tmp_path: Path,
 ) -> None:
-    """Exercise artifact plumbing only; these numbers are not model evidence."""
-
     dataset = _dataset(tmp_path)
     config = _config()
     model, training_receipt = trainer.train_model(dataset, config)
     calibration, calibration_fit = trainer.fit_group_calibration(
         model, dataset, config
     )
-    # Contract-path fixture only: make the calibration artifact internally
-    # consistent with the forced passing metrics below.
-    calibration = dict(calibration)
-    calibration["reject_all"] = False
-    calibration_base = dict(calibration)
-    calibration_base.pop("calibration_sha256")
-    calibration["calibration_sha256"] = canonical_sha256(calibration_base)
-    calibration_fit = copy.deepcopy(calibration_fit)
-    calibration_fit["calibration_sha256"] = calibration["calibration_sha256"]
-    calibration_fit["reject_all"] = False
-    calibration_fit["promotion_calibration_support_gate_passed"] = True
-    calibration_fit["low_confidence_reject_fit"]["status"] = (
-        "highest_coverage_threshold_meeting_false_accept_gate"
-    )
-    calibration_fit_base = dict(calibration_fit)
-    calibration_fit_base.pop("calibration_fit_receipt_sha256")
-    calibration_fit["calibration_fit_receipt_sha256"] = canonical_sha256(
-        calibration_fit_base
-    )
-    model.calibration = calibration
     validation = trainer.evaluate_independent_validation(
         model, dataset, calibration, calibration_fit, config
     )
-    validation["status"] = "independent_validation_passed_all_gates"
-    validation["independent_validation_groups"] = 60
-    validation["per_actor_validation_groups"] = {
-        "piper": 30,
-        "cross_body": 30,
-    }
-    validation["event_macro_accuracy"]["group_bootstrap_lcb95"] = 0.80
-    validation["predicate_macro_f1"]["group_bootstrap_lcb95"] = 0.75
-    validation["maximum_event_ece"] = 0.05
-    validation["maximum_predicate_ece"] = 0.05
-    validation["confidence_reject"]["false_accept_wilson_ucb95"] = 0.02
-    validation["gates"] = {name: True for name in validation["gates"]}
-    validation["all_promotion_gates_passed"] = True
-    unsigned = dict(validation)
-    unsigned.pop("validation_receipt_sha256")
-    validation["validation_receipt_sha256"] = canonical_sha256(unsigned)
 
-    output = tmp_path / "forced_contract_fixture"
+    forged_fit = copy.deepcopy(calibration_fit)
+    forged_fit["promotion_calibration_support_gate_passed"] = True
+    fit_unsigned = dict(forged_fit)
+    fit_unsigned.pop("calibration_fit_receipt_sha256")
+    forged_fit["calibration_fit_receipt_sha256"] = trainer.canonical_sha256(
+        fit_unsigned
+    )
+
+    forged_validation = copy.deepcopy(validation)
+    forged_validation["gates"] = {
+        name: True for name in forged_validation["gates"]
+    }
+    forged_validation["all_promotion_gates_passed"] = True
+    forged_validation["status"] = "independent_validation_passed_all_gates"
+    validation_unsigned = dict(forged_validation)
+    validation_unsigned.pop("validation_receipt_sha256")
+    forged_validation["validation_receipt_sha256"] = trainer.canonical_sha256(
+        validation_unsigned
+    )
+
+    cases = (
+        ("fit", forged_fit, validation, "calibration fit receipt"),
+        ("validation", calibration_fit, forged_validation, "validation receipt"),
+    )
+    for name, fit_receipt, validation_receipt, message in cases:
+        output = tmp_path / f"forged_{name}"
+        with pytest.raises(trainer.ObserverTrainingError, match=message):
+            trainer.freeze_bundle(
+                model=model,
+                dataset=dataset,
+                calibration=calibration,
+                calibration_fit=fit_receipt,
+                validation=validation_receipt,
+                training_receipt=training_receipt,
+                config=config,
+                output_directory=output,
+                synthetic_evidence=False,
+            )
+        assert not output.exists()
+
+
+def test_test_dataset_cannot_promote_when_caller_claims_real_evidence(
+    tmp_path: Path,
+) -> None:
+    dataset = _dataset(tmp_path)
+    config = _config()
+    model, training_receipt = trainer.train_model(dataset, config)
+    calibration, calibration_fit = trainer.fit_group_calibration(
+        model, dataset, config
+    )
+    validation = trainer.evaluate_independent_validation(
+        model, dataset, calibration, calibration_fit, config
+    )
+    output = tmp_path / "caller_claimed_real"
     result = trainer.freeze_bundle(
         model=model,
         dataset=dataset,
@@ -437,12 +545,47 @@ def test_test_only_forced_gate_fixture_matches_frozen_v4_runtime_loader(
         training_receipt=training_receipt,
         config=config,
         output_directory=output,
-        # This is deliberately false only to reach the production artifact
-        # parser in a temporary unit-test directory. No result is persisted.
         synthetic_evidence=False,
     )
-    assert result["v4_rerank_authority_issued"] is True
-    runtime = load_frozen_causal_observer_runtime(output)
-    assert runtime.authority["rerank_enabled"] is True
-    assert runtime.model.training is False
-    assert all(not parameter.requires_grad for parameter in runtime.model.parameters())
+    assert result["promotion_enabled"] is False
+    assert result["v4_rerank_authority_issued"] is False
+    assert not (output / "authority_manifest.json").exists()
+    monitor = json.loads(
+        (output / "monitor_freeze_manifest.json").read_text(encoding="utf-8")
+    )
+    assert monitor["synthetic_or_test_evidence"] is True
+
+
+def test_resigned_training_receipt_cannot_hide_validation_use(
+    tmp_path: Path,
+) -> None:
+    dataset = _dataset(tmp_path)
+    config = _config()
+    model, training_receipt = trainer.train_model(dataset, config)
+    calibration, calibration_fit = trainer.fit_group_calibration(
+        model, dataset, config
+    )
+    validation = trainer.evaluate_independent_validation(
+        model, dataset, calibration, calibration_fit, config
+    )
+    forged = copy.deepcopy(training_receipt)
+    forged["calibration_or_validation_used_by_optimizer"] = True
+    unsigned = dict(forged)
+    unsigned.pop("training_receipt_sha256")
+    forged["training_receipt_sha256"] = trainer.canonical_sha256(unsigned)
+    output = tmp_path / "forged_training_receipt"
+    with pytest.raises(
+        trainer.ObserverTrainingError, match="self-signed and content-bound"
+    ):
+        trainer.freeze_bundle(
+            model=model,
+            dataset=dataset,
+            calibration=calibration,
+            calibration_fit=calibration_fit,
+            validation=validation,
+            training_receipt=forged,
+            config=config,
+            output_directory=output,
+            synthetic_evidence=False,
+        )
+    assert not output.exists()

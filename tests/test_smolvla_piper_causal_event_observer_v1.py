@@ -73,10 +73,14 @@ def _promotion_evidence(training_sha: str, calibration_sha: str) -> dict:
         "independent_calibration_split_sha256": CALIBRATION_SPLIT_SHA,
         "independent_validation_split_sha256": VALIDATION_SPLIT_SHA,
         "actor_names": ["piper", "new_body"],
-        "independent_validation_groups": 60,
-        "per_actor_validation_groups": {"piper": 30, "new_body": 30},
+        "independent_validation_groups": 80,
+        "per_actor_validation_groups": {"piper": 40, "new_body": 40},
         "event_macro_accuracy_lcb95": 0.80,
+        "event_macro_f1_lcb95": 0.78,
         "predicate_macro_f1_lcb95": 0.75,
+        "event_predicate_ontology_consistency": 0.97,
+        "event_macro_f1_gain_over_train_frequency_lcb95": 0.10,
+        "predicate_macro_f1_gain_over_train_constant_lcb95": 0.08,
         "maximum_event_ece": 0.05,
         "maximum_predicate_ece": 0.05,
         "low_confidence_false_accept_ucb95": 0.02,
@@ -336,6 +340,35 @@ def test_monitor_only_and_low_confidence_both_fail_closed() -> None:
     assert prediction.confidence.item() == 1.0
     assert prediction.applicability.tolist() == [False]
     assert prediction.applicability_reason == ("low_confidence_fail_closed",)
+
+
+def test_runtime_confidence_tracks_the_emitted_thresholded_predicate() -> None:
+    observer = _observer(promoted=False, minimum_confidence=0.0)
+    observer.calibration = make_calibration(
+        event_spec_sha256=EVENT_SPEC_SHA,
+        independent_calibration_split_sha256=CALIBRATION_SPLIT_SHA,
+        predicate_thresholds=[0.8] * 5,
+        minimum_joint_confidence=0.0,
+    )
+    history, mask, proprio, receipts, image = _batch(observer)
+    with torch.no_grad():
+        observer.event_head.weight.zero_()
+        observer.event_head.bias.zero_()
+        observer.event_head.bias[0] = 20.0
+        observer.predicate_head.weight.zero_()
+        observer.predicate_head.bias.fill_(
+            float(torch.logit(torch.tensor(0.6)))
+        )
+    prediction = observer.observe(
+        history,
+        mask,
+        proprio,
+        actor_names=("piper",),
+        receipts=receipts,
+        image_features=image,
+    )
+    assert prediction.current_predicates.tolist() == [[0.0] * 5]
+    assert prediction.confidence.item() == pytest.approx(0.4, abs=1.0e-6)
 
 
 def test_promoted_observer_accepts_only_high_confidence_with_bound_optional_inputs() -> None:
