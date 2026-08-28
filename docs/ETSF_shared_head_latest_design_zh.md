@@ -651,7 +651,7 @@ Git commit `1f9e7d1e73cb249a67a958da8b258d6f61bcca2a` 的 r13 干净快照已部
 - causal observer 监督数据桥已完成：支持 Schema5/Source63 与 Schema6/Piper，按 logical reset group 划分 train/calibration/validation，导出 `[N,8,960]` 同分支因果历史、14-D proprio、当前 event/predicate 离线标签和上一已执行动作 SHA。object pose 只用于离线当前标签派生，不写入模型输入。
 - causal observer 训练器已完成：共享 GRU/core、逐 actor 低秩 adapter、actor-balanced loss、独立 group calibration、低置信拒绝、group bootstrap/Wilson 门与真实权重冻结。未过真实门或 synthetic 证据时不生成 production `authority_manifest.json`。
 - r12 Piper detached watcher 定向回归：39 项通过。
-- 最终全仓库 CPU 回归：1149 项全部通过；新 observer 数据/训练/runtime 联合定向回归为 36 项通过，Source63 请求冻结与自治 watcher 定向回归为 23 项通过。唯一 warning 是本机 PyTorch 的 CUDA driver 探测，不涉及远端 4090 训练。
+- 最终全仓库 CPU 回归：1150 项全部通过；新 observer 数据/训练/runtime 联合定向回归为 36 项通过，Source63 请求冻结与自治 watcher 定向回归为 23 项通过。唯一 warning 是本机 PyTorch 的 CUDA driver 探测，不涉及远端 4090 训练。
 
 这些是代码与合成协议验证，不是模型预测精度或任务成功率。
 
@@ -705,7 +705,7 @@ Git commit `1f9e7d1e73cb249a67a958da8b258d6f61bcca2a` 的 r13 干净快照已部
 | sealed result evaluator v3 | `68a3a95bc10fb98f4f23692eff90e8144bf2d0af98574807df9ce9264d3f7a31` |
 | evaluation400 v4 audit foundation | `e5841fa6086b8636e802b97e60618c427a24e2644e91e279721a0649166a8e10` |
 | actor-visible causal observer/runtime | `ef9f4bc4fe87e9a434c5c726a7485bac2fe41181f3f4e08d84d942e3aaa532a0` |
-| causal observer dataset materializer | `6bd767e6ca91e143596cc79d6d89fce7b4a2bc164f7807571c05c4c07f211a2e` |
+| causal observer dataset materializer | `044056173847ead875e85c57dc9355f2ca63034332f8aa80f3f5c685808d802f` |
 | causal observer trainer/freezer | `1211478322a9597eaf217202eead149da3d42a517da0cbd9a304a4706f9662d1` |
 | Source63 observer request freezer | `895f2dc7d72fd670e342b6727ad373cbc1297561d45644512c89eeec959ff3ca` |
 | Source63 observer autonomous watcher | `72f0be6f323c8d75d5a852e5e08855fdd5c4eb56aa5f844fa2f3b2f4d210457d` |

@@ -62,6 +62,58 @@ def _event_spec(path: Path) -> str:
     return bridge.file_sha256(path)
 
 
+def test_official_dual_goal_fields_use_exactly_one_nonempty_representation() -> None:
+    base = {
+        "moving": "can",
+        "offset": [0.0, 0.0, 0.0],
+        "delta_move": 0.02,
+        "delta_z": 0.05,
+        "tau_d": 0.06,
+        "tau_motion": 0.001,
+        "stationary_steps": 2,
+    }
+    centers = bridge._task_calibration(
+        {
+            "calibration": {
+                TASK: {
+                    **base,
+                    "anchor": "",
+                    "centers": [[0.1, 0.2, 0.3]],
+                }
+            }
+        },
+        TASK,
+    )
+    assert centers["anchor"] is None
+    assert centers["centers"] == [[0.1, 0.2, 0.3]]
+
+    anchor = bridge._task_calibration(
+        {
+            "calibration": {
+                TASK: {
+                    **base,
+                    "anchor": "pot",
+                    "centers": [],
+                }
+            }
+        },
+        TASK,
+    )
+    assert anchor["anchor"] == "pot"
+
+    for invalid in (
+        {"anchor": "", "centers": []},
+        {"anchor": "pot", "centers": [[0.1, 0.2, 0.3]]},
+    ):
+        with pytest.raises(
+            bridge.ObserverDatasetContractError,
+            match="exactly one goal representation",
+        ):
+            bridge._task_calibration(
+                {"calibration": {TASK: {**base, **invalid}}}, TASK
+            )
+
+
 def _poses(steps: int, *, near_goal: bool = False) -> np.ndarray:
     values = np.zeros((steps + 1, 2, 7), dtype=np.float64)
     values[..., 3] = 1.0

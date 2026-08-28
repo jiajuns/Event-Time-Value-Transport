@@ -655,7 +655,13 @@ def _task_calibration(event_spec: Mapping[str, Any], task: str) -> dict[str, Any
     }
     if not isinstance(calibration, Mapping) or not required.issubset(calibration):
         raise ObserverDatasetContractError("event calibration fields are incomplete")
-    if ("anchor" in calibration) == ("centers" in calibration):
+    anchor = calibration.get("anchor")
+    centers = calibration.get("centers")
+    anchor_active = isinstance(anchor, str) and bool(anchor)
+    centers_active = (
+        isinstance(centers, (list, tuple)) and len(centers) > 0
+    )
+    if anchor_active == centers_active:
         raise ObserverDatasetContractError(
             "event calibration must define exactly one goal representation"
         )
@@ -665,7 +671,14 @@ def _task_calibration(event_spec: Mapping[str, Any], task: str) -> dict[str, Any
             raise ObserverDatasetContractError("event calibration threshold is invalid")
     if not _strict_int(calibration["stationary_steps"], minimum=1):
         raise ObserverDatasetContractError("stationary_steps is invalid")
-    return dict(calibration)
+    normalized = dict(calibration)
+    if centers_active:
+        # The official event specification preserves both keys and uses an
+        # empty anchor string to select the non-empty centers representation.
+        # Normalize that external encoding to the internal Optional[str]
+        # contract consumed by label derivation.
+        normalized["anchor"] = None
+    return normalized
 
 
 def _derive_current_labels(
