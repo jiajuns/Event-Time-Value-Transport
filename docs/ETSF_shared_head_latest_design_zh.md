@@ -868,3 +868,83 @@ Schema6 r13 watcher 已正确等待 LOBO 终态，但在第一阶段 `materializ
 6. 最后仅在完全未见的 evaluation400 上报告任务成功率、harmful-rate、coverage 和六头预测指标。
 
 在第 5、6 步完成以前，项目可以声明“可训练、接口可插拔、已完成两种目标本体的 LOBO 诊断”，不能声明“已得到最优模型”或“已经稳定提高跨本体任务成功率”。
+
+## 19. 2026-08-29 r14e 权威终态更新
+
+本节覆盖第 18.4、18.6 节中的 Schema6 待执行状态。Source r13、LOBO r13 和跨本体结论边界没有变化：r14e 证明的是 Piper 开发采集链路已经可靠闭环，不是共享头已经提高了跨本体任务成功率。
+
+### 19.1 r14b–r14e 的失败闭环与最终修复
+
+所有失败根都已只读冻结，后续版本从未续跑或复用旧输出：
+
+| 版本 | 三阶段 return code | 终态与根因 | 可保留的证据 |
+|---|---|---|---|
+| r14b | `0/0/21` | materializer 对 SAPIEN 的 binary32 `1/250` 时间步做了错误的 Python binary64 精确比较 | 证明隔离 Python/import closure 已可运行；采集未完成 |
+| r14c | `0/0/21` | Schema6 runtime 以 5 个位置参数调用 Source-r13 的 4 参数 `derive_events` | 精确时间步合同通过；只执行 4 个环境步、无完成组 |
+| r14d | `0/0/-11` | 1 个组及 JSON 收据已经写入，但 SAPIEN/Vulkan/PyTorch 在解释器析构阶段触发 `SIGSEGV` | 只能证明崩溃前内部记录了 1 组、3 分支、12 环境步；真实进程 rc 为 `-11`，所以 watcher 正确拒绝成功，不能追认 |
+| r14e | `0/0/0` | 成功收据持久化后绕过不安全的第三方解释器 finalizer | 完整 one-seed Schema6 开发采集链路终态成功 |
+
+r14e 的 CLI 生命周期不是“把 `-11` 加入允许列表”，而是保留 watcher 对所有 signal return code 的拒绝，并修复成功结果的提交顺序：
+
+1. CUDA 工作同步完成；hook、scene step instrumentation、simulator、policy 和 CUDA cache 按顺序显式释放；
+2. HDF group 已由 collector 自身完成 schema validation，manifest/receipt 以原子替换写入；
+3. terminalizer 固定校验 `status ↔ exit code`、成功/无候选/failure 的 group 与 failure 语义，以及 runtime release 成功标志；
+4. 重新计算 group、manifest、receipt SHA，复核 receipt logical SHA，然后对文件、目录和 watcher 的 regular-file stdout 日志执行 `fsync`；
+5. 在 `run_authorized_collection` 栈仍持有 native 对象引用时执行 `os._exit(0/20)`，避免 CPython frame unwind 再触发第三方析构；任一校验、写出或 `fsync` 失败都不再 unwind，而是尽力记录诊断并直接 `os._exit(21)`；
+6. 合成测试证明：即使子进程先写了“成功收据”再收到 `SIGSEGV`，watcher 仍不调用 artifact validator，并以真实 `-11` fail-closed。
+
+对应实现提交为 `5d468c000bdafae46391130546f53ca9c06bf6c8`：
+
+| 组件 | SHA256 |
+|---|---|
+| r14e watcher | `b6bc378d850b220cfbe5388638c92862ed159a4eae17447e1f8bb8f0ae95da85` |
+| Schema6 collection launcher | `7d9300bdc1a08484b0d4c9311e51a4ca177d1fb38c002ff9328d4d7d9708e62d` |
+| reset-contract materializer | `03f05d5510bd40a7a71dd9e69db924c1aea50ea185ae2a84f60bde08f38dcf1b` |
+| clean Source-r13 event derivation implementation | `b8a20dcf15dea31d7708cf90c208b260d410eabd681499ab6101e6cb3cf8d491` |
+
+定向 watcher/collector 回归为 71 项全部通过，全仓库 CPU 回归为 **1304 项全部通过**。这些测试覆盖契约与失败语义，不是模型精度结果。
+
+### 19.2 r14e 在指定 4090 上的终态证据
+
+只读代码根为：
+
+```text
+/home/user/etsf_smolvla_piper_schema6_code_r14e_20260829
+```
+
+终态输出根为：
+
+```text
+/home/user/etsf_smolvla_piper_schema6_autonomous_r14e_20260829
+```
+
+静态预检在创建输出根以前完成，状态为 `static_preflight_complete_python_environment_verified_lobo_summary_not_read`，static plan SHA 为 `04d95911e8bc85b28ea73fbdcd5ca77240bff9eecf55d11c3a85f7a531599111`；预检记录 `hdf5_payloads_opened=0`、`test_or_label_payloads_opened=0`。脱离 watcher PID `2134823` 由服务器 init 接管，关闭本机不会影响运行。
+
+最终三个阶段真实 return code 均为 0，且每个进程和独立进程组均已回收：
+
+| 阶段 | PID | return code | 关键结果 |
+|---|---:|---:|---|
+| materialize reset-only registry | 2135022 | 0 | 0 environment step、0 HDF open、未读取轨迹/标签；精确接受 binary32 `1/250` 表示 |
+| freeze one-seed H=1 authority | 2135319 | 0 | seed `100101000`，root/continuation horizon 均为 1，max step 4 |
+| collect one-seed Schema6 | 2135432 | 0 | 1 个完成组、3 个合法候选分支、12 个 environment step |
+
+最终状态为 `complete_one_seed_schema6_collection_attempt`。final receipt 文件 SHA 为 `9e46df9834bf6050dafe6448e0955f46a1a4f7cc2c54458191065146419d3fda`，logical receipt SHA 为 `c0708510cc30a18158eed57b9bdced7b6d3ae54a3579ff5508c66696eb7023ed`；collection group SHA 由冻结收据声明为 `6386bea46a6635a5984513be1ee6f79bc0933b0fc875e778500dcd4f86c8aa49`。输出所有文件不可写、目录为 `0555`、无符号链接；GPU 锁已释放，指定 RTX 4090 D 回到 0% utilization、无 compute process。
+
+该运行的事件规范仍是 `move_can_pot: e0 → e12 → e3 → e4 → eK`，其中 `e1/e2` 合并为 `e12`。本次审计没有打开生成的 HDF，只依据 launcher 已写的 schema validation/hash 收据和静态文件元数据确认完成组。因此可以声称“Schema6 事件数据采集与证据链已经可执行”，不能据此声称逐行预测准确、跨本体迁移改善或任务成功率提高。
+
+### 19.3 dense260 v2 与下一训练门
+
+dense260 已升级到 create-once 的 v2 离线授权协议：它绑定 public issuer/role/source-lineage registry、精确六角色、OpenSSH Ed25519 SSHSIG detached verification、reset identity v2、400-row candidate/source authority，以及六签名后的 `100/80/80` 冻结；每组仍为 8 个候选、`action_exec_steps=5`、最长 200 step。v1+v2 定向测试共 29 项通过。
+
+但当前没有真实 issuer registry、六角色来源身份和六份签名，也没有被授权的 dense400 reset-only candidate 集。因此 dense260 仍未采集，不能把协议规模当作监督数据量。最短的下一步仍是：在不触碰 Formal/evaluation 身份的前提下完成可信 Source 开发数据授权与采集，先检验 `e3/e4/recovery` 的独立组支持；支持不足时继续补数据，而不是提前启动一个必然欠支持的共享头训练。
+
+### 19.4 当前能力结论
+
+- **可插拔接口**：已实现，actor 只需提供合法候选和 actor-visible root state；selector 不改 actor 参数。
+- **事件建模链路**：Source 与 Piper Schema6 均可运行；r14e 首次给出了 Piper one-seed 全链路 rc=0 的可信证据。
+- **跨本体可运行**：LOBO Piper/UR5 已证明接口可运行并输出可比较指标。
+- **跨本体普遍改善**：尚未证明；r13 LOBO 的收益混合且 UR5 支持很小。
+- **准确预测**：只有若干局部 Source/LOBO 指标，尚未通过充足独立组、逐头门和目标本体校准。
+- **提高任务成功率**：尚未证明；必须完成 Piper development、Formal190 paired LCB 与完全未见 evaluation400。
+
+因此最新模型设计与工程链路已经更完整，但“最优、可迁移、稳定改善”的最终目标仍处于证据建设阶段，不能因 r14e smoke 成功而提前宣告完成。
