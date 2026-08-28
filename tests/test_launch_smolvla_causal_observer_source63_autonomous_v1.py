@@ -302,9 +302,12 @@ def test_static_plan_binds_recursive_code_inputs_and_freezer_cli() -> None:
         assert plan["source_inputs"]["schema5_manifest"]["file_sha256"] == (
             launcher.file_sha256(manifest)
         )
+        launcher.initialize_output(plan)
         commands = launcher.build_stage_commands(plan)
         request = commands["request"]
-        assert request[:3] == [str(Path(sys.executable).resolve()), "-I", str(scripts / launcher.FREEZER)]
+        assert request[:3] == [str(Path(sys.executable).resolve()), "-I", "-c"]
+        assert request[3] == launcher.ISOLATED_RUNPY_BOOTSTRAP
+        assert request[6] == str(scripts / launcher.FREEZER)
         for flag in (
             "--schema5-manifest-sha256",
             "--frozen-split-sha256",
@@ -333,13 +336,77 @@ def test_cuda_environment_exposes_only_exact_uuid_and_scrubs_inheritance() -> No
     assert "CONDA_PREFIX" not in environment
 
 
+def test_real_isolated_subprocess_validates_closure_then_imports_sibling(
+    tmp_path: Path,
+) -> None:
+    code_root = tmp_path / "code"
+    scripts = code_root / "scripts"
+    scripts.mkdir(parents=True)
+    sibling = scripts / "sibling_dependency.py"
+    target = scripts / "target.py"
+    sibling.write_text("VALUE = 'sibling-import-ok'\n", encoding="utf-8")
+    target.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from sibling_dependency import VALUE\n"
+        "Path(sys.argv[1]).write_text(VALUE, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "isolated_output"
+    output.mkdir()
+    plan = _minimal_plan(output)
+    plan_base = dict(plan)
+    plan_base.pop("static_plan_sha256")
+    plan_base["code_closure"] = launcher.recursive_code_closure(code_root)
+    plan_base["entrypoints"] = {
+        target.name: {
+            "path": str(target.resolve()),
+            "file_sha256": launcher.file_sha256(target),
+        }
+    }
+    plan_base["python"] = {
+        "path": str(Path(sys.executable).resolve()),
+        "file_sha256": launcher.file_sha256(Path(sys.executable).resolve()),
+    }
+    plan = _signed(plan_base, "static_plan_sha256")
+    _write_json(output / "static_plan.json", plan)
+    result_path = tmp_path / "sibling_result.txt"
+    command = [*launcher.isolated_runpy_prefix(plan, target.name), str(result_path)]
+    completed = launcher.subprocess.run(
+        command,
+        env=launcher.cpu_stage_environment(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert result_path.read_text(encoding="utf-8") == "sibling-import-ok"
+
+    # The command was already frozen.  Mutating a sibling must now fail in the
+    # bootstrap before sys.path insertion/runpy execution.
+    result_path.unlink()
+    sibling.write_text("VALUE = 'tampered'\n", encoding="utf-8")
+    rejected = launcher.subprocess.run(
+        command,
+        env=launcher.cpu_stage_environment(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rejected.returncode != 0
+    assert "recursive code closure changed" in rejected.stderr
+    assert not result_path.exists()
+
+
 def _mock_stage_runner(plan: dict[str, Any], fail_training: bool = False):
     output = Path(plan["output"])
 
     def run(command: list[str], *, environment: dict[str, str], log_path: Path) -> dict[str, Any]:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("mock CPU subprocess\n", encoding="utf-8")
-        script = Path(command[2]).name
+        assert command[2] == "-c"
+        assert command[3] == launcher.ISOLATED_RUNPY_BOOTSTRAP
+        script = Path(command[6]).name
         if script == launcher.FREEZER:
             request_path = Path(command[command.index("--output") + 1])
             logical = {
@@ -435,6 +502,19 @@ def _idle_audit() -> dict[str, Any]:
 def test_cpu_mock_pipeline_monitor_only_is_honest_terminal_and_recoverable_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(
+        launcher,
+        "isolated_runpy_prefix",
+        lambda plan, name: [
+            str(plan["python"]["path"]),
+            "-I",
+            "-c",
+            launcher.ISOLATED_RUNPY_BOOTSTRAP,
+            str(Path(plan["output"]) / "static_plan.json"),
+            str(plan["static_plan_sha256"]),
+            str(plan["entrypoints"][name]["path"]),
+        ],
+    )
     first = tmp_path / "source63_run"
     plan = _minimal_plan(first)
     launcher.initialize_output(plan)

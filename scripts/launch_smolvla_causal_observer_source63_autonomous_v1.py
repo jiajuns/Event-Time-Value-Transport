@@ -99,6 +99,113 @@ SCRUBBED_ENV = frozenset(
     }
 )
 
+# This bootstrap intentionally uses only the Python standard library.  Under
+# ``python -I -c`` no repository directory is importable.  It first verifies
+# the signed static plan, reconstructs and authenticates the complete recursive
+# code closure, and proves that the requested target is the frozen entrypoint.
+# Only after all of those checks pass is the target's sibling directory added
+# to ``sys.path`` for the duration of ``runpy.run_path``.
+ISOLATED_RUNPY_BOOTSTRAP = r'''
+import hashlib
+import json
+import pathlib
+import runpy
+import stat
+import sys
+
+def canonical_sha256(value):
+    raw = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+if len(sys.argv) < 4:
+    raise SystemExit("isolated runpy bootstrap arguments are incomplete")
+plan_path = pathlib.Path(sys.argv[1])
+expected_plan_sha256 = sys.argv[2]
+requested_target = pathlib.Path(sys.argv[3])
+if plan_path.is_symlink() or not plan_path.is_file():
+    raise SystemExit("isolated runpy static plan is not a regular file")
+try:
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit("isolated runpy static plan is unreadable") from error
+if not isinstance(plan, dict):
+    raise SystemExit("isolated runpy static plan is not an object")
+logical_plan = dict(plan)
+claimed_plan_sha256 = logical_plan.pop("static_plan_sha256", None)
+if (
+    not isinstance(claimed_plan_sha256, str)
+    or claimed_plan_sha256 != expected_plan_sha256
+    or canonical_sha256(logical_plan) != claimed_plan_sha256
+):
+    raise SystemExit("isolated runpy static plan content address changed")
+closure = plan.get("code_closure")
+if not isinstance(closure, dict):
+    raise SystemExit("isolated runpy code closure is missing")
+try:
+    root = pathlib.Path(closure["root"]).resolve(strict=True)
+except (KeyError, OSError) as error:
+    raise SystemExit("isolated runpy code root is unavailable") from error
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit("isolated runpy code root is invalid")
+ignored = {".git", "__pycache__", ".pytest_cache"}
+observed_files = []
+for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+    relative = path.relative_to(root)
+    if any(part in ignored for part in relative.parts):
+        continue
+    if path.is_symlink():
+        raise SystemExit("isolated runpy code closure contains a symlink")
+    if path.is_dir():
+        continue
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("isolated runpy code closure contains a non-regular file")
+    observed_files.append(
+        {
+            "relative_path": relative.as_posix(),
+            "size_bytes": metadata.st_size,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "file_sha256": file_sha256(path),
+        }
+    )
+inventory = {"root": str(root), "files": observed_files}
+if (
+    closure.get("files") != observed_files
+    or closure.get("file_count") != len(observed_files)
+    or closure.get("closure_sha256") != canonical_sha256(inventory)
+):
+    raise SystemExit("isolated runpy recursive code closure changed")
+try:
+    target = requested_target.resolve(strict=True)
+except OSError as error:
+    raise SystemExit("isolated runpy target is unavailable") from error
+if target.is_symlink() or not target.is_file() or target.parent != root / "scripts":
+    raise SystemExit("isolated runpy target is outside the frozen scripts root")
+entrypoint = plan.get("entrypoints", {}).get(target.name)
+if (
+    not isinstance(entrypoint, dict)
+    or entrypoint.get("path") != str(target)
+    or entrypoint.get("file_sha256") != file_sha256(target)
+):
+    raise SystemExit("isolated runpy target entrypoint binding changed")
+sys.path.insert(0, str(target.parent))
+sys.argv = [str(target), *sys.argv[4:]]
+runpy.run_path(str(target), run_name="__main__")
+'''.strip()
+
 
 class LauncherContractError(RuntimeError):
     """An immutable plan, process, GPU, path, or terminal contract failed."""
@@ -729,9 +836,34 @@ def load_frozen_plan(output: Path, expected_sha: str | None = None) -> dict[str,
     return plan
 
 
+def isolated_runpy_prefix(plan: Mapping[str, Any], entrypoint_name: str) -> list[str]:
+    entrypoint = plan.get("entrypoints", {}).get(entrypoint_name)
+    if (
+        not isinstance(entrypoint, Mapping)
+        or not isinstance(entrypoint.get("path"), str)
+        or not is_sha256(entrypoint.get("file_sha256"))
+    ):
+        raise LauncherContractError("isolated stage entrypoint is not frozen")
+    target = Path(str(entrypoint["path"])).resolve(strict=True)
+    code_root = Path(str(plan["code_closure"]["root"])).resolve(strict=True)
+    if target.parent != code_root / "scripts" or file_sha256(target) != entrypoint["file_sha256"]:
+        raise LauncherContractError("isolated stage entrypoint binding changed")
+    static_plan_path = Path(str(plan["output"])) / "static_plan.json"
+    frozen_plan = _load_json(static_plan_path, "isolated stage static plan")
+    if frozen_plan != dict(plan):
+        raise LauncherContractError("isolated stage static plan file changed")
+    return [
+        str(plan["python"]["path"]),
+        "-I",
+        "-c",
+        ISOLATED_RUNPY_BOOTSTRAP,
+        str(static_plan_path),
+        str(plan["static_plan_sha256"]),
+        str(target),
+    ]
+
+
 def build_stage_commands(plan: Mapping[str, Any], attempt_output: Path | None = None) -> dict[str, list[str]]:
-    python = str(plan["python"]["path"])
-    entries = plan["entrypoints"]
     sources = plan["source_inputs"]
     identity = plan["source_identity"]
     output = Path(str(plan["output"]))
@@ -739,7 +871,7 @@ def build_stage_commands(plan: Mapping[str, Any], attempt_output: Path | None = 
     dataset_output = attempt_output or output / "dataset"
     training_output = attempt_output or output / "training"
     freezer = [
-        python, "-I", entries[FREEZER]["path"],
+        *isolated_runpy_prefix(plan, FREEZER),
         "--schema5-manifest", sources["schema5_manifest"]["path"],
         "--schema5-manifest-sha256", sources["schema5_manifest"]["file_sha256"],
         "--frozen-split", sources["frozen_split"]["path"],
@@ -758,12 +890,12 @@ def build_stage_commands(plan: Mapping[str, Any], attempt_output: Path | None = 
     return {
         "request": freezer,
         "dataset": [
-            python, "-I", entries[MATERIALIZER]["path"],
+            *isolated_runpy_prefix(plan, MATERIALIZER),
             "--request", str(request_path),
             "--output-directory", str(dataset_output),
         ],
         "training": [
-            python, "-I", entries[TRAINER]["path"],
+            *isolated_runpy_prefix(plan, TRAINER),
             "--dataset-manifest", str(output / "dataset" / "manifest.json"),
             "--output", str(training_output),
             "--hidden-dim", str(training["hidden_dim"]),
