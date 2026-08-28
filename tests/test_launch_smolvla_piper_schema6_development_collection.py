@@ -25,6 +25,7 @@ from launch_smolvla_piper_schema6_development_collection import (  # noqa: E402
     EXIT_SUCCESS,
     DecisionTelemetryClock,
     LauncherContractError,
+    RoboTwinCollectionRuntime,
     _write_manifest_and_receipt,
 )
 from materialize_smolvla_piper_schema6_reset_contract import build_pose_quality_spec  # noqa: E402
@@ -73,6 +74,23 @@ def _event_spec() -> dict[str, object]:
 
 def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_runtime_calls_the_pinned_four_argument_event_api() -> None:
+    calls = []
+
+    def derive(poses, names, success, event_spec):
+        calls.append((poses, names, success, event_spec))
+        return ["e0"], [0], ["e0"], [0]
+
+    runtime = object.__new__(RoboTwinCollectionRuntime)
+    runtime.derive_events_fn = derive
+    poses = object()
+    names = ["can", "pot"]
+    event_spec = _event_spec()
+    result = runtime.derive_events(poses, names, False, event_spec)
+    assert result == (["e0"], [0], ["e0"], [0])
+    assert calls == [(poses, names, False, event_spec)]
 
 
 def test_signed_seed_projection_contains_only_hash_commitments() -> None:

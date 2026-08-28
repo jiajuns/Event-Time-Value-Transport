@@ -133,15 +133,16 @@ R14_AUDITED_ENVIRONMENT_NAMES = (
     "VK_ICD_FILENAMES",
 )
 R14_CODE_ROOT = _R14Path(
-    "/home/user/etsf_smolvla_piper_schema6_code_r14c_20260829"
+    "/home/user/etsf_smolvla_piper_schema6_code_r14d_20260829"
 )
 R14_FORBIDDEN_PRIOR_CODE_ROOTS = (
     _R14Path("/home/user/etsf_smolvla_piper_schema6_code_r6j_20260828"),
     _R14Path("/home/user/etsf_smolvla_piper_schema6_code_r14_20260829"),
     _R14Path("/home/user/etsf_smolvla_piper_schema6_code_r14b_20260829"),
+    _R14Path("/home/user/etsf_smolvla_piper_schema6_code_r14c_20260829"),
 )
 R14_SCHEMA6_OUTPUT_ROOT = _R14Path(
-    "/home/user/etsf_smolvla_piper_schema6_autonomous_r14c_20260829"
+    "/home/user/etsf_smolvla_piper_schema6_autonomous_r14d_20260829"
 )
 R14_FORBIDDEN_PRIOR_SCHEMA6_OUTPUT_ROOTS = (
     _R14Path(
@@ -153,9 +154,15 @@ R14_FORBIDDEN_PRIOR_SCHEMA6_OUTPUT_ROOTS = (
     _R14Path(
         "/home/user/etsf_smolvla_piper_schema6_autonomous_r14b_20260829"
     ),
+    _R14Path(
+        "/home/user/etsf_smolvla_piper_schema6_autonomous_r14c_20260829"
+    ),
 )
 R14_DEFAULT_PYTHON_PROBE_TIMEOUT_SECONDS = 120.0
 R14_REQUIRED_IMPLEMENTATION_SHA256 = {
+    "scripts/launch_smolvla_piper_schema6_development_collection.py": (
+        "6903fb0d44c49878bfb56c05c463a264640cf8c12f000cb7f068a5cba8037c4e"
+    ),
     "scripts/materialize_smolvla_piper_schema6_reset_contract.py": (
         "03f05d5510bd40a7a71dd9e69db924c1aea50ea185ae2a84f60bde08f38dcf1b"
     ),

@@ -304,7 +304,10 @@ class RoboTwinCollectionRuntime:
         }
 
     def derive_events(self, poses, names, success, event_spec):
-        return self.derive_events_fn(poses, names, success, event_spec, TASK)
+        # This launcher binds the clean Source-r13 collector whose audited
+        # derive_events API is exactly four positional arguments and whose
+        # task is the module-level move_can_pot contract.
+        return self.derive_events_fn(poses, names, success, event_spec)
 
     def mapping(self) -> dict[str, Callable[..., Any]]:
         return {
