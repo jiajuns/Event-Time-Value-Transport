@@ -74,6 +74,7 @@ SENSITIVE_PATH_TOKENS = ("fresh", "confirmation")
 SHA256_CHARS = frozenset("0123456789abcdef")
 ENTRYPOINTS = (
     "launch_smolvla_schema5_source63_native_training.py",
+    "etsf_torch_weights_only_compat_v1.py",
     "run_etsf_bound_python_stage.py",
     "initialize_smolvla_schema5_native_event_core.py",
     "train_openvla_etsf_counterfactual.py",
@@ -2182,6 +2183,7 @@ def validate_initialized_output(path: Path) -> dict[str, Any]:
 def validate_training_output(
     path: Path, *, expected_pretrained_sha256: str
 ) -> dict[str, Any]:
+    from etsf_torch_weights_only_compat_v1 import load_numpy_weights_only
     from openvla_etsf_event_world_model import EventWorldModelConfig
     from train_openvla_etsf_counterfactual import (
         validate_reserved_rows_source_only_proof,
@@ -2203,12 +2205,6 @@ def validate_training_output(
         != "sealed_identity_attrs_and_sha256_only_label_datasets_not_opened"
     ):
         raise RuntimeError("counterfactual ensemble output is incomplete")
-    numpy_globals = [
-        __import__("numpy").core.multiarray._reconstruct,
-        __import__("numpy").ndarray,
-        __import__("numpy").dtype,
-        type(__import__("numpy").dtype(__import__("numpy").float32)),
-    ]
     proofs: list[dict[str, Any]] = []
     bridge_contract_shas: list[str] = []
     training_log_sha256: list[str] = []
@@ -2220,10 +2216,7 @@ def validate_training_output(
             raise RuntimeError("counterfactual member escaped training output")
         if file_sha256(member_path) != member.get("sha256"):
             raise RuntimeError("counterfactual member SHA changed")
-        import torch
-
-        with torch.serialization.safe_globals(numpy_globals):
-            checkpoint = torch.load(member_path, map_location="cpu", weights_only=True)
+        checkpoint = load_numpy_weights_only(member_path)
         if not isinstance(checkpoint, Mapping) or checkpoint.get("seed") != seed:
             raise RuntimeError("counterfactual member checkpoint is invalid")
         config = EventWorldModelConfig.from_dict(checkpoint["config"])
@@ -2270,12 +2263,7 @@ def validate_training_output(
         ensemble_path
     ) != ensemble_record.get("sha256"):
         raise RuntimeError("ensemble checkpoint provenance changed")
-    import torch
-
-    with torch.serialization.safe_globals(numpy_globals):
-        ensemble_checkpoint = torch.load(
-            ensemble_path, map_location="cpu", weights_only=True
-        )
+    ensemble_checkpoint = load_numpy_weights_only(ensemble_path)
     ensemble_bridge = validate_checkpoint_policy_bridge_header(
         ensemble_checkpoint.get("config", {}),
         ensemble_checkpoint.get("contract", {}),
