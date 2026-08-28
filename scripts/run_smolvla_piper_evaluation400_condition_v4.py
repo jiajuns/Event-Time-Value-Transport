@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Dependency-injected evaluation400 v4 condition runner integration.
 
-The module has no simulator launcher and performs no filesystem or target-data
-I/O.  It consumes the exact sealed-audit v1 contracts and delegates reset,
-query, step, recovery inference, and in-memory target trace construction to a
-caller-supplied backend.
+The module has no simulator launcher or target-data I/O.  Its authority entry
+point realizes one frozen observer directory before execution; condition
+execution then delegates reset, actor-visible query inputs, step, recovery
+inference, and in-memory target trace construction to a caller-supplied backend.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import numpy as np
 
 import smolvla_piper_evaluation400_audit_contract_v1 as audit
+import smolvla_piper_causal_event_observer_v1 as causal_observer
 
 
 CONDITION_NAMES = (
@@ -104,59 +105,60 @@ def _verify(
 
 
 def build_causal_observer_authority(
-    *, observer_core_file_sha256: str, observer_checkpoint_file_sha256: str,
-    training_contract_sha256: str, actor_adapter_set_sha256: str,
-    actor_adapter_checkpoint_set_sha256: str, calibration_sha256: str,
-    deployment_sha256: str, promotion_evidence_sha256: str,
-) -> dict[str, Any]:
-    values = {
-        "observer_core_file_sha256": observer_core_file_sha256,
-        "observer_checkpoint_file_sha256": observer_checkpoint_file_sha256,
-        "training_contract_sha256": training_contract_sha256,
-        "actor_adapter_set_sha256": actor_adapter_set_sha256,
-        "actor_adapter_checkpoint_set_sha256": actor_adapter_checkpoint_set_sha256,
-        "calibration_sha256": calibration_sha256,
-        "deployment_sha256": deployment_sha256,
-        "promotion_evidence_sha256": promotion_evidence_sha256,
-    }
-    for name, value in values.items():
-        _require_sha(value, f"causal observer {name}")
-    base = {
-        "format": OBSERVER_AUTHORITY_FORMAT,
-        "status": "frozen_promoted_actor_visible_observer_rerank_authorized",
-        **values,
-        "promotion_enabled": True,
-        "rerank_enabled": True,
-        "object_poses_allowed_online": False,
-        "simulator_predicate_reconstruction_allowed": False,
-        "hardcoded_event_fallback_allowed": False,
-    }
-    return _signed(base, "authority_sha256")
+    *, frozen_artifact_root: str,
+) -> causal_observer.FrozenCausalObserverRuntimeV1:
+    """Realize authority from files; raw caller-supplied digest labels are forbidden."""
+
+    try:
+        return causal_observer.load_frozen_causal_observer_runtime(
+            frozen_artifact_root
+        )
+    except causal_observer.CausalObserverContractError as error:
+        raise ConditionRunnerV4Error("causal observer artifact realization failed") from error
 
 
-def validate_causal_observer_authority(value: Mapping[str, Any]) -> str:
+def validate_causal_observer_authority(
+    value: causal_observer.FrozenCausalObserverRuntimeV1,
+) -> str:
+    if not isinstance(value, causal_observer.FrozenCausalObserverRuntimeV1):
+        raise ConditionRunnerV4Error(
+            "causal observer authority must be a realized frozen runtime"
+        )
+    try:
+        value.validate_frozen_realization()
+    except causal_observer.CausalObserverContractError as error:
+        raise ConditionRunnerV4Error(
+            "causal observer frozen realization changed"
+        ) from error
+    authority = value.authority
     fields = {
         "format", "status", "observer_core_file_sha256",
         "observer_checkpoint_file_sha256", "training_contract_sha256",
         "actor_adapter_set_sha256", "actor_adapter_checkpoint_set_sha256",
         "calibration_sha256", "deployment_sha256", "promotion_evidence_sha256",
+        "frozen_authority_manifest_file_sha256",
         "promotion_enabled", "rerank_enabled", "object_poses_allowed_online",
         "simulator_predicate_reconstruction_allowed",
         "hardcoded_event_fallback_allowed",
     }
     logical = _verify(
-        value, field="authority_sha256", fields=fields,
+        authority, field="authority_sha256", fields=fields,
         role="causal observer authority",
     )
     if (
-        value.get("format") != OBSERVER_AUTHORITY_FORMAT
-        or value.get("status")
+        authority.get("format") != OBSERVER_AUTHORITY_FORMAT
+        or authority.get("status")
         != "frozen_promoted_actor_visible_observer_rerank_authorized"
-        or value.get("promotion_enabled") is not True
-        or value.get("rerank_enabled") is not True
-        or value.get("object_poses_allowed_online") is not False
-        or value.get("simulator_predicate_reconstruction_allowed") is not False
-        or value.get("hardcoded_event_fallback_allowed") is not False
+        or authority.get("promotion_enabled") is not True
+        or authority.get("rerank_enabled") is not True
+        or authority.get("object_poses_allowed_online") is not False
+        or authority.get("simulator_predicate_reconstruction_allowed") is not False
+        or authority.get("hardcoded_event_fallback_allowed") is not False
+        or value.model.deployment.get("integration_target")
+        != causal_observer.EVALUATION400_V4_TARGET
+        or value.model.deployment.get("rerank_enabled") is not True
+        or value.model.training
+        or any(parameter.requires_grad for parameter in value.model.parameters())
     ):
         raise ConditionRunnerV4Error("causal observer is not production-rerank authorized")
     for name in fields - {
@@ -164,30 +166,44 @@ def validate_causal_observer_authority(value: Mapping[str, Any]) -> str:
         "object_poses_allowed_online", "simulator_predicate_reconstruction_allowed",
         "hardcoded_event_fallback_allowed",
     }:
-        _require_sha(value.get(name), f"causal observer {name}")
+        _require_sha(authority.get(name), f"causal observer {name}")
     return logical
 
 
 def build_causal_observer_receipt(
-    *, authority_sha256: str, pair_id: str, condition_id: str,
-    step_index: int, input_receipt_sha256: str, current_event_id: int,
-    current_predicates: Mapping[str, bool], confidence: float,
+    *, runtime: causal_observer.FrozenCausalObserverRuntimeV1,
+    pair_id: str, condition_id: str, step_index: int,
+    observation: causal_observer.VerifiedCausalObservation,
 ) -> dict[str, Any]:
+    authority_sha256 = validate_causal_observer_authority(runtime)
     _require_sha(authority_sha256, "observer authority")
     _require_sha(pair_id, "observer pair")
-    _require_sha(input_receipt_sha256, "observer input receipt")
+    if not isinstance(observation, causal_observer.VerifiedCausalObservation):
+        raise ConditionRunnerV4Error("observer output was not produced by frozen runtime")
+    _require_sha(observation.input_receipt_sha256, "observer input receipt")
+    _require_sha(observation.prediction_sha256, "observer prediction")
+    _require_sha(observation.calibration_sha256, "observer calibration")
     _require_int(step_index, "observer step")
-    _require_int(current_event_id, "observer current event")
-    if current_event_id >= 5:
+    _require_int(observation.current_event_id, "observer current event")
+    if observation.current_event_id >= 5:
         raise ConditionRunnerV4Error("observer event escaped canonical vocabulary")
-    predicates = dict(current_predicates)
+    predicates = dict(observation.current_predicates)
     if set(predicates) != set(PREDICATE_NAMES) or any(
         type(value) is not bool for value in predicates.values()
     ):
         raise ConditionRunnerV4Error("observer predicates changed")
-    confidence_value = _require_float(confidence, "observer confidence")
-    if not 0.0 <= confidence_value <= 1.0:
-        raise ConditionRunnerV4Error("observer confidence escaped [0,1]")
+    confidence_value = _require_float(observation.confidence, "observer confidence")
+    minimum_confidence = _require_float(
+        observation.minimum_joint_confidence, "observer minimum confidence"
+    )
+    if (
+        not 0.0 <= confidence_value <= 1.0
+        or not 0.0 <= minimum_confidence <= 1.0
+        or confidence_value < minimum_confidence
+        or observation.calibration_sha256
+        != runtime.authority["calibration_sha256"]
+    ):
+        raise ConditionRunnerV4Error("observer confidence/calibration failed closed")
     base = {
         "format": OBSERVER_RECEIPT_FORMAT,
         "status": "actor_visible_promoted_observation_applicable",
@@ -195,8 +211,11 @@ def build_causal_observer_receipt(
         "pair_id": pair_id,
         "condition_id": condition_id,
         "step_index": step_index,
-        "input_receipt_sha256": input_receipt_sha256,
-        "current_event_id": current_event_id,
+        "input_receipt_sha256": observation.input_receipt_sha256,
+        "prediction_sha256": observation.prediction_sha256,
+        "calibration_sha256": observation.calibration_sha256,
+        "minimum_joint_confidence": minimum_confidence,
+        "current_event_id": observation.current_event_id,
         "current_predicates": predicates,
         "confidence": confidence_value,
         "applicable": True,
@@ -208,12 +227,15 @@ def build_causal_observer_receipt(
 
 
 def validate_causal_observer_receipt(
-    value: Mapping[str, Any], *, authority_sha256: str, pair_id: str,
+    value: Mapping[str, Any], *,
+    runtime: causal_observer.FrozenCausalObserverRuntimeV1, pair_id: str,
     condition_id: str, step_index: int,
 ) -> tuple[int, dict[str, bool]]:
+    authority_sha256 = validate_causal_observer_authority(runtime)
     fields = {
         "format", "status", "authority_sha256", "pair_id", "condition_id",
-        "step_index", "input_receipt_sha256", "current_event_id",
+        "step_index", "input_receipt_sha256", "prediction_sha256",
+        "calibration_sha256", "minimum_joint_confidence", "current_event_id",
         "current_predicates", "confidence", "applicable",
         "object_pose_fields_present", "simulator_privileged_state_read",
         "hardcoded_event_fallback_used",
@@ -233,6 +255,9 @@ def validate_causal_observer_receipt(
     ):
         raise ConditionRunnerV4Error("observer receipt provenance/applicability changed")
     _require_sha(value.get("input_receipt_sha256"), "observer input receipt")
+    _require_sha(value.get("prediction_sha256"), "observer prediction")
+    if value.get("calibration_sha256") != runtime.authority["calibration_sha256"]:
+        raise ConditionRunnerV4Error("observer receipt calibration changed")
     event = _require_int(value.get("current_event_id"), "observer current event")
     if event >= 5:
         raise ConditionRunnerV4Error("observer event escaped canonical vocabulary")
@@ -242,8 +267,17 @@ def validate_causal_observer_receipt(
     ):
         raise ConditionRunnerV4Error("observer predicates changed")
     confidence = _require_float(value.get("confidence"), "observer confidence")
-    if not 0.0 <= confidence <= 1.0:
-        raise ConditionRunnerV4Error("observer confidence escaped [0,1]")
+    minimum = _require_float(
+        value.get("minimum_joint_confidence"), "observer minimum confidence"
+    )
+    if (
+        not 0.0 <= confidence <= 1.0
+        or not 0.0 <= minimum <= 1.0
+        or confidence < minimum
+        or minimum
+        != float(runtime.model.calibration["minimum_joint_confidence"])
+    ):
+        raise ConditionRunnerV4Error("observer receipt low confidence accepted")
     return event, dict(predicates)
 
 
@@ -608,7 +642,7 @@ def _validate_query(
     expected = {
         "ordered_candidate_sha256", "candidate_legal",
         "lowest_legal_original_candidate_index", "mapped_actions",
-        "pre_action_snapshot_sha256", "causal_observer_receipt",
+        "pre_action_snapshot_sha256", "actor_visible_observer_inputs",
     }
     if not isinstance(query, Mapping) or set(query) != expected:
         raise ConditionRunnerV4Error("backend query fields changed")
@@ -630,8 +664,13 @@ def _validate_query(
     if fallback != legal.index(True):
         raise ConditionRunnerV4Error("backend fallback is not lowest legal")
     _require_sha(query["pre_action_snapshot_sha256"], "pre-action snapshot")
-    if not isinstance(query["causal_observer_receipt"], Mapping):
-        raise ConditionRunnerV4Error("backend observer receipt is missing")
+    observer_inputs = query["actor_visible_observer_inputs"]
+    if (
+        not isinstance(observer_inputs, Mapping)
+        or set(observer_inputs)
+        != {"actor_name", "current_hidden", "current_proprio", "image_feature"}
+    ):
+        raise ConditionRunnerV4Error("backend actor-visible observer inputs changed")
     actions = query["mapped_actions"]
     if not isinstance(actions, list) or len(actions) != len(ordered):
         raise ConditionRunnerV4Error("backend mapped action registry changed")
@@ -647,7 +686,7 @@ def execute_condition_v4(
     dense_event_targets_fn: Callable[..., Mapping[str, Any]],
     recovery_targets_fn: Callable[..., Mapping[str, Any]],
     object_target_fn: Callable[..., Mapping[str, Any]],
-    causal_observer_authority: Mapping[str, Any],
+    causal_observer_runtime: causal_observer.FrozenCausalObserverRuntimeV1,
 ) -> dict[str, Any]:
     request_sha = validate_condition_request(request)
     root_sha = audit.validate_root_precommit(root_precommit)
@@ -656,7 +695,7 @@ def execute_condition_v4(
         decision_input, root_precommit=root_precommit
     )
     observer_authority_sha = validate_causal_observer_authority(
-        causal_observer_authority
+        causal_observer_runtime
     )
     if (
         request["root_prediction_commit_sha256"] != root_sha
@@ -672,6 +711,15 @@ def execute_condition_v4(
         raise ConditionRunnerV4Error("request/root precommit/ACK identity changed")
     if type(backend.max_steps) is not int or backend.max_steps != MAX_EPISODE_STEPS:
         raise ConditionRunnerV4Error("backend is not the exact 200-step runtime")
+    try:
+        causal_observer_runtime.start_condition(
+            pair_id=str(request["pair_id"]),
+            condition_id=str(request["condition_id"]),
+        )
+    except causal_observer.CausalObserverContractError as error:
+        raise ConditionRunnerV4Error(
+            "causal observer failed before backend reset"
+        ) from error
     observation, identity = backend.reset(str(request["pair_id"]))
     if identity != {
         "pair_id": request["pair_id"],
@@ -702,13 +750,35 @@ def execute_condition_v4(
     steps: list[dict[str, Any]] = []
     query = root_query
     historical_peak_event_id = 0
+    previous_action_sha256: str | None = None
+    executed_control_steps: int | None = None
     for step_index in range(MAX_EPISODE_STEPS):
         current_ordered, current_legal, current_fallback = _validate_query(
             query, expected_step_index=step_index
         )
+        try:
+            verified_observation = causal_observer_runtime.observe_actor_visible_query(
+                query["actor_visible_observer_inputs"],
+                pair_id=str(request["pair_id"]),
+                condition_id=str(request["condition_id"]),
+                step_index=step_index,
+                previous_action_sha256=previous_action_sha256,
+                executed_control_steps=executed_control_steps,
+            )
+        except causal_observer.CausalObserverContractError as error:
+            raise ConditionRunnerV4Error(
+                "causal observer rejected actor-visible query before action"
+            ) from error
+        observer_receipt = build_causal_observer_receipt(
+            runtime=causal_observer_runtime,
+            pair_id=str(request["pair_id"]),
+            condition_id=str(request["condition_id"]),
+            step_index=step_index,
+            observation=verified_observation,
+        )
         observed_event_id, _observed_predicates = validate_causal_observer_receipt(
-            query["causal_observer_receipt"],
-            authority_sha256=observer_authority_sha,
+            observer_receipt,
+            runtime=causal_observer_runtime,
             pair_id=str(request["pair_id"]),
             condition_id=str(request["condition_id"]),
             step_index=step_index,
@@ -790,16 +860,21 @@ def execute_condition_v4(
             type(terminated) is not bool
             or type(truncated) is not bool
             or not isinstance(info, Mapping)
-            or set(info) != {"success"}
+            or set(info) != {"success", "executed_control_steps"}
             or type(info["success"]) is not bool
+            or type(info["executed_control_steps"]) is not int
+            or info["executed_control_steps"] < 1
         ):
             raise ConditionRunnerV4Error("backend terminal/success contract changed")
+        previous_action_sha256 = current_ordered[chosen]
+        executed_control_steps = int(info["executed_control_steps"])
         success = success or info["success"]
         steps.append(
             {
                 "step_index": step_index,
                 "selected_candidate_index": chosen,
                 "candidate_sha256": current_ordered[chosen],
+                "observer_receipt_sha256": observer_receipt["receipt_sha256"],
                 "root_condition_selection": step_index == 0,
                 "terminated": terminated,
                 "truncated": truncated,
@@ -933,12 +1008,14 @@ def validate_condition_result(
             not isinstance(row, Mapping)
             or set(row) != {
                 "step_index", "selected_candidate_index", "candidate_sha256",
+                "observer_receipt_sha256",
                 "root_condition_selection", "terminated", "truncated",
             }
             or type(row.get("step_index")) is not int
             or row["step_index"] != index
             or type(row.get("selected_candidate_index")) is not int
             or not audit.is_sha256(row.get("candidate_sha256"))
+            or not audit.is_sha256(row.get("observer_receipt_sha256"))
             or type(row.get("root_condition_selection")) is not bool
             or row["root_condition_selection"] is not (index == 0)
             or type(row.get("terminated")) is not bool

@@ -19,6 +19,7 @@ from smolvla_piper_causal_event_observer_v1 import (  # noqa: E402
     ActorVisibleCausalEventObserverV1,
     CausalObserverConfig,
     CausalObserverContractError,
+    EVALUATION400_V4_TARGET,
     EmbodimentResidualAdapter,
     PROMOTION_EVIDENCE_FORMAT,
     build_causal_history_window,
@@ -38,6 +39,12 @@ from smolvla_piper_causal_event_observer_v1 import (  # noqa: E402
 CORE_SHA = "a" * 64
 EVENT_SPEC_SHA = "b" * 64
 CALIBRATION_SPLIT_SHA = "c" * 64
+DATASET_MANIFEST_SHA = "6" * 64
+VALIDATION_SPLIT_SHA = "5" * 64
+CHECKPOINT_SHA = "1" * 64
+CONFIG_SHA = "2" * 64
+ADAPTER_SET_SHA = "3" * 64
+ADAPTER_CHECKPOINT_SET_SHA = "4" * 64
 ACTORS = (
     {
         "actor_name": "piper",
@@ -52,13 +59,19 @@ ACTORS = (
 )
 
 
-def _promotion_evidence(training_sha: str) -> dict:
+def _promotion_evidence(training_sha: str, calibration_sha: str) -> dict:
     value = {
         "format": PROMOTION_EVIDENCE_FORMAT,
         "status": "independent_validation_passed_all_gates",
         "observer_core_file_sha256": CORE_SHA,
+        "observer_checkpoint_file_sha256": CHECKPOINT_SHA,
+        "observer_config_sha256": CONFIG_SHA,
         "training_supervision_contract_sha256": training_sha,
+        "actor_adapter_set_sha256": ADAPTER_SET_SHA,
+        "actor_adapter_checkpoint_set_sha256": ADAPTER_CHECKPOINT_SET_SHA,
+        "calibration_sha256": calibration_sha,
         "independent_calibration_split_sha256": CALIBRATION_SPLIT_SHA,
+        "independent_validation_split_sha256": VALIDATION_SPLIT_SHA,
         "actor_names": ["piper", "new_body"],
         "independent_validation_groups": 60,
         "per_actor_validation_groups": {"piper": 30, "new_body": 30},
@@ -88,7 +101,9 @@ def _observer(
         image_feature_dim=image_feature_dim,
     )
     training = training_supervision_contract(
-        event_spec_sha256=EVENT_SPEC_SHA, actor_registry=ACTORS
+        event_spec_sha256=EVENT_SPEC_SHA,
+        dataset_manifest_sha256=DATASET_MANIFEST_SHA,
+        actor_registry=ACTORS,
     )
     states = {}
     contracts = {}
@@ -119,16 +134,44 @@ def _observer(
         independent_calibration_split_sha256=CALIBRATION_SPLIT_SHA,
         minimum_joint_confidence=minimum_confidence,
     )
-    evidence = _promotion_evidence(training["contract_sha256"]) if promoted else None
+    evidence = (
+        _promotion_evidence(
+            training["contract_sha256"], calibration["calibration_sha256"]
+        )
+        if promoted else None
+    )
     observer = ActorVisibleCausalEventObserverV1(
         config,
         training_contract=training,
         observer_core_file_sha256=CORE_SHA,
+        observer_checkpoint_file_sha256=CHECKPOINT_SHA,
+        observer_config_sha256=CONFIG_SHA,
+        actor_adapter_set_sha256=ADAPTER_SET_SHA,
+        actor_adapter_checkpoint_set_sha256=ADAPTER_CHECKPOINT_SET_SHA,
         adapter_contracts=contracts,
         adapter_states=states,
         calibration=calibration,
         deployment=make_deployment(
-            promotion_enabled=promoted, promotion_evidence=evidence
+            promotion_enabled=promoted,
+            promotion_evidence=evidence,
+            integration_target=(
+                EVALUATION400_V4_TARGET if promoted else "monitor_only"
+            ),
+            promotion_validation_context=(
+                {
+                    "observer_core_file_sha256": CORE_SHA,
+                    "observer_checkpoint_file_sha256": CHECKPOINT_SHA,
+                    "observer_config_sha256": CONFIG_SHA,
+                    "training_contract_sha256": training["contract_sha256"],
+                    "actor_adapter_set_sha256": ADAPTER_SET_SHA,
+                    "actor_adapter_checkpoint_set_sha256": (
+                        ADAPTER_CHECKPOINT_SET_SHA
+                    ),
+                    "calibration_sha256": calibration["calibration_sha256"],
+                    "actor_names": ["piper", "new_body"],
+                }
+                if promoted else None
+            ),
         ),
     ).eval()
     return observer
@@ -232,7 +275,9 @@ def test_causal_window_is_future_invariant_padded_truncated_and_branch_local() -
 
 def test_training_contract_is_non_privileged_and_4096d_is_rejected() -> None:
     contract = training_supervision_contract(
-        event_spec_sha256=EVENT_SPEC_SHA, actor_registry=ACTORS
+        event_spec_sha256=EVENT_SPEC_SHA,
+        dataset_manifest_sha256=DATASET_MANIFEST_SHA,
+        actor_registry=ACTORS,
     )
     assert contract["privileged_label_source_available_to_model_inputs"] is False
     assert contract["future_query_features_available_to_model_inputs"] is False
@@ -272,6 +317,26 @@ def test_monitor_only_and_low_confidence_both_fail_closed() -> None:
     assert prediction.applicability.tolist() == [False]
     assert prediction.applicability_reason == ("low_confidence_fail_closed",)
 
+    # A no-threshold calibration must reject even float32 probabilities that
+    # saturate to exactly one; threshold=1 alone is not a reject-all sentinel.
+    promoted.calibration = make_calibration(
+        event_spec_sha256=EVENT_SPEC_SHA,
+        independent_calibration_split_sha256=CALIBRATION_SPLIT_SHA,
+        minimum_joint_confidence=1.0,
+        reject_all=True,
+    )
+    with torch.no_grad():
+        promoted.event_head.bias.fill_(-100)
+        promoted.event_head.bias[0] = 100
+        promoted.predicate_head.bias.fill_(100)
+    prediction = promoted.observe(
+        history, mask, proprio,
+        actor_names=("piper",), receipts=receipts, image_features=image,
+    )
+    assert prediction.confidence.item() == 1.0
+    assert prediction.applicability.tolist() == [False]
+    assert prediction.applicability_reason == ("low_confidence_fail_closed",)
+
 
 def test_promoted_observer_accepts_only_high_confidence_with_bound_optional_inputs() -> None:
     observer = _observer(promoted=True, minimum_confidence=0.9, image_feature_dim=4)
@@ -290,10 +355,12 @@ def test_promoted_observer_accepts_only_high_confidence_with_bound_optional_inpu
     assert prediction.current_predicates.tolist() == [[1, 1, 1, 1, 1]]
     assert prediction.applicability.tolist() == [True]
     assert prediction.applicability_reason == (
-        "applicable_observer_output_not_rerank_authorized",
+        "applicable_promoted_evaluation400_v4_rerank",
     )
-    assert observer.deployment["rerank_enabled"] is False
-    assert observer.deployment["integration_status"] == "not_integrated_into_evaluation400_v3"
+    assert observer.deployment["rerank_enabled"] is True
+    assert observer.deployment["integration_status"] == (
+        "integrated_frozen_observer_into_evaluation400_v4"
+    )
 
     wrong_extractor = copy.deepcopy(receipts[0])
     nested = wrong_extractor["image_feature_receipt"]
@@ -387,6 +454,10 @@ def test_multi_actor_adapter_is_content_addressed_and_pluggable() -> None:
             observer.config,
             training_contract=observer.training_contract,
             observer_core_file_sha256=CORE_SHA,
+            observer_checkpoint_file_sha256=CHECKPOINT_SHA,
+            observer_config_sha256=CONFIG_SHA,
+            actor_adapter_set_sha256=ADAPTER_SET_SHA,
+            actor_adapter_checkpoint_set_sha256=ADAPTER_CHECKPOINT_SET_SHA,
             adapter_contracts=tampered_contracts,
             adapter_states=states,
             calibration=observer.calibration,
@@ -396,13 +467,27 @@ def test_multi_actor_adapter_is_content_addressed_and_pluggable() -> None:
 
 def test_promotion_gate_rejects_re_signed_causal_or_support_failure() -> None:
     training = training_supervision_contract(
-        event_spec_sha256=EVENT_SPEC_SHA, actor_registry=ACTORS
+        event_spec_sha256=EVENT_SPEC_SHA,
+        dataset_manifest_sha256=DATASET_MANIFEST_SHA,
+        actor_registry=ACTORS,
     )
-    evidence = _promotion_evidence(training["contract_sha256"])
+    calibration = make_calibration(
+        event_spec_sha256=EVENT_SPEC_SHA,
+        independent_calibration_split_sha256=CALIBRATION_SPLIT_SHA,
+        minimum_joint_confidence=0.9,
+    )
+    evidence = _promotion_evidence(
+        training["contract_sha256"], calibration["calibration_sha256"]
+    )
     validate_promotion_evidence(
         evidence,
         observer_core_file_sha256=CORE_SHA,
+        observer_checkpoint_file_sha256=CHECKPOINT_SHA,
+        observer_config_sha256=CONFIG_SHA,
         training_contract_sha256=training["contract_sha256"],
+        actor_adapter_set_sha256=ADAPTER_SET_SHA,
+        actor_adapter_checkpoint_set_sha256=ADAPTER_CHECKPOINT_SET_SHA,
+        calibration_sha256=calibration["calibration_sha256"],
         actor_names=("piper", "new_body"),
     )
     for field, value in (
@@ -418,6 +503,61 @@ def test_promotion_gate_rejects_re_signed_causal_or_support_failure() -> None:
             validate_promotion_evidence(
                 changed,
                 observer_core_file_sha256=CORE_SHA,
+                observer_checkpoint_file_sha256=CHECKPOINT_SHA,
+                observer_config_sha256=CONFIG_SHA,
                 training_contract_sha256=training["contract_sha256"],
+                actor_adapter_set_sha256=ADAPTER_SET_SHA,
+                actor_adapter_checkpoint_set_sha256=ADAPTER_CHECKPOINT_SET_SHA,
+                calibration_sha256=calibration["calibration_sha256"],
                 actor_names=("piper", "new_body"),
             )
+
+
+def test_only_validated_v4_target_can_enable_rerank() -> None:
+    training = training_supervision_contract(
+        event_spec_sha256=EVENT_SPEC_SHA,
+        dataset_manifest_sha256=DATASET_MANIFEST_SHA,
+        actor_registry=ACTORS,
+    )
+    calibration = make_calibration(
+        event_spec_sha256=EVENT_SPEC_SHA,
+        independent_calibration_split_sha256=CALIBRATION_SPLIT_SHA,
+        minimum_joint_confidence=0.9,
+    )
+    evidence = _promotion_evidence(
+        training["contract_sha256"], calibration["calibration_sha256"]
+    )
+    context = {
+        "observer_core_file_sha256": CORE_SHA,
+        "observer_checkpoint_file_sha256": CHECKPOINT_SHA,
+        "observer_config_sha256": CONFIG_SHA,
+        "training_contract_sha256": training["contract_sha256"],
+        "actor_adapter_set_sha256": ADAPTER_SET_SHA,
+        "actor_adapter_checkpoint_set_sha256": ADAPTER_CHECKPOINT_SET_SHA,
+        "calibration_sha256": calibration["calibration_sha256"],
+        "actor_names": ["piper", "new_body"],
+    }
+    v4 = make_deployment(
+        promotion_enabled=True,
+        promotion_evidence=evidence,
+        integration_target=EVALUATION400_V4_TARGET,
+        promotion_validation_context=context,
+    )
+    assert v4["rerank_enabled"] is True
+    monitor = make_deployment(
+        promotion_enabled=True,
+        promotion_evidence=evidence,
+        integration_target="evaluation400_v3",
+    )
+    assert monitor["rerank_enabled"] is False
+    tampered = copy.deepcopy(evidence)
+    tampered["event_macro_accuracy_lcb95"] = 0.1
+    logical = dict(tampered); logical.pop("promotion_receipt_sha256")
+    tampered["promotion_receipt_sha256"] = canonical_sha256(logical)
+    with pytest.raises(CausalObserverContractError, match="failed closed"):
+        make_deployment(
+            promotion_enabled=True,
+            promotion_evidence=tampered,
+            integration_target=EVALUATION400_V4_TARGET,
+            promotion_validation_context=context,
+        )

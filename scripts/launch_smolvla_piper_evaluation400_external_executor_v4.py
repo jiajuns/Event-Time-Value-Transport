@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Pure, dependency-injected evaluation400 v4 executor integration.
 
-This module models the WORM execution/receipt layer without launching a
-simulator, subprocess, or reading target data.  Production adapters can supply
-the same interfaces later while retaining these exact schemas and chronology.
+This module realizes the frozen observer authority, then models the WORM
+execution/receipt layer without launching a simulator, subprocess, or reading
+target data. Production adapters can retain the exact schemas and chronology.
 """
 
 from __future__ import annotations
@@ -328,7 +328,7 @@ class Evaluation400ExecutorV4:
         dense_event_targets_fn: Callable[..., Mapping[str, Any]],
         recovery_targets_fn: Callable[..., Mapping[str, Any]],
         object_target_fn: Callable[..., Mapping[str, Any]],
-        causal_observer_authority: Mapping[str, Any],
+        causal_observer_artifact_root: str,
     ) -> None:
         self.protocol_core_v4_sha256 = _require_sha(
             protocol_core_v4_sha256, "v4 core"
@@ -346,10 +346,12 @@ class Evaluation400ExecutorV4:
         self.dense_event_targets_fn = dense_event_targets_fn
         self.recovery_targets_fn = recovery_targets_fn
         self.object_target_fn = object_target_fn
-        self.causal_observer_authority = copy.deepcopy(causal_observer_authority)
+        self.causal_observer_runtime = runner.build_causal_observer_authority(
+            frozen_artifact_root=causal_observer_artifact_root
+        )
         self.causal_observer_authority_sha256 = (
             runner.validate_causal_observer_authority(
-                self.causal_observer_authority
+                self.causal_observer_runtime
             )
         )
         self.ledger = WormLedgerV4(self.protocol_core_v4_sha256)
@@ -474,7 +476,7 @@ class Evaluation400ExecutorV4:
                 dense_event_targets_fn=self.dense_event_targets_fn,
                 recovery_targets_fn=self.recovery_targets_fn,
                 object_target_fn=self.object_target_fn,
-                causal_observer_authority=self.causal_observer_authority,
+                causal_observer_runtime=self.causal_observer_runtime,
             )
             result_sha = runner.validate_condition_result(
                 result,
