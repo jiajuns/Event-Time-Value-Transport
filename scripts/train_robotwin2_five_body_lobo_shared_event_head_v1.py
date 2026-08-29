@@ -78,6 +78,7 @@ TERMINAL_PROGRESS_STUDENT_T_DOF = 3.0
 TERMINAL_EVENT_LOSS_WEIGHT = 0.5
 TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT = 0.5
 DENSE_FAILURE_RANK_WEIGHT = 0.1
+DENSE_RANK_LABEL_EQUALITY_TOLERANCE = 1e-6
 ONE_DEVIATION_ESTIMAND = (
     "one_candidate_deviation_then_frozen_actor_continuation_not_"
     "recursive_closed_loop_delta_success_rate"
@@ -172,6 +173,35 @@ ABLATION_VARIANTS = (
 )
 
 
+def _dense_rank_labels_are_orderable(
+    terminal_event_level: Sequence[float],
+    terminal_goal_progress: Sequence[float],
+    *,
+    ablation_variant: str,
+) -> bool:
+    """Return whether an all-failure decision contains a ranking preference."""
+
+    if ablation_variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
+    event_values = [float(value) for value in terminal_event_level]
+    goal_values = [float(value) for value in terminal_goal_progress]
+    if (
+        len(event_values) != CANDIDATE_COUNT
+        or len(goal_values) != CANDIDATE_COUNT
+        or not all(math.isfinite(value) for value in (*event_values, *goal_values))
+    ):
+        raise FiveBodyContractError("dense rank labels have invalid shape/value")
+    if ablation_variant == "success_only":
+        return False
+    if max(event_values) - min(event_values) > DENSE_RANK_LABEL_EQUALITY_TOLERANCE:
+        return True
+    return bool(
+        ablation_variant != "no_object_effect"
+        and max(goal_values) - min(goal_values)
+        > DENSE_RANK_LABEL_EQUALITY_TOLERANCE
+    )
+
+
 def ablation_contract(variant: str) -> dict[str, Any]:
     if variant not in ABLATION_VARIANTS:
         raise FiveBodyContractError(f"unknown ablation variant {variant!r}")
@@ -212,6 +242,7 @@ def ablation_contract(variant: str) -> dict[str, Any]:
         "all_failure_dense_objective_weight": (
             0.0 if variant == "success_only" else DENSE_FAILURE_RANK_WEIGHT
         ),
+        "all_failure_dense_informative_labels_only": True,
         "dense_target_order": (
             "none"
             if variant == "success_only"
@@ -346,6 +377,8 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "all_failure_dense_listwise_weight": (
             0.0 if variant == "success_only" else DENSE_FAILURE_RANK_WEIGHT
         ),
+        "all_failure_dense_informative_labels_only": True,
+        "dense_rank_label_equality_tolerance": DENSE_RANK_LABEL_EQUALITY_TOLERANCE,
         "dense_target_requires_full_continuation": True,
         "dense_goal_progress_temperature_meters": (
             None
@@ -403,6 +436,12 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ],
         "all_failure_dense_listwise_weight": checkpoint[
             "all_failure_dense_listwise_weight"
+        ],
+        "all_failure_dense_informative_labels_only": checkpoint[
+            "all_failure_dense_informative_labels_only"
+        ],
+        "dense_rank_label_equality_tolerance": checkpoint[
+            "dense_rank_label_equality_tolerance"
         ],
         "dense_target_requires_full_continuation": True,
         "dense_goal_progress_temperature_meters": checkpoint[
@@ -1411,9 +1450,14 @@ class MacroBalancedRankDecisionBatchSampler:
         batch_size: int,
         seed: int,
         positive_group_weight: Mapping[str, float],
+        ablation_variant: str,
     ) -> None:
         if batch_size < CANDIDATE_COUNT:
             raise FiveBodyContractError("rank batch must fit one complete decision")
+        if ablation_variant not in ABLATION_VARIANTS:
+            raise FiveBodyContractError(
+                f"unknown ablation variant {ablation_variant!r}"
+            )
         grouped: dict[str, list[int]] = defaultdict(list)
         for index, row in enumerate(rows):
             grouped[str(row["logical_group"])].append(index)
@@ -1458,6 +1502,21 @@ class MacroBalancedRankDecisionBatchSampler:
                 or len(current_events) != 1
             ):
                 raise FiveBodyContractError("rank macro stratum identity changed")
+            if kind == "dense":
+                if not all(
+                    bool(rows[index]["terminal_event_mask"])
+                    and bool(rows[index]["terminal_goal_progress_mask"])
+                    for index in ordered
+                ):
+                    raise FiveBodyContractError(
+                        "dense rank decision lacks complete terminal supervision"
+                    )
+                if not _dense_rank_labels_are_orderable(
+                    [rows[index]["terminal_max_event_id"] for index in ordered],
+                    [rows[index]["terminal_goal_progress"] for index in ordered],
+                    ablation_variant=ablation_variant,
+                ):
+                    continue
             decisions[group] = ordered
             kinds[group] = kind
             strata[group] = (body, identity[1], current_events.pop())
@@ -2196,6 +2255,7 @@ def _candidate_rank_loss(
             "candidate_ranking_balanced_rank": zero,
             "mixed_success_groups_in_batch": score.new_tensor(0),
             "all_failure_dense_groups_in_batch": score.new_tensor(0),
+            "all_failure_uninformative_groups_in_batch": score.new_tensor(0),
         }
 
     success_terms: list[torch.Tensor] = []
@@ -2207,6 +2267,7 @@ def _candidate_rank_loss(
         by_group[str(group)].append(index)
     mixed_success_groups = 0
     all_failure_dense_groups = 0
+    all_failure_uninformative_groups = 0
     for indices in by_group.values():
         if len(indices) != CANDIDATE_COUNT:
             raise FiveBodyContractError("training batch split a candidate decision")
@@ -2257,11 +2318,24 @@ def _candidate_rank_loss(
                 raise FiveBodyContractError(
                     "dense rank decision lacks complete terminal supervision"
                 )
+            terminal_event_level = (
+                batch["terminal_max_event_id"].to(score)[selected].float()
+            )
+            terminal_goal_progress = (
+                batch["terminal_goal_progress"].to(score)[selected].float()
+            )
+            if not _dense_rank_labels_are_orderable(
+                terminal_event_level.detach().cpu().tolist(),
+                terminal_goal_progress.detach().cpu().tolist(),
+                ablation_variant=ablation_variant,
+            ):
+                all_failure_uninformative_groups += 1
+                continue
             dense_terms.append(
                 _dense_soft_listwise_loss(
                     group_scores,
-                    batch["terminal_max_event_id"].to(score)[selected].float(),
-                    batch["terminal_goal_progress"].to(score)[selected].float(),
+                    terminal_event_level,
+                    terminal_goal_progress,
                     ablation_variant=ablation_variant,
                 ).reshape(())
             )
@@ -2287,6 +2361,9 @@ def _candidate_rank_loss(
         "mixed_success_groups_in_batch": score.new_tensor(mixed_success_groups),
         "all_failure_dense_groups_in_batch": score.new_tensor(
             all_failure_dense_groups
+        ),
+        "all_failure_uninformative_groups_in_batch": score.new_tensor(
+            all_failure_uninformative_groups
         ),
     }
 
@@ -2339,7 +2416,15 @@ def evaluate_candidate_ranking(
         oracle_success = max(row[2] for row in rows)
         minimum_success = min(row[2] for row in rows)
         mixed_success = oracle_success > 0.5 and minimum_success <= 0.5
-        dense_applicable = variant != "success_only" and oracle_success <= 0.5
+        all_failure = oracle_success <= 0.5
+        dense_applicable = bool(
+            variant != "success_only"
+            and all_failure
+            and any(
+                _lexicographic_compare_values(row[3], rows[0][3]) != 0
+                for row in rows[1:]
+            )
+        )
         best_dense = rows[0][3]
         for row in rows[1:]:
             if _lexicographic_compare_values(row[3], best_dense) > 0:
@@ -2359,6 +2444,9 @@ def evaluate_candidate_ranking(
             "selected_terminal_goal_progress": selected[6],
             "mixed_success": mixed_success,
             "dense_applicable": dense_applicable,
+            "dense_uninformative": bool(
+                variant != "success_only" and all_failure and not dense_applicable
+            ),
             "selected_dense_best": bool(
                 dense_applicable
                 and _lexicographic_compare_values(selected[3], best_dense) == 0
@@ -2396,6 +2484,9 @@ def evaluate_candidate_ranking(
         selected = float(np.mean([float(row["selected_success"]) for row in rows]))
         mixed = [row for row in rows if bool(row["mixed_success"])]
         dense = [row for row in rows if bool(row["dense_applicable"])]
+        dense_uninformative = [
+            row for row in rows if bool(row["dense_uninformative"])
+        ]
         return {
             "decision_groups": len(rows),
             "baseline_success_rate": baseline,
@@ -2444,6 +2535,7 @@ def evaluate_candidate_ranking(
                 else None
             ),
             "dense_progress_decisions": len(dense),
+            "dense_uninformative_decisions": len(dense_uninformative),
             "dense_progress_selection_accuracy": (
                 float(np.mean([float(row["selected_dense_best"]) for row in dense]))
                 if dense
@@ -2920,6 +3012,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 batch_size=args.batch_size,
                 seed=seed,
                 positive_group_weight=rank_weight_for_member,
+                ablation_variant=args.ablation_variant,
             ),
             collate_fn=core.collate_rows,
         )

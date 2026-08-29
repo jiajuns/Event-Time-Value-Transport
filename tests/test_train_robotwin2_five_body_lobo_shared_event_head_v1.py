@@ -924,7 +924,30 @@ def test_all_failure_dense_target_is_true_lexicographic_terminal_value() -> None
         scores=[0.0, 5.0, 0.0, 0.0],
         variant="no_object_effect",
     )
-    assert no_object["all_failure_dense_soft_listwise_balanced_rank"] > 0.0
+    assert no_object["all_failure_dense_soft_listwise_balanced_rank"] == 0.0
+    assert no_object["all_failure_uninformative_groups_in_batch"] == 1
+    no_object_event_difference = _effect_loss(
+        success=[0, 0, 0, 0],
+        terminal_event=[1, 2, 1, 1],
+        terminal_goal_progress=[0.0, 1000.0, 2.0, 1.0],
+        scores=[0.0, 5.0, 0.0, 0.0],
+        variant="no_object_effect",
+    )
+    assert no_object_event_difference[
+        "all_failure_dense_soft_listwise_balanced_rank"
+    ] > 0.0
+
+
+def test_all_failure_without_candidate_consequence_difference_has_no_rank_loss() -> None:
+    pieces = _effect_loss(
+        success=[0, 0, 0, 0],
+        terminal_event=[2, 2, 2, 2],
+        terminal_goal_progress=[0.3, 0.3, 0.3, 0.3],
+        scores=[0.0, 5.0, -2.0, 1.0],
+    )
+    assert pieces["all_failure_dense_soft_listwise_balanced_rank"] == 0.0
+    assert pieces["all_failure_dense_groups_in_batch"] == 0
+    assert pieces["all_failure_uninformative_groups_in_batch"] == 1
 
 
 def test_effect_bootstrap_uses_one_plus_poisson_for_every_mixed_group(
@@ -1073,12 +1096,38 @@ def test_macro_balanced_rank_batches_include_mixed_without_group_duplicates() ->
                     "current_event_id": event,
                     "success": float(mixed and candidate == 0),
                     "success_mask": 1.0,
+                    "terminal_max_event_id": candidate,
+                    "terminal_event_mask": 1.0,
+                    "terminal_goal_progress": candidate / 10.0,
+                    "terminal_goal_progress_mask": 1.0,
                 }
             )
+    uninformative_group = "piper|clean|dense-uninformative"
+    weights[uninformative_group] = 1.0
+    for candidate in range(4):
+        rows.append(
+            {
+                "logical_group": uninformative_group,
+                "body": "piper",
+                "candidate_index": candidate,
+                "current_event_id": 0,
+                "success": 0.0,
+                "success_mask": 1.0,
+                "terminal_max_event_id": 1,
+                "terminal_event_mask": 1.0,
+                "terminal_goal_progress": 0.25,
+                "terminal_goal_progress_mask": 1.0,
+            }
+        )
     sampler = MacroBalancedRankDecisionBatchSampler(
-        rows, batch_size=32, seed=19, positive_group_weight=weights
+        rows,
+        batch_size=32,
+        seed=19,
+        positive_group_weight=weights,
+        ablation_variant="full",
     )
     assert len(sampler) == 2
+    assert uninformative_group not in sampler.decisions
     for batch in sampler:
         groups = [str(rows[index]["logical_group"]) for index in batch[::4]]
         assert len(groups) == len(set(groups))
@@ -1102,9 +1151,25 @@ class _FixedRankModel(torch.nn.Module):
 
 def _ranking_rows() -> list[dict[str, object]]:
     rows = []
-    for group, success, terminal in (
-        ("piper|clean|mixed", [0, 1, 0, 0], [4, 0, 3, 2]),
-        ("piper|clean|failure", [0, 0, 0, 0], [0, 3, 2, 1]),
+    for group, success, terminal, goal_progress in (
+        (
+            "piper|clean|mixed",
+            [0, 1, 0, 0],
+            [4, 0, 3, 2],
+            [0.0, 0.1, 0.2, 0.3],
+        ),
+        (
+            "piper|clean|failure",
+            [0, 0, 0, 0],
+            [0, 3, 2, 1],
+            [0.0, 0.1, 0.2, 0.3],
+        ),
+        (
+            "piper|clean|failure-tie",
+            [0, 0, 0, 0],
+            [2, 2, 2, 2],
+            [0.1, 0.1, 0.1, 0.1],
+        ),
     ):
         for candidate in range(4):
             rows.append(
@@ -1117,8 +1182,12 @@ def _ranking_rows() -> list[dict[str, object]]:
                     "terminal_stage_progress": np.float32(
                         1.0 if success[candidate] else terminal[candidate] / 4.0
                     ),
-                    "terminal_goal_distance": np.float32(1.0 - candidate / 10.0),
-                    "terminal_goal_progress": np.float32(candidate / 10.0),
+                    "terminal_goal_distance": np.float32(
+                        1.0 - goal_progress[candidate]
+                    ),
+                    "terminal_goal_progress": np.float32(
+                        goal_progress[candidate]
+                    ),
                 }
             )
     return rows
@@ -1138,6 +1207,7 @@ def test_ranking_evaluation_separates_success_change_from_dense_progress() -> No
     assert result["mixed_success_selection_accuracy"] == 1.0
     assert result["mixed_success_pairwise_accuracy"] == 1.0
     assert result["dense_progress_decisions"] == 1
+    assert result["dense_uninformative_decisions"] == 1
     assert result["dense_progress_selection_accuracy"] == 1.0
     assert result["dense_progress_pairwise_accuracy"] == 1.0
     success_only = evaluate_candidate_ranking(

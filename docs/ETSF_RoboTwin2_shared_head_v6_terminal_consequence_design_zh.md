@@ -154,7 +154,10 @@ member 的非零正负行、正负组、mixed group 和修复次数全部写入�
 
 terminal-event 和 terminal-progress 的初始 loss 权重均为 0.5。全失败 decision 的 dense rank 只占
 0.1 权重：先比较达到的最大事件，再在相同最大事件内比较终局目标进度。mixed-success decision
-直接训练把概率质量分给成功候选。
+直接训练把概率质量分给成功候选。若四个全失败候选的终局事件和可用的终局目标进度在 `1e-6`
+容差内完全相同，则该 decision 只进入 proper consequence likelihood，不进入 rank-only stream，
+也不进入 dense selection accuracy 的分母；因为它没有可辨识的候选偏好，均匀 listwise 标签只会
+压平 utility 分数并占用平衡批次。`no_object_effect` 消融只按终局事件差异判断是否可排序。
 
 ## 7. 保证四候选确实来自同一个根状态
 
