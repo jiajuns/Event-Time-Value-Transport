@@ -66,7 +66,7 @@ export PYTHONPATH=/home/user/etsf_stage0/lerobot/src:/home/user/etsf_stage0/.ven
   --vlm-metadata-path /home/user/etsf_smolvla_models/smolvla_base_c83c3163 \
   --robotwin-root /home/user/etsf_stage0/RoboTwin \
   --event-spec /home/user/etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v1.json \
-  --preregistration /home/user/public_benchmark_receipts/robotwin2_move_can_pot_5emb_preregistration_20260830_v2.json \
+  --preregistration /home/user/public_benchmark_receipts/robotwin2_move_can_pot_5emb_metrics_preregistration_20260830_v2.json \
   --lobo-fold aloha-agilex=/ABS/LOBO_ALOHA \
   --lobo-fold arx-x5=/ABS/LOBO_ARX \
   --lobo-fold franka=/ABS/LOBO_FRANKA \

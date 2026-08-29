@@ -171,8 +171,8 @@ nohup /usr/bin/python3 \
   --branches-root /home/user/etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic \
   --actor-checkpoint /home/user/etsf_smolvla_models/smolvla_robotwin2_move_can_pot_5emb_ee16_full2750_20k_20260830/checkpoints/020000/pretrained_model \
   --materialization-receipt /home/user/public_benchmark_receipts/robotwin2_move_can_pot_5emb_materialization_a967b852_20260830_v1.json \
-  --actor-authority /home/user/etsf_robotwin2_frozen_ee16_actor_authority_full8000_20260830_v2_analytic.json \
-  --binding /home/user/etsf_robotwin2_fivebody_lobo_training_binding_full8000_20260830_v2_analytic.json \
+  --actor-authority /home/user/etsf_robotwin2_fivebody_ee16_actor_authority_full8000_20260830_v2_analytic.json \
+  --binding /home/user/etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic.binding.json \
   --output-root /home/user/etsf_robotwin2_fivebody_lobo_shared_head_full8000_20260830_v2_analytic \
   --state /home/user/etsf_robotwin2_fivebody_lobo_full8000_20260830_v2_analytic.watcher_state.json \
   --run-exit /home/user/etsf_robotwin2_fivebody_lobo_full8000_20260830_v2_analytic.run.exit \
