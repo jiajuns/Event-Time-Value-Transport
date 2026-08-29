@@ -178,7 +178,7 @@ def ablation_contract(variant: str) -> dict[str, Any]:
     return {
         "variant": variant,
         "candidate_score": (
-            "proper_success_logit"
+            "proper_horizon_coherent_terminal_eK_success_logit"
             if variant == "success_only"
             else "group_listwise_candidate_rank_logit"
         ),
@@ -201,8 +201,7 @@ def ablation_contract(variant: str) -> dict[str, Any]:
         ),
         "time_duration_rank_features_enabled": variant
         not in {"success_only", "no_time_duration"},
-        "terminal_horizon_context_enabled": variant
-        not in {"success_only", "no_time_duration"},
+        "terminal_horizon_context_enabled": variant != "no_time_duration",
         "object_effect_loss_and_rank_target_enabled": variant
         not in {"success_only", "no_object_effect"},
         "mixed_success_objective": (
@@ -264,7 +263,9 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
     if variant not in ABLATION_VARIANTS:
         raise FiveBodyContractError(f"unknown ablation variant {variant!r}")
     if variant == "success_only":
-        feature_blocks = ["proper_success_logit_from_transitioned_semantic"]
+        feature_blocks = [
+            "proper_success_logit_exactly_from_terminal_event_eK_probability"
+        ]
     elif variant == "no_time_duration":
         feature_blocks = [
             "post_event_probability",
@@ -327,10 +328,9 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "duration_conditions_on_physical_event_age": variant
         not in {"success_only", "no_time_duration"},
         "terminal_consequences_condition_on_remaining_action_budget": variant
-        not in {"success_only", "no_time_duration"},
+        != "no_time_duration",
         "remaining_action_budget_has_direct_rank_path": False,
-        "event_age_has_numeric_score_path": variant
-        not in {"success_only", "no_time_duration"},
+        "event_age_has_numeric_score_path": variant != "no_time_duration",
         "direct_transitioned_or_clock_hidden_rank_path": False,
         "rank_inputs_are_detached_consequence_predictions": variant != "success_only",
         "goal_progress_definition": (
@@ -362,6 +362,12 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "rank_loss_updates_consequence_predictors": False,
         "terminal_event_loss": "proper_categorical_cross_entropy_uniform_stream",
         "terminal_goal_progress_loss": "proper_student_t3_nll_uniform_stream",
+        "success_probability_definition": (
+            "exact_terminal_event_probability_of_eK_with_shared_horizon_context"
+        ),
+        "recovery_probability_conditions_on_terminal_horizon_context": (
+            variant != "no_time_duration"
+        ),
     }
 
 
@@ -423,6 +429,12 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "terminal_event_loss": checkpoint["terminal_event_loss"],
         "terminal_goal_progress_loss": checkpoint[
             "terminal_goal_progress_loss"
+        ],
+        "success_probability_definition": checkpoint[
+            "success_probability_definition"
+        ],
+        "recovery_probability_conditions_on_terminal_horizon_context": checkpoint[
+            "recovery_probability_conditions_on_terminal_horizon_context"
         ],
         "feature_schema": checkpoint["feature_schema"],
         "goal_progress_definition": checkpoint["goal_progress_definition"],
@@ -1417,6 +1429,11 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
         super().__init__(core.ModelConfig(body_count=1, action_schema_count=1))
         self.ablation_variant = ablation_variant
+        # The base class exposes horizon-free terminal outcome heads.  Branch
+        # success and recovery are finite-horizon labels here, so those heads
+        # are frozen and replaced below by horizon-coherent predictions.
+        self.success.requires_grad_(False)
+        self.recovery.requires_grad_(False)
         self.register_buffer("state_mean", torch.zeros(core.STATE_DIM))
         self.register_buffer("state_std", torch.ones(core.STATE_DIM))
         self.event_age_encoder = torch.nn.Sequential(
@@ -1430,6 +1447,7 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             torch.nn.Linear(core.SEMANTIC_DIM, core.SEMANTIC_DIM),
         )
         self.terminal_event = torch.nn.Linear(core.SEMANTIC_DIM, 5)
+        self.terminal_recovery = torch.nn.Linear(core.SEMANTIC_DIM, 1)
         self.terminal_goal_progress_mean = torch.nn.Linear(core.SEMANTIC_DIM, 1)
         self.terminal_goal_progress_scale = torch.nn.Linear(core.SEMANTIC_DIM, 1)
         self.candidate_rank = torch.nn.Sequential(
@@ -1517,6 +1535,13 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         terminal_event_logits = terminal_event_logits.masked_fill(
             event_levels < current, -1e4
         )
+        # eK is the canonical success event.  Defining success as its exact
+        # categorical probability makes the two proper predictions coherent
+        # and, unlike the old base head, conditions success on remaining time.
+        terminal_success_logit = terminal_event_logits[:, -1] - torch.logsumexp(
+            terminal_event_logits[:, :-1], dim=-1
+        )
+        terminal_recovery_logit = self.terminal_recovery(terminal_hidden).squeeze(-1)
         terminal_goal_progress_mean = self.terminal_goal_progress_mean(
             terminal_hidden
         ).squeeze(-1)
@@ -1526,6 +1551,8 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             2.0,
         )
         output["terminal_event_logits"] = terminal_event_logits
+        output["success_logit"] = terminal_success_logit
+        output["recovery_logit"] = terminal_recovery_logit
         output["terminal_goal_progress_mean"] = terminal_goal_progress_mean
         output["terminal_goal_progress_log_scale"] = (
             terminal_goal_progress_log_scale

@@ -83,6 +83,12 @@ h_H=\tau_t+c_t.
 `terminal_max_event` 定义为包含当前根状态的最大事件，低于当前事件的类别在结构上不可能，代码只
 对这些类别施加固定的物理支持约束；这不是根据置信度回退动作的部署门控。
 
+`success` 是有限剩余预算内是否到达规范事件 `eK`，因此不再使用不读取 remaining budget 的独立
+base success head，而严格定义为 terminal-event 分布中的 `p(eK)`。success BCE 与 terminal-event
+CE 共同训练同一组一致概率，避免同一候选同时得到“高成功率、低 eK 概率”的矛盾预测。recovery
+同样改由读取 event age/remaining budget 的 terminal context 预测；`no_time_duration` 消融才会
+移除这条时域条件。
+
 Recovery 也改为可识别的联合量：
 
 \[

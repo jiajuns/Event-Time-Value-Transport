@@ -571,6 +571,9 @@ def test_rank_gradient_updates_only_consequence_utility_not_world_model() -> Non
     )
     assert all(parameter.grad is None for parameter in model.terminal_event.parameters())
     assert all(
+        parameter.grad is None for parameter in model.terminal_recovery.parameters()
+    )
+    assert all(
         parameter.grad is None
         for parameter in model.terminal_goal_progress_mean.parameters()
     )
@@ -739,6 +742,12 @@ def test_terminal_prediction_conditions_on_remaining_action_budget() -> None:
         model.terminal_goal_progress_mean.weight.zero_()
         model.terminal_goal_progress_mean.bias.zero_()
         model.terminal_goal_progress_mean.weight[0, 0] = 1.0
+        model.terminal_event.weight.zero_()
+        model.terminal_event.bias.zero_()
+        model.terminal_event.weight[-1, 0] = 1.0
+        model.terminal_recovery.weight.zero_()
+        model.terminal_recovery.bias.zero_()
+        model.terminal_recovery.weight[0, 0] = 1.0
     batch = _model_batch(torch.full((2,), 5.0 / 15.0))
     batch["state"][1] = batch["state"][0]
     batch["actions"][1] = batch["actions"][0]
@@ -747,6 +756,12 @@ def test_terminal_prediction_conditions_on_remaining_action_budget() -> None:
     assert output["terminal_goal_progress_mean"][0] != output[
         "terminal_goal_progress_mean"
     ][1]
+    assert output["success_logit"][0] != output["success_logit"][1]
+    assert output["recovery_logit"][0] != output["recovery_logit"][1]
+    terminal_probability = torch.softmax(output["terminal_event_logits"], dim=-1)
+    torch.testing.assert_close(
+        torch.sigmoid(output["success_logit"]), terminal_probability[:, -1]
+    )
 
 
 def test_rank_ensemble_standardizes_each_member_within_one_decision() -> None:
@@ -1121,6 +1136,9 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert ablation_contract("no_object_effect")[
         "object_effect_loss_and_rank_target_enabled"
     ] is False
+    assert ablation_contract("success_only")[
+        "terminal_horizon_context_enabled"
+    ] is True
     components = {
         "post_event_macro_error_ratio": 1.0,
         "next_event_macro_error_ratio": 1.0,
