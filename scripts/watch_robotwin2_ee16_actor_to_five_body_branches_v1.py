@@ -968,7 +968,10 @@ def main() -> int:
         return body, completed or fill_body(static, body)
 
     completed_by_body: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="body-collector") as pool:
+    # Three collectors fit the measured 4090 memory envelope while leaving
+    # enough headroom for CuRobo/Vulkan peaks.  Four would approach the 24 GiB
+    # device limit and turn throughput optimization into avoidable OOM risk.
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="body-collector") as pool:
         futures = []
         for index, body in enumerate(BODIES):
             futures.append(pool.submit(collect_body, body))
@@ -987,7 +990,7 @@ def main() -> int:
                     value["candidate_branches"]
                     for value in completed_by_body.values()
                 ),
-                max_parallel_body_collectors=2,
+                max_parallel_body_collectors=3,
             )
     body_manifests = {body: completed_by_body[body] for body in BODIES}
     receipt = signed(
