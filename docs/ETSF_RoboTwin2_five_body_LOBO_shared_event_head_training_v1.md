@@ -75,10 +75,18 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
 - success、recovery 和 mask；
 - `object_delta [N,6]` 与 mask。
 - `candidate_index=[0,1,2,3]`；
-- `dt [N]`，表示候选首段实际执行的秒数。
+- `dt [N]`，表示 critic 打分前已知的 planned 首段时长，正式合同固定为 `5/15` 秒；真实
+  simulator elapsed seconds 仅用于 duration 标签，不能把执行后信息泄漏进 critic 输入。
 
 这里 `N` 必须严格等于 4，四行的 state 与 current event 必须相同。否则无法形成同根排序监督，
 训练入口直接拒绝，而不是退化为随机逐行 batch。
+source validation 按 `(body, condition, requested_seed)` 切分；同一 reset seed 的全部 query 必须留在
+同一 lane，不能把 query 0/5/10/15 拆到 train/validation 后虚高 checkpoint-selection `ΔSR`。
+
+候选 rank 显式拼接 `transitioned`、`clock_hidden` 和 current-event 的 duration
+`log_mean/log_scale`，所以 planned `dt=5/15` 对最终 score 有数值计算路径。rank 梯度继续更新
+state/action/transition backbone；clock 与 duration 特征在 rank 分支处 detach，只由 proper duration
+likelihood 更新，rank loss 不直接改写 clock/duration heads。
 
 每个 body manifest 还必须绑定解析式 adapter：
 
@@ -102,6 +110,16 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
 这个 adapter 可以解析不同关节顺序、末端执行器和控制频率，但只能使用机器人描述、控制 API、
 单位和运动学等无标签信息。若需要从数据拟合尺度，它就不再属于本协议，尤其不能在 held-out
 body 上拟合。
+
+每个 manifest、training binding、preflight、checkpoint 和 summary 还必须统一绑定 analytic event
+spec SHA `4df5b7242d1c7bf8e3f5dac65c0eb4376043dbf6c60ef2633d086ab06e7e3aee` 及同一个事件实现 SHA；
+goal rule 固定为初始 can 相对初始 pot 的 x 符号与 `±0.18m` 偏移，required objects 恰为
+`can/pot`。训练标签中的五事件和 state27 relative-goal 与在线 runner 都调用这一实现。旧
+`8b1f…` Stage2 规范由成功轨迹拟合，永久禁止进入本五本体 LOBO。
+
+这里仍由旧 SHA `75fc9c6e…` 验证的是既有公开 source-slice materialization receipt，本次修复没有
+重新物化官方 slice。它不等于正式 paired 指标预注册；后者使用 corrected v2 SHA
+`a4e59f647c520609313e1c9aca03dbb3f770504e0383c66bb619dca94b4c6827`。
 
 ## 运行方式
 
@@ -130,6 +148,41 @@ python scripts/train_robotwin2_five_body_lobo_shared_event_head_v1.py \
 五个 held-out body 必须各用独立 create-new 输出根。训练产物中的
 `task_success_evaluation_authorized=false` 是刻意的：后续还需 label-blind live forward、同序候选
 commitment 和完整 paired simulator result，不能用 critic AUC/Brier 替代任务成功率。
+
+## 完整 8000 分支到五折训练的远程 watcher
+
+`watch_robotwin2_five_body_branches_to_lobo_training_v1.py` 是正式的断 SSH 后处理入口。它在
+CPU 上等待五个 manifest 达到精确的 `5 body × 2 condition × 50 seed × 4 query = 2000`
+decision，并逐个核验四候选 `candidate_index=[0,1,2,3]`、NPZ member/shape/dtype、正 planned `dt`、payload
+SHA 和无额外文件。watcher 不解释 success/event 等结果数组；每折真正打开的 payload 仍只来自
+另外四个 source body。等待期间不持有 GPU，完整采集且 4090 空闲后才顺序启动五折，每折固定
+5 个 ensemble member、每 member 3000 step。
+
+四个 query 固定为 `0/5/10/15`。若某个预定 seed 在 query 前已经 terminal，collector 可从
+`[2026081000, 2026090000)` 的开发区间补一个新 seed；watcher 验证的是每个
+`body×condition×query` 恰好 50 个唯一开发 seed，而不是错误要求五个本体都保留同一段连续 seed。
+正式 paired evaluation 的 `2026090000..2026090099` 不在这个区间内。
+
+本次远程正式链路采用：
+
+```bash
+nohup /usr/bin/python3 \
+  /home/user/etsf_robotwin2_branches_to_lobo_watcher_code_20260830_v2_analytic/watch_robotwin2_five_body_branches_to_lobo_training_v1.py \
+  --branches-root /home/user/etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic \
+  --actor-checkpoint /home/user/etsf_smolvla_models/smolvla_robotwin2_move_can_pot_5emb_ee16_full2750_20k_20260830/checkpoints/020000/pretrained_model \
+  --materialization-receipt /home/user/public_benchmark_receipts/robotwin2_move_can_pot_5emb_materialization_a967b852_20260830_v1.json \
+  --actor-authority /home/user/etsf_robotwin2_frozen_ee16_actor_authority_full8000_20260830_v2_analytic.json \
+  --binding /home/user/etsf_robotwin2_fivebody_lobo_training_binding_full8000_20260830_v2_analytic.json \
+  --output-root /home/user/etsf_robotwin2_fivebody_lobo_shared_head_full8000_20260830_v2_analytic \
+  --state /home/user/etsf_robotwin2_fivebody_lobo_full8000_20260830_v2_analytic.watcher_state.json \
+  --run-exit /home/user/etsf_robotwin2_fivebody_lobo_full8000_20260830_v2_analytic.run.exit \
+  > /home/user/etsf_robotwin2_fivebody_lobo_full8000_20260830_v2_analytic.watcher.log 2>&1 < /dev/null &
+```
+
+最终 `five_fold_training_summary.json` 对每折保存 source-validation 的 member 值及均值：宏
+best-of-4 `ΔSR`、宏 selected SR、候选 pairwise accuracy、success Brier/AUROC、post/next event
+F1/accuracy、时长 MAE/NLL、对象 RMSE/NLL 和各自 support。这里的宏 `ΔSR` 是训练与选模证据，
+不是 held-out 在线成功率；五本体正式 paired rollout 仍是下一阶段。
 
 ## 当前与旧入口的关系
 

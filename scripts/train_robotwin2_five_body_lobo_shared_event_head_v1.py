@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader
 
 import train_multibody_canonical_event_world_model as core
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
+import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
 import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materialization
 
 
@@ -45,9 +46,12 @@ TASK = "move_can_pot"
 PREREGISTRATION_SHA256 = (
     "75fc9c6e487e60c3ff274a2fb8c90f6a738b30999b9e74e00c98a54f1dce52ee"
 )
+EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
+SOURCE_EVENT_SAMPLING_HZ = 15.0
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 CANDIDATE_COUNT = 4
+CANDIDATE_RANK_FEATURE_DIM = core.SEMANTIC_DIM + 64 + 2
 CANONICAL_STATE_SCHEMA = canonical_adapter.STATE_SCHEMA
 CANONICAL_ACTION_SCHEMA = canonical_adapter.ACTION_SCHEMA
 REQUIRED_ARRAYS = {
@@ -281,6 +285,55 @@ def validate_body_manifest(
         or not _is_sha(adapter.get("implementation_sha256"))
     ):
         raise FiveBodyContractError(f"{expected_body} adapter is not analytic/label-free")
+    physical_time = value.get("physical_time_contract")
+    try:
+        analytic_event.validate_event_contract(value.get("analytic_event_contract"))
+    except analytic_event.AnalyticEventSpecError as error:
+        raise FiveBodyContractError(
+            f"{expected_body} analytic event contract changed"
+        ) from error
+    if (
+        value.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or not _is_sha(value.get("event_derivation_implementation_sha256"))
+        or value.get("state27_relative_goal_contract")
+        != (
+            "same_analytic_initial_side_pot_relative_goal_vector_used_for_"
+            "event_labels_and_online_state27_channels_0_2"
+        )
+        or not isinstance(physical_time, Mapping)
+        or physical_time.get("source")
+        != "counted_successful_sapien_scene_step_calls"
+        or physical_time.get("simulator_timestep_source") != "scene.get_timestep"
+        or physical_time.get("policy_action_call_count_used_as_time") is not False
+        or physical_time.get("wall_clock_used_as_time") is not False
+        or physical_time.get("dt_semantics")
+        != "planned_first_candidate_chunk_seconds"
+        or physical_time.get("planned_action_steps") != 5
+        or physical_time.get("actor_control_hz") != SOURCE_EVENT_SAMPLING_HZ
+        or physical_time.get("planned_dt_seconds") != 5.0 / SOURCE_EVENT_SAMPLING_HZ
+        or physical_time.get("duration_semantics")
+        != "simulator_elapsed_seconds_to_event_boundary"
+        or physical_time.get("zero_elapsed_duration_masked") is not True
+        or physical_time.get("stationary_window_seconds")
+        != analytic_event.THRESHOLDS["stationary_window_seconds"]
+        or physical_time.get("stationary_speed_threshold_m_per_s")
+        != analytic_event.THRESHOLDS["stationary_speed_m_per_s"]
+    ):
+        raise FiveBodyContractError(
+            f"{expected_body} lacks the physical simulator time/event contract"
+        )
+    candidate_action = value.get("candidate_action_contract")
+    if candidate_action != {
+        "critic_observation_time": "before_candidate_execution",
+        "planned_action_horizon": 5,
+        "action_mask_source": "planned_first_chunk_not_executed_count",
+        "executed_action_count_used_for_action_mask": False,
+        "executed_action_count_used_for_sim_time_accounting_only": True,
+        "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
+    }:
+        raise FiveBodyContractError(
+            f"{expected_body} censors planned candidates after execution"
+        )
     groups = value.get("groups")
     if not isinstance(groups, list) or len(groups) < 4:
         raise FiveBodyContractError(f"{expected_body} needs at least four canonical groups")
@@ -319,6 +372,9 @@ def validate_body_manifest(
         "groups": normalized,
         "group_identity_sha256": canonical_sha256(sorted(identities)),
         "adapter_sha256": adapter["implementation_sha256"],
+        "event_derivation_implementation_sha256": value[
+            "event_derivation_implementation_sha256"
+        ],
     }
 
 
@@ -330,6 +386,7 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         or binding.get("dataset_repo") != DATASET_REPO
         or binding.get("dataset_revision") != DATASET_REVISION
         or binding.get("task") != TASK
+        or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
         or binding.get("heldout_labels_may_train_fit_calibrate_or_select") is not False
         or binding.get("canonical_shared_body_rows") != 1
     ):
@@ -376,12 +433,21 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         manifests[body] = validate_body_manifest(
             manifest, expected_body=body, manifest_dir=manifest_path.parent
         )
+    event_implementations = {
+        item["event_derivation_implementation_sha256"] for item in manifests.values()
+    }
+    if len(event_implementations) != 1:
+        raise FiveBodyContractError(
+            "five bodies do not share one analytic event implementation"
+        )
     return {
         "binding": binding,
         "binding_file_sha256": expected_sha256.lower(),
         "materialization": materialization_audit,
         "actor": actor_audit,
         "manifests": manifests,
+        "event_spec_sha256": EVENT_SPEC_SHA256,
+        "event_derivation_implementation_sha256": event_implementations.pop(),
     }
 
 
@@ -402,17 +468,27 @@ def source_group_split(
         for group in groups:
             by_condition[str(group["condition"])].append(group)
         for condition in CONDITIONS:
-            ordered = sorted(
-                by_condition[condition],
-                key=lambda item: hashlib.sha256(
-                    f"{split_seed}|{body}|{condition}|{item['group_id']}".encode()
+            by_seed: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            for group in by_condition[condition]:
+                by_seed[int(group["requested_seed"])].append(group)
+            ordered_seeds = sorted(
+                by_seed,
+                key=lambda seed: hashlib.sha256(
+                    f"{split_seed}|{body}|{condition}|{seed}".encode()
                 ).hexdigest(),
             )
-            if len(ordered) < 2:
-                raise FiveBodyContractError(f"{body}/{condition} cannot form source validation")
-            validation_count = max(1, int(round(0.2 * len(ordered))))
-            validation.extend({**row, "body": body} for row in ordered[:validation_count])
-            training.extend({**row, "body": body} for row in ordered[validation_count:])
+            if len(ordered_seeds) < 2:
+                raise FiveBodyContractError(
+                    f"{body}/{condition} cannot form seed-disjoint source validation"
+                )
+            validation_seed_count = max(1, int(round(0.2 * len(ordered_seeds))))
+            validation_seeds = set(ordered_seeds[:validation_seed_count])
+            for seed in ordered_seeds:
+                target = validation if seed in validation_seeds else training
+                target.extend(
+                    {**row, "body": body}
+                    for row in sorted(by_seed[seed], key=lambda item: item["group_id"])
+                )
     if not training or not validation or not heldout:
         raise FiveBodyContractError("LOBO split contains an empty lane")
     return training, validation, heldout
@@ -430,6 +506,10 @@ def build_preflight_receipt(
         "format": FORMAT,
         "status": "preflight_passed_payloads_still_unopened",
         "dataset_revision": DATASET_REVISION,
+        "event_spec_sha256": audit["event_spec_sha256"],
+        "event_derivation_implementation_sha256": audit[
+            "event_derivation_implementation_sha256"
+        ],
         "binding_file_sha256": audit["binding_file_sha256"],
         "held_out_body": held_out_body,
         "source_bodies": [body for body in BODIES if body != held_out_body],
@@ -443,6 +523,7 @@ def build_preflight_receipt(
             sorted(f"{held_out_body}|{row['group_id']}" for row in heldout)
         ),
         "assignment_uses_labels": False,
+        "split_unit": "body_condition_requested_seed_all_queries",
         "heldout_group_npz_opened": 0,
         "heldout_group_payload_bytes_read": 0,
         "heldout_group_payload_deserialized": 0,
@@ -490,8 +571,38 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
         raise FiveBodyContractError(f"{path} contains empty/non-finite canonical rows")
     if np.any((arrays["current_event_id"] < 0) | (arrays["current_event_id"] >= 5)):
         raise FiveBodyContractError(f"{path} current event ids are invalid")
+    expected_event_onehot = np.zeros((count, 5), dtype=np.float32)
+    expected_event_onehot[np.arange(count), arrays["current_event_id"].astype(int)] = 1.0
+    if not np.array_equal(
+        np.asarray(arrays["state"][:, 18:23], dtype=np.float32),
+        expected_event_onehot,
+    ):
+        raise FiveBodyContractError(
+            f"{path} state event onehot disagrees with current_event_id"
+        )
     if np.any(arrays["dt"] <= 0):
-        raise FiveBodyContractError(f"{path} contains non-positive elapsed time")
+        raise FiveBodyContractError(f"{path} contains non-positive planned dt")
+    if not np.allclose(
+        arrays["dt"], 5.0 / SOURCE_EVENT_SAMPLING_HZ, atol=1e-6, rtol=0.0
+    ):
+        raise FiveBodyContractError(f"{path} planned dt is not fixed 5/15 seconds")
+    if np.any(arrays["duration"] < 0):
+        raise FiveBodyContractError(f"{path} contains invalid simulator duration")
+    if not np.array_equal(
+        np.asarray(arrays["duration_mask"] > 0.5), arrays["duration"] > 0.0
+    ):
+        raise FiveBodyContractError(
+            f"{path} duration mask is not tied to positive simulator exposure"
+        )
+    horizon = arrays["actions"].shape[1]
+    planned_mask = np.arange(horizon) < 5
+    if horizon < 5 or not np.array_equal(
+        np.asarray(arrays["action_mask"], dtype=bool),
+        np.repeat(planned_mask[None], CANDIDATE_COUNT, axis=0),
+    ):
+        raise FiveBodyContractError(
+            f"{path} action mask does not expose the full planned first chunk"
+        )
     if not np.array_equal(arrays["candidate_index"], np.arange(CANDIDATE_COUNT)):
         raise FiveBodyContractError(f"{path} candidate order is not [0,1,2,3]")
     if not np.array_equal(
@@ -564,8 +675,8 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         self.register_buffer("state_mean", torch.zeros(core.STATE_DIM))
         self.register_buffer("state_std", torch.ones(core.STATE_DIM))
         self.candidate_rank = torch.nn.Sequential(
-            torch.nn.LayerNorm(core.SEMANTIC_DIM),
-            torch.nn.Linear(core.SEMANTIC_DIM, core.SEMANTIC_DIM // 2),
+            torch.nn.LayerNorm(CANDIDATE_RANK_FEATURE_DIM),
+            torch.nn.Linear(CANDIDATE_RANK_FEATURE_DIM, core.SEMANTIC_DIM // 2),
             torch.nn.GELU(),
             torch.nn.Linear(core.SEMANTIC_DIM // 2, 1),
         )
@@ -589,9 +700,22 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             batch["state"] - self.state_mean
         ) / self.state_std
         output = super().forward(normalized_batch)
-        output["candidate_rank_logit"] = self.candidate_rank(
-            output["transitioned"]
-        ).squeeze(-1)
+        # Ranking sees semantic action effects, the dt-dependent isolated
+        # clock, and the current-event duration distribution.  The semantic
+        # block remains end-to-end so rank supervision can improve the shared
+        # state/action transition.  Clock/duration features are detached so
+        # rank loss cannot directly move their proper likelihood parameters.
+        rank_features = torch.cat(
+            (
+                output["transitioned"],
+                output["clock_hidden"].detach(),
+                output["duration_selected_log_mean"].detach()[:, None],
+                output["duration_selected_log_scale"].detach()[:, None],
+            ),
+            dim=-1,
+        )
+        output["candidate_rank_features"] = rank_features
+        output["candidate_rank_logit"] = self.candidate_rank(rank_features).squeeze(-1)
         return output
 
 
@@ -966,9 +1090,25 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                         "held_out_body": args.held_out_body,
                         "source_bodies": preflight["source_bodies"],
                         "body_adapter": "single_shared_row_zero_heldout_parameters",
-                        "model_family": "effect_aligned_shared_event_head_v2",
+                        "model_family": "effect_aligned_time_aware_shared_event_head_v3",
+                        "candidate_rank_contract": {
+                            "feature_blocks": [
+                                "transitioned_semantic_end_to_end",
+                                "clock_hidden_detached",
+                                "current_event_duration_log_mean_detached",
+                                "current_event_duration_log_scale_detached",
+                            ],
+                            "feature_dim": CANDIDATE_RANK_FEATURE_DIM,
+                            "dt_has_numeric_score_path": True,
+                            "rank_loss_updates_clock_or_duration_heads": False,
+                            "rank_loss_updates_semantic_action_transition": True,
+                        },
                         "canonical_state_schema": CANONICAL_STATE_SCHEMA,
                         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
+                        "event_spec_sha256": EVENT_SPEC_SHA256,
+                        "event_derivation_implementation_sha256": preflight[
+                            "event_derivation_implementation_sha256"
+                        ],
                         "action_stem_count": 1,
                         "body_to_id_source_only": body_to_id,
                         "heldout_rows_used_for_training_normalization_or_selection": 0,
@@ -1000,6 +1140,16 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         "source_bodies": preflight["source_bodies"],
         "canonical_state_schema": CANONICAL_STATE_SCHEMA,
         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
+        "event_spec_sha256": EVENT_SPEC_SHA256,
+        "event_derivation_implementation_sha256": preflight[
+            "event_derivation_implementation_sha256"
+        ],
+        "candidate_rank_contract": {
+            "time_and_duration_effect_used": True,
+            "dt_has_numeric_score_path": True,
+            "rank_loss_updates_clock_or_duration_heads": False,
+            "rank_loss_updates_semantic_action_transition": True,
+        },
         "mixed_outcome_source_decisions": mixed_outcome_decisions,
         "source_negative_to_positive_ratio": source_negative_to_positive_ratio,
         "success_probability_training_loss": "unweighted_proper_binary_cross_entropy",
@@ -1065,7 +1215,7 @@ __all__ = [
     "CANONICAL_STATE_SCHEMA", "CompleteDecisionBatchSampler",
     "CONDITIONS", "FORMAT",
     "EffectAlignedSharedEventHead", "FiveBodyContractError", "MANIFEST_FORMAT",
-    "MATERIALIZATION_FORMAT",
+    "EVENT_SPEC_SHA256", "MATERIALIZATION_FORMAT",
     "build_preflight_receipt", "canonical_sha256", "load_binding",
     "evaluate_candidate_ranking", "materialize_source_rows", "sha256_file",
     "sha256_tree", "source_group_split",

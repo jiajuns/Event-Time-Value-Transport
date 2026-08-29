@@ -127,6 +127,13 @@ def test_success_intervals_bootstrap_and_mcnemar_are_explicit(
     mcnemar = global_row["success"]["exact_two_sided_mcnemar"]
     assert mcnemar["method"] == "exact_two_sided_binomial_on_discordant_b_c"
     assert mcnemar["repeated_seed_dependence_accounted_for"] is False
+    assert mcnemar["inferentially_valid_for_this_reporting_unit"] is False
+    assert valid_report["per_body_condition"][0]["success"][
+        "exact_two_sided_mcnemar"
+    ]["inferentially_valid_for_this_reporting_unit"] is True
+    assert "global_exact_mcnemar_p_below_0.05" not in valid_report[
+        "prospective_improvement_gate"
+    ]["checks"]
 
 
 def test_progress_is_supporting_and_never_called_exact(valid_report: dict[str, Any]) -> None:

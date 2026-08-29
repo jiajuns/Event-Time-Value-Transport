@@ -2,8 +2,9 @@
 
 入口：`scripts/collect_robotwin2_five_body_ee_candidate_branches_v1.py`。
 
-该入口为共享事件头生成真正的 critic 监督，而不是把官方 expert 正样本冒充成成败数据。每个本体
-使用冻结的 EE16 SmolVLA actor；对 clean/randomized 的独立开发 seed，在固定 query 0/1/2/3 处从
+该入口为共享事件头生成真正的 critic 监督，而不是把官方 expert 正样本冒充成成败数据。五个本体
+共用同一个冻结的 EE16 SmolVLA actor；对 clean/randomized 的独立开发 seed，在固定
+query `0/5/10/15`（约为第 `0/25/50/75` 个动作帧）处从
 同一 actor、同一状态和固定 flow-noise 规则采四个候选。candidate 0 是 actor baseline。每个候选都
 从相同 seed 重置并完整重放相同 prefix，然后执行首段动作并由同一个 actor继续到终止或 200 step。
 
@@ -14,14 +15,33 @@
 - post/next event、物理秒 duration；
 - success、regression/recovery；
 - moving object 与 relative-goal 的 6D 变化；
-- 固定 candidate index 0–3 与实际首段 elapsed seconds。
+- 固定 candidate index 0–3 与执行前已知的 planned horizon `dt=5/15s`。
+
+`duration` 与 `dt` 的语义严格分开。RoboTwin 一次 EE action 会执行可变数量的内部物理步；采集器用
+透明 scene proxy 计数真实 `scene.step()`，再乘 `scene.get_timestep()`，只把这个物理时间用于事件
+边界 `duration`。`dt` 是 critic 打分时已知的五步动作窗口，固定为 `5/15s`，不会泄漏候选执行后的
+信息。e4 也不再是“连续三个可变时长动作端点”：它要求近目标且物理速度不超过解析规范中明确先验的
+`0.01 m/s`，并在 simulator time 上持续至少 `0.2s`。
+
+五本体正式链只接受
+`configs/robotwin2_move_can_pot_five_body_analytic_event_spec_v1.json`，文件 SHA-256 为
+`4df5b7242d1c7bf8e3f5dac65c0eb4376043dbf6c60ef2633d086ab06e7e3aee`。该规范没有复用
+Stage2 从 Aloha/ARX 成功标签和终点拟合的旧规范：moving=`can`、anchor=`pot`，目标左右侧取
+`sign(initial_can_x-initial_pot_x)`，目标为初始 pot 的同侧 `0.18m`。near-goal 半径
+`0.02m=min(0.035,0.20-0.18)` 直接来自公开任务代码；移动/抬升 `0.01m`、静止速度
+`0.01m/s` 与静止窗 `0.2s` 均明确记录为未拟合先验。采集和在线 paired runner 导入同一个解析实现，
+所以 e0/e12/e3/e4/eK 与 state27 的前三个 relative-goal 通道不会各自重写。
 
 开发采集默认 seed 从 `2026081000` 开始，与正式配对评估的
 `2026090000..2026090099` 完全分开。manifest 只保存 group identity、condition、seed、query、路径和
 payload SHA，不复制 candidate success/event 标签；因此外层 held-out body 的 manifest 可用于 LOBO
 分配而不提前读取目标 outcome。
 
-默认规模为 50 seed × 4 query × 2 condition × 5 body = 2,000 同根决策，即 8,000 条完整候选分支。
+正式规模为每个 body/condition/query 恰好 50 个完整决策，即
+`50 × 4 query × 2 condition × 5 body = 2,000` 个同根决策、8,000 条完整候选分支。先运行开发
+seed `2026081000..2026081049`；若晚期 query 因 actor 提前成功而缺失，watcher 只用后续开发 seed
+在相同 condition/query 分层补足到 50，不把 query 回退到早期，也绝不进入正式评估 seed
+`2026090000..2026090099`。
 五个本体顺序运行以共享一张 4090。采集完成后，每个 outer LOBO fold 仅打开另外四个 source body
 的 NPZ；held-out body payload 不参与 normalization、训练或 checkpoint selection。
 
@@ -45,7 +65,7 @@ payload SHA，不复制 candidate success/event 标签；因此外层 held-out b
 
 ```bash
 export PYTHONNOUSERSITE=1
-export COLLECTOR_CODE=/home/user/etsf_robotwin2_fivebody_branch_collector_dev_20260830
+export COLLECTOR_CODE=/home/user/etsf_robotwin2_fivebody_full8000_code_20260830_v2_analytic
 export ROBOTWIN_ROOT=/home/user/etsf_stage0/RoboTwin
 export PYTHONPATH=${COLLECTOR_CODE}:/home/user/etsf_stage0/lerobot/src:/home/user/etsf_stage0/.venv_lerobot_smolvla_v044/lib/python3.10/site-packages:${ROBOTWIN_ROOT}:${ROBOTWIN_ROOT}/envs/curobo/src:/home/user/anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages
 export ASSETS_PATH=${ROBOTWIN_ROOT}
@@ -78,62 +98,41 @@ for body in BODY_EMBODIMENT:
         obs = task.get_obs()["observation"]
         rgb = [obs[k]["rgb"].shape for k in ("head_camera", "left_camera", "right_camera")]
         action = current_ee_action16(task)
+        before = task.scene.step_count
         task.take_action(action, action_type="ee")
+        sim_steps = task.scene.step_count - before
         assert action.shape == (16,) and np.isfinite(action).all()
         assert all(shape == (240, 320, 3) for shape in rgb)
-        print(body, BODY_EMBODIMENT[body], rgb, "ee16/action/success=OK", bool(task.check_success()))
+        assert sim_steps > 0 and task.scene.timestep_seconds > 0
+        print(body, BODY_EMBODIMENT[body], rgb, "sim_steps", sim_steps,
+              "sim_seconds", sim_steps * task.scene.timestep_seconds,
+              "ee16/action/success=OK", bool(task.check_success()))
     finally:
         task.close_env(clear_cache=False)
 PY
 ```
 
-## 五本体顺序采集命令
+## Actor 完成后自动顺序采集
 
-当前远程机尚无任何 16D EE SmolVLA actor checkpoint。已有 checkpoint 是 14D joint actor，collector
-会按设计拒绝它，不能伪装成 EE actor。等五个 EE16 actor 目录生成后，按下面固定路径放置并顺序采集；
-每个进程都写独立日志和 body 目录，可以安全断开 SSH：
+入口 `scripts/watch_robotwin2_ee16_actor_to_five_body_branches_v1.py` 在远程后台等待 actor watcher 的
+`status=complete`，等待时不初始化 CUDA。它只接受固定 checkpoint：
+
+`/home/user/etsf_smolvla_models/smolvla_robotwin2_move_can_pot_5emb_ee16_full2750_20k_20260830/checkpoints/020000/pretrained_model`
+
+checkpoint 出现后，watcher 先验证并绑定目录树 SHA、`config.json` SHA、state16/action16，再用同一个
+actor 顺序运行五个本体。正式输出根固定为：
+
+`/home/user/etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic`
+
+完成时额外生成五本体 actor authority、完整 collection receipt 和 LOBO training binding。后台启动：
 
 ```bash
-export ACTOR_ROOT=/home/user/etsf_robotwin2_ee16_actors
-export BRANCH_ROOT=/home/user/etsf_robotwin2_fivebody_branches_20260830
-export VLM_METADATA=/home/user/etsf_stage0/offline_assets/smolvlm2_500m_metadata
-export EVENT_SPEC=/home/user/etsf_schema6_event_spec_r6g_20260828.json
-mkdir -p ${BRANCH_ROOT}/logs
-
-nohup bash -lc '
-set -euo pipefail
-export PYTHONNOUSERSITE=1
-export COLLECTOR_CODE=/home/user/etsf_robotwin2_fivebody_branch_collector_dev_20260830
-export ROBOTWIN_ROOT=/home/user/etsf_stage0/RoboTwin
-export PYTHONPATH=${COLLECTOR_CODE}:/home/user/etsf_stage0/lerobot/src:/home/user/etsf_stage0/.venv_lerobot_smolvla_v044/lib/python3.10/site-packages:${ROBOTWIN_ROOT}:${ROBOTWIN_ROOT}/envs/curobo/src:/home/user/anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages
-export ASSETS_PATH=${ROBOTWIN_ROOT}
-export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
-export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-PY=/home/user/anaconda3/envs/RoboTwin2/bin/python
-ACTOR_ROOT=/home/user/etsf_robotwin2_ee16_actors
-BRANCH_ROOT=/home/user/etsf_robotwin2_fivebody_branches_20260830
-VLM_METADATA=/home/user/etsf_stage0/offline_assets/smolvlm2_500m_metadata
-EVENT_SPEC=/home/user/etsf_schema6_event_spec_r6g_20260828.json
-cd ${ROBOTWIN_ROOT}
-for body in aloha-agilex arx-x5 franka piper ur5; do
-  ${PY} ${COLLECTOR_CODE}/collect_robotwin2_five_body_ee_candidate_branches_v1.py \
-    --body ${body} \
-    --actor-checkpoint ${ACTOR_ROOT}/${body}/checkpoints/last/pretrained_model \
-    --vlm-metadata-path ${VLM_METADATA} \
-    --robotwin-root ${ROBOTWIN_ROOT} \
-    --event-spec ${EVENT_SPEC} \
-    --conditions clean randomized \
-    --seed-start 2026081000 \
-    --seed-count 50 \
-    --root-query-indices 0 1 2 3 \
-    --action-exec-steps 5 \
-    --max-steps 200 \
-    --output ${BRANCH_ROOT}/${body} \
-    > ${BRANCH_ROOT}/logs/${body}.log 2>&1
-done
-' > ${BRANCH_ROOT}/logs/launcher.log 2>&1 &
-echo $! > ${BRANCH_ROOT}/launcher.pid
+CODE=/home/user/etsf_robotwin2_fivebody_full8000_code_20260830_v2_analytic
+WATCH=/home/user/etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic
+nohup /home/user/anaconda3/envs/RoboTwin2/bin/python \
+  ${CODE}/watch_robotwin2_ee16_actor_to_five_body_branches_v1.py \
+  > ${WATCH}.watcher.log 2>&1 < /dev/null &
+echo $! > ${WATCH}.watcher.pid
 ```
 
 单本体前台调用形式为：
@@ -141,14 +140,15 @@ echo $! > ${BRANCH_ROOT}/launcher.pid
 ```bash
 ${PY} ${COLLECTOR_CODE}/collect_robotwin2_five_body_ee_candidate_branches_v1.py \
   --body piper \
-  --actor-checkpoint /home/user/etsf_robotwin2_ee16_actors/piper/checkpoints/last/pretrained_model \
+  --actor-checkpoint /home/user/etsf_smolvla_models/smolvla_robotwin2_move_can_pot_5emb_ee16_full2750_20k_20260830/checkpoints/020000/pretrained_model \
   --vlm-metadata-path /home/user/etsf_stage0/offline_assets/smolvlm2_500m_metadata \
   --robotwin-root /home/user/etsf_stage0/RoboTwin \
-  --event-spec /home/user/etsf_schema6_event_spec_r6g_20260828.json \
+  --event-spec /home/user/etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v1.json \
   --conditions clean randomized \
   --seed-start 2026081000 \
   --seed-count 50 \
-  --output /home/user/etsf_robotwin2_fivebody_branches_20260830/piper
+  --root-query-indices 0 5 10 15 \
+  --output /home/user/etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic/piper
 ```
 
 该阶段的输出用于训练，不是最终测试结果。论文主数字仍来自五个 held-out body 上冻结策略

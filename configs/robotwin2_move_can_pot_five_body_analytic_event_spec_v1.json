@@ -1,0 +1,104 @@
+{
+  "calibration": {
+    "move_can_pot": {
+      "anchor": "pot",
+      "event_rules": {
+        "e0": "not_moved_and_not_lifted_and_not_near_goal_and_not_stationary_and_not_terminal_success",
+        "e12": "moved_or_lifted",
+        "e3": "near_goal",
+        "e4": "near_goal_and_stationary_for_window",
+        "eK": "terminal_simulator_success",
+        "precedence_low_to_high": [
+          "e0",
+          "e12",
+          "e3",
+          "e4",
+          "eK"
+        ]
+      },
+      "goal_rule": {
+        "anchor_pose_source": "episode_initial_pot_xyz",
+        "kind": "initial_moving_relative_anchor_x_sign",
+        "lateral_offset_m": 0.18,
+        "negative_initial_relative_x_offset_m": -0.18,
+        "positive_initial_relative_x_offset_m": 0.18,
+        "side_sign_source": "sign(initial_can_x_minus_initial_pot_x)",
+        "y_offset_m": 0.0,
+        "z_offset_m": 0.0,
+        "zero_sign_policy": "error_unreachable_under_public_task_initialization"
+      },
+      "moving": "can",
+      "required_objects": [
+        "can",
+        "pot"
+      ],
+      "thresholds": {
+        "lifted_delta_z_m": 0.01,
+        "moved_displacement_m": 0.01,
+        "near_goal_euclidean_m": 0.02,
+        "stationary_speed_m_per_s": 0.01,
+        "stationary_window_seconds": 0.2
+      }
+    }
+  },
+  "construction": {
+    "data_or_label_files_opened": 0,
+    "labels_or_outcomes_used_to_fit": false,
+    "method": "analytic_public_task_code_and_explicit_physical_priors_only",
+    "protected_hdf_or_labels_read": false,
+    "trainable": false
+  },
+  "event_names": [
+    "e0",
+    "e12",
+    "e3",
+    "e4",
+    "eK"
+  ],
+  "format": "etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v1",
+  "provenance": {
+    "public_task_code": {
+      "commit": "30954692d06ba7e89f7a6b76064f4062c488fa81",
+      "path": "envs/move_can_pot.py",
+      "repository": "https://github.com/RoboTwin-Platform/RoboTwin",
+      "semantic_facts": [
+        "task attributes are pot and can",
+        "arm side is selected from the initial can x side while the public task fixes pot x to zero",
+        "target x is initial pot x minus or plus 0.18 m and target y is initial pot y",
+        "initialization rejects abs(can_x) below 0.2 m so zero side is unreachable",
+        "success requires signed can-pot x distance below 0.2 m and absolute y distance below 0.035 m"
+      ],
+      "url": "https://github.com/RoboTwin-Platform/RoboTwin/blob/30954692d06ba7e89f7a6b76064f4062c488fa81/envs/move_can_pot.py"
+    },
+    "thresholds": {
+      "lifted_delta_z_m": {
+        "kind": "explicit_physical_prior_not_fitted",
+        "rationale": "one centimetre vertical displacement marks a material lift while remaining independent of any trajectory distribution",
+        "value": 0.01
+      },
+      "moved_displacement_m": {
+        "kind": "explicit_physical_prior_not_fitted",
+        "rationale": "one centimetre 3D displacement marks material object motion while remaining independent of any trajectory distribution",
+        "value": 0.01
+      },
+      "near_goal_euclidean_m": {
+        "formula": "min(public_success_y_tolerance_0.035, public_success_x_limit_0.20 - public_target_offset_0.18)",
+        "kind": "analytic_from_public_task_code",
+        "rationale": "a conservative position-only ball around the public target; orientation, release and terminal success remain separate",
+        "value": 0.02
+      },
+      "stationary_speed_m_per_s": {
+        "kind": "explicit_physical_prior_not_fitted",
+        "rationale": "one centimetre per second is the declared settled-motion prior",
+        "value": 0.01
+      },
+      "stationary_window_seconds": {
+        "kind": "explicit_physical_prior_not_fitted",
+        "rationale": "one fifth of a physical second is the declared persistence prior",
+        "value": 0.2
+      }
+    }
+  },
+  "status": "frozen_data_and_label_free_analytic_spec",
+  "task": "move_can_pot"
+}

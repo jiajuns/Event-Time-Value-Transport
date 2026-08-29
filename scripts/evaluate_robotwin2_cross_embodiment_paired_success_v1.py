@@ -23,9 +23,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-INPUT_FORMAT = "etsf_robotwin2_move_can_pot_paired_outcomes_v1"
+INPUT_FORMAT = "etsf_robotwin2_move_can_pot_paired_outcomes_v2"
 INPUT_STATUS = "frozen_complete_preregistered_five_body_two_condition_pairs"
-REPORT_FORMAT = "etsf_robotwin2_move_can_pot_cross_embodiment_paired_success_report_v1"
+REPORT_FORMAT = "etsf_robotwin2_move_can_pot_cross_embodiment_paired_success_report_v2"
 REPORT_STATUS = "metrics_computed_no_promotion_deployment_or_claim_authority"
 CONFIDENCE_LEVEL = 0.95
 ALPHA = 1.0 - CONFIDENCE_LEVEL
@@ -44,7 +44,7 @@ APPROVED_BOOTSTRAP_DRAW_INDEX_SHA256 = (
 )
 EXPECTED_PAIR_COUNT = len(BODIES) * len(EVALUATION_CONDITIONS) * EVALUATION_SEED_COUNT
 APPROVED_PREREGISTRATION_SHA256 = (
-    "75fc9c6e487e60c3ff274a2fb8c90f6a738b30999b9e74e00c98a54f1dce52ee"
+    "a4e59f647c520609313e1c9aca03dbb3f770504e0383c66bb619dca94b4c6827"
 )
 STAGE_PROGRESS_SUPPORT = (0.0, 0.25, 0.5, 0.75, 1.0)
 MAX_INPUT_BYTES = 32 * 1024 * 1024
@@ -732,9 +732,10 @@ def _unit_metrics(
                 "p_value": _fraction(exact_two_sided_mcnemar(baseline_only, etsf_only)),
                 "zero_discordant_p_is_one": True,
                 "repeated_seed_dependence_accounted_for": False,
+                "inferentially_valid_for_this_reporting_unit": cell_count == 1,
                 "scope_note": (
-                    "combinatorial p-value is exact conditional on independent pairs; "
-                    "for multi-cell macros it does not model repeated-seed clustering"
+                    "inferential only for one body-condition cell with distinct seeds; "
+                    "multi-cell macros repeat requested seeds and this value is descriptive"
                 ),
             },
             "binary_rate_interval_dependency": {
@@ -833,15 +834,11 @@ def evaluate_document(value: Mapping[str, Any], *, input_file_sha256: str | None
         cell_count=len(BODIES) * len(EVALUATION_CONDITIONS),
     )
     global_delta = global_macro["success"]["delta_etsf_minus_actor"]
-    global_mcnemar = global_macro["success"]["exact_two_sided_mcnemar"]
     gate_checks = {
         "all_1000_preregistered_pairs_complete": len(rows) == EXPECTED_PAIR_COUNT,
         "global_macro_delta_cluster_bootstrap_lcb95_strictly_positive": (
             global_delta["paired_requested_seed_cluster_bootstrap_95pct_ci"]["lower"]
             > 0.0
-        ),
-        "global_exact_mcnemar_p_below_0.05": (
-            global_mcnemar["p_value"]["value"] < 0.05
         ),
         "every_heldout_body_macro_delta_nonnegative": all(
             row["success"]["delta_etsf_minus_actor"]["estimate"] >= 0.0

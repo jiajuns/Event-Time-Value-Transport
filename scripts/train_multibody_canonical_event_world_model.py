@@ -806,6 +806,11 @@ class MultibodyCanonicalEventWorldModel(nn.Module):
             "semantic": semantic,
             "action_effect": action_effect,
             "transitioned": transitioned,
+            # Expose the isolated physical-time representation so downstream
+            # decision heads can consume time without reimplementing the
+            # clock.  The core proper duration heads continue to own the
+            # gradients into this representation.
+            "clock_hidden": clock_hidden,
             "post_event_logits": self.post_event(transitioned),
             "next_event_logits": self.next_event(transitioned),
             "success_logit": self.success(transitioned).squeeze(-1),

@@ -143,7 +143,7 @@ def test_primary_metrics_freeze_sr_delta_ci_mcnemar_and_stage_progress() -> None
         "etsf_best_of_4_sr",
         "paired_delta_sr",
         "paired_delta_sr_95pct_ci",
-        "exact_two_sided_mcnemar_p",
+        "per_body_condition_exact_two_sided_mcnemar_p",
         "discordant_actor_only_success_count",
         "discordant_etsf_only_success_count",
     ]
@@ -151,6 +151,8 @@ def test_primary_metrics_freeze_sr_delta_ci_mcnemar_and_stage_progress() -> None
     assert primary["delta_interval"]["method"] == "paired_seed_cluster_percentile_bootstrap"
     assert primary["delta_interval"]["bootstrap_samples"] == 20_000
     assert primary["mcnemar"]["method"] == "exact_two_sided_binomial_on_discordant_pairs"
+    assert primary["mcnemar"]["inferential_scope"] == "each_single_body_condition_cell_only"
+    assert "global_exact_mcnemar_p_below" not in primary["prospective_improvement_gate"]
     assert primary["stage_progress_or_critic_metric_may_replace_failed_full_task_sr"] is False
     assert progress["events"] == ["e0", "e12", "e3", "e4", "eK"]
     assert progress["terminal_max_event_progress"] == {

@@ -14,6 +14,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import train_multibody_canonical_event_world_model as core  # noqa: E402
+import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E402
 import verify_robotwin2_move_can_pot_public_materialization_v1 as verifier  # noqa: E402
 from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
@@ -24,9 +25,13 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     CANONICAL_STATE_SCHEMA,
     DATASET_REPO,
     DATASET_REVISION,
+    EVENT_SPEC_SHA256,
+    CANDIDATE_RANK_FEATURE_DIM,
+    EffectAlignedSharedEventHead,
     MANIFEST_FORMAT,
     MATERIALIZATION_FORMAT,
     PREREGISTRATION_SHA256,
+    SOURCE_EVENT_SAMPLING_HZ,
     TASK,
     FiveBodyContractError,
     build_preflight_receipt,
@@ -51,10 +56,13 @@ def _write_json(path: Path, value: dict[str, object]) -> str:
 
 
 def _group(path: Path, offset: float) -> None:
-    count, horizon = 4, 3
+    count, horizon = 4, 5
+    state = np.full((count, core.STATE_DIM), offset, dtype=np.float32)
+    state[:, 18:27] = 0.0
+    state[:, 18] = 1.0
     np.savez(
         path,
-        state=np.full((count, core.STATE_DIM), offset, dtype=np.float32),
+        state=state,
         actions=np.full((count, horizon, core.ACTION_DIM), offset, dtype=np.float32),
         action_mask=np.ones((count, horizon), dtype=np.float32),
         current_event_id=np.zeros(count, dtype=np.int64),
@@ -62,9 +70,9 @@ def _group(path: Path, offset: float) -> None:
         post_event_mask=np.ones(count, dtype=np.float32),
         next_event_id=np.asarray([1, 2, 3, 4], dtype=np.int64),
         next_event_mask=np.ones(count, dtype=np.float32),
-        duration=np.asarray([1, 2, 3, 4], dtype=np.float32),
-        duration_observed=np.ones(count, dtype=np.float32),
-        duration_mask=np.ones(count, dtype=np.float32),
+        duration=np.asarray([0, 2, 3, 4], dtype=np.float32),
+        duration_observed=np.asarray([0, 1, 1, 1], dtype=np.float32),
+        duration_mask=np.asarray([0, 1, 1, 1], dtype=np.float32),
         success=np.asarray([0, 1, 0, 1], dtype=np.float32),
         success_mask=np.ones(count, dtype=np.float32),
         recovery=np.asarray([0, 0, 1, 0], dtype=np.float32),
@@ -72,7 +80,7 @@ def _group(path: Path, offset: float) -> None:
         object_delta=np.full((count, core.OBJECT_DELTA_DIM), 0.1, dtype=np.float32),
         object_delta_mask=np.ones(count, dtype=np.float32),
         candidate_index=np.arange(count, dtype=np.int64),
-        dt=np.full(count, 0.1, dtype=np.float32),
+        dt=np.full(count, 5.0 / SOURCE_EVENT_SAMPLING_HZ, dtype=np.float32),
     )
 
 
@@ -212,6 +220,49 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                     "event_names": list(core.CANONICAL_EVENTS),
                     "implementation_sha256": f"{body_index + 60:064x}",
                 },
+                "event_spec_sha256": EVENT_SPEC_SHA256,
+                "analytic_event_contract": analytic_event.event_contract(
+                    {
+                        "moving": "can",
+                        "anchor": "pot",
+                        "required_objects": list(analytic_event.REQUIRED_OBJECTS),
+                        "goal_rule": dict(analytic_event.GOAL_RULE),
+                        "thresholds": dict(analytic_event.THRESHOLDS),
+                        "event_rules": dict(analytic_event.EVENT_RULES),
+                    }
+                ),
+                "event_derivation_implementation_sha256": "7" * 64,
+                "state27_relative_goal_contract": (
+                    "same_analytic_initial_side_pot_relative_goal_vector_used_for_"
+                    "event_labels_and_online_state27_channels_0_2"
+                ),
+                "physical_time_contract": {
+                    "source": "counted_successful_sapien_scene_step_calls",
+                    "simulator_timestep_source": "scene.get_timestep",
+                    "policy_action_call_count_used_as_time": False,
+                    "wall_clock_used_as_time": False,
+                    "dt_semantics": "planned_first_candidate_chunk_seconds",
+                    "planned_action_steps": 5,
+                    "actor_control_hz": SOURCE_EVENT_SAMPLING_HZ,
+                    "planned_dt_seconds": 5.0 / SOURCE_EVENT_SAMPLING_HZ,
+                    "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
+                    "zero_elapsed_duration_masked": True,
+                    "stationary_source_sampling_hz": SOURCE_EVENT_SAMPLING_HZ,
+                    "stationary_window_seconds": analytic_event.THRESHOLDS[
+                        "stationary_window_seconds"
+                    ],
+                    "stationary_speed_threshold_m_per_s": analytic_event.THRESHOLDS[
+                        "stationary_speed_m_per_s"
+                    ],
+                },
+                "candidate_action_contract": {
+                    "critic_observation_time": "before_candidate_execution",
+                    "planned_action_horizon": 5,
+                    "action_mask_source": "planned_first_chunk_not_executed_count",
+                    "executed_action_count_used_for_action_mask": False,
+                    "executed_action_count_used_for_sim_time_accounting_only": True,
+                    "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
+                },
                 "groups": groups,
             }
         )
@@ -227,6 +278,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
+            "event_spec_sha256": EVENT_SPEC_SHA256,
             "heldout_labels_may_train_fit_calibrate_or_select": False,
             "canonical_shared_body_rows": 1,
             "execution_authority": {
@@ -263,6 +315,57 @@ def test_preflight_is_five_fold_source_only_and_payload_blind(
         assert receipt["heldout_specific_trainable_parameters"] == 0
         assert receipt["model_body_rows"] == 1
         assert receipt["actor_frozen"] is True
+        assert receipt["split_unit"] == "body_condition_requested_seed_all_queries"
+
+
+def test_source_split_keeps_all_queries_from_one_seed_in_one_lane() -> None:
+    manifests = {}
+    for body in BODIES:
+        groups = []
+        for condition in ("clean", "randomized"):
+            for seed in (101, 102, 103, 104, 105):
+                for query in (0, 5, 10, 15):
+                    groups.append(
+                        {
+                            "condition": condition,
+                            "requested_seed": seed,
+                            "group_id": f"{condition}-seed{seed}-query{query}",
+                        }
+                    )
+        manifests[body] = {"groups": groups}
+    train, validation, _heldout = source_group_split(
+        {"manifests": manifests}, held_out_body="franka", split_seed=19
+    )
+    for body in BODIES:
+        if body == "franka":
+            continue
+        for condition in ("clean", "randomized"):
+            train_seeds = {
+                row["requested_seed"]
+                for row in train
+                if row["body"] == body and row["condition"] == condition
+            }
+            validation_seeds = {
+                row["requested_seed"]
+                for row in validation
+                if row["body"] == body and row["condition"] == condition
+            }
+            assert train_seeds and validation_seeds
+            assert train_seeds.isdisjoint(validation_seeds)
+            for seed in train_seeds | validation_seeds:
+                train_count = sum(
+                    row["requested_seed"] == seed
+                    and row["body"] == body
+                    and row["condition"] == condition
+                    for row in train
+                )
+                validation_count = sum(
+                    row["requested_seed"] == seed
+                    and row["body"] == body
+                    and row["condition"] == condition
+                    for row in validation
+                )
+                assert (train_count, validation_count) in {(4, 0), (0, 4)}
 
 
 def test_heldout_payload_is_not_stat_hashed_or_deserialized_in_preflight(
@@ -357,3 +460,55 @@ def test_incomplete_public_download_receipt_fails_closed(tmp_path: Path) -> None
     digest = _write_json(binding, decoded)
     with pytest.raises(FiveBodyContractError, match="not verified"):
         load_binding(binding, digest)
+
+
+def _model_batch(dt: torch.Tensor) -> dict[str, torch.Tensor]:
+    count = len(dt)
+    state = torch.zeros(count, core.STATE_DIM)
+    state[:, 18] = 1.0
+    return {
+        "state": state,
+        "actions": torch.randn(count, 5, core.ACTION_DIM),
+        "action_mask": torch.ones(count, 5, dtype=torch.bool),
+        "action_available": torch.ones(count, dtype=torch.bool),
+        "action_schema_id": torch.zeros(count, dtype=torch.long),
+        "body_id": torch.zeros(count, dtype=torch.long),
+        "dt": dt,
+        "current_event_id": torch.zeros(count, dtype=torch.long),
+    }
+
+
+def test_rank_gradient_updates_effect_backbone_but_not_clock_or_duration_heads() -> None:
+    torch.manual_seed(7)
+    model = EffectAlignedSharedEventHead().eval()
+    output = model(_model_batch(torch.full((4,), 5.0 / 15.0)))
+    output["candidate_rank_logit"].sum().backward()
+    assert any(parameter.grad is not None for parameter in model.semantic.parameters())
+    assert any(parameter.grad is not None for parameter in model.action.parameters())
+    assert any(parameter.grad is not None for parameter in model.transition.parameters())
+    assert all(parameter.grad is None for parameter in model.clock.parameters())
+    assert all(parameter.grad is None for parameter in model.duration_mean.parameters())
+    assert all(parameter.grad is None for parameter in model.duration_scale.parameters())
+    assert all(parameter.grad is None for parameter in model.post_event.parameters())
+    assert all(parameter.grad is None for parameter in model.success.parameters())
+
+
+def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
+    model = EffectAlignedSharedEventHead().eval()
+    linear = torch.nn.Linear(CANDIDATE_RANK_FEATURE_DIM, 1, bias=False)
+    with torch.no_grad():
+        linear.weight.zero_()
+        linear.weight[0, core.SEMANTIC_DIM] = 1.0
+        model.clock.body_beta.weight.zero_()
+        model.clock.base_tau.weight.zero_()
+        model.clock.base_tau.bias.zero_()
+        model.clock.candidate.weight.zero_()
+        model.clock.candidate.bias.zero_()
+        model.clock.candidate.bias[0] = 1.0
+    model.candidate_rank = linear
+    batch = _model_batch(torch.tensor([1.0 / 15.0, 5.0 / 15.0]))
+    batch["state"][1] = batch["state"][0]
+    batch["actions"][1] = batch["actions"][0]
+    output = model(batch)
+    assert output["clock_hidden"][0, 0] != output["clock_hidden"][1, 0]
+    assert output["candidate_rank_logit"][0] != output["candidate_rank_logit"][1]

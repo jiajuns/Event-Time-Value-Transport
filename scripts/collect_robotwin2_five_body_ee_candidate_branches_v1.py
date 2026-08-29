@@ -31,6 +31,7 @@ import torch
 import yaml
 
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
+import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
 
 
 FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v1"
@@ -45,9 +46,11 @@ NATIVE_EE_DIM = 16
 CANONICAL_ACTION_DIM = 14
 STATE_DIM = 27
 OBJECT_DELTA_DIM = 6
+SOURCE_EVENT_SAMPLING_HZ = 15.0
 DEFAULT_INSTRUCTION = "Move the can to the side of the pot."
 CANONICAL_EVENTS = ("e0", "e12", "e3", "e4", "eK")
 EVENT_TO_ID = {name: index for index, name in enumerate(CANONICAL_EVENTS)}
+EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
 STATE_SCHEMA = canonical_adapter.STATE_SCHEMA
 ACTION_SCHEMA = canonical_adapter.ACTION_SCHEMA
 BODY_EMBODIMENT = {
@@ -61,6 +64,42 @@ BODY_EMBODIMENT = {
 
 class BranchCollectionError(RuntimeError):
     """The actor, reset, replay or canonical output is invalid."""
+
+
+class SimulationClockScene:
+    """Transparent SAPIEN scene proxy with an exact physical-step clock.
+
+    RoboTwin's EE ``take_action`` executes a variable number of internal
+    ``scene.step`` calls.  Counting policy calls or wall time therefore cannot
+    produce a cross-embodiment duration target.  The proxy observes the actual
+    simulation steps without changing the scene implementation.
+    """
+
+    def __init__(self, scene: Any) -> None:
+        object.__setattr__(self, "_scene", scene)
+        timestep = float(scene.get_timestep())
+        if not np.isfinite(timestep) or timestep <= 0.0:
+            raise BranchCollectionError("RoboTwin scene timestep must be positive")
+        object.__setattr__(self, "timestep_seconds", timestep)
+        object.__setattr__(self, "step_count", 0)
+
+    def step(self) -> Any:
+        result = self._scene.step()
+        object.__setattr__(self, "step_count", int(self.step_count) + 1)
+        return result
+
+    @property
+    def sim_seconds(self) -> float:
+        return float(self.step_count) * float(self.timestep_seconds)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._scene, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"_scene", "timestep_seconds", "step_count"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._scene, name, value)
 
 
 def sha256_file(path: Path) -> str:
@@ -165,55 +204,25 @@ def _goal_vector(
     step: int,
     calibration: Mapping[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    moving_index = list(names).index(str(calibration["moving"]))
-    moving = poses[step, moving_index, :3]
-    anchor_name = str(calibration.get("anchor", ""))
-    if anchor_name:
-        anchor_index = list(names).index(anchor_name)
-        goal = poses[step, anchor_index, :3] + np.asarray(
-            calibration.get("offset", [0.0, 0.0, 0.0]), dtype=np.float32
-        )
-    else:
-        centers = np.asarray(calibration["centers"], dtype=np.float32)
-        goal = centers[np.linalg.norm(centers - moving[None], axis=1).argmin()]
-    return moving.astype(np.float32), (goal - moving).astype(np.float32)
+    try:
+        return analytic_event.goal_vector(poses, names, step, calibration)
+    except analytic_event.AnalyticEventSpecError as error:
+        raise BranchCollectionError(str(error)) from error
 
 
 def derive_predicates_and_events(
     poses: np.ndarray,
+    sim_times: np.ndarray,
     names: Sequence[str],
     success: bool,
     calibration: Mapping[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    moving_index = list(names).index(str(calibration["moving"]))
-    position = poses[:, moving_index, :3]
-    displacement = np.linalg.norm(position - position[0], axis=1)
-    moved = displacement >= float(calibration["delta_move"])
-    lifted = position[:, 2] >= position[0, 2] + float(calibration["delta_z"])
-    near = np.asarray(
-        [
-            np.linalg.norm(_goal_vector(poses, names, step, calibration)[1])
-            <= float(calibration["tau_d"])
-            for step in range(len(poses))
-        ],
-        dtype=bool,
-    )
-    motion = np.r_[0.0, np.linalg.norm(np.diff(position, axis=0), axis=1)]
-    instant_stationary = near & (motion <= float(calibration["tau_motion"]))
-    stationary = np.zeros(len(poses), dtype=bool)
-    width = int(calibration["stationary_steps"])
-    for step in range(width - 1, len(poses)):
-        stationary[step] = bool(instant_stationary[step - width + 1 : step + 1].all())
-    succeeded = np.zeros(len(poses), dtype=bool)
-    if success:
-        succeeded[-1] = True
-    predicates = np.stack((moved, lifted, near, stationary, succeeded), axis=-1)
-    events = np.full(len(poses), EVENT_TO_ID["e0"], dtype=np.int64)
-    events[moved | lifted] = EVENT_TO_ID["e12"]
-    events[near] = EVENT_TO_ID["e3"]
-    events[stationary] = EVENT_TO_ID["e4"]
-    events[succeeded] = EVENT_TO_ID["eK"]
-    return predicates.astype(np.float32), events
+    try:
+        return analytic_event.derive_predicates_and_events(
+            poses, sim_times, names, success, calibration
+        )
+    except (analytic_event.AnalyticEventSpecError, ValueError) as error:
+        raise BranchCollectionError(str(error)) from error
 
 
 def _image_chw(value: Any) -> torch.Tensor:
@@ -394,7 +403,28 @@ def _new_task(task_class: Any, args: Mapping[str, Any], seed: int, instruction: 
     if "step_lim" in args:
         task.step_lim = int(args["step_lim"])
     task.set_instruction(instruction=instruction)
+    task.scene = SimulationClockScene(task.scene)
     return task
+
+
+def _sim_time(task: Any) -> float:
+    scene = task.scene
+    if not isinstance(scene, SimulationClockScene):
+        raise BranchCollectionError("task scene is missing the physical simulation clock")
+    return scene.sim_seconds
+
+
+def _append_physical_observation(
+    task: Any,
+    objects: Sequence[Any],
+    trajectory: list[np.ndarray],
+    sim_times: list[float],
+) -> None:
+    now = _sim_time(task)
+    if now <= sim_times[-1]:
+        raise BranchCollectionError("EE action advanced no physical simulator steps")
+    trajectory.append(read_poses(objects))
+    sim_times.append(now)
 
 
 def _episode_done(task: Any, max_steps: int) -> bool:
@@ -423,6 +453,7 @@ def _root_prefix(
     try:
         names, objects = discover_pose_objects(task, required_pose_names)
         trajectory = [read_poses(objects)]
+        sim_times = [_sim_time(task)]
         for query_index in range(root_query):
             if _episode_done(task, max_steps):
                 return None
@@ -442,7 +473,7 @@ def _root_prefix(
                 if _episode_done(task, max_steps):
                     break
                 task.take_action(action, action_type="ee")
-                trajectory.append(read_poses(objects))
+                _append_physical_observation(task, objects, trajectory, sim_times)
         if _episode_done(task, max_steps):
             return None
         current = current_ee_action16(task)
@@ -464,6 +495,9 @@ def _root_prefix(
             "root_ee_action": current,
             "prefix_chunks": prefix_chunks,
             "prefix_trajectory": np.stack(trajectory),
+            "prefix_sim_times": np.asarray(sim_times, dtype=np.float64),
+            "root_sim_steps": int(task.scene.step_count),
+            "sim_timestep_seconds": float(task.scene.timestep_seconds),
             "candidates": candidates,
         }
     finally:
@@ -488,6 +522,8 @@ def _evaluate_candidate(
     expected_names: Sequence[str],
     expected_root_pose: np.ndarray,
     expected_root_ee: np.ndarray,
+    expected_root_sim_steps: int,
+    expected_sim_timestep_seconds: float,
     device: torch.device,
 ) -> dict[str, Any]:
     task = _new_task(task_class, args, seed, instruction)
@@ -496,13 +532,23 @@ def _evaluate_candidate(
         if list(names) != list(expected_names):
             raise BranchCollectionError("tracked object registry changed during reset")
         trajectory = [read_poses(objects)]
+        sim_times = [_sim_time(task)]
         for chunk in prefix_chunks:
             for action in chunk:
                 if _episode_done(task, max_steps):
                     raise BranchCollectionError("baseline prefix terminated during replay")
                 task.take_action(action, action_type="ee")
-                trajectory.append(read_poses(objects))
+                _append_physical_observation(task, objects, trajectory, sim_times)
         root_step = len(trajectory) - 1
+        if int(task.scene.step_count) != int(expected_root_sim_steps):
+            raise BranchCollectionError("physical step count changed across prefix replay")
+        if not np.isclose(
+            float(task.scene.timestep_seconds),
+            float(expected_sim_timestep_seconds),
+            atol=1e-12,
+            rtol=0.0,
+        ):
+            raise BranchCollectionError("simulator timestep changed across prefix replay")
         if not np.allclose(trajectory[-1], expected_root_pose, atol=2e-5, rtol=0.0):
             raise BranchCollectionError("object state changed across identical prefix replay")
         if not np.allclose(current_ee_action16(task), expected_root_ee, atol=2e-5, rtol=0.0):
@@ -514,9 +560,16 @@ def _evaluate_candidate(
             for action in candidate[:action_exec_steps]:
                 if _episode_done(task, max_steps):
                     break
-                task.take_action(action, action_type="ee")
+                before = _sim_time(task)
+                try:
+                    task.take_action(action, action_type="ee")
+                except Exception:
+                    if _sim_time(task) > before:
+                        first_executed += 1
+                        _append_physical_observation(task, objects, trajectory, sim_times)
+                    raise
                 first_executed += 1
-                trajectory.append(read_poses(objects))
+                _append_physical_observation(task, objects, trajectory, sim_times)
         except Exception as error:  # an infeasible candidate is a real failed branch
             branch_error = f"{type(error).__name__}: {error}"
         post_step = len(trajectory) - 1
@@ -537,8 +590,14 @@ def _evaluate_candidate(
                 for action in continuation[:action_exec_steps]:
                     if _episode_done(task, max_steps):
                         break
-                    task.take_action(action, action_type="ee")
-                    trajectory.append(read_poses(objects))
+                    before = _sim_time(task)
+                    try:
+                        task.take_action(action, action_type="ee")
+                    except Exception:
+                        if _sim_time(task) > before:
+                            _append_physical_observation(task, objects, trajectory, sim_times)
+                        raise
+                    _append_physical_observation(task, objects, trajectory, sim_times)
                 query_index += 1
             except Exception as error:
                 branch_error = f"{type(error).__name__}: {error}"
@@ -548,12 +607,20 @@ def _evaluate_candidate(
             try:
                 success = bool(task.check_success())
             except Exception:
+                # A candidate that already raised during execution is a real
+                # negative branch.  Otherwise an unreadable task outcome is
+                # not a negative label and must invalidate the sample instead
+                # of injecting false supervision into ranking.
+                if branch_error is None:
+                    raise
                 success = False
         return {
             "trajectory": np.stack(trajectory),
+            "sim_times": np.asarray(sim_times, dtype=np.float64),
             "root_step": root_step,
             "post_step": post_step,
             "first_executed": first_executed,
+            "sim_timestep_seconds": float(task.scene.timestep_seconds),
             "success": success,
             "branch_error": branch_error,
         }
@@ -595,14 +662,14 @@ def materialize_group(
     outcomes: Sequence[Mapping[str, Any]],
     calibration: Mapping[str, Any],
     action_exec_steps: int,
-    dt: float,
 ) -> dict[str, np.ndarray]:
     names = list(root["object_names"])
     moving_index = names.index(str(calibration["moving"]))
     prefix = np.asarray(root["prefix_trajectory"], dtype=np.float32)
     initial_moving = prefix[0, moving_index, :3]
+    prefix_times = np.asarray(root["prefix_sim_times"], dtype=np.float64)
     prefix_predicates, prefix_events = derive_predicates_and_events(
-        prefix, names, False, calibration
+        prefix, prefix_times, names, False, calibration
     )
     current_event = int(prefix_events[-1])
     state = _state27(
@@ -623,6 +690,7 @@ def materialize_group(
     next_mask = []
     duration = []
     duration_observed = []
+    duration_mask = []
     success = []
     recovery = []
     recovery_mask = []
@@ -630,10 +698,15 @@ def materialize_group(
     object_delta_mask = []
     for candidate, outcome in zip(root["candidates"], outcomes):
         action = canonical_action_chunk(root["root_ee_action"], candidate)
-        mask = np.arange(horizon) < int(outcome["first_executed"])
+        # The critic scores the proposal before execution, so it must see the
+        # complete planned first chunk even when planning/execution later
+        # fails.  Executed action count is used only for physical timing and
+        # must never censor the action that caused a negative outcome.
+        mask = np.arange(horizon) < min(int(action_exec_steps), horizon)
         trajectory = np.asarray(outcome["trajectory"], dtype=np.float32)
+        sim_times = np.asarray(outcome["sim_times"], dtype=np.float64)
         predicates, events = derive_predicates_and_events(
-            trajectory, names, bool(outcome["success"]), calibration
+            trajectory, sim_times, names, bool(outcome["success"]), calibration
         )
         root_step = int(outcome["root_step"])
         post_step = int(outcome["post_step"])
@@ -643,11 +716,11 @@ def materialize_group(
         if len(future):
             boundary = root_step + 1 + int(future[0])
             next_id = int(events[boundary])
-            duration_steps = boundary - root_step
+            duration_seconds = sim_times[boundary] - sim_times[root_step]
             observed = True
         else:
             next_id = current_event
-            duration_steps = max(len(events) - 1 - root_step, 1)
+            duration_seconds = sim_times[-1] - sim_times[root_step]
             observed = False
         regressed = int(events[post_step]) < current_event
         recovered = bool(regressed and np.any(events[post_step + 1 :] >= current_event))
@@ -662,13 +735,17 @@ def materialize_group(
         post_event.append(int(events[post_step]))
         next_event.append(next_id)
         next_mask.append(observed)
-        duration.append(max(float(duration_steps) * dt, dt))
+        duration.append(float(duration_seconds))
         duration_observed.append(observed)
+        # A zero-step planning failure has no temporal exposure.  Keep its
+        # success/ranking/zero-object-effect supervision, but do not turn a
+        # vacuous censored duration at t=0 into a clock gradient.
+        duration_mask.append(float(duration_seconds) > 0.0)
         success.append(bool(outcome["success"]))
         recovery.append(recovered)
         recovery_mask.append(regressed)
         object_delta.append(np.r_[moving_post - moving_start, relative_post - relative_start])
-        object_delta_mask.append(bool(outcome["first_executed"]))
+        object_delta_mask.append(True)
 
     count = CANDIDATE_COUNT
     arrays = {
@@ -682,7 +759,7 @@ def materialize_group(
         "next_event_mask": np.asarray(next_mask, dtype=np.float32),
         "duration": np.asarray(duration, dtype=np.float32),
         "duration_observed": np.asarray(duration_observed, dtype=np.float32),
-        "duration_mask": np.ones(count, dtype=np.float32),
+        "duration_mask": np.asarray(duration_mask, dtype=np.float32),
         "success": np.asarray(success, dtype=np.float32),
         "success_mask": np.ones(count, dtype=np.float32),
         "recovery": np.asarray(recovery, dtype=np.float32),
@@ -690,8 +767,12 @@ def materialize_group(
         "object_delta": np.asarray(object_delta, dtype=np.float32),
         "object_delta_mask": np.asarray(object_delta_mask, dtype=np.float32),
         "candidate_index": np.arange(count, dtype=np.int64),
-        "dt": np.asarray(
-            [max(int(outcome["first_executed"]), 1) * dt for outcome in outcomes],
+        # ``dt`` is an execution-time critic input, not an outcome.  Keep it
+        # equal across the four candidates and known before execution; only
+        # event ``duration`` above uses counted simulator seconds.
+        "dt": np.full(
+            count,
+            min(int(action_exec_steps), horizon) / SOURCE_EVENT_SAMPLING_HZ,
             dtype=np.float32,
         ),
     }
@@ -717,10 +798,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=list(CONDITIONS))
     parser.add_argument("--seed-start", type=int, default=2026081000)
     parser.add_argument("--seed-count", type=int, default=50)
-    parser.add_argument("--root-query-indices", nargs="+", type=int, default=[0, 1, 2, 3])
+    parser.add_argument("--root-query-indices", nargs="+", type=int, default=[0, 5, 10, 15])
     parser.add_argument("--action-exec-steps", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=200)
-    parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     return parser.parse_args()
 
@@ -729,8 +809,8 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
         raise BranchCollectionError("real branch collection requires remote RTX 4090 CUDA")
-    if args.seed_count <= 0 or args.action_exec_steps <= 0 or args.fps <= 0:
-        raise BranchCollectionError("seed-count/action-exec-steps/fps must be positive")
+    if args.seed_count <= 0 or args.action_exec_steps <= 0:
+        raise BranchCollectionError("seed-count/action-exec-steps must be positive")
     if not args.root_query_indices or min(args.root_query_indices) < 0:
         raise BranchCollectionError("root query indices must be non-negative")
     if len(set(args.root_query_indices)) != len(args.root_query_indices):
@@ -786,15 +866,15 @@ def main() -> None:
         },
     )
 
-    event_spec = json.loads(args.event_spec.read_text(encoding="utf-8"))
-    calibration = event_spec["calibration"][TASK]
-    required_pose_names = {str(calibration["moving"])}
-    anchor_name = str(calibration.get("anchor", "")).strip()
-    if anchor_name:
-        required_pose_names.add(anchor_name)
+    try:
+        event_spec, calibration = analytic_event.load_event_spec(args.event_spec)
+    except analytic_event.AnalyticEventSpecError as error:
+        raise BranchCollectionError(str(error)) from error
+    required_pose_names = set(analytic_event.REQUIRED_OBJECTS)
     adapter_source = Path(inspect.getsourcefile(canonical_adapter) or "")
     adapter_sha = sha256_file(adapter_source)
-    dt = 1.0 / float(args.fps)
+    event_source = Path(inspect.getsourcefile(analytic_event) or "")
+    event_implementation_sha = sha256_file(event_source)
     output = args.output.expanduser().resolve()
     groups_dir = output / "groups"
     groups_dir.mkdir(parents=True, exist_ok=True)
@@ -838,7 +918,46 @@ def main() -> None:
                 "event_names": list(CANONICAL_EVENTS),
                 "implementation_sha256": adapter_sha,
             },
-            "event_spec_sha256": sha256_file(args.event_spec),
+            "analytic_event_contract": analytic_event.event_contract(calibration),
+            "event_derivation_implementation_sha256": event_implementation_sha,
+            "state27_relative_goal_contract": (
+                "same_analytic_initial_side_pot_relative_goal_vector_used_for_"
+                "event_labels_and_online_state27_channels_0_2"
+            ),
+            "physical_time_contract": {
+                "source": "counted_successful_sapien_scene_step_calls",
+                "simulator_timestep_source": "scene.get_timestep",
+                "policy_action_call_count_used_as_time": False,
+                "wall_clock_used_as_time": False,
+                "dt_semantics": "planned_first_candidate_chunk_seconds",
+                "planned_action_steps": min(
+                    int(args.action_exec_steps), int(config.chunk_size)
+                ),
+                "actor_control_hz": SOURCE_EVENT_SAMPLING_HZ,
+                "planned_dt_seconds": min(
+                    int(args.action_exec_steps), int(config.chunk_size)
+                )
+                / SOURCE_EVENT_SAMPLING_HZ,
+                "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
+                "zero_elapsed_duration_masked": True,
+                "stationary_window_seconds": float(
+                    calibration["thresholds"]["stationary_window_seconds"]
+                ),
+                "stationary_speed_threshold_m_per_s": float(
+                    calibration["thresholds"]["stationary_speed_m_per_s"]
+                ),
+            },
+            "candidate_action_contract": {
+                "critic_observation_time": "before_candidate_execution",
+                "planned_action_horizon": min(
+                    int(args.action_exec_steps), int(config.chunk_size)
+                ),
+                "action_mask_source": "planned_first_chunk_not_executed_count",
+                "executed_action_count_used_for_action_mask": False,
+                "executed_action_count_used_for_sim_time_accounting_only": True,
+                "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
+            },
+            "event_spec_sha256": EVENT_SPEC_SHA256,
             "groups": [],
         }
 
@@ -892,6 +1011,8 @@ def main() -> None:
                         expected_names=root["object_names"],
                         expected_root_pose=root["root_object_poses"],
                         expected_root_ee=root["root_ee_action"],
+                        expected_root_sim_steps=root["root_sim_steps"],
+                        expected_sim_timestep_seconds=root["sim_timestep_seconds"],
                         device=device,
                     )
                     for candidate in root["candidates"]
@@ -901,7 +1022,6 @@ def main() -> None:
                     outcomes=outcomes,
                     calibration=calibration,
                     action_exec_steps=args.action_exec_steps,
-                    dt=dt,
                 )
                 filename = f"{condition}_seed_{seed}_query_{root_query}.npz"
                 path = groups_dir / filename

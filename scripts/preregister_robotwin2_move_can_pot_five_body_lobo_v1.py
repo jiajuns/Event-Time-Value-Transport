@@ -20,12 +20,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-FORMAT = "etsf_robotwin2_move_can_pot_five_body_lobo_preregistration_v1"
+FORMAT = "etsf_robotwin2_move_can_pot_five_body_lobo_preregistration_v2"
 STATUS = "preregistered_data_blind_no_download_training_evaluation_or_claim"
 SOURCE_FORMAT = "etsf_robotwin2_move_can_pot_official_hf_slice_v1"
 LOBO_FORMAT = "etsf_robotwin2_move_can_pot_five_fold_lobo_v1"
-EVALUATION_FORMAT = "etsf_robotwin2_move_can_pot_paired_crossbody_eval_v1"
-METRICS_FORMAT = "etsf_robotwin2_move_can_pot_crossbody_metrics_v1"
+EVALUATION_FORMAT = "etsf_robotwin2_move_can_pot_paired_crossbody_eval_v2"
+METRICS_FORMAT = "etsf_robotwin2_move_can_pot_crossbody_metrics_v2"
 
 HF_REPO_ID = "TianxingChen/RoboTwin2.0"
 HF_REPO_TYPE = "dataset"
@@ -386,7 +386,7 @@ def _metrics_protocol() -> dict[str, Any]:
                 "etsf_best_of_4_sr",
                 "paired_delta_sr",
                 "paired_delta_sr_95pct_ci",
-                "exact_two_sided_mcnemar_p",
+                "per_body_condition_exact_two_sided_mcnemar_p",
                 "discordant_actor_only_success_count",
                 "discordant_etsf_only_success_count",
             ],
@@ -405,10 +405,11 @@ def _metrics_protocol() -> dict[str, Any]:
                 "method": "exact_two_sided_binomial_on_discordant_pairs",
                 "zero_discordant_pair_p_value": 1.0,
                 "continuity_corrected_asymptotic_test_used": False,
+                "inferential_scope": "each_single_body_condition_cell_only",
+                "macro_or_global_values_with_repeated_seed_clusters_are_descriptive_only": True,
             },
             "prospective_improvement_gate": {
                 "global_macro_paired_delta_sr_lcb95_strictly_positive": True,
-                "global_exact_mcnemar_p_below": 0.05,
                 "each_heldout_body_macro_delta_sr_point_estimate_nonnegative": True,
                 "each_condition_macro_delta_sr_point_estimate_nonnegative": True,
                 "gate_itself_authorizes_claim_or_deployment": False,
@@ -455,7 +456,8 @@ def _metrics_protocol() -> dict[str, Any]:
             "diagnostic_missingness_and_applicability_masks_reported": True,
         },
         "multiple_comparison_note": (
-            "only_global_macro_full_task_delta_gate_is_primary; body_condition_and_critic_rows_are_supporting"
+            "only_the_requested_seed_cluster_bootstrap_global_macro_delta_gate_is_primary; "
+            "single-cell McNemar and body-condition/critic rows are supporting"
         ),
     }
 
