@@ -183,6 +183,12 @@ PhysX 的 `qacc` 是上一 solver step 的派生缓存，SAPIEN 3 的 fresh scen
 ensemble，held-out body 不参与 normalization、训练、选步或消融选择。source validation 的同一
 requested seed 下全部 query 保持在同一 split，避免相邻状态泄漏。
 
+正式 seed 又按四个相邻 query 组成十个不同 seed block；若直接从全部 seed 随机抽 20%，验证集可能
+完全漏掉某个 remaining-budget 区间。当前 split 因此只使用 manifest 中打分前已知的 query index，
+先以确定性 set cover 选择 seed，使 source train 和 source validation 在每个 body/condition 上都
+覆盖 query 0--39，再按冻结哈希顺序补足 20%。选择过程不读取任何 outcome label，且同一 seed 的
+全部 query 仍严格位于同一侧。
+
 完整数据的候选可改善空间由
 `scripts/audit_robotwin2_five_body_branch_effect_headroom_v1.py` 统一审计。它按 body/condition
 报告 candidate-0 与 one-deviation candidate oracle 的成功率差、mixed-success 比例、终局事件分歧、

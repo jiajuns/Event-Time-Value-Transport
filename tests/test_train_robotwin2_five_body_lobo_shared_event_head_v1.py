@@ -433,6 +433,55 @@ def test_source_split_keeps_all_queries_from_one_seed_in_one_lane() -> None:
                 assert (train_count, validation_count) in {(4, 0), (0, 4)}
 
 
+def test_source_split_validation_and_training_cover_every_formal_horizon() -> None:
+    manifests = {}
+    for body in BODIES:
+        groups = []
+        for condition in ("clean", "randomized"):
+            for block in range(10):
+                for seed_offset in range(5):
+                    seed = 10_000 + 5 * block + seed_offset
+                    for query in range(4 * block, 4 * block + 4):
+                        groups.append(
+                            {
+                                "condition": condition,
+                                "requested_seed": seed,
+                                "root_query_index": query,
+                                "group_id": (
+                                    f"{condition}|seed={seed}|query={query}"
+                                ),
+                            }
+                        )
+        manifests[body] = {"groups": groups}
+    train, validation, _heldout = source_group_split(
+        {"manifests": manifests}, held_out_body="franka", split_seed=19
+    )
+    for body in BODIES:
+        if body == "franka":
+            continue
+        for condition in ("clean", "randomized"):
+            train_rows = [
+                row
+                for row in train
+                if row["body"] == body and row["condition"] == condition
+            ]
+            validation_rows = [
+                row
+                for row in validation
+                if row["body"] == body and row["condition"] == condition
+            ]
+            train_seeds = {row["requested_seed"] for row in train_rows}
+            validation_seeds = {
+                row["requested_seed"] for row in validation_rows
+            }
+            assert len(validation_seeds) == 10
+            assert train_seeds.isdisjoint(validation_seeds)
+            assert {row["root_query_index"] for row in train_rows} == set(range(40))
+            assert {
+                row["root_query_index"] for row in validation_rows
+            } == set(range(40))
+
+
 def test_heldout_payload_is_not_stat_hashed_or_deserialized_in_preflight(
     tmp_path: Path,
 ) -> None:

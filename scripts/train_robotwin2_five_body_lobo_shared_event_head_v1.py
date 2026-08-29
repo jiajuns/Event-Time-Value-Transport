@@ -948,6 +948,108 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
     }
 
 
+def _declared_root_query_index(group: Mapping[str, Any]) -> int | None:
+    value = group.get("root_query_index")
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 40:
+        return int(value)
+    identity = str(group.get("group_id", ""))
+    marker = "|query="
+    if marker not in identity:
+        return None
+    suffix = identity.rsplit(marker, 1)[-1]
+    try:
+        parsed = int(suffix)
+    except ValueError:
+        return None
+    return parsed if 0 <= parsed < 40 else None
+
+
+def _horizon_covering_validation_seeds(
+    by_seed: Mapping[int, Sequence[Mapping[str, Any]]],
+    *,
+    ordered_seeds: Sequence[int],
+    target_count: int,
+) -> set[int]:
+    """Choose label-blind validation seeds covering every formal horizon.
+
+    Formal collection assigns different seed blocks to different query
+    budgets.  A plain global 20% seed sample can therefore omit a remaining
+    action budget entirely.  Greedy set cover uses only manifest query indices
+    and the preregistered hash order; it also leaves at least one training seed
+    for every query.  Synthetic/legacy manifests without the formal query
+    declaration retain the old hash-only split.
+    """
+
+    if target_count <= 0 or target_count >= len(ordered_seeds):
+        raise FiveBodyContractError("validation seed target cannot form two lanes")
+    query_by_seed = {
+        seed: {
+            query
+            for group in by_seed[seed]
+            if (query := _declared_root_query_index(group)) is not None
+        }
+        for seed in ordered_seeds
+    }
+    formal_queries = set(range(40))
+    if set().union(*query_by_seed.values()) != formal_queries:
+        return set(ordered_seeds[:target_count])
+
+    support = {
+        query: {seed for seed, queries in query_by_seed.items() if query in queries}
+        for query in formal_queries
+    }
+    if any(len(seeds) < 2 for seeds in support.values()):
+        raise FiveBodyContractError(
+            "formal source split needs train/validation seed support at every query"
+        )
+    priority = {seed: index for index, seed in enumerate(ordered_seeds)}
+    selected: set[int] = set()
+    validation_coverage: set[int] = set()
+
+    def preserves_training_coverage(seed: int) -> bool:
+        proposed = selected | {seed}
+        return all(bool(seeds - proposed) for seeds in support.values())
+
+    while validation_coverage != formal_queries:
+        candidates = [
+            seed
+            for seed in ordered_seeds
+            if seed not in selected
+            and bool(query_by_seed[seed] - validation_coverage)
+            and preserves_training_coverage(seed)
+        ]
+        if not candidates:
+            raise FiveBodyContractError(
+                "cannot cover every validation query while retaining training coverage"
+            )
+        chosen = min(
+            candidates,
+            key=lambda seed: (
+                -len(query_by_seed[seed] - validation_coverage),
+                priority[seed],
+            ),
+        )
+        selected.add(chosen)
+        validation_coverage.update(query_by_seed[chosen])
+
+    desired = max(target_count, len(selected))
+    for seed in ordered_seeds:
+        if len(selected) >= desired:
+            break
+        if seed not in selected and preserves_training_coverage(seed):
+            selected.add(seed)
+    if len(selected) < target_count:
+        raise FiveBodyContractError(
+            "formal horizon-covering split could not reach its validation fraction"
+        )
+    training_coverage = set().union(
+        *(query_by_seed[seed] for seed in ordered_seeds if seed not in selected)
+    )
+    if validation_coverage != formal_queries or training_coverage != formal_queries:
+        raise FiveBodyContractError("formal source split lost horizon coverage")
+    return selected
+
+
 def source_group_split(
     audit: Mapping[str, Any], *, held_out_body: str, split_seed: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -979,7 +1081,11 @@ def source_group_split(
                     f"{body}/{condition} cannot form seed-disjoint source validation"
                 )
             validation_seed_count = max(1, int(round(0.2 * len(ordered_seeds))))
-            validation_seeds = set(ordered_seeds[:validation_seed_count])
+            validation_seeds = _horizon_covering_validation_seeds(
+                by_seed,
+                ordered_seeds=ordered_seeds,
+                target_count=validation_seed_count,
+            )
             for seed in ordered_seeds:
                 target = validation if seed in validation_seeds else training
                 target.extend(
@@ -997,8 +1103,40 @@ def build_preflight_receipt(
     training, validation, heldout = source_group_split(
         audit, held_out_body=held_out_body, split_seed=split_seed
     )
+
     def identity(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         return sorted(f"{row.get('body', held_out_body)}|{row['group_id']}" for row in rows)
+
+    def query_coverage(
+        rows: Sequence[Mapping[str, Any]],
+    ) -> dict[str, list[int]]:
+        result: dict[str, set[int]] = defaultdict(set)
+        for row in rows:
+            query = _declared_root_query_index(row)
+            if query is not None:
+                result[f"{row['body']}|{row['condition']}"].add(query)
+        return {key: sorted(values) for key, values in sorted(result.items())}
+
+    training_query_coverage = query_coverage(training)
+    validation_query_coverage = query_coverage(validation)
+    expected_units = {
+        f"{body}|{condition}"
+        for body in BODIES
+        if body != held_out_body
+        for condition in CONDITIONS
+    }
+    formal_horizon_coverage = bool(training_query_coverage) or bool(
+        validation_query_coverage
+    )
+    if formal_horizon_coverage and (
+        set(training_query_coverage) != expected_units
+        or set(validation_query_coverage) != expected_units
+        or any(values != list(range(40)) for values in training_query_coverage.values())
+        or any(values != list(range(40)) for values in validation_query_coverage.values())
+    ):
+        raise FiveBodyContractError(
+            "source train/validation split does not cover every formal query"
+        )
     receipt = {
         "format": FORMAT,
         "status": "preflight_passed_payloads_still_unopened",
@@ -1021,6 +1159,16 @@ def build_preflight_receipt(
         ),
         "assignment_uses_labels": False,
         "split_unit": "body_condition_requested_seed_all_queries",
+        "validation_seed_selection": (
+            "label_blind_hash_ordered_greedy_full_horizon_cover_then_fill_20pct"
+            if formal_horizon_coverage
+            else "label_blind_hash_ordered_20pct_legacy_manifest"
+        ),
+        "formal_horizon_coverage_enforced": formal_horizon_coverage,
+        "source_train_query_indices_by_body_condition": training_query_coverage,
+        "source_validation_query_indices_by_body_condition": (
+            validation_query_coverage
+        ),
         "heldout_group_npz_opened": 0,
         "heldout_group_payload_bytes_read": 0,
         "heldout_group_payload_deserialized": 0,
