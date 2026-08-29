@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import sys
 from pathlib import Path
@@ -59,6 +60,23 @@ def _commitment() -> dict:
 
 def _rollout(method: str, success: int, progress: float) -> dict:
     commitment = _commitment()
+    raw_rank = np.asarray([[0.0, 0.0, 1.0, 0.0]] * 5, dtype=np.float64)
+    standardized = runner.shared_head.aggregate_standardized_rank_scores(
+        torch.as_tensor(raw_rank)
+    ).numpy()
+    critic_scores = {
+        "selected_candidate_index": 2,
+        "candidate_rank_score_standardized_ensemble": standardized.tolist(),
+        "candidate_rank_score_mean": raw_rank.mean(axis=0).tolist(),
+        "candidate_rank_score_raw_candidate_population_std": raw_rank.std(
+            axis=0, ddof=0
+        ).tolist(),
+        "candidate_rank_score_raw_member_candidate_mean": raw_rank.mean(axis=1).tolist(),
+        "candidate_rank_score_raw_member_candidate_population_std": raw_rank.std(
+            axis=1, ddof=0
+        ).tolist(),
+        "candidate_rank_score_members": raw_rank.tolist(),
+    }
     return {
         "method": method,
         "heldout_body": "piper",
@@ -84,7 +102,9 @@ def _rollout(method: str, success: int, progress: float) -> dict:
                 "candidate_count": 4,
                 "selected_candidate_index": 0 if method == "actor_baseline" else 2,
                 "executed_action_count": 5,
-                "critic_scores": None,
+                "critic_scores": (
+                    None if method == "actor_baseline" else critic_scores
+                ),
             }
         ],
     }
@@ -110,6 +130,37 @@ def test_tie_break_is_lowest_candidate_index() -> None:
     assert runner.select_candidate([3.0, 3.0, 3.0, 3.0]) == 0
     with pytest.raises(runner.PairedExecutionError):
         runner.select_candidate([1.0, float("nan"), 0.0, 0.0])
+
+
+def test_scoring_uses_equal_member_scale_not_raw_logit_magnitude() -> None:
+    class FixedModel:
+        def __init__(self, rank: list[float]):
+            self.rank = torch.tensor(rank, dtype=torch.float32)
+
+        def __call__(self, _batch):
+            zeros = torch.zeros(4, dtype=torch.float32)
+            event_logits = torch.zeros(4, 5, dtype=torch.float32)
+            return {
+                "candidate_rank_logit": self.rank,
+                "success_logit": zeros,
+                "post_event_logits": event_logits,
+                "next_event_logits": event_logits,
+                "duration_selected_log_mean": zeros,
+                "duration_selected_log_scale": zeros,
+            }
+
+    # One large-scale member prefers candidate 0; four equal-weight members
+    # prefer candidate 1. Raw averaging would incorrectly choose candidate 0.
+    models = [FixedModel([100.0, 0.0, 0.0, 0.0])] + [
+        FixedModel([0.0, 1.0, 0.0, 0.0]) for _ in range(4)
+    ]
+    scored = runner.score_candidates(models, {})
+    assert int(np.argmax(scored["candidate_rank_score_mean"])) == 0
+    assert scored["selected_candidate_index"] == 1
+    assert int(
+        np.argmax(scored["candidate_rank_score_standardized_ensemble"])
+    ) == 1
+    assert len(scored["candidate_rank_score_raw_member_candidate_population_std"]) == 5
 
 
 def test_array_hash_binds_order_shape_and_values() -> None:
@@ -162,12 +213,31 @@ def test_pair_records_discordance_and_requires_same_initial_candidates() -> None
         rollouts,
         attempt_sha256="d" * 64,
         commitment=_commitment(),
+        execution_contract_logical_sha256="e" * 64,
     )
     assert pair["discordance"] == "etsf_only"
     assert pair["same_resolved_reset"] is True
     assert pair["same_complete_observable_reset_snapshot"] is True
     assert pair["same_initial_candidate_set"] is True
     runner.validate_pair_record(pair, expected)
+    corrupted = copy.deepcopy(pair)
+    corrupted["rollouts"]["etsf_best_of_4"]["decisions"][0]["critic_scores"][
+        "candidate_rank_score_standardized_ensemble"
+    ][0] += 0.25
+    corrupted["pair_sha256"] = runner.canonical_sha256(
+        {key: value for key, value in corrupted.items() if key != "pair_sha256"}
+    )
+    with pytest.raises(runner.PairedExecutionError, match="cannot be replayed"):
+        runner.validate_pair_record(corrupted, expected)
+    corrupted = copy.deepcopy(pair)
+    corrupted["rollouts"]["actor_baseline"]["decisions"][0][
+        "selected_candidate_index"
+    ] = 1
+    corrupted["pair_sha256"] = runner.canonical_sha256(
+        {key: value for key, value in corrupted.items() if key != "pair_sha256"}
+    )
+    with pytest.raises(runner.PairedExecutionError, match="candidate zero"):
+        runner.validate_pair_record(corrupted, expected)
     rollouts["etsf_best_of_4"]["decisions"][0]["candidate_set_sha256"] = "c" * 64
     with pytest.raises(runner.PairedExecutionError):
         runner.materialize_pair(
@@ -175,6 +245,7 @@ def test_pair_records_discordance_and_requires_same_initial_candidates() -> None
             rollouts,
             attempt_sha256="d" * 64,
             commitment=_commitment(),
+            execution_contract_logical_sha256="e" * 64,
         )
 
 
@@ -299,13 +370,18 @@ def test_outcome_document_is_directly_accepted_by_existing_evaluator() -> None:
                 "condition": expected["condition"],
                 "requested_seed": expected["requested_seed"],
                 "method_order": expected["method_order"],
+                "pair_sha256": runner.canonical_sha256(expected),
                 "actor_baseline_binary_success": 0,
                 "actor_baseline_stage_progress": 0.0,
                 "etsf_best_of_4_binary_success": 0,
                 "etsf_best_of_4_stage_progress": 0.0,
             }
         )
-    document = runner.build_outcome_document(rows)
+    document = runner.build_outcome_document(
+        rows,
+        execution_contract_logical_sha256="e" * 64,
+        execution_contract_file_sha256="f" * 64,
+    )
     validated = runner.evaluator.validate_input_document(document)
     assert len(validated["rows"]) == 1000
     assert document["preregistration_sha256"] == runner.PREREGISTRATION_SHA256

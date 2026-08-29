@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-INPUT_FORMAT = "etsf_robotwin2_move_can_pot_paired_outcomes_v2"
+INPUT_FORMAT = "etsf_robotwin2_move_can_pot_paired_outcomes_v3"
 INPUT_STATUS = "frozen_complete_preregistered_five_body_two_condition_pairs"
 REPORT_FORMAT = "etsf_robotwin2_move_can_pot_cross_embodiment_paired_success_report_v2"
 REPORT_STATUS = "metrics_computed_no_promotion_deployment_or_claim_authority"
@@ -56,6 +56,9 @@ TOP_LEVEL_FIELDS = {
     "rows",
     "rows_sha256",
     "preregistration_sha256",
+    "execution_contract_logical_sha256",
+    "execution_contract_file_sha256",
+    "ordered_pair_sha256s_sha256",
     "document_sha256",
 }
 IDENTITY_FIELDS = {
@@ -63,6 +66,7 @@ IDENTITY_FIELDS = {
     "method_order",
 }
 ROW_FIELDS = IDENTITY_FIELDS | {
+    "pair_sha256",
     "actor_baseline_binary_success",
     "actor_baseline_stage_progress",
     "etsf_best_of_4_binary_success",
@@ -265,6 +269,10 @@ def _identity(
 
 def _outcome_row(value: Any, role: str) -> dict[str, Any]:
     row = _require_exact_fields(value, ROW_FIELDS, role)
+    if not _is_sha256(row["pair_sha256"]):
+        raise PairedCrossEmbodimentEvaluationError(
+            f"{role}.pair_sha256 must be a lowercase SHA-256"
+        )
     identity = _identity({key: row[key] for key in IDENTITY_FIELDS}, role)
     baseline_success = _binary(
         row["actor_baseline_binary_success"], f"{role}.actor baseline success"
@@ -296,6 +304,7 @@ def _outcome_row(value: Any, role: str) -> dict[str, Any]:
         "condition": identity[3],
         "requested_seed": identity[4],
         "method_order": list(identity[5]),
+        "pair_sha256": row["pair_sha256"],
         "actor_baseline_binary_success": baseline_success,
         "actor_baseline_stage_progress": baseline_progress,
         "etsf_best_of_4_binary_success": critic_success,
@@ -314,6 +323,15 @@ def validate_input_document(value: Mapping[str, Any]) -> dict[str, Any]:
         raise PairedCrossEmbodimentEvaluationError(
             "preregistration_sha256 is not the approved frozen RoboTwin2 contract"
         )
+    for field in (
+        "execution_contract_logical_sha256",
+        "execution_contract_file_sha256",
+        "ordered_pair_sha256s_sha256",
+    ):
+        if not _is_sha256(document[field]):
+            raise PairedCrossEmbodimentEvaluationError(
+                f"{field} must be a lowercase SHA-256"
+            )
     rows_raw = document["rows"]
     if not isinstance(rows_raw, list) or not rows_raw:
         raise PairedCrossEmbodimentEvaluationError("rows must be nonempty")
@@ -352,11 +370,27 @@ def validate_input_document(value: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     ordered_rows = [rows[identity] for identity in sorted(rows)]
+    ordered_pair_sha256s = [row["pair_sha256"] for row in ordered_rows]
+    if document["ordered_pair_sha256s_sha256"] != canonical_sha256(
+        ordered_pair_sha256s
+    ):
+        raise PairedCrossEmbodimentEvaluationError(
+            "ordered detailed-pair SHA-256 roster changed"
+        )
     return {
         "rows": ordered_rows,
         "document_sha256": recorded_document_sha,
         "rows_sha256": document["rows_sha256"],
         "preregistration_sha256": document["preregistration_sha256"],
+        "execution_contract_logical_sha256": document[
+            "execution_contract_logical_sha256"
+        ],
+        "execution_contract_file_sha256": document[
+            "execution_contract_file_sha256"
+        ],
+        "ordered_pair_sha256s_sha256": document[
+            "ordered_pair_sha256s_sha256"
+        ],
     }
 
 
@@ -857,6 +891,15 @@ def evaluate_document(value: Mapping[str, Any], *, input_file_sha256: str | None
             "input_document_sha256": validated["document_sha256"],
             "outcome_rows_sha256": validated["rows_sha256"],
             "preregistration_sha256": validated["preregistration_sha256"],
+            "execution_contract_logical_sha256": validated[
+                "execution_contract_logical_sha256"
+            ],
+            "execution_contract_file_sha256": validated[
+                "execution_contract_file_sha256"
+            ],
+            "ordered_pair_sha256s_sha256": validated[
+                "ordered_pair_sha256s_sha256"
+            ],
         },
         "benchmark": BENCHMARK,
         "task": TASK,

@@ -386,6 +386,8 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
     current_event_implementation_sha = sha256_file(
         Path(analytic_event.__file__).resolve()
     )
+    current_trainer_sha = sha256_file(Path(shared_head.__file__).resolve())
+    ensemble_selection = summary.get("ensemble_checkpoint_selection")
     if (
         summary.get("format") != shared_head.FORMAT
         or summary.get("status") != "source_only_checkpoint_selection_complete"
@@ -399,6 +401,15 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         or summary.get("candidate_rank_contract")
         != shared_head.summary_candidate_rank_contract("full")
         or summary.get("ablation") != shared_head.ablation_contract("full")
+        or summary.get("trainer_file_sha256") != current_trainer_sha
+        or not isinstance(ensemble_selection, Mapping)
+        or ensemble_selection.get("common_step_required_for_all_five_members")
+        is not True
+        or ensemble_selection.get("rank_aggregation")
+        != shared_head.standardized_rank_ensemble_contract()
+        or not isinstance(ensemble_selection.get("selected_step"), int)
+        or ensemble_selection.get("selected_step", 0) <= 0
+        or ensemble_selection.get("heldout_rows_used") != 0
     ):
         raise PairedExecutionError(f"LOBO fold summary contract changed for {body}")
     members = summary.get("members")
@@ -420,6 +431,13 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         observed = sha256_file(checkpoint)
         if observed != item.get("checkpoint_sha256"):
             raise PairedExecutionError("fold member checkpoint SHA-256 mismatch")
+        if (
+            item.get("best_step") != ensemble_selection["selected_step"]
+            or item.get("trainer_file_sha256") != current_trainer_sha
+        ):
+            raise PairedExecutionError(
+                "fold member was not selected by the common deployment ensemble"
+            )
         identities.add(member)
         normalized.append(
             {
@@ -438,6 +456,8 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         "training_summary_sha256": sha256_file(summary_path),
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": current_event_implementation_sha,
+        "trainer_file_sha256": current_trainer_sha,
+        "ensemble_common_selection_step": ensemble_selection["selected_step"],
         "members": sorted(normalized, key=lambda row: row["member"]),
     }
 
@@ -468,6 +488,10 @@ def load_ensemble(
             or checkpoint.get("event_spec_sha256") != EVENT_SPEC_SHA256
             or checkpoint.get("event_derivation_implementation_sha256")
             != fold["event_derivation_implementation_sha256"]
+            or checkpoint.get("trainer_file_sha256")
+            != fold["trainer_file_sha256"]
+            or checkpoint.get("ensemble_common_selection_step")
+            != fold["ensemble_common_selection_step"]
         ):
             raise PairedExecutionError("LOBO checkpoint contract changed")
         model = shared_head.EffectAlignedSharedEventHead().to(device)
@@ -573,11 +597,27 @@ def score_candidates(
         for value in (ranks, success, post, following, duration_mean, duration_scale)
     ):
         raise PairedExecutionError("LOBO ensemble produced a non-finite score")
-    means = ranks.mean(axis=0)
-    selected = select_candidate(means.tolist())
+    standardized = shared_head.aggregate_standardized_rank_scores(
+        torch.as_tensor(ranks)
+    ).cpu().numpy()
+    raw_candidate_mean = ranks.mean(axis=0)
+    raw_candidate_std = ranks.std(axis=0, ddof=0)
+    raw_member_candidate_mean = ranks.mean(axis=1)
+    raw_member_candidate_std = ranks.std(axis=1, ddof=0)
+    selected = select_candidate(standardized.tolist())
     return {
         "selected_candidate_index": selected,
-        "candidate_rank_score_mean": means.astype(float).tolist(),
+        "candidate_rank_score_standardized_ensemble": standardized.astype(float).tolist(),
+        "candidate_rank_score_mean": raw_candidate_mean.astype(float).tolist(),
+        "candidate_rank_score_raw_candidate_population_std": (
+            raw_candidate_std.astype(float).tolist()
+        ),
+        "candidate_rank_score_raw_member_candidate_mean": (
+            raw_member_candidate_mean.astype(float).tolist()
+        ),
+        "candidate_rank_score_raw_member_candidate_population_std": (
+            raw_member_candidate_std.astype(float).tolist()
+        ),
         "candidate_rank_score_members": ranks.astype(float).tolist(),
         "candidate_success_probability_mean": success.mean(axis=0).astype(float).tolist(),
         "candidate_post_event_probability_mean": post.mean(axis=0).astype(float).tolist(),
@@ -895,7 +935,104 @@ def execute_rollout(
         task.close_env(clear_cache=False)
 
 
-def validate_pair_record(value: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
+def _validate_rollout_decisions(
+    rollout: Mapping[str, Any], method: str, expected: Mapping[str, Any]
+) -> None:
+    if (
+        rollout.get("method") != method
+        or rollout.get("heldout_body") != expected["heldout_body"]
+        or rollout.get("condition") != expected["condition"]
+        or rollout.get("requested_seed") != expected["requested_seed"]
+        or type(rollout.get("binary_success")) is not int
+        or rollout["binary_success"] not in (0, 1)
+        or type(rollout.get("max_event_id")) is not int
+        or not 0 <= rollout["max_event_id"] <= STAGE_DENOMINATOR
+    ):
+        raise PairedExecutionError(f"{method} rollout identity/outcome changed")
+    expected_progress = (
+        1.0
+        if rollout["binary_success"] == 1
+        else rollout["max_event_id"] / float(STAGE_DENOMINATOR)
+    )
+    if abs(float(rollout.get("stage_progress", -1.0)) - expected_progress) > 1e-9:
+        raise PairedExecutionError(f"{method} stage progress changed")
+    decisions = rollout.get("decisions")
+    if (
+        not isinstance(decisions, list)
+        or not decisions
+        or rollout.get("policy_query_count") != len(decisions)
+    ):
+        raise PairedExecutionError(f"{method} decision roster changed")
+    for query_index, decision in enumerate(decisions):
+        if (
+            not isinstance(decision, Mapping)
+            or decision.get("query_index") != query_index
+            or decision.get("candidate_count") != CANDIDATE_COUNT
+            or not isinstance(decision.get("candidate_set_sha256"), str)
+            or len(decision["candidate_set_sha256"]) != 64
+            or type(decision.get("selected_candidate_index")) is not int
+            or not 0 <= decision["selected_candidate_index"] < CANDIDATE_COUNT
+        ):
+            raise PairedExecutionError(f"{method} decision identity changed")
+        scores = decision.get("critic_scores")
+        if method == "actor_baseline":
+            if decision["selected_candidate_index"] != 0 or scores is not None:
+                raise PairedExecutionError(
+                    "actor baseline must execute candidate zero without critic scores"
+                )
+            continue
+        if not isinstance(scores, Mapping):
+            raise PairedExecutionError("ETSF decision lacks five-member critic scores")
+        raw = np.asarray(scores.get("candidate_rank_score_members"), dtype=np.float64)
+        recorded = np.asarray(
+            scores.get("candidate_rank_score_standardized_ensemble"),
+            dtype=np.float64,
+        )
+        if raw.shape != (5, CANDIDATE_COUNT) or recorded.shape != (CANDIDATE_COUNT,):
+            raise PairedExecutionError("ETSF critic score shape changed")
+        if not np.isfinite(raw).all() or not np.isfinite(recorded).all():
+            raise PairedExecutionError("ETSF critic score is non-finite")
+        recomputed = shared_head.aggregate_standardized_rank_scores(
+            torch.as_tensor(raw)
+        ).cpu().numpy()
+        raw_mean = raw.mean(axis=0)
+        raw_candidate_std = raw.std(axis=0, ddof=0)
+        raw_member_mean = raw.mean(axis=1)
+        raw_member_std = raw.std(axis=1, ddof=0)
+        recorded_arrays = (
+            (scores.get("candidate_rank_score_mean"), raw_mean),
+            (
+                scores.get("candidate_rank_score_raw_candidate_population_std"),
+                raw_candidate_std,
+            ),
+            (scores.get("candidate_rank_score_raw_member_candidate_mean"), raw_member_mean),
+            (
+                scores.get("candidate_rank_score_raw_member_candidate_population_std"),
+                raw_member_std,
+            ),
+        )
+        if not np.allclose(recorded, recomputed, atol=1e-6, rtol=0.0):
+            raise PairedExecutionError("ETSF standardized ensemble score cannot be replayed")
+        for observed, expected_values in recorded_arrays:
+            observed_array = np.asarray(observed, dtype=np.float64)
+            if observed_array.shape != expected_values.shape or not np.allclose(
+                observed_array, expected_values, atol=1e-6, rtol=0.0
+            ):
+                raise PairedExecutionError("ETSF raw rank audit cannot be replayed")
+        selected = select_candidate(recomputed.tolist())
+        if (
+            scores.get("selected_candidate_index") != selected
+            or decision["selected_candidate_index"] != selected
+        ):
+            raise PairedExecutionError("ETSF selected candidate disagrees with frozen scorer")
+
+
+def validate_pair_record(
+    value: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    expected_execution_contract_sha256: str | None = None,
+) -> None:
+    contract_sha = value.get("execution_contract_logical_sha256")
     if (
         value.get("format") != PAIR_FORMAT
         or value.get("benchmark") != BENCHMARK
@@ -909,6 +1046,12 @@ def validate_pair_record(value: Mapping[str, Any], expected: Mapping[str, Any]) 
         or value.get("same_initial_candidate_set") is not True
         or not isinstance(value.get("attempt_sha256"), str)
         or not isinstance(value.get("initial_candidate_commitment_sha256"), str)
+        or not isinstance(contract_sha, str)
+        or len(contract_sha) != 64
+        or (
+            expected_execution_contract_sha256 is not None
+            and contract_sha != expected_execution_contract_sha256
+        )
         or value.get("pair_sha256")
         != canonical_sha256({key: item for key, item in value.items() if key != "pair_sha256"})
     ):
@@ -916,6 +1059,15 @@ def validate_pair_record(value: Mapping[str, Any], expected: Mapping[str, Any]) 
     rollouts = value.get("rollouts")
     if not isinstance(rollouts, Mapping) or set(rollouts) != set(METHODS):
         raise PairedExecutionError("pair record does not contain both methods")
+    for method in METHODS:
+        if not isinstance(rollouts[method], Mapping):
+            raise PairedExecutionError("pair rollout must be an object")
+        _validate_rollout_decisions(rollouts[method], method, expected)
+        if (
+            rollouts[method].get("initial_candidate_commitment_sha256")
+            != value["initial_candidate_commitment_sha256"]
+        ):
+            raise PairedExecutionError("pair rollout commitment binding changed")
 
 
 def materialize_pair(
@@ -924,7 +1076,13 @@ def materialize_pair(
     *,
     attempt_sha256: str,
     commitment: Mapping[str, Any],
+    execution_contract_logical_sha256: str,
 ) -> dict[str, Any]:
+    if (
+        not isinstance(execution_contract_logical_sha256, str)
+        or len(execution_contract_logical_sha256) != 64
+    ):
+        raise PairedExecutionError("pair lacks the frozen execution-contract SHA-256")
     baseline = rollouts["actor_baseline"]
     etsf = rollouts["etsf_best_of_4"]
     commitment_sha = commitment.get("commitment_sha256")
@@ -960,6 +1118,7 @@ def materialize_pair(
         "task": TASK,
         **dict(expected),
         "attempt_sha256": attempt_sha256,
+        "execution_contract_logical_sha256": execution_contract_logical_sha256,
         "initial_candidate_commitment_sha256": commitment_sha,
         "same_resolved_reset": same_reset,
         "same_complete_observable_reset_snapshot": same_snapshot,
@@ -988,6 +1147,7 @@ def outcome_row(pair: Mapping[str, Any]) -> dict[str, Any]:
         "condition": pair["condition"],
         "requested_seed": pair["requested_seed"],
         "method_order": pair["method_order"],
+        "pair_sha256": pair["pair_sha256"],
         "actor_baseline_binary_success": baseline["binary_success"],
         "actor_baseline_stage_progress": baseline["stage_progress"],
         "etsf_best_of_4_binary_success": etsf["binary_success"],
@@ -995,14 +1155,23 @@ def outcome_row(pair: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_outcome_document(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def build_outcome_document(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    execution_contract_logical_sha256: str,
+    execution_contract_file_sha256: str,
+) -> dict[str, Any]:
     normalized = [dict(row) for row in rows]
+    ordered_pair_sha256s = [str(row["pair_sha256"]) for row in normalized]
     base = {
         "format": OUTCOME_FORMAT,
         "status": OUTCOME_STATUS,
         "rows": normalized,
         "rows_sha256": canonical_sha256(normalized),
         "preregistration_sha256": PREREGISTRATION_SHA256,
+        "execution_contract_logical_sha256": execution_contract_logical_sha256,
+        "execution_contract_file_sha256": execution_contract_file_sha256,
+        "ordered_pair_sha256s_sha256": canonical_sha256(ordered_pair_sha256s),
     }
     document = {**base, "document_sha256": canonical_sha256(base)}
     evaluator.validate_input_document(document)
@@ -1115,6 +1284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vlm_metadata_file_count": vlm_file_count,
         "vlm_metadata_size_bytes": vlm_size,
         "folds": folds,
+        "candidate_rank_ensemble_contract": (
+            shared_head.standardized_rank_ensemble_contract()
+        ),
         "event_spec": str(event_spec_path),
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": sha256_file(
@@ -1145,6 +1317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise PairedExecutionError("existing execution contract differs")
     else:
         atomic_json(contract_path, contract, frozen=True)
+    contract_file_sha256 = sha256_file(contract_path)
 
     from envs import CONFIGS_PATH  # noqa: F401
     from lerobot.configs.policies import PreTrainedConfig
@@ -1199,7 +1372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         path = pairs_dir / f"{identity}.json"
         if path.exists():
             pair = json.loads(path.read_text(encoding="utf-8"))
-            validate_pair_record(pair, expected)
+            validate_pair_record(pair, expected, contract["logical_sha256"])
         else:
             attempt_path = attempts_dir / f"{identity}.json"
             commitment_path = commitments_dir / f"{identity}.json"
@@ -1268,7 +1441,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     rollouts,
                     attempt_sha256=attempt_sha,
                     commitment=commitment,
+                    execution_contract_logical_sha256=contract["logical_sha256"],
                 )
+                validate_pair_record(pair, expected, contract["logical_sha256"])
                 atomic_json(path, pair, frozen=True)
             except Exception as error:
                 failure_base = {
@@ -1319,7 +1494,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
 
-    document = build_outcome_document(rows)
+    document = build_outcome_document(
+        rows,
+        execution_contract_logical_sha256=contract["logical_sha256"],
+        execution_contract_file_sha256=contract_file_sha256,
+    )
     if outcome_path.exists():
         existing = json.loads(outcome_path.read_text(encoding="utf-8"))
         if existing != document:
@@ -1327,6 +1506,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         atomic_json(outcome_path, document, frozen=True)
     outcome_file_sha = sha256_file(outcome_path)
+    completion_path = output / "paired_execution_completion_receipt.json"
+    completion_base = {
+        "format": "etsf_robotwin2_paired_execution_completion_receipt_v1",
+        "status": "complete_1000_pairs_2000_rollouts_frozen",
+        "execution_contract_path": str(contract_path),
+        "execution_contract_logical_sha256": contract["logical_sha256"],
+        "execution_contract_file_sha256": contract_file_sha256,
+        "candidate_rank_ensemble_contract": (
+            shared_head.standardized_rank_ensemble_contract()
+        ),
+        "pair_count": len(rows),
+        "rollout_count": len(rows) * 2,
+        "ordered_pair_sha256s_sha256": document[
+            "ordered_pair_sha256s_sha256"
+        ],
+        "outcome_path": str(outcome_path),
+        "outcome_document_sha256": document["document_sha256"],
+        "outcome_file_sha256": outcome_file_sha,
+    }
+    completion = {
+        **completion_base,
+        "logical_sha256": canonical_sha256(completion_base),
+    }
+    if completion_path.exists():
+        if json.loads(completion_path.read_text(encoding="utf-8")) != completion:
+            raise PairedExecutionError("existing paired completion receipt differs")
+    else:
+        atomic_json(completion_path, completion, frozen=True)
     print(
         "PAIRED_EXECUTION_COMPLETE="
         + json.dumps(
@@ -1335,6 +1542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "rollouts": len(rows) * 2,
                 "outcome": str(outcome_path),
                 "outcome_file_sha256": outcome_file_sha,
+                "completion_receipt": str(completion_path),
+                "completion_receipt_file_sha256": sha256_file(completion_path),
                 "evaluator_command": (
                     "python3 scripts/evaluate_robotwin2_cross_embodiment_paired_success_v1.py "
                     f"--input {outcome_path} --input-file-sha256 {outcome_file_sha} "

@@ -4,8 +4,11 @@
 
 该入口为共享事件头生成真正的 critic 监督，而不是把官方 expert 正样本冒充成成败数据。五个本体
 共用同一个冻结的 EE16 SmolVLA actor；对 clean/randomized 的独立开发 seed，在固定
-query `0/5/10/15`（约为第 `0/25/50/75` 个动作帧）处从
-同一 actor、同一状态和固定 flow-noise 规则采四个候选。candidate 0 是 actor baseline。每个候选都
+query `0/10/20/30`（约为第 `0/50/100/150` 个动作帧）处从
+同一 actor、同一状态和固定 flow-noise 规则采四个候选，因此在仍保持 2,000 个决策/8,000 条分支
+预算不变时覆盖完整 200-step rollout 的早、中、晚阶段。candidate 0 是 actor baseline。四个 flow
+noise 固定为两组反对偶标准正态 `(z0,-z0,z2,-z2)`：candidate 0 与旧规则逐位相同，每个候选的
+边际分布仍为 `N(0,I)`，但候选集合显式覆盖两个采样方向。每个候选都
 从相同 seed 重置并完整重放相同 prefix，然后执行首段动作并由同一个 actor继续到终止或 200 step。
 
 模拟器逐步记录 can/pot 真值 pose、左右 EE 与夹爪，随后生成一个四行 NPZ：
@@ -14,8 +17,17 @@ query `0/5/10/15`（约为第 `0/25/50/75` 个动作帧）处从
 - EE SE(3)+gripper 的 14D action effect；
 - post/next event、物理秒 duration；
 - success、regression/recovery；
-- moving object 与 relative-goal 的 6D 变化；
+- 完整 continuation 的 terminal max-event、与正式 paired runner 完全相同的 terminal stage-progress、
+  terminal goal-distance 与从根状态到终点的 goal-progress；
+- moving object 的 6D SE(3) 变化 `[Δxyz, shortest Δaxis-angle]`；旧的
+  `relative_goal_delta=-moving_delta_xyz` 是严格冗余量，已移除；
 - 固定 candidate index 0–3 与执行前已知的 planned horizon `dt=5/15s`。
+
+每个核心 group NPZ 旁另写一个绑定 SHA-256 的 diagnostics NPZ，只用于完整数据诊断，不会静默成为
+模型输入。它保存四个候选在首段实际推进的 action 数、是否发生 branch execution/continuation error，
+以及四候选在计划前五步 14D canonical action effect 上的对称 pairwise RMS 距离矩阵。因此完整 8,000
+分支结束后可以直接区分“candidate oracle 没有头部空间”“候选覆盖不足”和“候选不可执行”，而不把
+`8000` 条相关分支误写成 `8000` 个独立决策。
 
 `duration` 与 `dt` 的语义严格分开。RoboTwin 一次 EE action 会执行可变数量的内部物理步；采集器用
 透明 scene proxy 计数真实 `scene.step()`，再乘 `scene.get_timestep()`，只把这个物理时间用于事件
@@ -147,7 +159,7 @@ ${PY} ${COLLECTOR_CODE}/collect_robotwin2_five_body_ee_candidate_branches_v1.py 
   --conditions clean randomized \
   --seed-start 2026081000 \
   --seed-count 50 \
-  --root-query-indices 0 5 10 15 \
+  --root-query-indices 0 10 20 30 \
   --output /home/user/etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic/piper
 ```
 

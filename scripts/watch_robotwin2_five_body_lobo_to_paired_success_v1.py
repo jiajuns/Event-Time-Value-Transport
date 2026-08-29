@@ -46,10 +46,10 @@ EXPECTED_EVENT_MODULE_SHA256 = (
     "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
 )
 EXPECTED_RUNNER_SHA256 = (
-    "1c6fa9eb5c83ff9ed64210afc76e11c175ca5b95fda4b65c2ab518403f431bae"
+    "98463a7979d1fb88cefddecf07548069ec51b6731b15d1777eb4f90ef7e50648"
 )
 EXPECTED_EVALUATOR_SHA256 = (
-    "01181e8278a1534f6ad971eab17909e5703f8a6f2f8d49b512f8548b693d098a"
+    "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"
 )
 EXPECTED_MATERIALIZATION_RECEIPT_FILE_SHA256 = (
     "aefd33cd337dbaad5d85e6a7cf5490221cb515fe6bb06462257d279a091f8582"
@@ -77,6 +77,17 @@ EXPECTED_MEMBERS_PER_FOLD = 5
 ACTION_EXEC_STEPS = 5
 MAX_STEPS = 200
 FPS = 15
+STANDARDIZED_RANK_ENSEMBLE_CONTRACT = {
+    "format": "etsf_within_decision_standardized_rank_ensemble_v1",
+    "member_count": 5,
+    "candidate_count": 4,
+    "member_transform": "subtract_candidate_mean_divide_population_std",
+    "population_std_correction": 0,
+    "std_floor": 1e-6,
+    "member_with_std_at_or_below_floor": "all_zero_contribution",
+    "aggregation": "equal_mean_over_exactly_five_member_contributions",
+    "normalization_scope": "one_four_candidate_decision_per_member",
+}
 
 
 class PairedWatcherError(RuntimeError):
@@ -136,6 +147,10 @@ class FormalPaths:
     @property
     def outcomes(self) -> Path:
         return self.output_root / "paired_outcomes.json"
+
+    @property
+    def completion_receipt(self) -> Path:
+        return self.output_root / "paired_execution_completion_receipt.json"
 
     @property
     def report(self) -> Path:
@@ -846,6 +861,8 @@ def validate_runner_contract(paths: FormalPaths, binding: Mapping[str, Any]) -> 
         or contract.get("action_exec_steps") != ACTION_EXEC_STEPS
         or contract.get("max_steps") != MAX_STEPS
         or contract.get("fps") != float(FPS)
+        or contract.get("candidate_rank_ensemble_contract")
+        != STANDARDIZED_RANK_ENSEMBLE_CONTRACT
         or contract.get("no_training") is not True
     ):
         raise PairedWatcherError("runner execution contract differs from watcher binding")
@@ -877,6 +894,45 @@ def validate_report(paths: FormalPaths, outcomes_sha256: str) -> dict[str, Any]:
     ):
         raise PairedWatcherError("paired success report contract or SHA changed")
     return report
+
+
+def validate_completion_receipt(paths: FormalPaths) -> dict[str, Any]:
+    if not paths.completion_receipt.is_file() or paths.completion_receipt.is_symlink():
+        raise PairedWatcherError("paired runner did not create a real completion receipt")
+    receipt = read_json(paths.completion_receipt, "paired execution completion receipt")
+    receipt_unsigned = dict(receipt)
+    receipt_logical = receipt_unsigned.pop("logical_sha256", None)
+    contract = read_json(paths.execution_contract, "runner execution contract")
+    outcomes = read_json(paths.outcomes, "paired outcomes")
+    outcomes_unsigned = dict(outcomes)
+    outcomes_document_sha = outcomes_unsigned.pop("document_sha256", None)
+    if (
+        receipt.get("format")
+        != "etsf_robotwin2_paired_execution_completion_receipt_v1"
+        or receipt.get("status") != "complete_1000_pairs_2000_rollouts_frozen"
+        or receipt.get("pair_count") != EXPECTED_PAIRS
+        or receipt.get("rollout_count") != EXPECTED_ROLLOUTS
+        or receipt.get("execution_contract_path") != str(paths.execution_contract)
+        or receipt.get("execution_contract_logical_sha256")
+        != contract.get("logical_sha256")
+        or receipt.get("execution_contract_file_sha256")
+        != sha256_file(paths.execution_contract)
+        or receipt.get("candidate_rank_ensemble_contract")
+        != contract.get("candidate_rank_ensemble_contract")
+        or receipt.get("ordered_pair_sha256s_sha256")
+        != outcomes.get("ordered_pair_sha256s_sha256")
+        or receipt.get("outcome_path") != str(paths.outcomes)
+        or receipt.get("outcome_document_sha256") != outcomes_document_sha
+        or receipt.get("outcome_file_sha256") != sha256_file(paths.outcomes)
+        or outcomes.get("execution_contract_logical_sha256")
+        != contract.get("logical_sha256")
+        or outcomes.get("execution_contract_file_sha256")
+        != sha256_file(paths.execution_contract)
+        or outcomes_document_sha != canonical_sha256(outcomes_unsigned)
+        or receipt_logical != canonical_sha256(receipt_unsigned)
+    ):
+        raise PairedWatcherError("paired completion receipt or evidence chain changed")
+    return receipt
 
 
 def acquire_instance_lock(paths: FormalPaths) -> Any:
@@ -1030,6 +1086,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise PairedWatcherError("paired runner did not create a real paired_outcomes.json")
     validate_runner_contract(paths, binding)
     outcomes_sha = sha256_file(paths.outcomes)
+    completion_receipt = validate_completion_receipt(paths)
     if not paths.report.exists():
         evaluator_command = build_evaluator_command(paths, outcomes_sha)
         write_state(
@@ -1077,6 +1134,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_binding_logical_sha256=binding["logical_sha256"],
         paired_outcomes=str(paths.outcomes),
         paired_outcomes_file_sha256=outcomes_sha,
+        paired_completion_receipt=str(paths.completion_receipt),
+        paired_completion_receipt_file_sha256=sha256_file(
+            paths.completion_receipt
+        ),
+        ordered_pair_sha256s_sha256=completion_receipt[
+            "ordered_pair_sha256s_sha256"
+        ],
         paired_success_report=str(paths.report),
         paired_success_report_file_sha256=sha256_file(paths.report),
         paired_success_report_logical_sha256=report["report_sha256"],

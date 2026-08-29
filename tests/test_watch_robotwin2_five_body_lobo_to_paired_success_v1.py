@@ -262,10 +262,10 @@ def test_analytic_and_execution_code_identities_are_frozen() -> None:
         "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
     )
     assert watcher.EXPECTED_RUNNER_SHA256 == (
-        "1c6fa9eb5c83ff9ed64210afc76e11c175ca5b95fda4b65c2ab518403f431bae"
+        "98463a7979d1fb88cefddecf07548069ec51b6731b15d1777eb4f90ef7e50648"
     )
     assert watcher.EXPECTED_EVALUATOR_SHA256 == (
-        "01181e8278a1534f6ad971eab17909e5703f8a6f2f8d49b512f8548b693d098a"
+        "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"
     )
 
 
@@ -284,6 +284,63 @@ def test_metrics_preregistration_v2_is_distinct_from_materialization_v1(
         watcher.EXPECTED_MATERIALIZATION_PREREGISTRATION_SHA256
     )
     assert paths.materialization_receipt != paths.metrics_preregistration
+
+
+def test_completion_receipt_closes_contract_pair_and_outcome_chain(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    paths.output_root.mkdir(parents=True)
+    contract_base = {
+        "candidate_rank_ensemble_contract": (
+            watcher.STANDARDIZED_RANK_ENSEMBLE_CONTRACT
+        )
+    }
+    contract = {
+        **contract_base,
+        "logical_sha256": watcher.canonical_sha256(contract_base),
+    }
+    _json(paths.execution_contract, contract)
+    outcomes_base = {
+        "execution_contract_logical_sha256": contract["logical_sha256"],
+        "execution_contract_file_sha256": _sha(paths.execution_contract),
+        "ordered_pair_sha256s_sha256": "a" * 64,
+    }
+    outcomes = {
+        **outcomes_base,
+        "document_sha256": watcher.canonical_sha256(outcomes_base),
+    }
+    _json(paths.outcomes, outcomes)
+    receipt_base = {
+        "format": "etsf_robotwin2_paired_execution_completion_receipt_v1",
+        "status": "complete_1000_pairs_2000_rollouts_frozen",
+        "execution_contract_path": str(paths.execution_contract),
+        "execution_contract_logical_sha256": contract["logical_sha256"],
+        "execution_contract_file_sha256": _sha(paths.execution_contract),
+        "candidate_rank_ensemble_contract": (
+            watcher.STANDARDIZED_RANK_ENSEMBLE_CONTRACT
+        ),
+        "pair_count": watcher.EXPECTED_PAIRS,
+        "rollout_count": watcher.EXPECTED_ROLLOUTS,
+        "ordered_pair_sha256s_sha256": outcomes["ordered_pair_sha256s_sha256"],
+        "outcome_path": str(paths.outcomes),
+        "outcome_document_sha256": outcomes["document_sha256"],
+        "outcome_file_sha256": _sha(paths.outcomes),
+    }
+    receipt = {
+        **receipt_base,
+        "logical_sha256": watcher.canonical_sha256(receipt_base),
+    }
+    _json(paths.completion_receipt, receipt)
+    assert watcher.validate_completion_receipt(paths)["pair_count"] == 1000
+
+    receipt["ordered_pair_sha256s_sha256"] = "b" * 64
+    receipt_unsigned = dict(receipt)
+    receipt_unsigned.pop("logical_sha256")
+    receipt["logical_sha256"] = watcher.canonical_sha256(receipt_unsigned)
+    _json(paths.completion_receipt, receipt)
+    with pytest.raises(watcher.PairedWatcherError):
+        watcher.validate_completion_receipt(paths)
 
 
 def test_waiting_watcher_has_no_torch_numpy_or_simulator_import() -> None:

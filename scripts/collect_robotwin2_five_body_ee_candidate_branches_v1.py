@@ -5,8 +5,9 @@ The collector is intentionally operational rather than a data-contract tool:
 it loads one frozen 16-D EE SmolVLA actor, creates four fixed-flow-noise action
 candidates at several fixed query indices, executes each candidate after an
 identical reset/replayed baseline prefix, and writes one four-row canonical
-NPZ per decision.  Events, object effects and success are derived from the
-simulator trajectory, never from the public expert archive.
+NPZ plus a non-trainable diagnostic sidecar per decision.  Events, terminal
+progress, SE(3) object effects and success are derived from the simulator
+trajectory, never from the public expert archive.
 
 Run this program only on the remote 4090 with the public RoboTwin simulator.
 One invocation collects both clean and randomized groups for one embodiment;
@@ -36,6 +37,7 @@ import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
 
 FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
+DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v1"
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
@@ -53,6 +55,41 @@ EVENT_TO_ID = {name: index for index, name in enumerate(CANONICAL_EVENTS)}
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
 STATE_SCHEMA = canonical_adapter.STATE_SCHEMA
 ACTION_SCHEMA = canonical_adapter.ACTION_SCHEMA
+OBJECT_EFFECT_SCHEMA = {
+    "format": "etsf_robotwin2_moving_object_se3_effect_6d_v1",
+    "channels": [
+        "moving_delta_x",
+        "moving_delta_y",
+        "moving_delta_z",
+        "moving_delta_axis_angle_x",
+        "moving_delta_axis_angle_y",
+        "moving_delta_axis_angle_z",
+    ],
+    "rotation": "q_post_times_conjugate_q_root_shortest_axis_angle_wxyz",
+    "redundant_relative_goal_delta_removed": True,
+}
+CANDIDATE_NOISE_CONTRACT = {
+    "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
+    "candidate_indices": [0, 1, 2, 3],
+    "base_noise_indices": [0, 0, 2, 2],
+    "signs": [1, -1, 1, -1],
+    "candidate_zero_legacy_noise_unchanged": True,
+}
+TERMINAL_SUPERVISION_CONTRACT = {
+    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
+    "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
+    "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "same_stage_progress_definition_as_formal_paired_runner": True,
+}
+BRANCH_DIAGNOSTIC_CONTRACT = {
+    "format": DIAGNOSTIC_FORMAT,
+    "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
+    "branch_error": "boolean_execution_or_continuation_exception",
+    "candidate_action_pairwise_rms": (
+        "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
+    ),
+}
 BODY_EMBODIMENT = {
     "aloha-agilex": ["aloha-agilex"],
     "arx-x5": ["ARX-X5", "ARX-X5", 0.6],
@@ -142,12 +179,20 @@ def make_noise(
     candidate_index: int,
     device: torch.device,
 ) -> torch.Tensor:
+    if candidate_index < 0:
+        raise BranchCollectionError("candidate index must be non-negative")
+    # Preserve the legacy candidate-zero draw exactly, while pairing every
+    # even draw with its antithetic negative.  Each candidate marginal remains
+    # N(0,I), but four proposals cover both directions of two independent flow
+    # draws instead of relying on four potentially clustered draws.
+    base_candidate_index = int(candidate_index) - int(candidate_index) % 2
+    sign = 1.0 if int(candidate_index) % 2 == 0 else -1.0
     seed = int(
         (
             20260903
             + int(scene_seed) * 1_000_003
             + int(query_index) * 10_007
-            + int(candidate_index) * 101
+            + base_candidate_index * 101
         )
         % (2**63 - 1)
     )
@@ -158,7 +203,7 @@ def make_noise(
         generator=generator,
         device=device,
         dtype=torch.float32,
-    )
+    ).mul_(sign)
 
 
 def _pose_vector(value: Any) -> np.ndarray | None:
@@ -663,6 +708,8 @@ def materialize_group(
     calibration: Mapping[str, Any],
     action_exec_steps: int,
 ) -> dict[str, np.ndarray]:
+    if len(outcomes) != CANDIDATE_COUNT or len(root["candidates"]) != CANDIDATE_COUNT:
+        raise BranchCollectionError("materialization requires exactly four complete branches")
     names = list(root["object_names"])
     moving_index = names.index(str(calibration["moving"]))
     prefix = np.asarray(root["prefix_trajectory"], dtype=np.float32)
@@ -696,6 +743,10 @@ def materialize_group(
     recovery_mask = []
     object_delta = []
     object_delta_mask = []
+    terminal_max_event = []
+    terminal_stage_progress = []
+    terminal_goal_distance = []
+    terminal_goal_progress = []
     for candidate, outcome in zip(root["candidates"], outcomes):
         action = canonical_action_chunk(root["root_ee_action"], candidate)
         # The critic scores the proposal before execution, so it must see the
@@ -727,9 +778,18 @@ def materialize_group(
         moving_start, relative_start = _goal_vector(
             trajectory, names, root_step, calibration
         )
-        moving_post, relative_post = _goal_vector(
+        moving_post, _relative_post = _goal_vector(
             trajectory, names, post_step, calibration
         )
+        _moving_terminal, relative_terminal = _goal_vector(
+            trajectory, names, len(trajectory) - 1, calibration
+        )
+        moving_rotation_delta = canonical_adapter.relative_axis_angle_wxyz(
+            trajectory[root_step, moving_index, 3:7],
+            trajectory[post_step, moving_index, 3:7],
+        )
+        maximum_event = int(events.max())
+        branch_success = bool(outcome["success"])
         actions.append(action)
         masks.append(mask)
         post_event.append(int(events[post_step]))
@@ -741,11 +801,18 @@ def materialize_group(
         # success/ranking/zero-object-effect supervision, but do not turn a
         # vacuous censored duration at t=0 into a clock gradient.
         duration_mask.append(float(duration_seconds) > 0.0)
-        success.append(bool(outcome["success"]))
+        success.append(branch_success)
         recovery.append(recovered)
         recovery_mask.append(regressed)
-        object_delta.append(np.r_[moving_post - moving_start, relative_post - relative_start])
+        object_delta.append(np.r_[moving_post - moving_start, moving_rotation_delta])
         object_delta_mask.append(True)
+        terminal_max_event.append(maximum_event)
+        terminal_stage_progress.append(
+            1.0 if branch_success else maximum_event / float(len(CANONICAL_EVENTS) - 1)
+        )
+        terminal_distance = float(np.linalg.norm(relative_terminal))
+        terminal_goal_distance.append(terminal_distance)
+        terminal_goal_progress.append(float(np.linalg.norm(relative_start)) - terminal_distance)
 
     count = CANDIDATE_COUNT
     arrays = {
@@ -766,6 +833,10 @@ def materialize_group(
         "recovery_mask": np.asarray(recovery_mask, dtype=np.float32),
         "object_delta": np.asarray(object_delta, dtype=np.float32),
         "object_delta_mask": np.asarray(object_delta_mask, dtype=np.float32),
+        "terminal_max_event_id": np.asarray(terminal_max_event, dtype=np.int64),
+        "terminal_stage_progress": np.asarray(terminal_stage_progress, dtype=np.float32),
+        "terminal_goal_distance": np.asarray(terminal_goal_distance, dtype=np.float32),
+        "terminal_goal_progress": np.asarray(terminal_goal_progress, dtype=np.float32),
         "candidate_index": np.arange(count, dtype=np.int64),
         # ``dt`` is an execution-time critic input, not an outcome.  Keep it
         # equal across the four candidates and known before execution; only
@@ -782,8 +853,77 @@ def materialize_group(
         raise BranchCollectionError("canonical group state shape changed")
     if arrays["object_delta"].shape != (count, OBJECT_DELTA_DIM):
         raise BranchCollectionError("canonical object effect shape changed")
+    if not np.array_equal(
+        arrays["terminal_stage_progress"],
+        np.where(
+            arrays["success"] > 0.5,
+            1.0,
+            arrays["terminal_max_event_id"] / float(len(CANONICAL_EVENTS) - 1),
+        ).astype(np.float32),
+    ):
+        raise BranchCollectionError("terminal stage progress disagrees with formal definition")
+    if np.any(
+        (arrays["terminal_max_event_id"] < 0)
+        | (arrays["terminal_max_event_id"] >= len(CANONICAL_EVENTS))
+        | (arrays["terminal_goal_distance"] < 0.0)
+    ):
+        raise BranchCollectionError("terminal branch supervision is outside its domain")
     if any(not np.isfinite(value).all() for value in arrays.values()):
         raise BranchCollectionError("canonical group contains non-finite values")
+    return arrays
+
+
+def materialize_branch_diagnostics(
+    *,
+    root: Mapping[str, Any],
+    outcomes: Sequence[Mapping[str, Any]],
+    action_exec_steps: int,
+) -> dict[str, np.ndarray]:
+    """Return label-free/action-execution diagnostics bound beside one group.
+
+    These fields are deliberately separate from the trainable row arrays: they
+    quantify proposal coverage and simulator infeasibility without silently
+    becoming model inputs or ranking targets.
+    """
+
+    candidates = np.asarray(root["candidates"], dtype=np.float32)
+    if candidates.ndim != 3 or len(candidates) != CANDIDATE_COUNT:
+        raise BranchCollectionError("branch diagnostics require four actor candidates")
+    if len(outcomes) != CANDIDATE_COUNT:
+        raise BranchCollectionError("branch diagnostics require four outcomes")
+    current = np.asarray(root["root_ee_action"], dtype=np.float32)
+    effects = np.stack(
+        [canonical_action_chunk(current, candidate) for candidate in candidates]
+    ).astype(np.float32)
+    planned = min(int(action_exec_steps), int(effects.shape[1]))
+    if planned <= 0:
+        raise BranchCollectionError("branch diagnostics require a positive planned horizon")
+    first = effects[:, None, :planned, :]
+    second = effects[None, :, :planned, :]
+    pairwise_rms = np.sqrt(np.mean(np.square(first - second), axis=(2, 3))).astype(
+        np.float32
+    )
+    arrays = {
+        "first_executed": np.asarray(
+            [int(outcome["first_executed"]) for outcome in outcomes], dtype=np.int64
+        ),
+        "branch_error": np.asarray(
+            [outcome.get("branch_error") is not None for outcome in outcomes], dtype=bool
+        ),
+        "candidate_action_pairwise_rms": pairwise_rms,
+    }
+    if arrays["first_executed"].shape != (CANDIDATE_COUNT,) or np.any(
+        (arrays["first_executed"] < 0) | (arrays["first_executed"] > planned)
+    ):
+        raise BranchCollectionError("first-executed diagnostic is outside planned horizon")
+    if arrays["branch_error"].shape != (CANDIDATE_COUNT,):
+        raise BranchCollectionError("branch-error diagnostic shape changed")
+    if pairwise_rms.shape != (CANDIDATE_COUNT, CANDIDATE_COUNT) or not np.allclose(
+        pairwise_rms, pairwise_rms.T, atol=1e-7, rtol=0.0
+    ) or not np.allclose(np.diag(pairwise_rms), 0.0, atol=1e-7, rtol=0.0):
+        raise BranchCollectionError("candidate pairwise-distance diagnostic is invalid")
+    if any(not np.isfinite(value).all() for value in arrays.values()):
+        raise BranchCollectionError("branch diagnostics contain non-finite values")
     return arrays
 
 
@@ -798,7 +938,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=list(CONDITIONS))
     parser.add_argument("--seed-start", type=int, default=2026081000)
     parser.add_argument("--seed-count", type=int, default=50)
-    parser.add_argument("--root-query-indices", nargs="+", type=int, default=[0, 5, 10, 15])
+    parser.add_argument("--root-query-indices", nargs="+", type=int, default=[0, 10, 20, 30])
     parser.add_argument("--action-exec-steps", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
@@ -883,11 +1023,20 @@ def main() -> None:
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         unsigned = dict(manifest)
-        unsigned.pop("logical_sha256", None)
+        logical = unsigned.pop("logical_sha256", None)
         if (
-            manifest.get("format") != MANIFEST_FORMAT
+            logical != canonical_sha256(unsigned)
+            or manifest.get("format") != MANIFEST_FORMAT
             or manifest.get("body") != args.body
             or manifest.get("actor_checkpoint") != str(args.actor_checkpoint.resolve())
+            or manifest.get("candidate_count") != CANDIDATE_COUNT
+            or manifest.get("root_query_indices") != sorted(args.root_query_indices)
+            or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+            or manifest.get("terminal_supervision_contract")
+            != TERMINAL_SUPERVISION_CONTRACT
+            or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+            or manifest.get("branch_diagnostic_contract")
+            != BRANCH_DIAGNOSTIC_CONTRACT
         ):
             raise BranchCollectionError("existing manifest does not match this collection")
     else:
@@ -903,6 +1052,7 @@ def main() -> None:
             "candidate_count": CANDIDATE_COUNT,
             "candidate_zero_is_actor_baseline": True,
             "same_ordered_candidate_set_for_baseline_and_etsf": True,
+            "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "root_query_indices": sorted(args.root_query_indices),
             "schema_adapter": {
                 "kind": "analytic_label_free_canonical_v1",
@@ -957,6 +1107,9 @@ def main() -> None:
                 "executed_action_count_used_for_sim_time_accounting_only": True,
                 "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
             },
+            "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+            "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "groups": [],
         }
@@ -1023,9 +1176,19 @@ def main() -> None:
                     calibration=calibration,
                     action_exec_steps=args.action_exec_steps,
                 )
+                diagnostics = materialize_branch_diagnostics(
+                    root=root,
+                    outcomes=outcomes,
+                    action_exec_steps=args.action_exec_steps,
+                )
                 filename = f"{condition}_seed_{seed}_query_{root_query}.npz"
                 path = groups_dir / filename
                 atomic_npz(path, arrays)
+                diagnostic_filename = (
+                    f"{condition}_seed_{seed}_query_{root_query}.diagnostics.npz"
+                )
+                diagnostic_path = groups_dir / diagnostic_filename
+                atomic_npz(diagnostic_path, diagnostics)
                 item = {
                     "group_id": group_id,
                     "condition": condition,
@@ -1033,6 +1196,9 @@ def main() -> None:
                     "root_query_index": int(root_query),
                     "path": f"groups/{filename}",
                     "sha256": sha256_file(path),
+                    "diagnostic_format": DIAGNOSTIC_FORMAT,
+                    "diagnostics_path": f"groups/{diagnostic_filename}",
+                    "diagnostics_sha256": sha256_file(diagnostic_path),
                     "wall_seconds": time.time() - started,
                 }
                 manifest["groups"].append(item)

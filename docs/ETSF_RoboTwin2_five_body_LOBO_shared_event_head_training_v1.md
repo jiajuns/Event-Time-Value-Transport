@@ -52,16 +52,27 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
 
 - event/success/recovery/duration 保留 unweighted proper loss，`sigmoid(success_logit)` 仍可解释为
   成功概率，不使用会改变先验的 class-weighted BCE；
-- 增加独立 `candidate_rank_logit`，用同根 pairwise logistic loss 直接学习
-  `success > event stage > goal-distance reduction` 的词典序；
+- 增加独立 `candidate_rank_logit`。同根四候选只要同时存在成功/失败，就直接最小化“softmax
+  分给任一成功候选的概率质量”的负对数；不再让大量 failure/failure pair 淹没真正改变成功率的
+  监督；
+- 全失败 decision 才以 `0.1` 权重学习完整 continuation 的严格 tuple 词典序：先比较
+  `terminal_max_event_id`，仅同事件阶段时再比较 `terminal_goal_progress`。不再把标签乘
+  `100/10` 相加，异常对象运动不能翻转 success/event 优先级；
 - 对象效果使用 Student-t(3) 稳健 NLL，避免旧 Gaussian scale head 的少数异常值把 validation
   object loss 推到上千并拖坏 shared trunk；
-- checkpoint 主键改为 source validation 的 body×condition 宏平均 best-of-4 `ΔSR`，其次为宏平均
-  selected SR 与 success-changing pair accuracy；六头复合预测分数只作 tie-break；
+- 五个成员不再各自挑一个 raw-logit 最优 checkpoint。每个成员保存相同 eval step 的 source-only
+  快照，然后用正式部署同一个 decision 内标准化五成员 ensemble 联合选择一个共同 step；主键为
+  body×condition 宏平均 best-of-4 `ΔSR`，其次依次为 mixed-success decision 的选中成功率和
+  success-changing pair accuracy；只有这些同分时才看全失败 dense continuation 排序，五成员六头
+  复合预测分数均值最后破同分；
 - `dt` 与 duration 都使用物理秒，duration 不再主导候选重排 checkpoint。
 
 这样训练目标直接对应最终的“candidate 0 与 best-of-4 哪个成功”，而不是靠 AUC/MAE 猜测重排是否
 可能有效。
+
+五成员仍采用 decision-group Poisson bootstrap，但会确定性修复极少数把所有 mixed-success group
+抽成零权重的成员：每个成员都必须实际看到正样本、负样本和至少一个同根成功/失败比较。修复只改变
+训练采样权重，不读取 held-out，也不靠推理门控掩盖一个没有学到成功排序的成员。
 
 ## Canonical group 契约
 
@@ -73,7 +84,11 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
 - current/post/next event id 和 mask；
 - duration、observed/censor mask；
 - success、recovery 和 mask；
-- `object_delta [N,6]` 与 mask。
+- moving object 的 SE(3) `object_delta [N,6]`（`Δxyz + shortest Δaxis-angle`）与 mask；
+- 完整 continuation 的 `terminal_max_event_id / terminal_stage_progress /
+  terminal_goal_distance / terminal_goal_progress [N]`；前两者满足
+  `terminal_stage_progress=1 if success else terminal_max_event_id/4`，后两者和 root state 的
+  goal residual 一致；
 - `candidate_index=[0,1,2,3]`；
 - `dt [N]`，表示 critic 打分前已知的 planned 首段时长，正式合同固定为 `5/15` 秒；真实
   simulator elapsed seconds 仅用于 duration 标签，不能把执行后信息泄漏进 critic 输入。
@@ -81,12 +96,19 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
 这里 `N` 必须严格等于 4，四行的 state 与 current event 必须相同。否则无法形成同根排序监督，
 训练入口直接拒绝，而不是退化为随机逐行 batch。
 source validation 按 `(body, condition, requested_seed)` 切分；同一 reset seed 的全部 query 必须留在
-同一 lane，不能把 query 0/5/10/15 拆到 train/validation 后虚高 checkpoint-selection `ΔSR`。
+同一 lane，不能把 query 0/10/20/30 拆到 train/validation 后虚高 checkpoint-selection `ΔSR`。
 
 候选 rank 显式拼接 `transitioned`、`clock_hidden` 和 current-event 的 duration
 `log_mean/log_scale`，所以 planned `dt=5/15` 对最终 score 有数值计算路径。rank 梯度继续更新
 state/action/transition backbone；clock 与 duration 特征在 rank 分支处 detach，只由 proper duration
 likelihood 更新，rank loss 不直接改写 clock/duration heads。
+
+五成员部署聚合也不再直接平均不可比的 raw logit。对每个 decision、每个 member 的四个分数先减去
+该 member 的候选均值，再除以四候选 population std；std 不大于 `1e-6` 的常数成员贡献全零，最后
+始终对恰好五个成员等权平均。该纯函数与合同由 trainer 导出，source validation、离线 heldout 和
+正式 runner 必须共用，禁止跨 decision 计算均值/方差或让某个 logit 尺度大的成员支配选择。
+训练 summary/checkpoint 同时绑定 trainer 文件 SHA、共同选择 step、全部 source-only 候选 step 的选择键，
+正式 runner 会拒绝五成员 step 不一致或并非由当前训练实现产生的 checkpoint。
 
 每个 body manifest 还必须绑定解析式 adapter：
 
@@ -164,9 +186,23 @@ commitment 和完整 paired simulator result，不能用 critic AUC/Brier 替代
 validation 选 checkpoint。入口先完成全部 `4 variant × 5 fold = 20` 次 source-only 训练与选模，
 然后才打开 held-out body payload 做只读 posthoc 评估；heldout 指标既不回流 checkpoint，也不选
 variant。输出同时保留 source-validation 五成员均值和真正 heldout-body 五折结果。heldout 的
-best-of-4 `ΔSR`、selected/oracle SR、pairwise accuracy 按正式推理方式先平均五成员 rank score 再
-选候选；success/event/duration/object 预测指标为五成员逐模型指标的算术均值，明确不是
-ensemble-calibrated 指标。最终 equal-fold macro 跨五个 heldout body 等权计算。
+best-of-4 `ΔSR`、selected/oracle SR、pairwise accuracy 使用与正式部署相同的“五成员各自在同一
+四候选内 z-score 标准化后等权平均”合同，避免 raw rank logit 尺度不同造成单成员支配。
+success、post/next event、duration、object-effect、recovery 均先把五个冻结成员在概率或密度空间
+组成部署 ensemble，再计算 Brier/NLL/ECE/AUROC、macro-F1、秒制 MAE、Student-t(3) mixture NLL
+和 recovery Brier/AP 及逐阈值 precision--recall 曲线；没有 recovery 正例时必须显式标记 PR
+不可用，不能填 0。上述预测在打分前还会拒绝任何非有限输出，不再用“五个成员各算一次指标再
+平均”冒充 ensemble 质量。
+duration NLL 同时报告 observed density、censored survival 和两者合并后的总 mixture NLL；五折宏
+平均还必须附每项实际有支持的 fold 数，缺标签的 fold 不得暗中当作零。
+
+不确定性只来自同一五成员的预测分歧。报告按 success/event/duration/object/recovery 给出
+error--risk-coverage 与 AURC，并按候选决策给出 rank 与 success argmax/pairwise 分歧、成员 rank
+选择分歧下的 selected-failure/oracle-regret risk-coverage。预测 observation unit 是 candidate
+branch，排序 unit 是完整四候选 decision，依赖 cluster 明确为
+`heldout_body×condition×requested_seed` 下的全部 query/candidate；最终 equal-fold macro 跨五个
+heldout body 等权计算。该 posthoc 消融不构造置信区间，也不得据其 heldout 结果选择 variant 后再
+把同一 heldout 当作确认性证据。
 禁用头的预测指标只作 descriptive 输出，不进入该 variant 的 checkpoint tie-break；例如
 `success_only` 的 diagnostic tie-break 只允许 success Brier，不能借 event/duration/object 标签选模。
 
@@ -191,7 +227,8 @@ SHA 和无额外文件。watcher 不解释 success/event 等结果数组；每�
 另外四个 source body。等待期间不持有 GPU，完整采集且 4090 空闲后才顺序启动五折，每折固定
 5 个 ensemble member、每 member 3000 step。
 
-四个 query 固定为 `0/5/10/15`。若某个预定 seed 在 query 前已经 terminal，collector 可从
+四个 query 固定为 `0/10/20/30`，覆盖 `max_steps=200` 闭环的早/中/后段，而不是只采前
+15 个 policy query。若某个预定 seed 在 query 前已经 terminal，collector 可从
 `[2026081000, 2026090000)` 的开发区间补一个新 seed；watcher 验证的是每个
 `body×condition×query` 恰好 50 个唯一开发 seed，而不是错误要求五个本体都保留同一段连续 seed。
 正式 paired evaluation 的 `2026090000..2026090099` 不在这个区间内。

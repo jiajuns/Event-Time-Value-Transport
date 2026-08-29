@@ -45,6 +45,9 @@ def outcome_document() -> dict[str, Any]:
                             if seed_ordinal % 2 == 0
                             else list(reversed(evaluator.METHODS))
                         ),
+                        "pair_sha256": hashlib.sha256(
+                            f"{body}|{condition}|{seed_ordinal}".encode()
+                        ).hexdigest(),
                         "actor_baseline_binary_success": baseline,
                         "actor_baseline_stage_progress": _progress(
                             baseline, seed_ordinal + body_index
@@ -61,6 +64,11 @@ def outcome_document() -> dict[str, Any]:
         "preregistration_sha256": evaluator.APPROVED_PREREGISTRATION_SHA256,
         "rows": rows,
         "rows_sha256": evaluator.canonical_sha256(rows),
+        "execution_contract_logical_sha256": "c" * 64,
+        "execution_contract_file_sha256": "d" * 64,
+        "ordered_pair_sha256s_sha256": evaluator.canonical_sha256(
+            [row["pair_sha256"] for row in rows]
+        ),
     }
     return {**base, "document_sha256": evaluator.canonical_sha256(base)}
 
@@ -68,6 +76,9 @@ def outcome_document() -> dict[str, Any]:
 def resign(value: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(value)
     result["rows_sha256"] = evaluator.canonical_sha256(result["rows"])
+    result["ordered_pair_sha256s_sha256"] = evaluator.canonical_sha256(
+        [row["pair_sha256"] for row in result["rows"]]
+    )
     result.pop("document_sha256", None)
     result["document_sha256"] = evaluator.canonical_sha256(result)
     return result

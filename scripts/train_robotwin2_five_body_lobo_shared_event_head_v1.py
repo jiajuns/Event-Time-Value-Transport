@@ -19,6 +19,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import random
 from collections import defaultdict
@@ -52,6 +53,47 @@ BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 CANDIDATE_COUNT = 4
 CANDIDATE_RANK_FEATURE_DIM = core.SEMANTIC_DIM + 64 + 2
+DENSE_FAILURE_RANK_WEIGHT = 0.1
+RANK_ENSEMBLE_STD_FLOOR = 1e-6
+STANDARDIZED_RANK_ENSEMBLE_CONTRACT = {
+    "format": "etsf_within_decision_standardized_rank_ensemble_v1",
+    "member_count": 5,
+    "candidate_count": CANDIDATE_COUNT,
+    "member_transform": "subtract_candidate_mean_divide_population_std",
+    "population_std_correction": 0,
+    "std_floor": RANK_ENSEMBLE_STD_FLOOR,
+    "member_with_std_at_or_below_floor": "all_zero_contribution",
+    "aggregation": "equal_mean_over_exactly_five_member_contributions",
+    "normalization_scope": "one_four_candidate_decision_per_member",
+}
+CANDIDATE_NOISE_CONTRACT = {
+    "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
+    "candidate_indices": [0, 1, 2, 3],
+    "base_noise_indices": [0, 0, 2, 2],
+    "signs": [1, -1, 1, -1],
+    "candidate_zero_legacy_noise_unchanged": True,
+}
+OBJECT_EFFECT_SCHEMA = {
+    "format": "etsf_robotwin2_moving_object_se3_effect_6d_v1",
+    "channels": list(canonical_adapter.OBJECT_EFFECT6_CHANNELS),
+    "rotation": "q_post_times_conjugate_q_root_shortest_axis_angle_wxyz",
+    "redundant_relative_goal_delta_removed": True,
+}
+TERMINAL_SUPERVISION_CONTRACT = {
+    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
+    "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
+    "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "same_stage_progress_definition_as_formal_paired_runner": True,
+}
+BRANCH_DIAGNOSTIC_CONTRACT = {
+    "format": "etsf_robotwin2_candidate_branch_diagnostics_v1",
+    "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
+    "branch_error": "boolean_execution_or_continuation_exception",
+    "candidate_action_pairwise_rms": (
+        "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
+    ),
+}
 ABLATION_VARIANTS = (
     "success_only",
     "no_time_duration",
@@ -68,7 +110,7 @@ def ablation_contract(variant: str) -> dict[str, Any]:
         "candidate_score": (
             "proper_success_logit"
             if variant == "success_only"
-            else "pairwise_candidate_rank_logit"
+            else "group_listwise_candidate_rank_logit"
         ),
         "multitask_heads_enabled": (
             ["success"]
@@ -85,6 +127,20 @@ def ablation_contract(variant: str) -> dict[str, Any]:
         not in {"success_only", "no_time_duration"},
         "object_effect_loss_and_rank_target_enabled": variant
         not in {"success_only", "no_object_effect"},
+        "mixed_success_objective": (
+            "none"
+            if variant == "success_only"
+            else "negative_log_softmax_mass_on_any_successful_candidate"
+        ),
+        "all_failure_dense_objective_weight": (
+            0.0 if variant == "success_only" else DENSE_FAILURE_RANK_WEIGHT
+        ),
+        "dense_target_order": (
+            "none"
+            if variant == "success_only"
+            else "lexicographic_terminal_max_event_then_terminal_goal_progress"
+        ),
+        "rank_ensemble_aggregation": standardized_rank_ensemble_contract(),
         "same_seed_disjoint_split": True,
         "heldout_labels_used_for_training_or_selection": False,
     }
@@ -146,7 +202,14 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "feature_blocks": feature_blocks,
         "feature_dim": CANDIDATE_RANK_FEATURE_DIM,
         "dt_has_numeric_score_path": variant not in {"success_only", "no_time_duration"},
-        "pairwise_rank_loss_enabled": variant != "success_only",
+        "pairwise_rank_loss_enabled": False,
+        "group_listwise_success_mass_loss_enabled": variant != "success_only",
+        "all_failure_dense_listwise_loss_enabled": variant != "success_only",
+        "all_failure_dense_listwise_weight": (
+            0.0 if variant == "success_only" else DENSE_FAILURE_RANK_WEIGHT
+        ),
+        "dense_target_requires_full_continuation": True,
+        "rank_ensemble_aggregation": standardized_rank_ensemble_contract(),
         "rank_loss_updates_clock_or_duration_heads": False,
         "rank_loss_updates_semantic_action_transition": variant != "success_only",
     }
@@ -162,6 +225,17 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         not in {"success_only", "no_time_duration"},
         "dt_has_numeric_score_path": checkpoint["dt_has_numeric_score_path"],
         "pairwise_rank_loss_enabled": checkpoint["pairwise_rank_loss_enabled"],
+        "group_listwise_success_mass_loss_enabled": checkpoint[
+            "group_listwise_success_mass_loss_enabled"
+        ],
+        "all_failure_dense_listwise_loss_enabled": checkpoint[
+            "all_failure_dense_listwise_loss_enabled"
+        ],
+        "all_failure_dense_listwise_weight": checkpoint[
+            "all_failure_dense_listwise_weight"
+        ],
+        "dense_target_requires_full_continuation": True,
+        "rank_ensemble_aggregation": standardized_rank_ensemble_contract(),
         "rank_loss_updates_clock_or_duration_heads": False,
         "rank_loss_updates_semantic_action_transition": checkpoint[
             "rank_loss_updates_semantic_action_transition"
@@ -187,6 +261,10 @@ REQUIRED_ARRAYS = {
     "recovery_mask",
     "object_delta",
     "object_delta_mask",
+    "terminal_max_event_id",
+    "terminal_stage_progress",
+    "terminal_goal_distance",
+    "terminal_goal_progress",
     "candidate_index",
     "dt",
 }
@@ -194,6 +272,49 @@ REQUIRED_ARRAYS = {
 
 class FiveBodyContractError(RuntimeError):
     """A five-body training authority or payload failed closed."""
+
+
+def standardized_rank_ensemble_contract() -> dict[str, Any]:
+    """Return the frozen deployment aggregation contract without shared mutation."""
+
+    return dict(STANDARDIZED_RANK_ENSEMBLE_CONTRACT)
+
+
+def aggregate_standardized_rank_scores(
+    member_scores: torch.Tensor,
+    *,
+    std_floor: float = RANK_ENSEMBLE_STD_FLOOR,
+) -> torch.Tensor:
+    """Aggregate five raw rank heads without allowing one scale to dominate.
+
+    The last axis is one complete four-candidate decision.  Leading axes after
+    the member axis are permitted so callers can aggregate several already
+    grouped decisions at once.  A constant member contributes an all-zero row;
+    the final divisor remains five so every member keeps exactly equal weight.
+    """
+
+    if not isinstance(member_scores, torch.Tensor):
+        raise TypeError("member rank scores must be a torch.Tensor")
+    if (
+        member_scores.ndim < 2
+        or member_scores.shape[0] != 5
+        or member_scores.shape[-1] != CANDIDATE_COUNT
+    ):
+        raise FiveBodyContractError(
+            "member rank scores must be [5,...,4] with decisions on the last axis"
+        )
+    if not math.isclose(
+        float(std_floor), RANK_ENSEMBLE_STD_FLOOR, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise FiveBodyContractError("rank ensemble std floor is frozen by contract")
+    if not bool(torch.isfinite(member_scores).all()):
+        raise FiveBodyContractError("member rank scores contain non-finite values")
+    centered = member_scores - member_scores.mean(dim=-1, keepdim=True)
+    population_std = centered.square().mean(dim=-1, keepdim=True).sqrt()
+    active = population_std > float(std_floor)
+    denominator = population_std.clamp_min(float(std_floor))
+    standardized = torch.where(active, centered / denominator, torch.zeros_like(centered))
+    return standardized.mean(dim=0)
 
 
 def canonical_sha256(value: Any) -> str:
@@ -449,6 +570,17 @@ def validate_body_manifest(
         raise FiveBodyContractError(
             f"{expected_body} censors planned candidates after execution"
         )
+    if (
+        value.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+        or value.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+        or value.get("terminal_supervision_contract")
+        != TERMINAL_SUPERVISION_CONTRACT
+        or value.get("branch_diagnostic_contract")
+        != BRANCH_DIAGNOSTIC_CONTRACT
+    ):
+        raise FiveBodyContractError(
+            f"{expected_body} candidate/object/terminal/diagnostic semantics changed"
+        )
     groups = value.get("groups")
     if not isinstance(groups, list) or len(groups) < 4:
         raise FiveBodyContractError(f"{expected_body} needs at least four canonical groups")
@@ -468,6 +600,9 @@ def validate_body_manifest(
             or isinstance(item.get("requested_seed"), bool)
             or not isinstance(item.get("requested_seed"), int)
             or not _is_sha(item.get("sha256"))
+            or item.get("diagnostic_format")
+            != BRANCH_DIAGNOSTIC_CONTRACT["format"]
+            or not _is_sha(item.get("diagnostics_sha256"))
         ):
             raise FiveBodyContractError(f"invalid canonical group for {expected_body}")
         # Manifest validation is deliberately payload-blind.  In particular,
@@ -477,9 +612,18 @@ def validate_body_manifest(
         path = _lexical_contained_payload_path(
             manifest_dir, str(item.get("path", "")), "group"
         )
+        diagnostics_path = _lexical_contained_payload_path(
+            manifest_dir, str(item.get("diagnostics_path", "")), "group diagnostics"
+        )
         identities.add(group_id)
         conditions.add(condition)
-        normalized.append({**dict(item), "resolved_path": str(path)})
+        normalized.append(
+            {
+                **dict(item),
+                "resolved_path": str(path),
+                "resolved_diagnostics_path": str(diagnostics_path),
+            }
+        )
     if conditions != set(CONDITIONS):
         raise FiveBodyContractError(f"{expected_body} lacks clean/randomized groups")
     return {
@@ -502,6 +646,12 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         or binding.get("dataset_revision") != DATASET_REVISION
         or binding.get("task") != TASK
         or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+        or binding.get("terminal_supervision_contract")
+        != TERMINAL_SUPERVISION_CONTRACT
+        or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+        or binding.get("branch_diagnostic_contract")
+        != BRANCH_DIAGNOSTIC_CONTRACT
         or binding.get("heldout_labels_may_train_fit_calibrate_or_select") is not False
         or binding.get("canonical_shared_body_rows") != 1
     ):
@@ -659,10 +809,11 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
     if not path.is_file() or sha256_file(path) != group["sha256"]:
         raise FiveBodyContractError(f"source canonical group missing/tampered: {path}")
     with np.load(path, allow_pickle=False) as values:
-        if set(values.files) != REQUIRED_ARRAYS:
+        observed_arrays = set(values.files)
+        if observed_arrays != REQUIRED_ARRAYS:
             raise FiveBodyContractError(
-                f"{path} arrays mismatch: missing={sorted(REQUIRED_ARRAYS-set(values.files))}, "
-                f"extra={sorted(set(values.files)-REQUIRED_ARRAYS)}"
+                f"{path} arrays mismatch: missing={sorted(REQUIRED_ARRAYS-observed_arrays)}, "
+                f"extra={sorted(observed_arrays-REQUIRED_ARRAYS)}"
             )
         arrays = {name: np.asarray(values[name]) for name in values.files}
     count = len(arrays["state"])
@@ -679,13 +830,49 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
     for name, expected in shapes.items():
         if arrays[name].shape != expected:
             raise FiveBodyContractError(f"{path} array {name} shape mismatch")
-    scalar = REQUIRED_ARRAYS - set(shapes)
+    scalar = set(arrays) - set(shapes)
     if any(arrays[name].shape != (count,) for name in scalar):
         raise FiveBodyContractError(f"{path} scalar supervision array shape mismatch")
     if count == 0 or any(not np.isfinite(value).all() for value in arrays.values()):
         raise FiveBodyContractError(f"{path} contains empty/non-finite canonical rows")
     if np.any((arrays["current_event_id"] < 0) | (arrays["current_event_id"] >= 5)):
         raise FiveBodyContractError(f"{path} current event ids are invalid")
+    terminal_event = arrays["terminal_max_event_id"]
+    if (
+        not np.array_equal(terminal_event, terminal_event.astype(np.int64))
+        or np.any((terminal_event < 0) | (terminal_event >= 5))
+        or np.any(terminal_event < arrays["current_event_id"])
+    ):
+        raise FiveBodyContractError(f"{path} terminal max event ids are invalid")
+    terminal_stage_progress = arrays["terminal_stage_progress"]
+    if np.any((terminal_stage_progress < 0.0) | (terminal_stage_progress > 1.0)):
+        raise FiveBodyContractError(f"{path} terminal stage progress is outside [0,1]")
+    if not np.allclose(
+        terminal_stage_progress,
+        np.where(
+            arrays["success"] > 0.5,
+            1.0,
+            terminal_event.astype(np.float32) / 4.0,
+        ),
+        atol=1e-6,
+        rtol=0.0,
+    ):
+        raise FiveBodyContractError(
+            f"{path} terminal max event and stage progress disagree"
+        )
+    terminal_goal_distance = arrays["terminal_goal_distance"]
+    if np.any(terminal_goal_distance < 0.0):
+        raise FiveBodyContractError(f"{path} terminal goal distance is negative")
+    initial_goal_distance = np.linalg.norm(arrays["state"][:, 0:3], axis=-1)
+    if not np.allclose(
+        arrays["terminal_goal_progress"],
+        initial_goal_distance - terminal_goal_distance,
+        atol=2e-5,
+        rtol=0.0,
+    ):
+        raise FiveBodyContractError(
+            f"{path} terminal goal progress disagrees with state and terminal distance"
+        )
     expected_event_onehot = np.zeros((count, 5), dtype=np.float32)
     expected_event_onehot[np.arange(count), arrays["current_event_id"].astype(int)] = 1.0
     if not np.array_equal(
@@ -728,7 +915,7 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
         )
     rows = []
     for index in range(count):
-        row = {name: arrays[name][index] for name in REQUIRED_ARRAYS}
+        row = {name: arrays[name][index] for name in arrays}
         row.update(
             {
                 "action_available": np.float32(1.0),
@@ -851,6 +1038,108 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         return output
 
 
+class StandardizedRankEnsemble(torch.nn.Module):
+    """Source-validation wrapper identical to the formal deployment scorer."""
+
+    def __init__(
+        self,
+        models: Sequence[EffectAlignedSharedEventHead],
+        ablation_variant: str,
+    ) -> None:
+        super().__init__()
+        if len(models) != 5 or ablation_variant not in ABLATION_VARIANTS:
+            raise FiveBodyContractError(
+                "checkpoint selection requires five same-variant ensemble members"
+            )
+        self.models = torch.nn.ModuleList(models)
+        self.ablation_variant = ablation_variant
+
+    def forward(self, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+        member_scores = torch.stack(
+            [model(batch)["candidate_rank_logit"] for model in self.models]
+        )
+        if member_scores.ndim != 2:
+            raise FiveBodyContractError("ensemble rank rows must be [5,N]")
+        groups: dict[str, list[int]] = defaultdict(list)
+        for index, group in enumerate(batch["logical_group"]):
+            groups[str(group)].append(index)
+        aggregate = torch.empty_like(member_scores[0])
+        for indices in groups.values():
+            if len(indices) != CANDIDATE_COUNT:
+                raise FiveBodyContractError(
+                    "ensemble validation batch split a four-candidate decision"
+                )
+            ordered = sorted(
+                indices,
+                key=lambda index: int(batch["candidate_index"][index]),
+            )
+            if [int(batch["candidate_index"][index]) for index in ordered] != list(
+                range(CANDIDATE_COUNT)
+            ):
+                raise FiveBodyContractError(
+                    "ensemble validation candidate order is not exactly 0..3"
+                )
+            selected = torch.as_tensor(
+                ordered, device=member_scores.device, dtype=torch.long
+            )
+            aggregate[selected] = aggregate_standardized_rank_scores(
+                member_scores[:, selected]
+            )
+        return {"candidate_rank_logit": aggregate}
+
+
+def _dense_rank_components(
+    batch: Mapping[str, Any],
+    reference: torch.Tensor,
+    *,
+    ablation_variant: str,
+) -> list[torch.Tensor]:
+    """Return ordered labels; comparisons must never collapse them to weights."""
+
+    if ablation_variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
+    components = [batch["terminal_max_event_id"].to(reference).float()]
+    if ablation_variant != "no_object_effect":
+        components.append(batch["terminal_goal_progress"].to(reference).float())
+    return components
+
+
+def _lexicographic_preferred_mask(
+    components: Sequence[torch.Tensor], indices: Sequence[int]
+) -> torch.Tensor:
+    if not components or not indices:
+        raise FiveBodyContractError("lexicographic ranking needs labels and candidates")
+    selected = torch.as_tensor(indices, device=components[0].device, dtype=torch.long)
+    preferred = torch.ones(len(indices), device=selected.device, dtype=torch.bool)
+    for component in components:
+        values = component[selected]
+        best = values[preferred].max()
+        preferred = preferred & torch.isclose(values, best, atol=1e-6, rtol=0.0)
+    if not bool(preferred.any()):
+        raise FiveBodyContractError("lexicographic target selected no candidate")
+    return preferred
+
+
+def _negative_log_probability_mass(
+    scores: torch.Tensor, preferred: torch.Tensor
+) -> torch.Tensor:
+    if scores.ndim != 1 or preferred.shape != scores.shape or not bool(preferred.any()):
+        raise FiveBodyContractError("listwise probability mass target is invalid")
+    return torch.logsumexp(scores, dim=0) - torch.logsumexp(scores[preferred], dim=0)
+
+
+def _lexicographic_compare_values(
+    left: Sequence[float], right: Sequence[float]
+) -> int:
+    if len(left) != len(right) or not left:
+        raise FiveBodyContractError("dense lexicographic values have incompatible shapes")
+    for left_value, right_value in zip(left, right):
+        if abs(float(left_value) - float(right_value)) <= 1e-6:
+            continue
+        return 1 if float(left_value) > float(right_value) else -1
+    return 0
+
+
 def _effect_aligned_loss(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
@@ -858,7 +1147,7 @@ def _effect_aligned_loss(
     *,
     ablation_variant: str = "full",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Optimize robust object effects and within-root ordering.
+    """Optimize robust object effects and deployment-aligned group choice.
 
     Event, outcome, recovery and duration heads keep their unweighted proper
     losses in ``compute_multitask_loss`` so their probabilities remain
@@ -886,51 +1175,69 @@ def _effect_aligned_loss(
         * batch["object_delta_mask"].to(sample_weight),
     )
 
-    ranking_terms: list[torch.Tensor] = []
-    ranking_weights: list[torch.Tensor] = []
+    success_terms: list[torch.Tensor] = []
+    success_weights: list[torch.Tensor] = []
+    dense_terms: list[torch.Tensor] = []
+    dense_weights: list[torch.Tensor] = []
     by_group: dict[str, list[int]] = defaultdict(list)
     for index, group in enumerate(batch["logical_group"]):
         by_group[str(group)].append(index)
-    event_value = batch["post_event_id"].to(output["candidate_rank_logit"]).float()
-    relative_start = batch["state"][:, 0:3].to(output["candidate_rank_logit"])
-    relative_end = relative_start + batch["object_delta"][:, 3:6].to(relative_start)
-    goal_progress = relative_start.norm(dim=-1) - relative_end.norm(dim=-1)
-    if ablation_variant == "no_object_effect":
-        goal_progress = torch.zeros_like(goal_progress)
-    # Lexicographic target: task success first, then event stage, then geometric
-    # progress.  The large fixed gaps prevent a partial-progress failure from
-    # outranking any successful candidate.
-    target = 100.0 * labels + 10.0 * event_value + goal_progress
     score = output["candidate_rank_logit"]
+    dense_components = _dense_rank_components(
+        batch, score, ablation_variant=ablation_variant
+    )
+    mixed_success_groups = 0
+    all_failure_dense_groups = 0
     for indices in by_group.values():
         if len(indices) != CANDIDATE_COUNT:
             raise FiveBodyContractError("training batch split a candidate decision")
-        for left in range(CANDIDATE_COUNT):
-            for right in range(left + 1, CANDIDATE_COUNT):
-                first, second = indices[left], indices[right]
-                difference = target[first] - target[second]
-                if bool(torch.abs(difference) <= 1e-6):
-                    continue
-                sign = torch.sign(difference).detach()
-                ranking_terms.append(
-                    torch.nn.functional.softplus(-sign * (score[first] - score[second]))
-                )
-                ranking_weights.append(torch.minimum(sample_weight[first], sample_weight[second]))
-    if ranking_terms:
-        ranking = core._weighted_mean(
-            torch.stack(ranking_terms), torch.stack(ranking_weights)
+        selected = torch.as_tensor(indices, device=score.device, dtype=torch.long)
+        group_scores = score[selected]
+        successful = labels[selected] > 0.5
+        group_weight = sample_weight[selected].min()
+        if bool(successful.any()) and bool((~successful).any()):
+            success_terms.append(
+                _negative_log_probability_mass(group_scores, successful).reshape(())
+            )
+            success_weights.append(group_weight)
+            mixed_success_groups += 1
+        elif not bool(successful.any()):
+            preferred = _lexicographic_preferred_mask(dense_components, indices)
+            dense_terms.append(
+                _negative_log_probability_mass(group_scores, preferred).reshape(())
+            )
+            dense_weights.append(group_weight)
+            all_failure_dense_groups += 1
+    if success_terms:
+        success_ranking = core._weighted_mean(
+            torch.stack(success_terms), torch.stack(success_weights)
         )
     else:
-        ranking = score.sum() * 0.0
+        success_ranking = score.sum() * 0.0
+    if dense_terms:
+        dense_ranking = core._weighted_mean(
+            torch.stack(dense_terms), torch.stack(dense_weights)
+        )
+    else:
+        dense_ranking = score.sum() * 0.0
+    ranking = success_ranking + DENSE_FAILURE_RANK_WEIGHT * dense_ranking
     if ablation_variant == "success_only":
         object_effect = object_effect * 0.0
         ranking = ranking * 0.0
+        success_ranking = success_ranking * 0.0
+        dense_ranking = dense_ranking * 0.0
     elif ablation_variant == "no_object_effect":
         object_effect = object_effect * 0.0
     total = 0.5 * object_effect + ranking
     return total, {
         "robust_object_effect": object_effect,
-        "pairwise_ranking": ranking,
+        "group_listwise_success_mass": success_ranking,
+        "all_failure_dense_listwise": dense_ranking,
+        "candidate_ranking": ranking,
+        "mixed_success_groups_in_batch": score.new_tensor(mixed_success_groups),
+        "all_failure_dense_groups_in_batch": score.new_tensor(
+            all_failure_dense_groups
+        ),
     }
 
 
@@ -939,30 +1246,38 @@ def evaluate_candidate_ranking(
     model: EffectAlignedSharedEventHead,
     loader: DataLoader,
     device: torch.device,
+    *,
+    ablation_variant: str | None = None,
 ) -> dict[str, Any]:
     model.eval()
-    groups: dict[str, list[tuple[int, float, float, float]]] = defaultdict(list)
+    variant = ablation_variant or getattr(model, "ablation_variant", "full")
+    if variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {variant!r}")
+    groups: dict[
+        str,
+        list[tuple[int, float, float, tuple[float, ...], float, float, float]],
+    ] = defaultdict(list)
     for raw in loader:
         batch = core._move_batch(raw, device)
         output = model(batch)
+        dense_components = _dense_rank_components(
+            batch, output["candidate_rank_logit"], ablation_variant=variant
+        )
         for index, group in enumerate(raw["logical_group"]):
-            relative_start = batch["state"][index, 0:3]
-            relative_end = relative_start + batch["object_delta"][index, 3:6]
-            target = (
-                100.0 * float(batch["success"][index])
-                + 10.0 * float(batch["post_event_id"][index])
-                + float(relative_start.norm() - relative_end.norm())
-            )
             groups[str(group)].append(
                 (
                     int(batch["candidate_index"][index]),
                     float(output["candidate_rank_logit"][index]),
                     float(batch["success"][index]),
-                    target,
+                    tuple(float(component[index]) for component in dense_components),
+                    float(batch["terminal_stage_progress"][index]),
+                    float(batch["terminal_goal_distance"][index]),
+                    float(batch["terminal_goal_progress"][index]),
                 )
             )
     decisions: list[dict[str, Any]] = []
-    pair_correct = pair_total = 0
+    mixed_pairs: list[dict[str, Any]] = []
+    dense_pairs: list[dict[str, Any]] = []
     for group, rows in groups.items():
         rows = sorted(rows)
         if len(rows) != CANDIDATE_COUNT or [row[0] for row in rows] != list(range(4)):
@@ -970,26 +1285,67 @@ def evaluate_candidate_ranking(
         identity = group.split("|", 2)
         if len(identity) != 3 or identity[0] not in BODIES or identity[1] not in CONDITIONS:
             raise FiveBodyContractError(f"validation decision identity changed: {group}")
-        decisions.append(
-            {
-                "body": identity[0],
-                "condition": identity[1],
-                "baseline_success": rows[0][2],
-                "selected_success": max(rows, key=lambda row: row[1])[2],
-                "oracle_success": max(row[2] for row in rows),
-            }
-        )
+        selected = max(rows, key=lambda row: row[1])
+        oracle_success = max(row[2] for row in rows)
+        minimum_success = min(row[2] for row in rows)
+        mixed_success = oracle_success > 0.5 and minimum_success <= 0.5
+        dense_applicable = variant != "success_only" and oracle_success <= 0.5
+        best_dense = rows[0][3]
+        for row in rows[1:]:
+            if _lexicographic_compare_values(row[3], best_dense) > 0:
+                best_dense = row[3]
+        decision = {
+            "body": identity[0],
+            "condition": identity[1],
+            "baseline_success": rows[0][2],
+            "selected_success": selected[2],
+            "oracle_success": oracle_success,
+            "baseline_terminal_stage_progress": rows[0][4],
+            "selected_terminal_stage_progress": selected[4],
+            "oracle_terminal_stage_progress": max(row[4] for row in rows),
+            "baseline_terminal_goal_distance": rows[0][5],
+            "selected_terminal_goal_distance": selected[5],
+            "baseline_terminal_goal_progress": rows[0][6],
+            "selected_terminal_goal_progress": selected[6],
+            "mixed_success": mixed_success,
+            "dense_applicable": dense_applicable,
+            "selected_dense_best": bool(
+                dense_applicable
+                and _lexicographic_compare_values(selected[3], best_dense) == 0
+            ),
+        }
+        decisions.append(decision)
         for left in range(4):
             for right in range(left + 1, 4):
-                target_difference = rows[left][3] - rows[right][3]
-                if abs(target_difference) <= 1e-6:
-                    continue
-                pair_total += 1
                 score_difference = rows[left][1] - rows[right][1]
-                pair_correct += int(score_difference * target_difference > 0)
-    def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
+                success_difference = rows[left][2] - rows[right][2]
+                if abs(success_difference) > 1e-6:
+                    mixed_pairs.append(
+                        {
+                            "body": identity[0],
+                            "condition": identity[1],
+                            "correct": bool(score_difference * success_difference > 0),
+                        }
+                    )
+                elif dense_applicable and (
+                    dense_comparison := _lexicographic_compare_values(
+                        rows[left][3], rows[right][3]
+                    )
+                ):
+                    dense_sign = float(dense_comparison)
+                    dense_pairs.append(
+                        {
+                            "body": identity[0],
+                            "condition": identity[1],
+                            "correct": bool(score_difference * dense_sign > 0),
+                        }
+                    )
+
+    def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         baseline = float(np.mean([float(row["baseline_success"]) for row in rows]))
         selected = float(np.mean([float(row["selected_success"]) for row in rows]))
+        mixed = [row for row in rows if bool(row["mixed_success"])]
+        dense = [row for row in rows if bool(row["dense_applicable"])]
         return {
             "decision_groups": len(rows),
             "baseline_success_rate": baseline,
@@ -998,10 +1354,71 @@ def evaluate_candidate_ranking(
             "oracle_success_rate": float(
                 np.mean([float(row["oracle_success"]) for row in rows])
             ),
+            "baseline_terminal_stage_progress": float(
+                np.mean([float(row["baseline_terminal_stage_progress"]) for row in rows])
+            ),
+            "selected_terminal_stage_progress": float(
+                np.mean([float(row["selected_terminal_stage_progress"]) for row in rows])
+            ),
+            "delta_terminal_stage_progress": float(
+                np.mean(
+                    [
+                        float(row["selected_terminal_stage_progress"])
+                        - float(row["baseline_terminal_stage_progress"])
+                        for row in rows
+                    ]
+                )
+            ),
+            "oracle_terminal_stage_progress": float(
+                np.mean([float(row["oracle_terminal_stage_progress"]) for row in rows])
+            ),
+            "baseline_terminal_goal_distance": float(
+                np.mean([float(row["baseline_terminal_goal_distance"]) for row in rows])
+            ),
+            "selected_terminal_goal_distance": float(
+                np.mean([float(row["selected_terminal_goal_distance"]) for row in rows])
+            ),
+            "delta_terminal_goal_progress": float(
+                np.mean(
+                    [
+                        float(row["selected_terminal_goal_progress"])
+                        - float(row["baseline_terminal_goal_progress"])
+                        for row in rows
+                    ]
+                )
+            ),
+            "mixed_success_decisions": len(mixed),
+            "mixed_success_selection_accuracy": (
+                float(np.mean([float(row["selected_success"]) for row in mixed]))
+                if mixed
+                else None
+            ),
+            "dense_progress_decisions": len(dense),
+            "dense_progress_selection_accuracy": (
+                float(np.mean([float(row["selected_dense_best"]) for row in dense]))
+                if dense
+                else None
+            ),
         }
 
+    def pair_summary(
+        rows: Sequence[Mapping[str, Any]], *, body: str | None = None,
+        condition: str | None = None,
+    ) -> tuple[float | None, int]:
+        selected = [
+            row for row in rows
+            if (body is None or row["body"] == body)
+            and (condition is None or row["condition"] == condition)
+        ]
+        return (
+            float(np.mean([float(row["correct"]) for row in selected]))
+            if selected
+            else None,
+            len(selected),
+        )
+
     global_metrics = summarize(decisions)
-    units: dict[str, dict[str, float | int]] = {}
+    units: dict[str, dict[str, Any]] = {}
     for body in BODIES:
         for condition in CONDITIONS:
             selected_rows = [
@@ -1010,7 +1427,27 @@ def evaluate_candidate_ranking(
                 if row["body"] == body and row["condition"] == condition
             ]
             if selected_rows:
-                units[f"{body}|{condition}"] = summarize(selected_rows)
+                unit = summarize(selected_rows)
+                mixed_pair_accuracy, mixed_pair_count = pair_summary(
+                    mixed_pairs, body=body, condition=condition
+                )
+                dense_pair_accuracy, dense_pair_count = pair_summary(
+                    dense_pairs, body=body, condition=condition
+                )
+                unit.update(
+                    {
+                        "mixed_success_pairwise_accuracy": mixed_pair_accuracy,
+                        "mixed_success_pairwise_comparisons": mixed_pair_count,
+                        "dense_progress_pairwise_accuracy": dense_pair_accuracy,
+                        "dense_progress_pairwise_comparisons": dense_pair_count,
+                    }
+                )
+                units[f"{body}|{condition}"] = unit
+
+    def macro(name: str) -> float | None:
+        values = [row[name] for row in units.values() if row.get(name) is not None]
+        return float(np.mean([float(value) for value in values])) if values else None
+
     macro_delta = float(np.mean([row["delta_success_rate"] for row in units.values()]))
     macro_selected = float(
         np.mean([row["selected_success_rate"] for row in units.values()])
@@ -1018,15 +1455,62 @@ def evaluate_candidate_ranking(
     macro_oracle = float(
         np.mean([row["oracle_success_rate"] for row in units.values()])
     )
+    mixed_pair_accuracy, mixed_pair_count = pair_summary(mixed_pairs)
+    dense_pair_accuracy, dense_pair_count = pair_summary(dense_pairs)
     return {
         **global_metrics,
         "body_condition_units": units,
         "macro_delta_success_rate": macro_delta,
         "macro_selected_success_rate": macro_selected,
         "macro_oracle_success_rate": macro_oracle,
-        "pairwise_accuracy": float(pair_correct / pair_total) if pair_total else None,
-        "pairwise_comparisons": pair_total,
+        "macro_delta_terminal_stage_progress": macro(
+            "delta_terminal_stage_progress"
+        ),
+        "macro_delta_terminal_goal_progress": macro(
+            "delta_terminal_goal_progress"
+        ),
+        "macro_mixed_success_selection_accuracy": macro(
+            "mixed_success_selection_accuracy"
+        ),
+        "mixed_success_pairwise_accuracy": mixed_pair_accuracy,
+        "mixed_success_pairwise_comparisons": mixed_pair_count,
+        "macro_mixed_success_pairwise_accuracy": macro(
+            "mixed_success_pairwise_accuracy"
+        ),
+        "macro_dense_progress_selection_accuracy": macro(
+            "dense_progress_selection_accuracy"
+        ),
+        "dense_progress_pairwise_accuracy": dense_pair_accuracy,
+        "dense_progress_pairwise_comparisons": dense_pair_count,
+        "macro_dense_progress_pairwise_accuracy": macro(
+            "dense_progress_pairwise_accuracy"
+        ),
+        # Backward-compatible diagnostic aliases now mean success-changing
+        # comparisons only; dense failure ordering is reported separately.
+        "pairwise_accuracy": mixed_pair_accuracy,
+        "pairwise_comparisons": mixed_pair_count,
     }
+
+
+def candidate_checkpoint_selection_key(
+    ranking: Mapping[str, Any], diagnostic_score: float, step: int
+) -> tuple[float, float, float, float, float, float, int]:
+    """Select for deployed top-1 success before any dense diagnostic."""
+
+    def maximize(value: Any) -> float:
+        if value is None or not math.isfinite(float(value)):
+            return 0.0
+        return -float(value)
+
+    return (
+        maximize(ranking["macro_delta_success_rate"]),
+        maximize(ranking.get("macro_mixed_success_selection_accuracy")),
+        maximize(ranking.get("macro_mixed_success_pairwise_accuracy")),
+        maximize(ranking.get("macro_dense_progress_selection_accuracy")),
+        maximize(ranking.get("macro_dense_progress_pairwise_accuracy")),
+        float(diagnostic_score),
+        int(step),
+    )
 
 
 def materialize_source_rows(
@@ -1040,6 +1524,74 @@ def materialize_source_rows(
     if any(row["body"] == held_out_body for row in rows):
         raise FiveBodyContractError("held-out row reached source fitting")
     return rows
+
+
+def effect_preserving_group_bootstrap_weights(
+    rows: Sequence[Mapping[str, Any]], *, members: int, seed: int
+) -> tuple[np.ndarray, list[dict[str, int]]]:
+    """Poisson group bootstrap with deterministic mixed-outcome preservation."""
+
+    group_order = [str(row["logical_group"]) for row in rows]
+    weights = core.logical_group_bootstrap_weights(
+        group_order, members=members, seed=seed
+    )
+    indices_by_group: dict[str, list[int]] = defaultdict(list)
+    for index, group in enumerate(group_order):
+        indices_by_group[group].append(index)
+    mixed_groups = []
+    for group, indices in sorted(indices_by_group.items()):
+        outcomes = {
+            float(rows[index]["success"])
+            for index in indices
+            if bool(rows[index]["success_mask"])
+        }
+        if outcomes == {0.0, 1.0}:
+            mixed_groups.append(group)
+    if not mixed_groups:
+        raise FiveBodyContractError(
+            "effect-preserving bootstrap requires a mixed-success decision"
+        )
+    audit: list[dict[str, int]] = []
+    for member in range(members):
+        active_mixed = [
+            group
+            for group in mixed_groups
+            if float(weights[member, indices_by_group[group][0]]) > 0.0
+        ]
+        repaired = 0
+        if not active_mixed:
+            group = mixed_groups[(int(seed) + member) % len(mixed_groups)]
+            weights[member, indices_by_group[group]] = 1.0
+            repaired = 1
+        active_indices = [
+            index for index in range(len(rows)) if float(weights[member, index]) > 0.0
+        ]
+        positives = sum(
+            bool(rows[index]["success_mask"]) and float(rows[index]["success"]) > 0.5
+            for index in active_indices
+        )
+        negatives = sum(
+            bool(rows[index]["success_mask"]) and float(rows[index]["success"]) <= 0.5
+            for index in active_indices
+        )
+        active_mixed_count = sum(
+            float(weights[member, indices_by_group[group][0]]) > 0.0
+            for group in mixed_groups
+        )
+        if not positives or not negatives or not active_mixed_count:
+            raise FiveBodyContractError(
+                "effect-preserving bootstrap failed to retain outcome supervision"
+            )
+        audit.append(
+            {
+                "member": member,
+                "positive_rows_with_nonzero_weight": int(positives),
+                "negative_rows_with_nonzero_weight": int(negatives),
+                "mixed_success_groups_with_nonzero_weight": int(active_mixed_count),
+                "deterministic_mixed_group_repairs": repaired,
+            }
+        )
+    return weights.astype(np.float32, copy=False), audit
 
 
 def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str, Any]:
@@ -1125,8 +1677,8 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
     )
     device = torch.device(args.device)
     group_order = [str(row["logical_group"]) for row in train_rows]
-    bootstrap = core.logical_group_bootstrap_weights(
-        group_order, members=5, seed=args.split_seed
+    bootstrap, bootstrap_support = effect_preserving_group_bootstrap_weights(
+        train_rows, members=5, seed=args.split_seed
     )
     group_weight = {
         group: bootstrap[:, index].tolist() for index, group in enumerate(group_order)
@@ -1141,7 +1693,11 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         base_loss_weights["success"] = 1.0
     elif args.ablation_variant == "no_time_duration":
         base_loss_weights["duration"] = 0.0
-    members = []
+    trainer_file_sha256 = sha256_file(Path(__file__).resolve())
+    snapshot_root = output / "source_validation_common_step_snapshots"
+    snapshot_root.mkdir()
+    member_eval_records: list[dict[int, dict[str, Any]]] = []
+    member_snapshot_paths: list[dict[int, Path]] = []
     for member, seed in enumerate(args.ensemble_seeds):
         random.seed(seed)
         np.random.seed(seed)
@@ -1168,10 +1724,8 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             collate_fn=core.collate_rows,
         )
         iterator = iter(loader)
-        best_key = None
-        best_metrics = None
-        best_step = 0
-        checkpoint = output / f"member_{member:02d}_seed_{seed}_best.pt"
+        eval_records: dict[int, dict[str, Any]] = {}
+        snapshot_paths: dict[int, Path] = {}
         for step in range(1, args.steps + 1):
             try:
                 raw = next(iterator)
@@ -1224,65 +1778,166 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 **{name: float(value.detach()) for name, value in pieces.items() if name != "total"},
                 **{name: float(value.detach()) for name, value in decision_pieces.items()},
             }
-            ranking = metrics["candidate_ranking"]
-            pairwise = ranking["pairwise_accuracy"]
-            key = (
-                -float(ranking["macro_delta_success_rate"]),
-                -float(ranking["macro_selected_success_rate"]),
-                -float(pairwise) if pairwise is not None else 0.0,
-                float(diagnostic_score),
-                int(step),
+            snapshot = snapshot_root / (
+                f"member_{member:02d}_seed_{seed}_step_{step:06d}.pt"
             )
-            if best_key is None or key < best_key:
-                best_key = key
-                best_metrics = metrics
-                best_step = step
-                torch.save(
-                    {
-                        "format": FORMAT,
-                        "model": model.state_dict(),
-                        "config": dataclasses.asdict(model.config),
-                        "member": member,
-                        "seed": seed,
-                        "step": step,
-                        "held_out_body": args.held_out_body,
-                        "source_bodies": preflight["source_bodies"],
-                        "body_adapter": "single_shared_row_zero_heldout_parameters",
-                        "model_family": "effect_aligned_time_aware_shared_event_head_v3",
-                        "ablation": ablation_contract(args.ablation_variant),
-                        "candidate_rank_contract": checkpoint_candidate_rank_contract(
-                            args.ablation_variant
-                        ),
-                        "canonical_state_schema": CANONICAL_STATE_SCHEMA,
-                        "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
-                        "event_spec_sha256": EVENT_SPEC_SHA256,
-                        "event_derivation_implementation_sha256": preflight[
-                            "event_derivation_implementation_sha256"
-                        ],
-                        "action_stem_count": 1,
-                        "body_to_id_source_only": body_to_id,
-                        "heldout_rows_used_for_training_normalization_or_selection": 0,
-                        "actor_frozen": True,
-                        "action_normalization": normalization,
-                        "state_normalization": state_normalization,
-                        "preflight_logical_sha256": preflight["logical_sha256"],
-                        "validation": metrics,
-                    },
-                    checkpoint,
-                )
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "member": member,
+                    "seed": seed,
+                    "step": step,
+                    "trainer_file_sha256": trainer_file_sha256,
+                },
+                snapshot,
+            )
+            eval_records[step] = metrics
+            snapshot_paths[step] = snapshot
             model.train()
-        if best_metrics is None:
-            raise FiveBodyContractError("ensemble member selected no checkpoint")
+        if not eval_records:
+            raise FiveBodyContractError("ensemble member produced no common-step snapshot")
+        member_eval_records.append(eval_records)
+        member_snapshot_paths.append(snapshot_paths)
+        del optimizer, model
+        torch.cuda.empty_cache()
+
+    common_steps = sorted(
+        set.intersection(*(set(records) for records in member_eval_records))
+    )
+    expected_steps = list(range(args.eval_every, args.steps + 1, args.eval_every))
+    if not expected_steps or expected_steps[-1] != args.steps:
+        expected_steps.append(args.steps)
+    if common_steps != expected_steps:
+        raise FiveBodyContractError(
+            "five members do not share every preregistered source-validation step"
+        )
+    selection_models = [
+        EffectAlignedSharedEventHead(args.ablation_variant).to(device)
+        for _ in args.ensemble_seeds
+    ]
+    ensemble_model = StandardizedRankEnsemble(
+        selection_models, args.ablation_variant
+    ).to(device)
+    best_ensemble_key: tuple[float, float, float, float, float, float, int] | None = None
+    best_ensemble_step = 0
+    best_ensemble_ranking: dict[str, Any] | None = None
+    best_ensemble_diagnostic = float("inf")
+    common_step_selection_audit = []
+    for step in common_steps:
+        for member, model in enumerate(selection_models):
+            snapshot = torch.load(
+                member_snapshot_paths[member][step],
+                map_location=device,
+                weights_only=True,
+            )
+            if (
+                snapshot.get("member") != member
+                or snapshot.get("seed") != args.ensemble_seeds[member]
+                or snapshot.get("step") != step
+                or snapshot.get("trainer_file_sha256") != trainer_file_sha256
+            ):
+                raise FiveBodyContractError("common-step member snapshot changed")
+            model.load_state_dict(snapshot["model"], strict=True)
+            model.eval()
+        ensemble_ranking = evaluate_candidate_ranking(
+            ensemble_model,
+            validation_loader,
+            device,
+            ablation_variant=args.ablation_variant,
+        )
+        diagnostic = float(
+            np.mean(
+                [
+                    member_eval_records[member][step][
+                        "diagnostic_multitask_score"
+                    ]
+                    for member in range(5)
+                ]
+            )
+        )
+        key = candidate_checkpoint_selection_key(
+            ensemble_ranking, diagnostic, step
+        )
+        common_step_selection_audit.append(
+            {
+                "step": step,
+                "selection_key": list(key),
+                "ensemble_candidate_ranking": ensemble_ranking,
+                "mean_member_diagnostic_multitask_score": diagnostic,
+            }
+        )
+        if best_ensemble_key is None or key < best_ensemble_key:
+            best_ensemble_key = key
+            best_ensemble_step = step
+            best_ensemble_ranking = ensemble_ranking
+            best_ensemble_diagnostic = diagnostic
+    if best_ensemble_ranking is None or best_ensemble_key is None:
+        raise FiveBodyContractError("deployment-homomorphic ensemble selected no checkpoint")
+
+    members = []
+    for member, seed in enumerate(args.ensemble_seeds):
+        snapshot = torch.load(
+            member_snapshot_paths[member][best_ensemble_step],
+            map_location="cpu",
+            weights_only=True,
+        )
+        checkpoint = output / f"member_{member:02d}_seed_{seed}_best.pt"
+        member_validation = member_eval_records[member][best_ensemble_step]
+        torch.save(
+            {
+                "format": FORMAT,
+                "model": snapshot["model"],
+                "config": dataclasses.asdict(selection_models[member].config),
+                "member": member,
+                "seed": seed,
+                "step": best_ensemble_step,
+                "ensemble_common_selection_step": best_ensemble_step,
+                "held_out_body": args.held_out_body,
+                "source_bodies": preflight["source_bodies"],
+                "body_adapter": "single_shared_row_zero_heldout_parameters",
+                "model_family": "effect_aligned_time_aware_shared_event_head_v3",
+                "ablation": ablation_contract(args.ablation_variant),
+                "candidate_rank_contract": checkpoint_candidate_rank_contract(
+                    args.ablation_variant
+                ),
+                "canonical_state_schema": CANONICAL_STATE_SCHEMA,
+                "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
+                "event_spec_sha256": EVENT_SPEC_SHA256,
+                "event_derivation_implementation_sha256": preflight[
+                    "event_derivation_implementation_sha256"
+                ],
+                "trainer_file_sha256": trainer_file_sha256,
+                "action_stem_count": 1,
+                "body_to_id_source_only": body_to_id,
+                "heldout_rows_used_for_training_normalization_or_selection": 0,
+                "actor_frozen": True,
+                "action_normalization": normalization,
+                "state_normalization": state_normalization,
+                "preflight_logical_sha256": preflight["logical_sha256"],
+                "validation": member_validation,
+                "deployment_homomorphic_ensemble_source_validation": (
+                    best_ensemble_ranking
+                ),
+            },
+            checkpoint,
+        )
         members.append(
             {
                 "member": member,
                 "seed": seed,
-                "best_step": best_step,
+                "best_step": best_ensemble_step,
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": sha256_file(checkpoint),
-                "source_validation": best_metrics,
+                "trainer_file_sha256": trainer_file_sha256,
+                "source_validation": member_validation,
             }
         )
+    del ensemble_model, selection_models
+    torch.cuda.empty_cache()
+    for paths in member_snapshot_paths:
+        for snapshot in paths.values():
+            snapshot.unlink()
+    snapshot_root.rmdir()
     summary = {
         "format": FORMAT,
         "status": "source_only_checkpoint_selection_complete",
@@ -1294,6 +1949,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         "event_derivation_implementation_sha256": preflight[
             "event_derivation_implementation_sha256"
         ],
+        "trainer_file_sha256": trainer_file_sha256,
         "candidate_rank_contract": summary_candidate_rank_contract(
             args.ablation_variant
         ),
@@ -1307,8 +1963,23 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         },
         "mixed_outcome_source_decisions": mixed_outcome_decisions,
         "source_negative_to_positive_ratio": source_negative_to_positive_ratio,
+        "ensemble_bootstrap_effect_support": bootstrap_support,
         "success_probability_training_loss": "unweighted_proper_binary_cross_entropy",
-        "checkpoint_selection_primary": "validation_best_of_4_delta_success_rate",
+        "checkpoint_selection_primary": (
+            "deployment_homomorphic_five_member_standardized_ensemble_source_validation"
+        ),
+        "ensemble_checkpoint_selection": {
+            "common_step_required_for_all_five_members": True,
+            "rank_aggregation": standardized_rank_ensemble_contract(),
+            "selected_step": best_ensemble_step,
+            "selected_key": list(best_ensemble_key),
+            "selected_ensemble_candidate_ranking": best_ensemble_ranking,
+            "selected_mean_member_diagnostic_multitask_score": (
+                best_ensemble_diagnostic
+            ),
+            "heldout_rows_used": 0,
+            "evaluated_common_steps": common_step_selection_audit,
+        },
         "members": members,
         "heldout_group_npz_opened": 0,
         "heldout_group_payload_bytes_read": 0,
@@ -1371,15 +2042,23 @@ if __name__ == "__main__":
 __all__ = [
     "ABLATION_VARIANTS",
     "ACTOR_FORMAT", "BINDING_FORMAT", "BODIES", "CANONICAL_ACTION_SCHEMA",
-    "CANONICAL_STATE_SCHEMA", "CompleteDecisionBatchSampler",
+    "CANONICAL_STATE_SCHEMA", "CANDIDATE_NOISE_CONTRACT",
+    "CANDIDATE_RANK_FEATURE_DIM", "BRANCH_DIAGNOSTIC_CONTRACT",
+    "CompleteDecisionBatchSampler", "DENSE_FAILURE_RANK_WEIGHT",
     "CONDITIONS", "FORMAT",
     "EffectAlignedSharedEventHead", "FiveBodyContractError", "MANIFEST_FORMAT",
-    "EVENT_SPEC_SHA256", "MATERIALIZATION_FORMAT",
+    "EVENT_SPEC_SHA256", "MATERIALIZATION_FORMAT", "OBJECT_EFFECT_SCHEMA",
+    "REQUIRED_ARRAYS",
+    "STANDARDIZED_RANK_ENSEMBLE_CONTRACT",
+    "TERMINAL_SUPERVISION_CONTRACT",
     "ablation_contract", "ablation_selection_components",
+    "aggregate_standardized_rank_scores",
     "build_preflight_receipt", "canonical_sha256",
-    "checkpoint_candidate_rank_contract", "load_binding",
+    "candidate_checkpoint_selection_key", "checkpoint_candidate_rank_contract",
+    "effect_preserving_group_bootstrap_weights", "load_binding",
     "evaluate_candidate_ranking", "materialize_source_rows", "sha256_file",
     "sha256_tree", "source_group_split", "summary_candidate_rank_contract",
+    "standardized_rank_ensemble_contract",
     "validate_actor_authority", "validate_body_manifest",
     "validate_materialization_receipt",
 ]

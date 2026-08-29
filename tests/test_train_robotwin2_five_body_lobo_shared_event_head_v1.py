@@ -19,28 +19,39 @@ import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E
 import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
 import verify_robotwin2_move_can_pot_public_materialization_v1 as verifier  # noqa: E402
 from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
+    _effect_aligned_loss,
     ABLATION_VARIANTS,
     ACTOR_FORMAT,
     BINDING_FORMAT,
     BODIES,
     CANONICAL_ACTION_SCHEMA,
     CANONICAL_STATE_SCHEMA,
+    CANDIDATE_NOISE_CONTRACT,
     DATASET_REPO,
     DATASET_REVISION,
     EVENT_SPEC_SHA256,
     CANDIDATE_RANK_FEATURE_DIM,
+    DENSE_FAILURE_RANK_WEIGHT,
+    BRANCH_DIAGNOSTIC_CONTRACT,
     EffectAlignedSharedEventHead,
     MANIFEST_FORMAT,
     MATERIALIZATION_FORMAT,
+    OBJECT_EFFECT_SCHEMA,
     PREREGISTRATION_SHA256,
+    STANDARDIZED_RANK_ENSEMBLE_CONTRACT,
+    TERMINAL_SUPERVISION_CONTRACT,
     SOURCE_EVENT_SAMPLING_HZ,
     TASK,
     FiveBodyContractError,
     ablation_contract,
     ablation_selection_components,
+    aggregate_standardized_rank_scores,
     build_preflight_receipt,
     canonical_sha256,
     checkpoint_candidate_rank_contract,
+    candidate_checkpoint_selection_key,
+    effect_preserving_group_bootstrap_weights,
+    evaluate_candidate_ranking,
     load_binding,
     materialize_source_rows,
     sha256_file,
@@ -66,6 +77,10 @@ def _group(path: Path, offset: float) -> None:
     state = np.full((count, core.STATE_DIM), offset, dtype=np.float32)
     state[:, 18:27] = 0.0
     state[:, 18] = 1.0
+    terminal_goal_progress = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+    terminal_goal_distance = (
+        np.linalg.norm(state[:, 0:3], axis=-1) - terminal_goal_progress
+    ).astype(np.float32)
     np.savez(
         path,
         state=state,
@@ -85,6 +100,10 @@ def _group(path: Path, offset: float) -> None:
         recovery_mask=np.ones(count, dtype=np.float32),
         object_delta=np.full((count, core.OBJECT_DELTA_DIM), 0.1, dtype=np.float32),
         object_delta_mask=np.ones(count, dtype=np.float32),
+        terminal_max_event_id=np.asarray([1, 4, 3, 4], dtype=np.int64),
+        terminal_stage_progress=np.asarray([0.25, 1.0, 0.75, 1.0], dtype=np.float32),
+        terminal_goal_distance=terminal_goal_distance,
+        terminal_goal_progress=terminal_goal_progress,
         candidate_index=np.arange(count, dtype=np.int64),
         dt=np.full(count, 5.0 / SOURCE_EVENT_SAMPLING_HZ, dtype=np.float32),
     )
@@ -203,6 +222,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                         "requested_seed": body_index * 100 + group_index,
                         "path": name,
                         "sha256": sha256_file(group_path),
+                        "diagnostic_format": BRANCH_DIAGNOSTIC_CONTRACT["format"],
+                        "diagnostics_path": name.replace(".npz", ".diagnostics.npz"),
+                        "diagnostics_sha256": "d" * 64,
                     }
                 )
         manifest = _signed(
@@ -269,6 +291,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                     "executed_action_count_used_for_sim_time_accounting_only": True,
                     "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
                 },
+                "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+                "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+                "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+                "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
                 "groups": groups,
             }
         )
@@ -285,6 +311,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
             "event_spec_sha256": EVENT_SPEC_SHA256,
+            "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+            "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "heldout_labels_may_train_fit_calibrate_or_select": False,
             "canonical_shared_body_rows": 1,
             "execution_authority": {
@@ -330,7 +360,7 @@ def test_source_split_keeps_all_queries_from_one_seed_in_one_lane() -> None:
         groups = []
         for condition in ("clean", "randomized"):
             for seed in (101, 102, 103, 104, 105):
-                for query in (0, 5, 10, 15):
+                for query in (0, 10, 20, 30):
                     groups.append(
                         {
                             "condition": condition,
@@ -520,6 +550,227 @@ def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
     assert output["candidate_rank_logit"][0] != output["candidate_rank_logit"][1]
 
 
+def test_rank_ensemble_standardizes_each_member_within_one_decision() -> None:
+    scores = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0, 0.0],
+            [7.0, 7.0, 7.0, 7.0],
+            [0.0, 100.0, 0.0, 0.0],
+        ]
+    )
+    assert int(scores.mean(0).argmax()) == 1
+    aggregate = aggregate_standardized_rank_scores(scores)
+    assert aggregate.shape == (4,)
+    assert int(aggregate.argmax()) == 0
+    assert STANDARDIZED_RANK_ENSEMBLE_CONTRACT["population_std_correction"] == 0
+    assert STANDARDIZED_RANK_ENSEMBLE_CONTRACT[
+        "member_with_std_at_or_below_floor"
+    ] == "all_zero_contribution"
+    constant_only = aggregate_standardized_rank_scores(torch.ones(5, 4))
+    assert torch.equal(constant_only, torch.zeros(4))
+
+
+def _effect_loss(
+    *,
+    success: list[float],
+    terminal_event: list[int],
+    terminal_goal_progress: list[float],
+    scores: list[float],
+    variant: str = "full",
+) -> dict[str, torch.Tensor]:
+    score = torch.tensor(scores, dtype=torch.float32, requires_grad=True)
+    output = {
+        "candidate_rank_logit": score,
+        "success_logit": torch.zeros(4, requires_grad=True),
+        "object_delta_mean": torch.zeros(4, core.OBJECT_DELTA_DIM, requires_grad=True),
+        "object_delta_log_scale": torch.zeros(
+            4, core.OBJECT_DELTA_DIM, requires_grad=True
+        ),
+    }
+    batch = {
+        "success": torch.tensor(success),
+        "state": torch.zeros(4, core.STATE_DIM),
+        "post_event_id": torch.zeros(4, dtype=torch.long),
+        "terminal_max_event_id": torch.tensor(terminal_event, dtype=torch.long),
+        "terminal_goal_progress": torch.tensor(terminal_goal_progress),
+        "object_delta": torch.zeros(4, core.OBJECT_DELTA_DIM),
+        "object_delta_mask": torch.ones(4),
+        "action_available": torch.ones(4),
+        "logical_group": ["piper|clean|one"] * 4,
+    }
+    _total, pieces = _effect_aligned_loss(
+        output,
+        batch,
+        torch.ones(4),
+        ablation_variant=variant,
+    )
+    return pieces
+
+
+def test_mixed_success_uses_group_listwise_success_probability_mass() -> None:
+    good = _effect_loss(
+        success=[0, 1, 0, 0],
+        terminal_event=[4, 0, 3, 2],
+        terminal_goal_progress=[1000.0, -1000.0, 10.0, 5.0],
+        scores=[0.0, 5.0, 0.0, 0.0],
+    )
+    bad = _effect_loss(
+        success=[0, 1, 0, 0],
+        terminal_event=[4, 0, 3, 2],
+        terminal_goal_progress=[1000.0, -1000.0, 10.0, 5.0],
+        scores=[5.0, 0.0, 0.0, 0.0],
+    )
+    assert good["group_listwise_success_mass"] < bad[
+        "group_listwise_success_mass"
+    ]
+    assert good["all_failure_dense_listwise"] == 0.0
+
+
+def test_all_failure_dense_target_is_true_lexicographic_terminal_value() -> None:
+    # Candidate 0 has an extreme geometric value, but candidate 1 reached the
+    # later terminal event.  No fixed 100/10 scalar can reverse that ordering.
+    good = _effect_loss(
+        success=[0, 0, 0, 0],
+        terminal_event=[1, 2, 1, 1],
+        terminal_goal_progress=[1000.0, -1000.0, 0.0, 0.0],
+        scores=[0.0, 5.0, 0.0, 0.0],
+    )
+    bad = _effect_loss(
+        success=[0, 0, 0, 0],
+        terminal_event=[1, 2, 1, 1],
+        terminal_goal_progress=[1000.0, -1000.0, 0.0, 0.0],
+        scores=[5.0, 0.0, 0.0, 0.0],
+    )
+    assert good["all_failure_dense_listwise"] < bad["all_failure_dense_listwise"]
+    assert torch.allclose(
+        good["candidate_ranking"],
+        DENSE_FAILURE_RANK_WEIGHT * good["all_failure_dense_listwise"],
+    )
+    no_object = _effect_loss(
+        success=[0, 0, 0, 0],
+        terminal_event=[1, 1, 1, 1],
+        terminal_goal_progress=[0.0, 1000.0, 2.0, 1.0],
+        scores=[0.0, 5.0, 0.0, 0.0],
+        variant="no_object_effect",
+    )
+    assert no_object["all_failure_dense_listwise"] == 0.0
+
+
+def test_effect_bootstrap_repairs_missing_mixed_success_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        {
+            "logical_group": "piper|clean|mixed",
+            "success": float(index == 1),
+            "success_mask": 1.0,
+        }
+        for index in range(4)
+    ]
+    rows += [
+        {
+            "logical_group": "piper|clean|failure",
+            "success": 0.0,
+            "success_mask": 1.0,
+        }
+        for _index in range(4)
+    ]
+    monkeypatch.setattr(
+        core,
+        "logical_group_bootstrap_weights",
+        lambda groups, *, members, seed: np.zeros((members, len(groups)), np.float32),
+    )
+    weights, audit = effect_preserving_group_bootstrap_weights(
+        rows, members=5, seed=17
+    )
+    assert weights.shape == (5, 8)
+    assert all(item["positive_rows_with_nonzero_weight"] > 0 for item in audit)
+    assert all(item["negative_rows_with_nonzero_weight"] > 0 for item in audit)
+    assert all(item["mixed_success_groups_with_nonzero_weight"] > 0 for item in audit)
+    assert all(item["deterministic_mixed_group_repairs"] == 1 for item in audit)
+
+
+class _FixedRankModel(torch.nn.Module):
+    def __init__(self, variant: str) -> None:
+        super().__init__()
+        self.ablation_variant = variant
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        values = torch.tensor([0.0, 3.0, 2.0, 1.0], device=batch["candidate_index"].device)
+        return {"candidate_rank_logit": values[batch["candidate_index"].long()]}
+
+
+def _ranking_rows() -> list[dict[str, object]]:
+    rows = []
+    for group, success, terminal in (
+        ("piper|clean|mixed", [0, 1, 0, 0], [4, 0, 3, 2]),
+        ("piper|clean|failure", [0, 0, 0, 0], [0, 3, 2, 1]),
+    ):
+        for candidate in range(4):
+            rows.append(
+                {
+                    "logical_group": group,
+                    "body": "piper",
+                    "candidate_index": np.int64(candidate),
+                    "success": np.float32(success[candidate]),
+                    "terminal_max_event_id": np.int64(terminal[candidate]),
+                    "terminal_stage_progress": np.float32(
+                        1.0 if success[candidate] else terminal[candidate] / 4.0
+                    ),
+                    "terminal_goal_distance": np.float32(1.0 - candidate / 10.0),
+                    "terminal_goal_progress": np.float32(candidate / 10.0),
+                }
+            )
+    return rows
+
+
+def test_ranking_evaluation_separates_success_change_from_dense_progress() -> None:
+    loader = torch.utils.data.DataLoader(
+        core.TransitionDataset(_ranking_rows(), {"piper": 0}),
+        batch_size=8,
+        shuffle=False,
+        collate_fn=core.collate_rows,
+    )
+    result = evaluate_candidate_ranking(
+        _FixedRankModel("full"), loader, torch.device("cpu")
+    )
+    assert result["mixed_success_decisions"] == 1
+    assert result["mixed_success_selection_accuracy"] == 1.0
+    assert result["mixed_success_pairwise_accuracy"] == 1.0
+    assert result["dense_progress_decisions"] == 1
+    assert result["dense_progress_selection_accuracy"] == 1.0
+    assert result["dense_progress_pairwise_accuracy"] == 1.0
+    success_only = evaluate_candidate_ranking(
+        _FixedRankModel("success_only"), loader, torch.device("cpu")
+    )
+    assert success_only["dense_progress_decisions"] == 0
+    assert success_only["dense_progress_pairwise_accuracy"] is None
+
+
+def test_checkpoint_selection_prefers_mixed_success_before_dense_diagnostics() -> None:
+    base = {
+        "macro_delta_success_rate": 0.1,
+        "macro_mixed_success_pairwise_accuracy": 0.8,
+        "macro_dense_progress_selection_accuracy": 0.5,
+        "macro_dense_progress_pairwise_accuracy": 0.5,
+    }
+    stronger_mixed = {
+        **base,
+        "macro_mixed_success_selection_accuracy": 0.8,
+    }
+    stronger_dense_only = {
+        **base,
+        "macro_mixed_success_selection_accuracy": 0.7,
+        "macro_dense_progress_selection_accuracy": 1.0,
+        "macro_dense_progress_pairwise_accuracy": 1.0,
+    }
+    assert candidate_checkpoint_selection_key(
+        stronger_mixed, 1.0, 100
+    ) < candidate_checkpoint_selection_key(stronger_dense_only, 0.1, 100)
+
+
 def test_ablation_variants_change_only_declared_score_features() -> None:
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
@@ -563,6 +814,9 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
         "pairwise_rank_loss_enabled"
     ] is False
     assert summary_candidate_rank_contract("full")[
+        "group_listwise_success_mass_loss_enabled"
+    ] is True
+    assert summary_candidate_rank_contract("full")[
         "dt_has_numeric_score_path"
     ] is True
 
@@ -605,12 +859,20 @@ def _ablation_validation_metrics(offset: float) -> dict[str, object]:
 
 
 def _ablation_fold_summary(body: str, variant: str, offset: float) -> dict[str, object]:
+    trainer_sha = sha256_file(Path(ablation.trainer.__file__).resolve())
     return {
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": body,
         "source_bodies": [item for item in BODIES if item != body],
         "ablation": ablation_contract(variant),
         "candidate_rank_contract": summary_candidate_rank_contract(variant),
+        "trainer_file_sha256": trainer_sha,
+        "ensemble_checkpoint_selection": {
+            "common_step_required_for_all_five_members": True,
+            "rank_aggregation": ablation.trainer.standardized_rank_ensemble_contract(),
+            "selected_step": 3000,
+            "heldout_rows_used": 0,
+        },
         "training_budget": {
             "steps_per_member": 3000,
             "eval_every_steps": 100,
@@ -625,6 +887,8 @@ def _ablation_fold_summary(body: str, variant: str, offset: float) -> dict[str, 
             {
                 "member": member,
                 "seed": seed,
+                "best_step": 3000,
+                "trainer_file_sha256": trainer_sha,
                 "source_validation": _ablation_validation_metrics(offset),
             }
             for member, seed in enumerate(ablation.ENSEMBLE_SEEDS)
@@ -689,7 +953,36 @@ def test_ablation_entry_reports_every_fold_macro_and_prediction_metric() -> None
             body: {
                 "held_out_body": body,
                 "metrics": {
-                    name: 0.1 + 0.01 * variant_index for name in ablation.METRICS
+                    name: 0.1 + 0.01 * variant_index
+                    for name in ablation.POSTHOC_ENSEMBLE_METRICS
+                },
+                "uncertainty_risk_coverage": {
+                    endpoint: {
+                        "support": 10,
+                        "error_kind": f"{endpoint}_error",
+                        "uncertainty_kind": f"{endpoint}_uncertainty",
+                        "aurc": 0.2,
+                        "full_coverage_risk": 0.3,
+                        "error_uncertainty_spearman": 0.4,
+                        "risk_at_coverage": [
+                            {
+                                "coverage": coverage,
+                                "retained": max(1, int(10 * coverage)),
+                                "risk": 0.1 + coverage,
+                            }
+                            for coverage in ablation.RISK_COVERAGE_LEVELS
+                        ],
+                    }
+                    for endpoint in (
+                        "rank_selected_failure",
+                        "rank_oracle_regret",
+                        "success",
+                        "post_event",
+                        "next_event",
+                        "duration",
+                        "object",
+                        "recovery",
+                    )
                 },
             }
             for body in BODIES
@@ -700,7 +993,7 @@ def test_ablation_entry_reports_every_fold_macro_and_prediction_metric() -> None
     for variant in ablation.VARIANTS:
         assert len(heldout_result[variant]["folds"]) == 5
         assert set(heldout_result[variant]["equal_fold_macro"]) == set(
-            ablation.METRICS
+            ablation.POSTHOC_ENSEMBLE_METRICS
         )
 
 
@@ -711,6 +1004,10 @@ def test_ablation_posthoc_heldout_uses_frozen_five_member_rank_ensemble(
     audit = load_binding(binding, digest)
     variant = "full"
     heldout = "franka"
+    for ordinal, group in enumerate(audit["manifests"][heldout]["groups"]):
+        group["group_id"] = (
+            f"{group['condition']}|seed={group['requested_seed']}|query={ordinal}"
+        )
     summary = _ablation_fold_summary(heldout, variant, 0.0)
     for member, item in enumerate(summary["members"]):
         model = EffectAlignedSharedEventHead(variant).eval()
@@ -726,7 +1023,11 @@ def test_ablation_posthoc_heldout_uses_frozen_five_member_rank_ensemble(
                 "candidate_rank_contract": checkpoint_candidate_rank_contract(
                     variant
                 ),
-                "heldout_rows_used_for_training_normalization_or_selection": 0,
+                    "heldout_rows_used_for_training_normalization_or_selection": 0,
+                    "trainer_file_sha256": sha256_file(
+                        Path(ablation.trainer.__file__).resolve()
+                    ),
+                    "ensemble_common_selection_step": 3000,
             },
             checkpoint_path,
         )
@@ -743,8 +1044,12 @@ def test_ablation_posthoc_heldout_uses_frozen_five_member_rank_ensemble(
     assert result["heldout_decisions"] == 4
     assert result["heldout_branches"] == 16
     assert result["heldout_labels_used_for_training_checkpoint_or_variant_selection"] is False
-    assert set(result["metrics"]) == set(ablation.METRICS)
-    assert result["candidate_metric_aggregation"].startswith("mean_five_frozen")
-    assert result["prediction_metric_aggregation"].endswith(
-        "not_ensemble_calibrated"
+    assert set(result["metrics"]) == set(ablation.POSTHOC_ENSEMBLE_METRICS)
+    assert result["candidate_metric_aggregation"] == (
+        ablation.trainer.STANDARDIZED_RANK_ENSEMBLE_CONTRACT
     )
+    assert result["prediction_metric_aggregation"] == (
+        "five_frozen_members_mixed_in_probability_or_density_space_then_scored"
+    )
+    assert result["prediction_support"]["complete_four_candidate_decisions"] == 4
+    assert "rank_oracle_regret" in result["uncertainty_risk_coverage"]

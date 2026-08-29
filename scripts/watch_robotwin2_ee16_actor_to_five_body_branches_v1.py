@@ -33,7 +33,7 @@ DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
-ROOT_QUERIES = (0, 5, 10, 15)
+ROOT_QUERIES = (0, 10, 20, 30)
 CANDIDATE_COUNT = 4
 TARGET_PER_CONDITION_QUERY = 50
 BASE_SEED_START = 2026081000
@@ -48,6 +48,42 @@ EXPECTED_GROUPS_PER_BODY = (
 EXPECTED_BRANCHES_PER_BODY = EXPECTED_GROUPS_PER_BODY * CANDIDATE_COUNT
 EXPECTED_TOTAL_BRANCHES = EXPECTED_BRANCHES_PER_BODY * len(BODIES)
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
+DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v1"
+OBJECT_EFFECT_SCHEMA = {
+    "format": "etsf_robotwin2_moving_object_se3_effect_6d_v1",
+    "channels": [
+        "moving_delta_x",
+        "moving_delta_y",
+        "moving_delta_z",
+        "moving_delta_axis_angle_x",
+        "moving_delta_axis_angle_y",
+        "moving_delta_axis_angle_z",
+    ],
+    "rotation": "q_post_times_conjugate_q_root_shortest_axis_angle_wxyz",
+    "redundant_relative_goal_delta_removed": True,
+}
+CANDIDATE_NOISE_CONTRACT = {
+    "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
+    "candidate_indices": [0, 1, 2, 3],
+    "base_noise_indices": [0, 0, 2, 2],
+    "signs": [1, -1, 1, -1],
+    "candidate_zero_legacy_noise_unchanged": True,
+}
+TERMINAL_SUPERVISION_CONTRACT = {
+    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
+    "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
+    "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "same_stage_progress_definition_as_formal_paired_runner": True,
+}
+BRANCH_DIAGNOSTIC_CONTRACT = {
+    "format": DIAGNOSTIC_FORMAT,
+    "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
+    "branch_error": "boolean_execution_or_continuation_exception",
+    "candidate_action_pairwise_rms": (
+        "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
+    ),
+}
 
 HOME_ROOT = Path("/home/user")
 UPSTREAM_STATE = HOME_ROOT / (
@@ -297,11 +333,15 @@ def freeze_actor_authority(
         "candidate_indices": list(range(CANDIDATE_COUNT)),
         "candidate_zero_is_actor_baseline": True,
         "same_ordered_candidate_set_for_baseline_and_etsf": True,
-        "flow_noise_distribution": "torch_standard_normal",
-        "flow_noise_seed_expression": (
-            "(20260903 + scene_seed*1000003 + query_index*10007 + "
-            "candidate_index*101) mod (2**63-1)"
+        "flow_noise_distribution": (
+            "antithetic_standard_normal_pairs_each_candidate_marginal_N_0_I"
         ),
+        "flow_noise_seed_expression": (
+            "base_index=candidate_index-candidate_index%2; "
+            "(20260903 + scene_seed*1000003 + query_index*10007 + "
+            "base_index*101) mod (2**63-1); odd candidates negate the draw"
+        ),
+        "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
         "conditions": list(CONDITIONS),
         "root_query_indices": list(ROOT_QUERIES),
         "action_exec_steps": ACTION_EXEC_STEPS,
@@ -320,6 +360,9 @@ def freeze_actor_authority(
             "event_derivation_implementation_sha256"
         ],
         "analytic_goal_rule": analytic_event.GOAL_RULE,
+        "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+        "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+        "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
         "wall_clock_used_as_physical_time": False,
     }
     sampling_sha = canonical_sha256(sampling_contract)
@@ -524,6 +567,12 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("actor_checkpoint") != str(ACTOR_CHECKPOINT)
         or value.get("candidate_count") != CANDIDATE_COUNT
         or value.get("root_query_indices") != list(ROOT_QUERIES)
+        or value.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+        or value.get("terminal_supervision_contract")
+        != TERMINAL_SUPERVISION_CONTRACT
+        or value.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+        or value.get("branch_diagnostic_contract")
+        != BRANCH_DIAGNOSTIC_CONTRACT
         or value.get("event_spec_sha256") != EVENT_SPEC_SHA256
         or value.get("event_derivation_implementation_sha256")
         != static["event_derivation_implementation_sha256"]
@@ -567,8 +616,16 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(item, Mapping):
             raise ContinuationError(f"manifest group is invalid for {body}")
         identity = str(item.get("group_id", ""))
-        if not identity or identity in identities:
-            raise ContinuationError(f"manifest group identity is duplicate for {body}")
+        if (
+            not identity
+            or identity in identities
+            or item.get("diagnostic_format") != DIAGNOSTIC_FORMAT
+            or not isinstance(item.get("diagnostics_path"), str)
+            or not isinstance(item.get("diagnostics_sha256"), str)
+        ):
+            raise ContinuationError(
+                f"manifest group identity/diagnostic binding is invalid for {body}"
+            )
         identities.add(identity)
     return value
 
@@ -668,13 +725,23 @@ def finalize_body_manifest(
     groups = list(manifest["groups"])
     for item in groups:
         relative = Path(str(item.get("path", "")))
-        if relative.is_absolute() or ".." in relative.parts:
+        diagnostics_relative = Path(str(item.get("diagnostics_path", "")))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or diagnostics_relative.is_absolute()
+            or ".." in diagnostics_relative.parts
+        ):
             raise ContinuationError(f"unsafe group path for {body}: {relative}")
         payload = (path.parent / relative).resolve()
+        diagnostics_payload = (path.parent / diagnostics_relative).resolve()
         if (
             not payload.is_file()
             or payload.is_symlink()
             or sha256_file(payload) != item.get("sha256")
+            or not diagnostics_payload.is_file()
+            or diagnostics_payload.is_symlink()
+            or sha256_file(diagnostics_payload) != item.get("diagnostics_sha256")
         ):
             raise ContinuationError(f"group payload missing/tampered: {payload}")
     finalized = dict(manifest)
@@ -685,6 +752,10 @@ def finalize_body_manifest(
             "complete_candidate_branch_count": EXPECTED_BRANCHES_PER_BODY,
             "complete_per_condition_query": TARGET_PER_CONDITION_QUERY,
             "collector_file_sha256": static["collector_sha256"],
+            "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+            "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "actor_binding": {
                 "authority_path": relative_to_home(ACTOR_AUTHORITY),
                 "authority_file_sha256": sha256_file(ACTOR_AUTHORITY),
@@ -713,6 +784,7 @@ def finalize_body_manifest(
     atomic_json(path, finalized)
     for item in groups:
         (path.parent / str(item["path"])).chmod(0o444)
+        (path.parent / str(item["diagnostics_path"])).chmod(0o444)
     path.chmod(0o444)
     return {
         "path": relative_to_home(path),
@@ -746,6 +818,10 @@ def freeze_training_binding(
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
             "event_spec_sha256": EVENT_SPEC_SHA256,
+            "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+            "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "heldout_labels_may_train_fit_calibrate_or_select": False,
             "canonical_shared_body_rows": 1,
             "execution_authority": {
@@ -818,6 +894,10 @@ def main() -> int:
             "event_derivation_implementation_sha256": static[
                 "event_derivation_implementation_sha256"
             ],
+            "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+            "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "output_root": str(OUTPUT_ROOT),
             "actor_authority_file_sha256": actor_authority_sha,
             "body_manifests": body_manifests,

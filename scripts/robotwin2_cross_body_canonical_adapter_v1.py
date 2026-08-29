@@ -34,6 +34,14 @@ ACTION_EFFECT14_CHANNELS = (
     "right_delta_axis_angle_z",
     "right_delta_gripper",
 )
+OBJECT_EFFECT6_CHANNELS = (
+    "moving_delta_x",
+    "moving_delta_y",
+    "moving_delta_z",
+    "moving_delta_axis_angle_x",
+    "moving_delta_axis_angle_y",
+    "moving_delta_axis_angle_z",
+)
 STATE27_CHANNELS = (
     "relative_goal_x",
     "relative_goal_y",
@@ -91,6 +99,7 @@ def contract() -> dict[str, Any]:
         "relative_rotation": "q_next_times_conjugate_q_current_shortest_axis_angle",
         "translation_delta_frame": "source_world_frame",
         "action_effect14_channels": list(ACTION_EFFECT14_CHANNELS),
+        "object_effect6_channels": list(OBJECT_EFFECT6_CHANNELS),
         "state27_channels": list(STATE27_CHANNELS),
         "state27_inputs_are_supplied_not_inferred_by_this_adapter": True,
         "public_expert_hdf5_does_not_supply_complete_state27": True,
@@ -150,6 +159,21 @@ def _relative_axis_angle_wxyz(current: Any, following: Any):
         where=vector_norm > 1e-10,
     )
     return vector * scale
+
+
+def relative_axis_angle_wxyz(current: Any, following: Any):
+    """Return the shortest `q_following * conjugate(q_current)` axis-angle.
+
+    This public geometry-only helper lets branch materialization use exactly
+    the same quaternion convention as the canonical dual-EE action adapter.
+    It accepts any finite arrays with trailing quaternion dimension four.
+    """
+
+    current_array = _array(current, "current_quaternion_wxyz", 4)
+    following_array = _array(following, "following_quaternion_wxyz", 4)
+    if current_array.shape != following_array.shape:
+        raise CanonicalAdapterError("quaternion arrays must have equal shape")
+    return _relative_axis_angle_wxyz(current_array, following_array)
 
 
 def task_space_action_effect14(

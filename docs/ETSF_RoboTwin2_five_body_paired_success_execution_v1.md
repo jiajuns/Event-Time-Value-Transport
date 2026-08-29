@@ -14,8 +14,8 @@
 EE16 actor 按固定 flow-noise 规则生成四个有序候选：
 
 - `actor_baseline` 固定执行 `candidate_index=0`；
-- `etsf_best_of_4` 使用该 body 对应的 LOBO 五成员共享头，按 ensemble mean
-  `candidate_rank_logit` 选择；
+- `etsf_best_of_4` 使用该 body 对应的 LOBO 五成员共享头；每个成员先在当前四候选内对 raw rank
+  logit 做 population z-score，再对恰好五成员等权平均后选择；
 - 分数精确相同时，选择最低 candidate index；
 - 两个方法的初始 reset 和第一次四候选集合必须一致；动作分叉后，各自在自己的真实闭环状态继续查询并
   执行动作，不使用 simulator lookahead 或候选 rollout outcome。
@@ -48,6 +48,8 @@ failure receipt 并停止，后续启动不会静默重跑该 pair。动作本�
 每个 `--lobo-fold` 使用 `heldout-body=/absolute/path`，必须恰好提供五次。执行器会核对 summary 的
 held-out identity、无 held-out 监督、单共享 action stem、五成员编号和所有 checkpoint SHA，然后仅
 加载对应 held-out body 的 ensemble。
+五个 checkpoint 必须来自同一个 source-only 共同评估 step，该 step 已用与在线完全相同的标准化
+ensemble 在 source validation 上联合选择；summary、checkpoint 和当前 trainer 实现 SHA 必须一致。
 
 ## 远程 4090 命令
 
@@ -84,8 +86,10 @@ export PYTHONPATH=/home/user/etsf_stage0/lerobot/src:/home/user/etsf_stage0/.ven
 `physical_sim_seconds`；planned actor-token 时间与执行后的 simulator 物理时间不会混写。
 
 正式长任务应由服务器端 `setsid`/`nohup` 包装，stdout/stderr 写入服务器日志。输出目录可恢复：每完成
-一个 pair 就原子写入只读 `pairs/<identity>.json`，重启同一命令会验证并跳过已经完整的 pair，不换
-seed、不删除失败 pair，也不根据 outcome 提前停止。
+一个 pair 就原子写入只读 `pairs/<identity>.json`。重启时不仅校验顶层 SHA，还会逐 query 重算
+`raw[5,4] → decision内标准化 → ensemble[4] → selected index`，并强制 baseline 始终执行 candidate 0；
+任何旧格式或无法复算的 pair 都会停止而不是被静默接纳。流程不换 seed、不删除失败 pair，也不根据
+outcome 提前停止。
 
 ## 输出与现有 evaluator
 
@@ -94,10 +98,14 @@ seed、不删除失败 pair，也不根据 outcome 提前停止。
 - 两方法二值成功、阶段进度和 discordance；
 - 初始 reset identity 与第一次 candidate-set SHA；
 - 每次 query 的候选集合 SHA、selected candidate index 和实际执行步数；
-- ETSF 的五成员 rank logits、ensemble mean rank、success/post-event/next-event 预测。
+- ETSF 的五成员 raw rank logits、每成员候选 mean/std、标准化 ensemble rank、
+  success/post-event/next-event 预测。
 
-全部 1000 pairs 完成后才冻结发布 `paired_outcomes.json`。该文件只有现有 evaluator 允许的严格字段，
-执行器最后会打印文件 SHA 和可直接复制的命令：
+全部 1000 pairs 完成后才冻结发布 v3 `paired_outcomes.json` 和
+`paired_execution_completion_receipt.json`。每个 outcome row 绑定对应详细 pair SHA，顶层绑定有序
+1000 个 pair SHA 摘要、execution-contract logical/file SHA；completion receipt 再绑定五折 checkpoint、
+标准化聚合合同、outcome document/file SHA。evaluator 仍只读取严格结果字段和这些 SHA，不打开
+checkpoint/轨迹。执行器最后会打印文件 SHA 和可直接复制的命令：
 
 ```bash
 python3 scripts/evaluate_robotwin2_cross_embodiment_paired_success_v1.py \

@@ -366,8 +366,26 @@ def test_state27_packer_freezes_requested_channel_order() -> None:
     )
     contract = adapter.contract()
     assert contract["action_effect14_channels"] == list(adapter.ACTION_EFFECT14_CHANNELS)
+    assert contract["object_effect6_channels"] == list(adapter.OBJECT_EFFECT6_CHANNELS)
     assert contract["state27_channels"] == list(adapter.STATE27_CHANNELS)
     assert contract["success_failure_recovery_object_event_labels_generated"] is False
+
+
+def test_public_object_rotation_effect_uses_shortest_wxyz_axis_angle() -> None:
+    identity = np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float64)
+    half = np.pi / 4.0
+    quarter_turn_z = np.asarray(
+        [[np.cos(half), 0.0, 0.0, np.sin(half)]], dtype=np.float64
+    )
+    result = adapter.relative_axis_angle_wxyz(identity, quarter_turn_z)
+    np.testing.assert_allclose(result, [[0.0, 0.0, np.pi / 2.0]], atol=1e-7)
+    # Quaternion sign represents the same rotation and must not change the
+    # canonical shortest-axis-angle effect.
+    np.testing.assert_allclose(
+        adapter.relative_axis_angle_wxyz(identity, -quarter_turn_z),
+        result,
+        atol=1e-7,
+    )
 
 
 def test_canonical_adapter_rejects_mismatched_or_nonfinite_inputs() -> None:

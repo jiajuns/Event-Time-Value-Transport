@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
+
+
+def test_inventory_is_full_and_uses_late_episode_queries() -> None:
+    manifests = {}
+    for body_index, body in enumerate(ablation.trainer.BODIES):
+        groups = []
+        for condition_index, condition in enumerate(ablation.trainer.CONDITIONS):
+            for query in ablation.QUERY_INDICES:
+                for ordinal in range(ablation.SEEDS_PER_CONDITION_QUERY):
+                    groups.append(
+                        {
+                            "condition": condition,
+                            "root_query_index": query,
+                            "requested_seed": (
+                                2_026_081_000
+                                + body_index * 10_000
+                                + condition_index * 1_000
+                                + query * 50
+                                + ordinal
+                            ),
+                        }
+                    )
+        manifests[body] = {"groups": groups}
+    audit = {"manifests": manifests}
+    receipt = ablation.validate_complete_inventory(audit)
+    assert ablation.QUERY_INDICES == (0, 10, 20, 30)
+    assert receipt["root_query_indices"] == [0, 10, 20, 30]
+    assert receipt["decisions"] == 2_000
+    assert receipt["branches"] == 8_000
+
+    audit["manifests"][ablation.trainer.BODIES[0]]["groups"][0][
+        "root_query_index"
+    ] = 5
+    with pytest.raises(ablation.AblationError):
+        ablation.validate_complete_inventory(audit)
+
+
+def test_standardized_frozen_rank_ensemble_prevents_raw_scale_domination() -> None:
+    class FixedRank(torch.nn.Module):
+        def __init__(self, scores: list[float]) -> None:
+            super().__init__()
+            self.register_buffer("scores", torch.tensor(scores))
+
+        def forward(self, _batch: dict[str, object]) -> dict[str, torch.Tensor]:
+            return {"candidate_rank_logit": self.scores}
+
+    # One member has a huge raw scale and selects candidate 1.  The other four
+    # equally weighted standardized members select candidate 2.
+    models = [FixedRank([0.0, 1_000.0, 0.0, 0.0])] + [
+        FixedRank([0.0, 0.0, 1.0, 0.0]) for _ in range(4)
+    ]
+    ensemble = ablation._FrozenRankEnsemble(models)
+    output = ensemble(
+        {
+            "logical_group": ["g"] * 4,
+            "candidate_index": torch.tensor([0, 1, 2, 3]),
+        }
+    )["candidate_rank_logit"]
+    assert int(output.argmax()) == 2
+    assert ablation.trainer.STANDARDIZED_RANK_ENSEMBLE_CONTRACT[
+        "normalization_scope"
+    ] == "one_four_candidate_decision_per_member"
+
+
+class _PerfectPredictionModel(torch.nn.Module):
+    def __init__(self, member_offset: float) -> None:
+        super().__init__()
+        self.member_offset = float(member_offset)
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        success = batch["success"].float()
+        recovery = batch["recovery"].float()
+        post = batch["post_event_id"].long()
+        following = batch["next_event_id"].long()
+        object_delta = batch["object_delta"].float()
+        duration = batch["duration"].float()
+        count = len(success)
+        post_logits = torch.full((count, 5), -7.0, dtype=torch.float32)
+        next_logits = torch.full((count, 5), -7.0, dtype=torch.float32)
+        post_logits[torch.arange(count), post] = 7.0 + self.member_offset
+        next_logits[torch.arange(count), following] = 7.0 + self.member_offset
+        # Candidate score is monotone with success; exact ties use the same
+        # lowest-index convention as ensemble success argmax.
+        rank = 5.0 * success
+        return {
+            "candidate_rank_logit": rank + self.member_offset,
+            "success_logit": (success * 2.0 - 1.0) * (7.0 + self.member_offset),
+            "post_event_logits": post_logits,
+            "next_event_logits": next_logits,
+            "duration_selected_log_mean": torch.log1p(duration)
+            + self.member_offset * 0.001,
+            "duration_selected_log_scale": torch.full_like(duration, -3.0),
+            "recovery_logit": (recovery * 2.0 - 1.0) * (7.0 + self.member_offset),
+            "object_delta_mean": object_delta + self.member_offset * 0.001,
+            "object_delta_log_scale": torch.full_like(object_delta, -3.0),
+        }
+
+
+def _prediction_batch() -> dict[str, object]:
+    count = 8
+    success = torch.tensor([0, 1, 0, 1, 1, 0, 1, 0], dtype=torch.float32)
+    recovery = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.float32)
+    duration = torch.arange(1, count + 1, dtype=torch.float32) / 10.0
+    object_delta = torch.arange(count * 6, dtype=torch.float32).reshape(count, 6) / 100.0
+    return {
+        "logical_group": [
+            "piper|clean|clean|seed=2026081001|query=0"
+        ]
+        * 4
+        + ["piper|randomized|randomized|seed=2026081002|query=10"] * 4,
+        "candidate_index": torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]),
+        "post_event_id": torch.tensor([0, 1, 2, 3, 1, 2, 3, 4]),
+        "post_event_mask": torch.ones(count),
+        "next_event_id": torch.tensor([1, 2, 3, 4, 0, 1, 2, 3]),
+        "next_event_mask": torch.ones(count),
+        "duration": duration,
+        "duration_observed": torch.tensor([1, 1, 0, 1, 1, 0, 1, 1]),
+        "duration_mask": torch.ones(count),
+        "success": success,
+        "success_mask": torch.ones(count),
+        "recovery": recovery,
+        "recovery_mask": torch.ones(count),
+        "action_available": torch.ones(count),
+        "object_delta": object_delta,
+        "object_delta_mask": torch.ones(count),
+    }
+
+
+def test_deployed_ensemble_prediction_metrics_cover_all_heads_and_uncertainty() -> None:
+    models = [_PerfectPredictionModel(offset) for offset in (-0.2, -0.1, 0.0, 0.1, 0.2)]
+    result = ablation.evaluate_deployed_ensemble_predictions(
+        models, [_prediction_batch()], torch.device("cpu")
+    )
+    metrics = result["metrics"]
+    assert metrics["success_brier"] < 1e-4
+    assert metrics["success_nll"] < 0.01
+    assert metrics["success_auroc"] == pytest.approx(1.0)
+    assert metrics["post_event_macro_f1"] == pytest.approx(1.0)
+    assert metrics["next_event_macro_f1"] == pytest.approx(1.0)
+    assert metrics["duration_mixture_mae_seconds"] < 0.01
+    assert metrics["duration_mixture_nll_log1p"] is not None
+    assert metrics["duration_mixture_censored_nll_log1p"] is not None
+    assert metrics["object_mixture_rmse"] < 0.01
+    assert metrics["recovery_brier"] < 1e-4
+    assert metrics["recovery_average_precision"] == pytest.approx(1.0)
+    assert result["recovery_precision_recall"]["status"] == "available"
+    assert result["recovery_precision_recall"]["points"][-1]["recall"] == 1.0
+    assert metrics["rank_success_argmax_disagreement_rate"] == pytest.approx(0.0)
+    assert result["support"]["complete_four_candidate_decisions"] == 2
+    assert result["support"]["requested_seed_clusters"] == 2
+    assert set(result["uncertainty_risk_coverage"]) == {
+        "rank_selected_failure",
+        "rank_oracle_regret",
+        "success",
+        "post_event",
+        "next_event",
+        "duration",
+        "object",
+        "recovery",
+    }
+    assert result["statistical_units"]["dependence_cluster_unit"].endswith(
+        "all_query_decisions_and_candidates"
+    )
+
+
+def test_recovery_pr_is_explicitly_unavailable_without_positive_labels() -> None:
+    batch = _prediction_batch()
+    batch["recovery"] = torch.zeros(8)
+    models = [_PerfectPredictionModel(offset) for offset in (-0.2, -0.1, 0.0, 0.1, 0.2)]
+    result = ablation.evaluate_deployed_ensemble_predictions(
+        models, [batch], torch.device("cpu")
+    )
+    assert result["metrics"]["recovery_average_precision"] is None
+    assert result["support"]["recovery"]["precision_recall_available"] is False
+    assert result["recovery_precision_recall"] == {
+        "status": "unavailable_no_positive_labels",
+        "positive": 0,
+        "negative": 8,
+        "average_precision": None,
+        "points": [],
+    }
+
+
+def test_risk_coverage_retains_low_uncertainty_first() -> None:
+    curve = ablation._risk_coverage(
+        np.asarray([0.0, 0.0, 1.0, 1.0]),
+        np.asarray([0.0, 0.1, 0.8, 0.9]),
+        error_kind="test_error",
+        uncertainty_kind="test_uncertainty",
+    )
+    assert curve["support"] == 4
+    assert curve["risk_at_coverage"][1]["coverage"] == 0.5
+    assert curve["risk_at_coverage"][1]["risk"] == pytest.approx(0.0)
+    assert curve["full_coverage_risk"] == pytest.approx(0.5)
+    assert curve["error_uncertainty_spearman"] > 0.8
+
+
+def test_posthoc_macro_is_equal_fold_and_keeps_risk_coverage() -> None:
+    models = [_PerfectPredictionModel(offset) for offset in (-0.2, -0.1, 0.0, 0.1, 0.2)]
+    prediction = ablation.evaluate_deployed_ensemble_predictions(
+        models, [_prediction_batch()], torch.device("cpu")
+    )
+    fold_metrics = dict(prediction["metrics"])
+    fold_metrics.update(
+        {
+            "best_of_4_delta_success_rate": 0.1,
+            "selected_success_rate": 0.6,
+            "oracle_success_rate": 0.8,
+            "pairwise_accuracy": 0.75,
+        }
+    )
+    assert set(fold_metrics) == set(ablation.POSTHOC_ENSEMBLE_METRICS)
+    evaluations = {
+        variant: {
+            body: {
+                "metrics": dict(fold_metrics),
+                "uncertainty_risk_coverage": prediction[
+                    "uncertainty_risk_coverage"
+                ],
+            }
+            for body in ablation.trainer.BODIES
+        }
+        for variant in ablation.VARIANTS
+    }
+    summary = ablation.aggregate_posthoc_heldout(evaluations)
+    assert summary["full"]["equal_fold_macro"][
+        "best_of_4_delta_success_rate"
+    ] == pytest.approx(0.1)
+    assert summary["full"]["uncertainty_risk_coverage_equal_fold_macro"][
+        "success"
+    ]["folds_with_support"] == 5
+    assert summary["full"]["metric_folds_with_support"][
+        "recovery_average_precision"
+    ] == 5
+    assert summary["comparison_to_success_only"]["full"][
+        "success_brier"
+    ] == pytest.approx(0.0)

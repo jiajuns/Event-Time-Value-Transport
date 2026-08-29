@@ -54,7 +54,47 @@ CANDIDATE_COUNT = 4
 SEED_START = 2026081000
 DEVELOPMENT_SEED_STOP = 2026090000
 SEEDS_PER_CONDITION_QUERY = 50
-QUERY_INDICES = (0, 5, 10, 15)
+# Four equally budgeted roots span the full 200-control-step episode instead
+# of concentrating all branch supervision in the first half.  With five
+# executed actions per policy query, query 30 observes late/recovery states
+# while the existing supplemental-seed logic fills terminal-root gaps.
+QUERY_INDICES = (0, 10, 20, 30)
+CANDIDATE_NOISE_CONTRACT = {
+    "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
+    "candidate_indices": [0, 1, 2, 3],
+    "base_noise_indices": [0, 0, 2, 2],
+    "signs": [1, -1, 1, -1],
+    "candidate_zero_legacy_noise_unchanged": True,
+}
+TERMINAL_SUPERVISION_CONTRACT = {
+    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
+    "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
+    "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "same_stage_progress_definition_as_formal_paired_runner": True,
+}
+OBJECT_EFFECT_SCHEMA = {
+    "format": "etsf_robotwin2_moving_object_se3_effect_6d_v1",
+    "channels": [
+        "moving_delta_x",
+        "moving_delta_y",
+        "moving_delta_z",
+        "moving_delta_axis_angle_x",
+        "moving_delta_axis_angle_y",
+        "moving_delta_axis_angle_z",
+    ],
+    "rotation": "q_post_times_conjugate_q_root_shortest_axis_angle_wxyz",
+    "redundant_relative_goal_delta_removed": True,
+}
+DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v1"
+BRANCH_DIAGNOSTIC_CONTRACT = {
+    "format": DIAGNOSTIC_FORMAT,
+    "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
+    "branch_error": "boolean_execution_or_continuation_exception",
+    "candidate_action_pairwise_rms": (
+        "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
+    ),
+}
 DECISIONS_PER_BODY_CONDITION = SEEDS_PER_CONDITION_QUERY * len(QUERY_INDICES)
 DECISIONS_PER_BODY = len(CONDITIONS) * DECISIONS_PER_BODY_CONDITION
 TOTAL_DECISIONS = len(BODIES) * DECISIONS_PER_BODY
@@ -79,6 +119,10 @@ REQUIRED_ARRAYS = {
     "recovery_mask",
     "object_delta",
     "object_delta_mask",
+    "terminal_max_event_id",
+    "terminal_stage_progress",
+    "terminal_goal_distance",
+    "terminal_goal_progress",
     "candidate_index",
     "dt",
 }
@@ -96,10 +140,19 @@ FLOAT_ARRAYS = {
     "recovery_mask",
     "object_delta",
     "object_delta_mask",
+    "terminal_stage_progress",
+    "terminal_goal_distance",
+    "terminal_goal_progress",
     "dt",
 }
 INTEGER_ARRAYS = {
-    "current_event_id", "post_event_id", "next_event_id", "candidate_index"
+    "current_event_id", "post_event_id", "next_event_id",
+    "terminal_max_event_id", "candidate_index"
+}
+DIAGNOSTIC_ARRAYS = {
+    "first_executed",
+    "branch_error",
+    "candidate_action_pairwise_rms",
 }
 _FAILURE_STATE_PATH: Path | None = None
 _FAILURE_RUN_EXIT_PATH: Path | None = None
@@ -331,9 +384,126 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                 raise LoboWatcherError(f"decision contains non-positive planned dt: {path}")
             if any(abs(value - 5.0 / 15.0) > 1e-6 for value in elapsed):
                 raise LoboWatcherError(f"decision planned dt is not fixed 5/15 seconds: {path}")
+            with archive.open("actions.npy") as stream:
+                header = read_npy_header(stream, f"{path}:actions")
+                byte_order = "<" if header["descr"] == "<f4" else "="
+                action_count = CANDIDATE_COUNT * horizon * 14
+                action_values = struct.unpack(
+                    byte_order + f"{action_count}f",
+                    _read_exact(stream, action_count * 4, "actions"),
+                )
+                if stream.read(1):
+                    raise LoboWatcherError(f"decision actions contain trailing bytes: {path}")
+            pairwise_rms: list[list[float]] = []
+            for left in range(CANDIDATE_COUNT):
+                row = []
+                for right in range(CANDIDATE_COUNT):
+                    squared = 0.0
+                    for step in range(5):
+                        for channel in range(14):
+                            left_index = (left * horizon + step) * 14 + channel
+                            right_index = (right * horizon + step) * 14 + channel
+                            difference = (
+                                action_values[left_index] - action_values[right_index]
+                            )
+                            squared += difference * difference
+                    row.append(math.sqrt(squared / float(5 * 14)))
+                pairwise_rms.append(row)
     except zipfile.BadZipFile as error:
         raise LoboWatcherError(f"decision NPZ is corrupt: {path}") from error
-    return {"candidate_count": 4, "action_horizon": horizon}
+    return {
+        "candidate_count": 4,
+        "action_horizon": horizon,
+        "candidate_action_pairwise_rms": pairwise_rms,
+    }
+
+
+def validate_diagnostic_npz(
+    path: Path,
+    expected_sha256: str,
+    expected_pairwise_rms: Sequence[Sequence[float]],
+) -> dict[str, Any]:
+    """Validate the bound proposal-coverage sidecar without using it as a label."""
+
+    if not path.is_file() or path.is_symlink():
+        raise LoboWatcherError(f"diagnostic payload is missing/symlink: {path}")
+    if sha256_file(path) != expected_sha256:
+        raise LoboWatcherError(f"diagnostic payload SHA-256 mismatch: {path}")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            expected_members = {f"{name}.npy" for name in DIAGNOSTIC_ARRAYS}
+            member_names = archive.namelist()
+            if len(member_names) != len(expected_members) or set(member_names) != expected_members:
+                raise LoboWatcherError(f"diagnostic NPZ member set mismatch: {path}")
+            headers: dict[str, dict[str, Any]] = {}
+            for name in sorted(DIAGNOSTIC_ARRAYS):
+                with archive.open(f"{name}.npy") as stream:
+                    headers[name] = read_npy_header(stream, f"{path}:{name}")
+            expected = {
+                "first_executed": ((CANDIDATE_COUNT,), {"<i8", "=i8"}),
+                "branch_error": ((CANDIDATE_COUNT,), {"|b1"}),
+                "candidate_action_pairwise_rms": (
+                    (CANDIDATE_COUNT, CANDIDATE_COUNT),
+                    {"<f4", "=f4"},
+                ),
+            }
+            for name, (shape, dtypes) in expected.items():
+                if tuple(headers[name]["shape"]) != shape or headers[name]["descr"] not in dtypes:
+                    raise LoboWatcherError(
+                        f"diagnostic {name} shape/dtype mismatch: {path}"
+                    )
+            with archive.open("first_executed.npy") as stream:
+                header = read_npy_header(stream, f"{path}:first_executed")
+                byte_order = "<" if header["descr"] == "<i8" else "="
+                first_executed = struct.unpack(
+                    byte_order + "4q", _read_exact(stream, 32, "first_executed")
+                )
+                if stream.read(1):
+                    raise LoboWatcherError(
+                        f"diagnostic first_executed contains trailing bytes: {path}"
+                    )
+            if any(value < 0 or value > 5 for value in first_executed):
+                raise LoboWatcherError(
+                    f"diagnostic first_executed is outside planned first five steps: {path}"
+                )
+            with archive.open("branch_error.npy") as stream:
+                read_npy_header(stream, f"{path}:branch_error")
+                branch_error = _read_exact(stream, CANDIDATE_COUNT, "branch_error")
+                if stream.read(1) or any(value not in (0, 1) for value in branch_error):
+                    raise LoboWatcherError(
+                        f"diagnostic branch_error is not a strict bool payload: {path}"
+                    )
+            with archive.open("candidate_action_pairwise_rms.npy") as stream:
+                header = read_npy_header(
+                    stream, f"{path}:candidate_action_pairwise_rms"
+                )
+                byte_order = "<" if header["descr"] == "<f4" else "="
+                pairwise = struct.unpack(
+                    byte_order + "16f",
+                    _read_exact(stream, 64, "candidate_action_pairwise_rms"),
+                )
+                if stream.read(1):
+                    raise LoboWatcherError(
+                        f"diagnostic pairwise RMS contains trailing bytes: {path}"
+                    )
+            for left in range(CANDIDATE_COUNT):
+                for right in range(CANDIDATE_COUNT):
+                    observed = float(pairwise[left * CANDIDATE_COUNT + right])
+                    expected_value = float(expected_pairwise_rms[left][right])
+                    reverse = float(pairwise[right * CANDIDATE_COUNT + left])
+                    if (
+                        not math.isfinite(observed)
+                        or observed < 0.0
+                        or abs(observed - reverse) > 1e-7
+                        or (left == right and abs(observed) > 1e-7)
+                        or abs(observed - expected_value) > 2e-6
+                    ):
+                        raise LoboWatcherError(
+                            f"diagnostic pairwise RMS disagrees with core actions: {path}"
+                        )
+    except zipfile.BadZipFile as error:
+        raise LoboWatcherError(f"diagnostic NPZ is corrupt: {path}") from error
+    return {"diagnostic_format": DIAGNOSTIC_FORMAT}
 
 
 def collection_progress(branches_root: Path) -> dict[str, Any]:
@@ -432,6 +602,7 @@ def validate_complete_collection(
     manifest_bindings: dict[str, dict[str, str]] = {}
     manifest_audits: dict[str, Any] = {}
     shared_adapter_sha: str | None = None
+    shared_collector_sha: str | None = None
     shared_event_spec_sha: str | None = None
     shared_event_implementation_sha: str | None = None
     decision_count = branch_count = 0
@@ -459,11 +630,21 @@ def validate_complete_collection(
             or manifest.get("dataset_revision") != DATASET_REVISION
             or manifest.get("task") != TASK
             or manifest.get("body") != body
+            or manifest.get("status")
+            != "complete_400_decisions_1600_candidate_branches"
+            or not isinstance(manifest.get("collector_file_sha256"), str)
+            or len(manifest["collector_file_sha256"]) != 64
             or manifest.get("actor_checkpoint") != str(actor_checkpoint)
             or manifest.get("candidate_count") != CANDIDATE_COUNT
             or manifest.get("candidate_zero_is_actor_baseline") is not True
             or manifest.get("same_ordered_candidate_set_for_baseline_and_etsf") is not True
             or manifest.get("root_query_indices") != list(QUERY_INDICES)
+            or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+            or manifest.get("terminal_supervision_contract")
+            != TERMINAL_SUPERVISION_CONTRACT
+            or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+            or manifest.get("branch_diagnostic_contract")
+            != BRANCH_DIAGNOSTIC_CONTRACT
             or not isinstance(adapter, Mapping)
             or adapter.get("kind") != "analytic_label_free_canonical_v1"
             or adapter.get("trainable") is not False
@@ -528,10 +709,12 @@ def validate_complete_collection(
             raise LoboWatcherError(f"{body} lacks adapter/event-spec SHA-256")
         if shared_adapter_sha is None:
             shared_adapter_sha = adapter_sha
+            shared_collector_sha = str(manifest["collector_file_sha256"])
             shared_event_spec_sha = event_spec_sha
             shared_event_implementation_sha = event_implementation_sha
         if (
             adapter_sha != shared_adapter_sha
+            or manifest.get("collector_file_sha256") != shared_collector_sha
             or event_spec_sha != shared_event_spec_sha
             or event_implementation_sha != shared_event_implementation_sha
         ):
@@ -543,6 +726,7 @@ def validate_complete_collection(
             raise LoboWatcherError(f"{body} does not contain exactly 400 decisions")
         observed_ids: set[str] = set()
         observed_paths: set[str] = set()
+        observed_diagnostic_paths: set[str] = set()
         condition_counts = {condition: 0 for condition in CONDITIONS}
         seeds_by_unit = {
             (condition, query): set()
@@ -571,7 +755,11 @@ def validate_complete_collection(
             if group_id != f"{condition}|seed={seed}|query={query}":
                 raise LoboWatcherError(f"{body}/{group_id} group identity is inconsistent")
             expected_filename = f"{condition}_seed_{seed}_query_{query}.npz"
+            expected_diagnostic_filename = (
+                f"{condition}_seed_{seed}_query_{query}.diagnostics.npz"
+            )
             relative = item.get("path")
+            diagnostics_relative = item.get("diagnostics_path")
             if (
                 item.get("condition") != condition
                 or item.get("requested_seed") != seed
@@ -579,6 +767,11 @@ def validate_complete_collection(
                 or relative != f"groups/{expected_filename}"
                 or not isinstance(item.get("sha256"), str)
                 or len(item["sha256"]) != 64
+                or item.get("diagnostic_format") != DIAGNOSTIC_FORMAT
+                or diagnostics_relative
+                != f"groups/{expected_diagnostic_filename}"
+                or not isinstance(item.get("diagnostics_sha256"), str)
+                or len(item["diagnostics_sha256"]) != 64
             ):
                 raise LoboWatcherError(f"{body}/{group_id} identity fields changed")
             payload = branches_root / body / str(relative)
@@ -587,9 +780,24 @@ def validate_complete_collection(
             except ValueError as error:
                 raise LoboWatcherError(f"{body}/{group_id} payload escapes body root") from error
             decision = validate_decision_npz(payload, str(item["sha256"]))
+            diagnostics_payload = branches_root / body / str(diagnostics_relative)
+            try:
+                diagnostics_payload.resolve().relative_to(
+                    (branches_root / body).resolve()
+                )
+            except ValueError as error:
+                raise LoboWatcherError(
+                    f"{body}/{group_id} diagnostic payload escapes body root"
+                ) from error
+            validate_diagnostic_npz(
+                diagnostics_payload,
+                str(item["diagnostics_sha256"]),
+                decision["candidate_action_pairwise_rms"],
+            )
             action_horizons.add(int(decision["action_horizon"]))
             observed_ids.add(str(group_id))
             observed_paths.add(str(relative))
+            observed_diagnostic_paths.add(str(diagnostics_relative))
             seeds_by_unit[(str(condition), int(query))].add(int(seed))
             condition_counts[condition] += 1
             decision_count += 1
@@ -605,10 +813,19 @@ def validate_complete_collection(
         disk_paths = {
             path.relative_to(branches_root / body).as_posix()
             for path in (branches_root / body / "groups").glob("*.npz")
-            if path.is_file()
+            if path.is_file() and not path.name.endswith(".diagnostics.npz")
         }
         if disk_paths != observed_paths:
             raise LoboWatcherError(f"{body} has missing or extra decision NPZ files")
+        disk_diagnostic_paths = {
+            path.relative_to(branches_root / body).as_posix()
+            for path in (branches_root / body / "groups").glob("*.diagnostics.npz")
+            if path.is_file()
+        }
+        if disk_diagnostic_paths != observed_diagnostic_paths:
+            raise LoboWatcherError(
+                f"{body} has missing or extra diagnostic NPZ files"
+            )
         if sha256_file(manifest_path) != before_sha:
             raise LoboWatcherError(f"{body} manifest changed during validation")
         manifest_bindings[body] = {
@@ -633,6 +850,7 @@ def validate_complete_collection(
             },
             "manifest_file_sha256": before_sha,
             "manifest_logical_sha256": manifest["logical_sha256"],
+            "diagnostic_sidecars": len(observed_diagnostic_paths),
         }
     if decision_count != TOTAL_DECISIONS or branch_count != TOTAL_BRANCHES:
         raise LoboWatcherError("five-body collection total is not exactly 2000/8000")
@@ -642,11 +860,17 @@ def validate_complete_collection(
         "branches": branch_count,
         "bodies": manifest_audits,
         "adapter_implementation_sha256": shared_adapter_sha,
+        "collector_file_sha256": shared_collector_sha,
         "event_spec_sha256": shared_event_spec_sha,
         "event_derivation_implementation_sha256": shared_event_implementation_sha,
         "action_horizons": sorted(action_horizons),
         "outcome_or_event_arrays_interpreted_by_watcher": False,
         "candidate_index_and_dt_arrays_interpreted_by_watcher": True,
+        "diagnostic_arrays_interpreted_as_training_labels": False,
+        "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+        "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+        "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+        "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
         "manifest_bindings": manifest_bindings,
     }
 
@@ -707,6 +931,7 @@ def summarize_fold(
     summary_path = path / "training_summary.json"
     summary = read_json(summary_path, f"{held_out_body} training summary")
     members = summary.get("members")
+    ensemble_selection = summary.get("ensemble_checkpoint_selection")
     if (
         summary.get("status") != "source_only_checkpoint_selection_complete"
         or summary.get("held_out_body") != held_out_body
@@ -724,6 +949,23 @@ def summarize_fold(
         or not isinstance(summary.get("preflight"), Mapping)
         or summary["preflight"].get("binding_file_sha256")
         != expected_binding_sha256
+        or not isinstance(summary.get("trainer_file_sha256"), str)
+        or len(summary["trainer_file_sha256"]) != 64
+        or not isinstance(ensemble_selection, Mapping)
+        or ensemble_selection.get("common_step_required_for_all_five_members")
+        is not True
+        or ensemble_selection.get("rank_aggregation", {}).get("format")
+        != "etsf_within_decision_standardized_rank_ensemble_v1"
+        or not isinstance(
+            ensemble_selection.get("selected_ensemble_candidate_ranking"),
+            Mapping,
+        )
+        or any(
+            member.get("best_step") != ensemble_selection.get("selected_step")
+            or member.get("trainer_file_sha256")
+            != summary.get("trainer_file_sha256")
+            for member in members
+        )
     ):
         raise LoboWatcherError(f"{held_out_body} training summary violates outer-LOBO")
     for member in members:
@@ -793,6 +1035,11 @@ def summarize_fold(
                 "support_by_member": nested_values(members, "object_support"),
             },
         },
+        "deployment_homomorphic_ensemble_source_validation": (
+            ensemble_selection["selected_ensemble_candidate_ranking"]
+        ),
+        "ensemble_common_selection_step": ensemble_selection["selected_step"],
+        "trainer_file_sha256": summary["trainer_file_sha256"],
         "member_best_steps": [member.get("best_step") for member in members],
         "member_checkpoints": [
             {
@@ -808,112 +1055,142 @@ def summarize_fold(
     }
 
 
-def build_authorities(
+def validate_existing_authorities(
     args: argparse.Namespace,
     collection: Mapping[str, Any],
     checkpoint_sha: str,
     checkpoint_files: int,
     checkpoint_bytes: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    authority_dir = args.actor_authority.parent.resolve()
+    """Reuse the immutable artifacts produced by actor-to-branches.
+
+    The upstream watcher owns these files.  Reconstructing them here used to
+    create a second, incompatible schema at the same paths and would stop the
+    pipeline after all 8,000 branches had already been collected.
+    """
+
+    actor_authority = read_json(args.actor_authority, "actor authority")
+    verify_logical_sha(actor_authority, "actor authority")
+    sampling_contract = actor_authority.get("sampling_contract")
+    actors = actor_authority.get("actors")
+    if (
+        actor_authority.get("format") != ACTOR_FORMAT
+        or actor_authority.get("task") != TASK
+        or actor_authority.get("dataset_repo") != DATASET_REPO
+        or actor_authority.get("dataset_revision") != DATASET_REVISION
+        or actor_authority.get("public_expert_episode_count") != 2750
+        or actor_authority.get("one_universal_actor_for_all_five_bodies") is not True
+        or not isinstance(sampling_contract, Mapping)
+        or sampling_contract.get("format")
+        != "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v1"
+        or sampling_contract.get("frozen_actor_checkpoint_tree_sha256")
+        != checkpoint_sha
+        or sampling_contract.get("collector_file_sha256")
+        != collection["collector_file_sha256"]
+        or sampling_contract.get("canonical_adapter_file_sha256")
+        != collection["adapter_implementation_sha256"]
+        or sampling_contract.get("candidate_count") != CANDIDATE_COUNT
+        or sampling_contract.get("candidate_indices") != list(range(CANDIDATE_COUNT))
+        or sampling_contract.get("candidate_zero_is_actor_baseline") is not True
+        or sampling_contract.get("same_ordered_candidate_set_for_baseline_and_etsf")
+        is not True
+        or sampling_contract.get("candidate_noise_contract")
+        != CANDIDATE_NOISE_CONTRACT
+        or sampling_contract.get("conditions") != list(CONDITIONS)
+        or sampling_contract.get("root_query_indices") != list(QUERY_INDICES)
+        or sampling_contract.get("action_exec_steps") != 5
+        or sampling_contract.get("max_policy_action_calls") != 200
+        or sampling_contract.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or sampling_contract.get("event_derivation_implementation_sha256")
+        != collection["event_derivation_implementation_sha256"]
+        or sampling_contract.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+        or sampling_contract.get("terminal_supervision_contract")
+        != TERMINAL_SUPERVISION_CONTRACT
+        or sampling_contract.get("branch_diagnostic_contract")
+        != BRANCH_DIAGNOSTIC_CONTRACT
+        or not isinstance(actors, Mapping)
+        or set(actors) != set(BODIES)
+    ):
+        raise LoboWatcherError("existing actor authority violates the frozen collection")
     checkpoint_relative = contained_relative(
-        authority_dir, args.actor_checkpoint, "actor checkpoint"
+        args.actor_authority.parent.resolve(), args.actor_checkpoint, "actor checkpoint"
     )
-    sampling_contract = {
-        "format": "etsf_robotwin2_five_body_ordered_flow_candidate_contract_v1",
-        "collector_format": COLLECTOR_FORMAT,
-        "task": TASK,
-        "conditions": list(CONDITIONS),
-        "development_seed_interval": {
-            "start_inclusive": SEED_START,
-            "stop_exclusive": DEVELOPMENT_SEED_STOP,
-        },
-        "seeds_per_body_condition_query": SEEDS_PER_CONDITION_QUERY,
-        "supplemental_development_seeds_after_terminal_root_skip_allowed": True,
-        "root_query_indices": list(QUERY_INDICES),
-        "candidate_count": CANDIDATE_COUNT,
-        "candidate_zero_is_actor_baseline": True,
-        "same_ordered_candidate_set_for_baseline_and_etsf": True,
-        "state_schema": STATE_SCHEMA,
-        "action_schema": ACTION_SCHEMA,
-        "actor_checkpoint_sha256": checkpoint_sha,
-        "adapter_implementation_sha256": collection["adapter_implementation_sha256"],
-        "event_spec_sha256": collection["event_spec_sha256"],
-        "planned_dt_seconds": 5.0 / 15.0,
-        "duration_time_source": "counted_successful_sapien_scene_step_calls",
-    }
     sampling_sha = canonical_sha256(sampling_contract)
-    actors = {
-        body: {
-            "family": "smolvla_v0.4.4_universal_five_body_ee16_actor",
-            "frozen": True,
-            "optimizer_updates_allowed": False,
-            "checkpoint_path": checkpoint_relative,
-            "checkpoint_kind": "directory_tree",
-            "checkpoint_sha256": checkpoint_sha,
-            "checkpoint_file_count": checkpoint_files,
-            "checkpoint_total_bytes": checkpoint_bytes,
-            "sampling_contract_sha256": sampling_sha,
-            "candidate_count": CANDIDATE_COUNT,
-            "candidate_zero_is_actor_baseline": True,
-            "same_ordered_candidate_set_for_baseline_and_etsf": True,
-        }
-        for body in BODIES
-    }
-    actor_authority = signed(
-        {
-            "format": ACTOR_FORMAT,
-            "task": TASK,
-            "universal_actor_same_checkpoint_for_all_bodies": True,
-            "sampling_contract": sampling_contract,
-            "actors": actors,
-        }
-    )
-    create_once_or_verify(args.actor_authority, actor_authority, "actor authority")
+    config_sha: str | None = None
+    for body in BODIES:
+        actor = actors[body]
+        if (
+            not isinstance(actor, Mapping)
+            or actor.get("embodiment") != body
+            or actor.get("shared_checkpoint_across_all_five_bodies") is not True
+            or actor.get("frozen") is not True
+            or actor.get("optimizer_updates_allowed") is not False
+            or actor.get("checkpoint_path") != checkpoint_relative
+            or actor.get("checkpoint_kind") != "directory_tree"
+            or actor.get("checkpoint_sha256") != checkpoint_sha
+            or actor.get("checkpoint_tree_file_count") != checkpoint_files
+            or actor.get("checkpoint_tree_size_bytes") != checkpoint_bytes
+            or actor.get("policy_type") != "smolvla"
+            or actor.get("state_shape") != [16]
+            or actor.get("action_shape") != [16]
+            or actor.get("sampling_contract_sha256") != sampling_sha
+            or actor.get("candidate_count") != CANDIDATE_COUNT
+            or actor.get("candidate_zero_is_actor_baseline") is not True
+            or actor.get("same_ordered_candidate_set_for_baseline_and_etsf") is not True
+            or not isinstance(actor.get("config_file_sha256"), str)
+            or len(actor["config_file_sha256"]) != 64
+        ):
+            raise LoboWatcherError(f"existing actor authority changed for {body}")
+        if config_sha is None:
+            config_sha = str(actor["config_file_sha256"])
+        elif actor["config_file_sha256"] != config_sha:
+            raise LoboWatcherError("five actor rows do not share one frozen config")
     actor_file_sha = sha256_file(args.actor_authority)
+
+    binding = read_json(args.binding, "training binding")
+    verify_logical_sha(binding, "training binding")
     binding_dir = args.binding.parent.resolve()
     materialization_relative = contained_relative(
         binding_dir, args.materialization_receipt, "materialization receipt"
     )
     actor_relative = contained_relative(binding_dir, args.actor_authority, "actor authority")
-    body_bindings: dict[str, Any] = {}
+    expected_body_bindings: dict[str, Any] = {}
     for body in BODIES:
         manifest_path = args.branches_root / body / "manifest.json"
-        body_bindings[body] = {
+        expected_body_bindings[body] = {
             "path": contained_relative(binding_dir, manifest_path, f"{body} manifest"),
             "sha256": collection["bodies"][body]["manifest_file_sha256"],
         }
-    binding = signed(
-        {
-            "format": BINDING_FORMAT,
-            "dataset_repo": DATASET_REPO,
-            "dataset_revision": DATASET_REVISION,
-            "task": TASK,
-            "event_spec_sha256": EVENT_SPEC_SHA256,
-            "heldout_labels_may_train_fit_calibrate_or_select": False,
-            "canonical_shared_body_rows": 1,
-            "execution_authority": {
-                "explicit_user_training_request_recorded": True,
-                "public_data_only": True,
-                "protected_internal_data_allowed": False,
-                "remote_cuda_only": True,
-            },
-            "materialization_receipt": {
-                "path": materialization_relative,
-                "sha256": sha256_file(args.materialization_receipt),
-            },
-            "actor_authority": {"path": actor_relative, "sha256": actor_file_sha},
-            "body_manifests": body_bindings,
-            "collection_audit": {
-                "decisions": collection["decisions"],
-                "branches": collection["branches"],
-                "five_bodies": list(BODIES),
-                "conditions": list(CONDITIONS),
-                "outcome_or_event_arrays_interpreted_by_watcher": False,
-            },
+    if (
+        binding.get("format") != BINDING_FORMAT
+        or binding.get("dataset_repo") != DATASET_REPO
+        or binding.get("dataset_revision") != DATASET_REVISION
+        or binding.get("task") != TASK
+        or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+        or binding.get("terminal_supervision_contract")
+        != TERMINAL_SUPERVISION_CONTRACT
+        or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+        or binding.get("branch_diagnostic_contract") != BRANCH_DIAGNOSTIC_CONTRACT
+        or binding.get("heldout_labels_may_train_fit_calibrate_or_select") is not False
+        or binding.get("canonical_shared_body_rows") != 1
+        or binding.get("execution_authority")
+        != {
+            "explicit_user_training_request_recorded": True,
+            "public_data_only": True,
+            "protected_internal_data_allowed": False,
+            "remote_cuda_only": True,
         }
-    )
-    create_once_or_verify(args.binding, binding, "training binding")
+        or binding.get("materialization_receipt")
+        != {
+            "path": materialization_relative,
+            "sha256": sha256_file(args.materialization_receipt),
+        }
+        or binding.get("actor_authority")
+        != {"path": actor_relative, "sha256": actor_file_sha}
+        or binding.get("body_manifests") != expected_body_bindings
+    ):
+        raise LoboWatcherError("existing training binding changed after collection")
     return actor_authority, binding
 
 
@@ -987,11 +1264,19 @@ def main() -> int:
         progress = collection_progress(args.branches_root)
         reject_irrecoverable_progress(progress)
         actor_ready = args.actor_checkpoint.is_dir()
-        if not progress_is_complete(progress) or not actor_ready:
+        upstream_authorities_ready = (
+            args.actor_authority.is_file() and args.binding.is_file()
+        )
+        if (
+            not progress_is_complete(progress)
+            or not actor_ready
+            or not upstream_authorities_ready
+        ):
             write_state(
                 "waiting_for_complete_public_branches",
                 collection_progress=progress,
                 actor_checkpoint_present=actor_ready,
+                upstream_authorities_present=upstream_authorities_ready,
                 gpu=gpu,
                 gpu_reserved_by_watcher=False,
             )
@@ -1008,7 +1293,7 @@ def main() -> int:
 
     write_state("hashing_frozen_actor_checkpoint", collection_audit=collection, gpu=gpu)
     checkpoint_sha, checkpoint_files, checkpoint_bytes = sha256_tree(args.actor_checkpoint)
-    actor_authority, binding = build_authorities(
+    actor_authority, binding = validate_existing_authorities(
         args, collection, checkpoint_sha, checkpoint_files, checkpoint_bytes
     )
     binding_sha = sha256_file(args.binding)
@@ -1110,7 +1395,9 @@ def main() -> int:
         )
 
     macro_deltas = [
-        row["source_validation"]["macro_best_of_4_delta_success_rate"]["mean"]
+        row["deployment_homomorphic_ensemble_source_validation"][
+            "macro_delta_success_rate"
+        ]
         for row in fold_results
     ]
     final = signed(
