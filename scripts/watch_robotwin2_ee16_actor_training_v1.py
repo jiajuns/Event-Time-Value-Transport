@@ -24,6 +24,7 @@ LEROBOT_ROOT = Path("/home/user/etsf_stage0/lerobot")
 PYTHON = Path("/home/user/etsf_stage0/.venv_lerobot_smolvla_v044/bin/python")
 TRAIN = Path("/home/user/etsf_stage0/.venv_lerobot_smolvla_v044/bin/lerobot-train")
 BASE_MODEL = Path("/home/user/etsf_smolvla_models/smolvla_base_c83c3163")
+VLM_METADATA = Path("/home/user/etsf_stage0/offline_assets/smolvlm2_500m_metadata")
 OUTPUT_ROOT = Path(
     "/home/user/etsf_smolvla_models/"
     "smolvla_robotwin2_move_can_pot_5emb_ee16_full2750_20k_20260830"
@@ -65,7 +66,7 @@ def compact_json(value: object) -> str:
 
 def write_state(status: str, **extra: object) -> None:
     payload = {
-        "format": "etsf_robotwin2_ee16_actor_training_watcher_v1",
+        "format": "etsf_robotwin2_ee16_actor_training_watcher_v2",
         "status": status,
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         "dataset_id": DATASET_ID,
@@ -138,6 +139,12 @@ def training_command() -> list[str]:
     return [
         str(TRAIN),
         f"--policy.path={BASE_MODEL}",
+        # The complete SmolVLA checkpoint below supplies every VLM weight.
+        # Construct the identical architecture from the reviewed local
+        # config/tokenizer bundle, then let policy.from_pretrained load the
+        # checkpoint instead of attempting an unnecessary Hub download.
+        f"--policy.vlm_model_name={VLM_METADATA}",
+        "--policy.load_vlm_weights=false",
         f"--policy.input_features={compact_json(INPUT_FEATURES)}",
         f"--policy.output_features={compact_json(OUTPUT_FEATURES)}",
         "--policy.adapt_to_pi_aloha=false",
@@ -168,35 +175,50 @@ def main() -> int:
             "PYTHONNOUSERSITE": "1",
             "PYTHONUNBUFFERED": "1",
             "HF_HOME": "/home/user/.cache/huggingface",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
             "PYTHONPATH": f"{LEROBOT_ROOT / 'src'}:{ROBOTWIN_ROOT}",
             "CUDA_VISIBLE_DEVICES": "0",
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
-    for required in (PYTHON, TRAIN, BASE_MODEL, ROBOTWIN_ROOT, LEROBOT_ROOT):
+    for required in (
+        PYTHON,
+        TRAIN,
+        BASE_MODEL,
+        BASE_MODEL / "model.safetensors",
+        VLM_METADATA,
+        VLM_METADATA / "config.json",
+        VLM_METADATA / "tokenizer.json",
+        ROBOTWIN_ROOT,
+        LEROBOT_ROOT,
+    ):
         if not required.exists():
             raise FileNotFoundError(required)
     if OUTPUT_ROOT.exists():
         raise FileExistsError(f"training output already exists: {OUTPUT_ROOT}")
     if DATASET_ROOT.exists():
-        raise FileExistsError(f"dataset destination already exists: {DATASET_ROOT}")
-
-    convert = conversion_command()
-    write_state("conversion_running", conversion_command=convert)
-    with CONVERT_LOG.open("w", encoding="utf-8") as stream:
-        conversion = subprocess.run(
-            convert,
-            cwd=ROBOTWIN_ROOT,
-            env=environment,
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
-    write_state("conversion_exited", conversion_exit_code=conversion.returncode)
-    if conversion.returncode != 0:
-        raise RuntimeError(f"conversion failed with exit code {conversion.returncode}")
-
-    dataset_contract = validate_dataset()
+        dataset_contract = validate_dataset()
+        conversion_exit_code = 0
+        dataset_reused_after_strict_validation = True
+    else:
+        convert = conversion_command()
+        write_state("conversion_running", conversion_command=convert)
+        with CONVERT_LOG.open("w", encoding="utf-8") as stream:
+            conversion = subprocess.run(
+                convert,
+                cwd=ROBOTWIN_ROOT,
+                env=environment,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        write_state("conversion_exited", conversion_exit_code=conversion.returncode)
+        if conversion.returncode != 0:
+            raise RuntimeError(f"conversion failed with exit code {conversion.returncode}")
+        dataset_contract = validate_dataset()
+        conversion_exit_code = conversion.returncode
+        dataset_reused_after_strict_validation = False
     free_bytes = shutil.disk_usage("/home/user").free
     if free_bytes < 20 * 1024**3:
         raise RuntimeError(f"less than 20 GiB free before training: {free_bytes}")
@@ -213,8 +235,11 @@ def main() -> int:
         TRAIN_PID_PATH.write_text(f"{training.pid}\n", encoding="utf-8")
         write_state(
             "training_running",
-            conversion_exit_code=conversion.returncode,
+            conversion_exit_code=conversion_exit_code,
             dataset_contract=dataset_contract,
+            dataset_reused_after_strict_validation=dataset_reused_after_strict_validation,
+            offline_vlm_metadata=str(VLM_METADATA),
+            offline_checkpoint_weights=str(BASE_MODEL / "model.safetensors"),
             free_bytes_before_training=free_bytes,
             training_pid=training.pid,
             training_command=train,
