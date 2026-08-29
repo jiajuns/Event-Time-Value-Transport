@@ -2507,6 +2507,122 @@ def effect_preserving_group_bootstrap_weights(
     return weights.astype(np.float32, copy=False), audit
 
 
+def proper_outcome_preserving_group_bootstrap_weights(
+    rows: Sequence[Mapping[str, Any]], *, members: int, seed: int
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Keep every proper-likelihood member identifiable for task success.
+
+    The ordinary Poisson group bootstrap is retained exactly unless it drops
+    every success-positive or every success-negative logical group for one
+    member.  In that rare case one complete mixed-success decision is restored
+    with unit weight.  Restoring a whole decision preserves the same-root
+    candidate dependence and gives the coherent terminal-event/success heads
+    both outcome classes without introducing a global class weight.
+    """
+
+    group_order = [str(row["logical_group"]) for row in rows]
+    weights = core.logical_group_bootstrap_weights(
+        group_order, members=members, seed=seed
+    )
+    if weights.shape != (members, len(rows)):
+        raise FiveBodyContractError("proper bootstrap returned an invalid shape")
+
+    indices_by_group: dict[str, list[int]] = defaultdict(list)
+    for index, group in enumerate(group_order):
+        indices_by_group[group].append(index)
+    positive_groups: list[str] = []
+    negative_groups: list[str] = []
+    mixed_groups: list[str] = []
+    for group, indices in sorted(indices_by_group.items()):
+        if not all(bool(rows[index]["success_mask"]) for index in indices):
+            raise FiveBodyContractError(
+                "proper success bootstrap requires complete group supervision"
+            )
+        outcomes = {float(rows[index]["success"]) for index in indices}
+        if not outcomes <= {0.0, 1.0}:
+            raise FiveBodyContractError(
+                "proper success bootstrap found a non-binary outcome"
+            )
+        if 1.0 in outcomes:
+            positive_groups.append(group)
+        if 0.0 in outcomes:
+            negative_groups.append(group)
+        if outcomes == {0.0, 1.0}:
+            mixed_groups.append(group)
+    if not positive_groups or not negative_groups or not mixed_groups:
+        raise FiveBodyContractError(
+            "proper outcome-preserving bootstrap requires positive, negative, "
+            "and mixed-success logical groups"
+        )
+
+    audit: list[dict[str, Any]] = []
+    for member in range(members):
+        repaired_groups: list[str] = []
+
+        def active(group: str) -> bool:
+            return float(weights[member, indices_by_group[group][0]]) > 0.0
+
+        if not any(active(group) for group in positive_groups) or not any(
+            active(group) for group in negative_groups
+        ):
+            selector = int.from_bytes(
+                hashlib.sha256(
+                    f"{seed}|proper-outcome|{member}".encode()
+                ).digest()[:8],
+                "big",
+            )
+            repaired = mixed_groups[selector % len(mixed_groups)]
+            selected = indices_by_group[repaired]
+            weights[member, selected] = np.maximum(
+                weights[member, selected], np.float32(1.0)
+            )
+            repaired_groups.append(repaired)
+
+        active_indices = [
+            index for index in range(len(rows)) if float(weights[member, index]) > 0.0
+        ]
+        positive_rows = sum(
+            float(rows[index]["success"]) > 0.5 for index in active_indices
+        )
+        negative_rows = sum(
+            float(rows[index]["success"]) <= 0.5 for index in active_indices
+        )
+        active_positive_groups = sum(active(group) for group in positive_groups)
+        active_negative_groups = sum(active(group) for group in negative_groups)
+        active_mixed_groups = sum(active(group) for group in mixed_groups)
+        if (
+            not positive_rows
+            or not negative_rows
+            or not active_positive_groups
+            or not active_negative_groups
+        ):
+            raise FiveBodyContractError(
+                "proper outcome-preserving bootstrap lost identifiable success support"
+            )
+        for group, indices in indices_by_group.items():
+            group_values = weights[member, indices]
+            if not np.all(group_values == group_values[0]):
+                raise FiveBodyContractError(
+                    f"proper bootstrap changed within logical group {group}"
+                )
+        audit.append(
+            {
+                "member": member,
+                "positive_rows_with_nonzero_weight": int(positive_rows),
+                "negative_rows_with_nonzero_weight": int(negative_rows),
+                "positive_groups_with_nonzero_weight": int(active_positive_groups),
+                "negative_groups_with_nonzero_weight": int(active_negative_groups),
+                "mixed_success_groups_with_nonzero_weight": int(active_mixed_groups),
+                "positive_groups_total": len(positive_groups),
+                "negative_groups_total": len(negative_groups),
+                "mixed_success_groups_total": len(mixed_groups),
+                "deterministic_mixed_group_repairs": len(repaired_groups),
+                "repaired_groups": repaired_groups,
+            }
+        )
+    return weights.astype(np.float32, copy=False), audit
+
+
 def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str, Any]:
     output = args.output.expanduser().resolve()
     if output.exists():
@@ -2590,8 +2706,10 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
     )
     device = torch.device(args.device)
     group_order = [str(row["logical_group"]) for row in train_rows]
-    proper_bootstrap = core.logical_group_bootstrap_weights(
-        group_order, members=5, seed=args.split_seed
+    proper_bootstrap, proper_bootstrap_support = (
+        proper_outcome_preserving_group_bootstrap_weights(
+            train_rows, members=5, seed=args.split_seed
+        )
     )
     rank_bootstrap, bootstrap_support = effect_preserving_group_bootstrap_weights(
         train_rows, members=5, seed=args.split_seed
@@ -2939,6 +3057,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         "mixed_outcome_source_decisions": mixed_outcome_decisions,
         "source_negative_to_positive_ratio": source_negative_to_positive_ratio,
         "ensemble_bootstrap_effect_support": bootstrap_support,
+        "ensemble_proper_bootstrap_outcome_support": proper_bootstrap_support,
         "success_probability_training_loss": "unweighted_proper_binary_cross_entropy",
         "checkpoint_selection_primary": (
             "five_member_standardized_one_deviation_source_validation_surrogate"
@@ -3034,6 +3153,7 @@ __all__ = [
     "build_preflight_receipt", "canonical_sha256",
     "candidate_checkpoint_selection_key", "checkpoint_candidate_rank_contract",
     "effect_preserving_group_bootstrap_weights", "load_binding",
+    "proper_outcome_preserving_group_bootstrap_weights",
     "evaluate_candidate_ranking", "materialize_source_rows", "sha256_file",
     "sha256_tree", "source_group_split", "summary_candidate_rank_contract",
     "standardized_rank_ensemble_contract",

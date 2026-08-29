@@ -62,6 +62,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     checkpoint_candidate_rank_contract,
     candidate_checkpoint_selection_key,
     effect_preserving_group_bootstrap_weights,
+    proper_outcome_preserving_group_bootstrap_weights,
     evaluate_candidate_ranking,
     load_binding,
     materialize_source_rows,
@@ -913,6 +914,50 @@ def test_effect_bootstrap_uses_one_plus_poisson_for_every_mixed_group(
     assert all(item["mixed_success_groups_total"] == 1 for item in audit)
     assert all(item["mixed_weight_minimum"] == 1 for item in audit)
     assert all(item["deterministic_mixed_group_repairs"] == 0 for item in audit)
+
+
+def test_proper_bootstrap_repairs_only_missing_binary_outcome_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        {
+            "logical_group": "piper|clean|mixed",
+            "success": float(index == 1),
+            "success_mask": 1.0,
+        }
+        for index in range(4)
+    ]
+    rows += [
+        {
+            "logical_group": "piper|clean|failure",
+            "success": 0.0,
+            "success_mask": 1.0,
+        }
+        for _index in range(4)
+    ]
+    base = np.zeros((5, len(rows)), dtype=np.float32)
+    base[1:, :4] = 2.0
+    base[1:, 4:] = 1.0
+    monkeypatch.setattr(
+        core,
+        "logical_group_bootstrap_weights",
+        lambda groups, *, members, seed: base.copy(),
+    )
+    weights, audit = proper_outcome_preserving_group_bootstrap_weights(
+        rows, members=5, seed=17
+    )
+    assert weights.shape == (5, 8)
+    assert np.all(weights[0, :4] == 1.0)
+    assert np.all(weights[0, 4:] == 0.0)
+    assert np.array_equal(weights[1:], base[1:])
+    assert audit[0]["deterministic_mixed_group_repairs"] == 1
+    assert all(
+        item["deterministic_mixed_group_repairs"] == 0 for item in audit[1:]
+    )
+    assert all(item["positive_rows_with_nonzero_weight"] > 0 for item in audit)
+    assert all(item["negative_rows_with_nonzero_weight"] > 0 for item in audit)
+    assert all(item["positive_groups_with_nonzero_weight"] > 0 for item in audit)
+    assert all(item["negative_groups_with_nonzero_weight"] > 0 for item in audit)
 
 
 def test_dense_goal_progress_uses_frozen_soft_target_inside_max_event() -> None:

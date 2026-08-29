@@ -146,6 +146,12 @@ distance/progress、终止原因、事件年龄和剩余预算。正常成功、
 2. balanced rank-only stream：训练四候选 listwise utility。它可过采样稀有 mixed-success decision，
    但不会反向更新 world/terminal heads，也不会改变概率先验。
 
+五个 ensemble member 的 proper stream 仍使用 logical-group Poisson bootstrap，但新增了结果支持保持：
+若某个 member 恰好把全部成功组或全部失败组抽成零权重，只确定性恢复一个完整 mixed-success
+decision 的单位权重。修复以四候选 decision 为整体，不拆组、不使用全局 `pos_weight`，因此既保留
+同根相关性，也保证每个 member 的 terminal-event / coherent-success 头都实际见过两类结果。每个
+member 的非零正负行、正负组、mixed group 和修复次数全部写入训练摘要。
+
 terminal-event 和 terminal-progress 的初始 loss 权重均为 0.5。全失败 decision 的 dense rank 只占
 0.1 权重：先比较达到的最大事件，再在相同最大事件内比较终局目标进度。mixed-success decision
 直接训练把概率质量分给成功候选。
