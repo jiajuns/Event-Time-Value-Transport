@@ -50,14 +50,28 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
 旧训练只优化逐行六头损失，且每个本体 action stem 独立；目标本体 action stem 没有训练样本时仍是
 随机网络。v2 取消这种关节索引别名，并把同一 root 的四个 candidate 始终放在同一 batch：
 
-- event/success/recovery/duration 保留 unweighted proper loss，`sigmoid(success_logit)` 仍可解释为
-  成功概率，不使用会改变先验的 class-weighted BCE；
-- 增加独立 `candidate_rank_logit`。同根四候选只要同时存在成功/失败，就直接最小化“softmax
+- 每个 optimizer step 使用两个互不替代的数据流：uniform complete-decision batch 只训练
+  event/success/recovery/duration 的 unweighted proper loss 与 object Student-t(3) NLL；另一个
+  balanced rank-only batch 只训练 group listwise utility。`sigmoid(success_logit)` 因此仍可解释为
+  成功概率，不使用会改变先验的 class-weighted BCE，也不让 mixed oversampling 改写概率先验；
+- v5 的 `candidate_rank_logit` 不再读取自由的 `transitioned` latent 或 `clock_hidden`。排序头只接收
+  28 维显式 predicted-consequence 向量：post-event 五类概率、next-event 五类概率、成功概率、恢复
+  概率、当前事件 duration 的 `log1p` 分布 mean/scale、moving-object SE(3) effect 的六维
+  mean/scale，以及由 `state[0:3]` relative goal 与预测 object translation 计算的目标距离进展和
+  Student-t(3) 径向不确定性。目标进展严格定义为
+  `||relative_goal|| - ||relative_goal - predicted_object_translation||`；不确定性用 object
+  translation scale 的 delta-method 径向标准差；
+- 上述 consequence feature 在进入 utility MLP 前整体 stop-gradient。listwise loss 只学习如何组合
+  已校准的事件、结果、时间和对象预测，不会把 proper prediction head 或 shared transition 重新训练成
+  绕开事件语义的隐式 critic；这些预测头仍由各自 proper likelihood 和 robust object-effect loss
+  训练；
+- 同根四候选只要同时存在成功/失败，就直接最小化“softmax
   分给任一成功候选的概率质量”的负对数；不再让大量 failure/failure pair 淹没真正改变成功率的
   监督；
-- 全失败 decision 才以 `0.1` 权重学习完整 continuation 的严格 tuple 词典序：先比较
-  `terminal_max_event_id`，仅同事件阶段时再比较 `terminal_goal_progress`。不再把标签乘
-  `100/10` 相加，异常对象运动不能翻转 success/event 优先级；
+- 全失败 decision 才以 `0.1` 权重学习完整 continuation：先严格限制在最大的
+  `terminal_max_event_id` 层，层外目标质量恒为零；层内按冻结的 `0.02m` goal-progress softmax
+  温度分配 listwise 目标（`no_object_effect` 在最高层均匀）。不再把标签乘 `100/10` 相加，也不把
+  `1e-6m` 数值抖动硬标成唯一最优；
 - 对象效果使用 Student-t(3) 稳健 NLL，避免旧 Gaussian scale head 的少数异常值把 validation
   object loss 推到上千并拖坏 shared trunk；
 - 五个成员不再各自挑一个 raw-logit 最优 checkpoint。每个成员保存相同 eval step 的 source-only
@@ -65,14 +79,20 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
   body×condition 宏平均 best-of-4 `ΔSR`，其次依次为 mixed-success decision 的选中成功率和
   success-changing pair accuracy；只有这些同分时才看全失败 dense continuation 排序，五成员六头
   复合预测分数均值最后破同分；
-- `dt` 与 duration 都使用物理秒，duration 不再主导候选重排 checkpoint。
+- `dt`、duration 与 `event_age_seconds` 都使用计数 simulator step 得到的物理秒。事件年龄是“当前规范
+  事件自最近一次进入以来的已持续时间”，在候选执行前可得，同根四候选完全相同；它和 planned `dt`
+  一起进入 proper duration 分布，再由 duration mean/scale 间接进入 utility，不存在
+  `clock_hidden → rank` 的自由直通；duration 也不再主导候选重排 checkpoint。
 
 这样训练目标直接对应最终的“candidate 0 与 best-of-4 哪个成功”，而不是靠 AUC/MAE 猜测重排是否
 可能有效。
 
-五成员仍采用 decision-group Poisson bootstrap，但会确定性修复极少数把所有 mixed-success group
-抽成零权重的成员：每个成员都必须实际看到正样本、负样本和至少一个同根成功/失败比较。修复只改变
-训练采样权重，不读取 held-out，也不靠推理门控掩盖一个没有学到成功排序的成员。
+五成员的 uniform proper 数据流仍使用原始 decision-group Poisson bootstrap。rank-only 数据流对每个
+mixed-success decision 使用 `1 + Poisson(1)`，保证五个成员都看到每个稀有成功改变比较，同时保留
+成员间权重差异；全失败 decision 继续使用可为零的 `Poisson(1)`。rank sampler 在
+`body × condition × current_event` 间轮转，尽量让每个 batch 同时包含 mixed 与 dense group，且同一
+logical group 绝不在同一 batch 重复。该重采样只作用于 utility listwise loss，不读取 held-out，
+也不改变 proper success/event 概率的训练分布。
 
 ## Canonical group 契约
 
@@ -98,10 +118,11 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
 source validation 按 `(body, condition, requested_seed)` 切分；同一 reset seed 的全部 query 必须留在
 同一 lane，不能把 query 0/10/20/30 拆到 train/validation 后虚高 checkpoint-selection `ΔSR`。
 
-候选 rank 显式拼接 `transitioned`、`clock_hidden` 和 current-event 的 duration
-`log_mean/log_scale`，所以 planned `dt=5/15` 对最终 score 有数值计算路径。rank 梯度继续更新
-state/action/transition backbone；clock 与 duration 特征在 rank 分支处 detach，只由 proper duration
-likelihood 更新，rank loss 不直接改写 clock/duration heads。
+候选 rank 只拼接显式 consequence prediction。planned `dt=5/15` 与当前物理事件年龄先经过隔离
+clock 形成 proper current-event duration 分布，再以该分布的 mean/scale 间接进入 utility；`transitioned` 和
+`clock_hidden` 本身都不进入排序特征。整块 28 维 feature 在 rank 分支处 detach，因此 rank loss
+只更新 utility MLP，不直接更新 state/action/transition backbone 或任何 event、success、recovery、
+duration、object predictor；这些模块只由其 proper/robust 监督更新。
 
 五成员部署聚合也不再直接平均不可比的 raw logit。对每个 decision、每个 member 的四个分数先减去
 该 member 的候选均值，再除以四候选 population std；std 不大于 `1e-6` 的常数成员贡献全零，最后
@@ -177,8 +198,9 @@ commitment 和完整 paired simulator result，不能用 critic AUC/Brier 替代
 `2000 decision × 4 candidate = 8000` 分支 binding，并固定运行四个 variant：
 
 - `success_only`：只训练 proper success BCE，直接按 success logit 选候选；
-- `no_time_duration`：关闭 duration loss，并把 rank 的 clock/duration 输入置零；
-- `no_object_effect`：关闭 robust object-effect loss 和 rank target 的 geometric progress；
+- `no_time_duration`：关闭 duration loss，并把 consequence utility 的 duration mean/scale 两维置零；
+- `no_object_effect`：关闭 robust object-effect loss 和 rank target 的 geometric progress，并把 utility
+  的 object mean/scale、predicted goal progress/uncertainty 共十四维置零；
 - `full`：正式完整共享头。
 
 四者使用完全相同的 requested-seed-disjoint split、五折、五成员 seed、每成员 3000 step、eval

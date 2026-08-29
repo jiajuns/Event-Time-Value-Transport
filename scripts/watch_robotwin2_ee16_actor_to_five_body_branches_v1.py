@@ -76,6 +76,13 @@ TERMINAL_SUPERVISION_CONTRACT = {
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
     "same_stage_progress_definition_as_formal_paired_runner": True,
 }
+EVENT_AGE_CONTRACT = {
+    "array": "event_age_seconds",
+    "semantics": "elapsed_physical_seconds_since_current_canonical_event_entry",
+    "clock_source": "counted_successful_sapien_scene_step_calls",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
+}
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": DIAGNOSTIC_FORMAT,
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
@@ -362,6 +369,7 @@ def freeze_actor_authority(
         "analytic_goal_rule": analytic_event.GOAL_RULE,
         "object_effect_schema": OBJECT_EFFECT_SCHEMA,
         "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+        "event_age_contract": EVENT_AGE_CONTRACT,
         "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
         "wall_clock_used_as_physical_time": False,
     }
@@ -475,6 +483,8 @@ def collector_command(
         str(seed_count),
         "--root-query-indices",
         *(str(query) for query in queries),
+        "--manifest-root-query-indices",
+        *(str(query) for query in ROOT_QUERIES),
         "--action-exec-steps",
         str(ACTION_EXEC_STEPS),
         "--max-steps",
@@ -570,6 +580,7 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or value.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
+        or value.get("event_age_contract") != EVENT_AGE_CONTRACT
         or value.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or value.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
@@ -754,6 +765,7 @@ def finalize_body_manifest(
             "collector_file_sha256": static["collector_sha256"],
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "event_age_contract": EVENT_AGE_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "actor_binding": {
@@ -820,6 +832,7 @@ def freeze_training_binding(
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "event_age_contract": EVENT_AGE_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "heldout_labels_may_train_fit_calibrate_or_select": False,
@@ -896,6 +909,7 @@ def main() -> int:
             ],
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "event_age_contract": EVENT_AGE_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "output_root": str(OUTPUT_ROOT),

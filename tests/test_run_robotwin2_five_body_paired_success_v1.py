@@ -102,6 +102,7 @@ def _rollout(method: str, success: int, progress: float) -> dict:
                 "candidate_count": 4,
                 "selected_candidate_index": 0 if method == "actor_baseline" else 2,
                 "executed_action_count": 5,
+                "event_age_seconds": None if method == "actor_baseline" else 0.0,
                 "critic_scores": (
                     None if method == "actor_baseline" else critic_scores
                 ),
@@ -187,6 +188,7 @@ def test_scoring_batch_uses_planned_first_five_tokens_at_actor_15hz() -> None:
         current_ee=current,
         candidates=candidates,
         current_event=0,
+        event_age_seconds=0.4,
         action_exec_steps=5,
         dt=1.0 / runner.ACTOR_DATASET_FPS,
         device=torch.device("cpu"),
@@ -195,6 +197,7 @@ def test_scoring_batch_uses_planned_first_five_tokens_at_actor_15hz() -> None:
     assert batch["action_mask"][:, :5].all()
     assert not batch["action_mask"][:, 5:].any()
     assert torch.allclose(batch["dt"], torch.full((4,), 5.0 / 15.0))
+    assert torch.allclose(batch["event_age_seconds"], torch.full((4,), 0.4))
 
 
 def test_pair_records_discordance_and_requires_same_initial_candidates() -> None:
@@ -432,9 +435,10 @@ def test_analytic_events_and_state27_goal_are_identical_offline_and_online() -> 
         initial_moving_position=poses[0, 0, :3], ee_action=ee,
         event=int(events[-1]), predicates=predicates, calibration=calibration,
     )
-    online, online_event = runner.canonical_state_at(
+    online, online_event, online_event_age = runner.canonical_state_at(
         trajectory=poses, sim_times=times, names=["can", "pot"],
         ee_action=ee, calibration=calibration,
     )
+    assert online_event_age == pytest.approx(0.0)
     assert online_event == 3
     np.testing.assert_array_equal(online, offline)

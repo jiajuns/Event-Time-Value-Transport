@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -44,6 +45,29 @@ def test_antithetic_noise_preserves_candidate_zero_and_normal_marginals() -> Non
     assert torch.equal(values[3], -values[2])
     assert not torch.equal(values[0], values[2])
     assert collector.CANDIDATE_NOISE_CONTRACT == watcher.CANDIDATE_NOISE_CONTRACT
+
+
+def test_single_query_resume_preserves_full_manifest_query_universe() -> None:
+    requested, declared = collector.resolve_query_contract(
+        [30], watcher.ROOT_QUERIES
+    )
+    assert requested == [30]
+    assert declared == [0, 10, 20, 30]
+    command = watcher.collector_command(
+        {"collector": Path("/code/collector.py")},
+        body="piper",
+        conditions=("clean",),
+        seed_start=2026081050,
+        seed_count=1,
+        queries=(30,),
+    )
+    active = command.index("--root-query-indices")
+    universe = command.index("--manifest-root-query-indices")
+    assert command[active + 1 : universe] == ["30"]
+    assert command[universe + 1 : universe + 5] == ["0", "10", "20", "30"]
+
+    with pytest.raises(collector.BranchCollectionError):
+        collector.resolve_query_contract([31], watcher.ROOT_QUERIES)
 
 
 def _pose(x: float, quaternion: np.ndarray | None = None) -> np.ndarray:
@@ -150,8 +174,17 @@ def test_materialization_keeps_terminal_endpoints_and_se3_object_effect() -> Non
     np.testing.assert_allclose(
         arrays["object_delta"][1, 3:], [0.0, 0.0, np.pi / 2.0], atol=1e-5
     )
+    np.testing.assert_array_equal(arrays["event_age_seconds"], np.zeros(4))
     assert collector.OBJECT_EFFECT_SCHEMA == watcher.OBJECT_EFFECT_SCHEMA
     assert collector.TERMINAL_SUPERVISION_CONTRACT == watcher.TERMINAL_SUPERVISION_CONTRACT
+    assert collector.EVENT_AGE_CONTRACT == watcher.EVENT_AGE_CONTRACT
+
+
+def test_event_age_uses_physical_time_since_latest_event_entry() -> None:
+    events = np.asarray([0, 0, 1, 1, 1, 2], dtype=np.int64)
+    times = np.asarray([0.0, 0.1, 0.3, 0.5, 0.8, 1.0], dtype=np.float64)
+    assert collector.event_age_seconds(events, times, step=4) == pytest.approx(0.5)
+    assert collector.event_age_seconds(events, times) == pytest.approx(0.0)
 
 
 def test_branch_diagnostics_capture_infeasibility_and_action_coverage() -> None:

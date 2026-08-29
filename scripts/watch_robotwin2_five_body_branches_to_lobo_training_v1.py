@@ -73,6 +73,13 @@ TERMINAL_SUPERVISION_CONTRACT = {
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
     "same_stage_progress_definition_as_formal_paired_runner": True,
 }
+EVENT_AGE_CONTRACT = {
+    "array": "event_age_seconds",
+    "semantics": "elapsed_physical_seconds_since_current_canonical_event_entry",
+    "clock_source": "counted_successful_sapien_scene_step_calls",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
+}
 OBJECT_EFFECT_SCHEMA = {
     "format": "etsf_robotwin2_moving_object_se3_effect_6d_v1",
     "channels": [
@@ -124,6 +131,7 @@ REQUIRED_ARRAYS = {
     "terminal_goal_distance",
     "terminal_goal_progress",
     "candidate_index",
+    "event_age_seconds",
     "dt",
 }
 FLOAT_ARRAYS = {
@@ -143,6 +151,7 @@ FLOAT_ARRAYS = {
     "terminal_stage_progress",
     "terminal_goal_distance",
     "terminal_goal_progress",
+    "event_age_seconds",
     "dt",
 }
 INTEGER_ARRAYS = {
@@ -384,6 +393,18 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                 raise LoboWatcherError(f"decision contains non-positive planned dt: {path}")
             if any(abs(value - 5.0 / 15.0) > 1e-6 for value in elapsed):
                 raise LoboWatcherError(f"decision planned dt is not fixed 5/15 seconds: {path}")
+            with archive.open("event_age_seconds.npy") as stream:
+                header = read_npy_header(stream, f"{path}:event_age_seconds")
+                byte_order = "<" if header["descr"] == "<f4" else "="
+                event_ages = struct.unpack(
+                    byte_order + "4f", _read_exact(stream, 16, "event_age_seconds")
+                )
+            if any(not math.isfinite(value) or value < 0.0 for value in event_ages):
+                raise LoboWatcherError(f"decision contains invalid event age: {path}")
+            if any(abs(value - event_ages[0]) > 1e-6 for value in event_ages[1:]):
+                raise LoboWatcherError(
+                    f"decision candidates do not share one pre-action event age: {path}"
+                )
             with archive.open("actions.npy") as stream:
                 header = read_npy_header(stream, f"{path}:actions")
                 byte_order = "<" if header["descr"] == "<f4" else "="
@@ -642,6 +663,7 @@ def validate_complete_collection(
             or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
             or manifest.get("terminal_supervision_contract")
             != TERMINAL_SUPERVISION_CONTRACT
+            or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
             or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
             or manifest.get("branch_diagnostic_contract")
             != BRANCH_DIAGNOSTIC_CONTRACT
@@ -866,9 +888,11 @@ def validate_complete_collection(
         "action_horizons": sorted(action_horizons),
         "outcome_or_event_arrays_interpreted_by_watcher": False,
         "candidate_index_and_dt_arrays_interpreted_by_watcher": True,
+        "event_age_array_interpreted_as_pre_action_input": True,
         "diagnostic_arrays_interpreted_as_training_labels": False,
         "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
         "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+        "event_age_contract": EVENT_AGE_CONTRACT,
         "object_effect_schema": OBJECT_EFFECT_SCHEMA,
         "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
         "manifest_bindings": manifest_bindings,
@@ -1106,6 +1130,7 @@ def validate_existing_authorities(
         or sampling_contract.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or sampling_contract.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
+        or sampling_contract.get("event_age_contract") != EVENT_AGE_CONTRACT
         or sampling_contract.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
         or not isinstance(actors, Mapping)
@@ -1170,6 +1195,7 @@ def validate_existing_authorities(
         or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
+        or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
         or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or binding.get("branch_diagnostic_contract") != BRANCH_DIAGNOSTIC_CONTRACT
         or binding.get("heldout_labels_may_train_fit_calibrate_or_select") is not False

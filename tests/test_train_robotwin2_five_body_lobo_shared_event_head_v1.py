@@ -19,7 +19,9 @@ import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E
 import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
 import verify_robotwin2_move_can_pot_public_materialization_v1 as verifier  # noqa: E402
 from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
-    _effect_aligned_loss,
+    _candidate_rank_loss,
+    _dense_soft_listwise_loss,
+    _robust_object_effect_loss,
     ABLATION_VARIANTS,
     ACTOR_FORMAT,
     BINDING_FORMAT,
@@ -30,12 +32,17 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     DATASET_REPO,
     DATASET_REVISION,
     EVENT_SPEC_SHA256,
+    EVENT_AGE_CONTRACT,
     CANDIDATE_RANK_FEATURE_DIM,
+    CANDIDATE_RANK_FEATURE_SCHEMA,
     DENSE_FAILURE_RANK_WEIGHT,
+    DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
     BRANCH_DIAGNOSTIC_CONTRACT,
     EffectAlignedSharedEventHead,
     MANIFEST_FORMAT,
     MATERIALIZATION_FORMAT,
+    MacroBalancedRankDecisionBatchSampler,
+    MODEL_FAMILY,
     OBJECT_EFFECT_SCHEMA,
     PREREGISTRATION_SHA256,
     STANDARDIZED_RANK_ENSEMBLE_CONTRACT,
@@ -105,6 +112,7 @@ def _group(path: Path, offset: float) -> None:
         terminal_goal_distance=terminal_goal_distance,
         terminal_goal_progress=terminal_goal_progress,
         candidate_index=np.arange(count, dtype=np.int64),
+        event_age_seconds=np.full(count, 0.4, dtype=np.float32),
         dt=np.full(count, 5.0 / SOURCE_EVENT_SAMPLING_HZ, dtype=np.float32),
     )
 
@@ -294,6 +302,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                 "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
                 "object_effect_schema": OBJECT_EFFECT_SCHEMA,
                 "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+                "event_age_contract": EVENT_AGE_CONTRACT,
                 "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
                 "groups": groups,
             }
@@ -313,6 +322,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "event_age_contract": EVENT_AGE_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "heldout_labels_may_train_fit_calibrate_or_select": False,
@@ -510,23 +520,86 @@ def _model_batch(dt: torch.Tensor) -> dict[str, torch.Tensor]:
         "action_schema_id": torch.zeros(count, dtype=torch.long),
         "body_id": torch.zeros(count, dtype=torch.long),
         "dt": dt,
+        "event_age_seconds": torch.zeros(len(dt), dtype=torch.float32),
         "current_event_id": torch.zeros(count, dtype=torch.long),
     }
 
 
-def test_rank_gradient_updates_effect_backbone_but_not_clock_or_duration_heads() -> None:
+def test_rank_gradient_updates_only_consequence_utility_not_world_model() -> None:
     torch.manual_seed(7)
     model = EffectAlignedSharedEventHead().eval()
     output = model(_model_batch(torch.full((4,), 5.0 / 15.0)))
     output["candidate_rank_logit"].sum().backward()
-    assert any(parameter.grad is not None for parameter in model.semantic.parameters())
-    assert any(parameter.grad is not None for parameter in model.action.parameters())
-    assert any(parameter.grad is not None for parameter in model.transition.parameters())
+    assert any(parameter.grad is not None for parameter in model.candidate_rank.parameters())
+    assert all(parameter.grad is None for parameter in model.semantic.parameters())
+    assert all(parameter.grad is None for parameter in model.action.parameters())
+    assert all(parameter.grad is None for parameter in model.transition.parameters())
     assert all(parameter.grad is None for parameter in model.clock.parameters())
+    assert all(parameter.grad is None for parameter in model.event_age_encoder.parameters())
     assert all(parameter.grad is None for parameter in model.duration_mean.parameters())
     assert all(parameter.grad is None for parameter in model.duration_scale.parameters())
     assert all(parameter.grad is None for parameter in model.post_event.parameters())
+    assert all(parameter.grad is None for parameter in model.next_event.parameters())
     assert all(parameter.grad is None for parameter in model.success.parameters())
+    assert all(parameter.grad is None for parameter in model.recovery.parameters())
+    assert all(parameter.grad is None for parameter in model.object_mean.parameters())
+    assert all(parameter.grad is None for parameter in model.object_scale.parameters())
+
+
+def test_rank_features_are_only_explicit_predicted_consequences() -> None:
+    torch.manual_seed(11)
+    model = EffectAlignedSharedEventHead().eval()
+    batch = _model_batch(torch.full((4,), 5.0 / 15.0))
+    batch["state"][:, :3] = torch.tensor(
+        [[0.4, -0.2, 0.1], [0.3, 0.2, -0.1], [0.2, 0.1, 0.3], [0.1, -0.3, 0.2]]
+    )
+    output = model(batch)
+    features = output["candidate_rank_features"]
+    assert features.shape == (4, CANDIDATE_RANK_FEATURE_DIM)
+    assert features.requires_grad is False
+
+    def block(name: str) -> torch.Tensor:
+        start, stop = CANDIDATE_RANK_FEATURE_SCHEMA[name]
+        return features[:, start:stop]
+
+    assert torch.allclose(
+        block("post_event_probability"),
+        torch.softmax(output["post_event_logits"], -1),
+    )
+    assert torch.allclose(
+        block("next_event_probability"),
+        torch.softmax(output["next_event_logits"], -1),
+    )
+    assert torch.allclose(
+        block("success_probability")[:, 0], torch.sigmoid(output["success_logit"])
+    )
+    assert torch.allclose(
+        block("recovery_probability")[:, 0], torch.sigmoid(output["recovery_logit"])
+    )
+    assert torch.allclose(
+        block("duration_log1p_mean")[:, 0], output["duration_selected_log_mean"]
+    )
+    assert torch.allclose(
+        block("duration_log1p_scale")[:, 0],
+        torch.exp(output["duration_selected_log_scale"]),
+    )
+    assert torch.allclose(block("object_delta_mean"), output["object_delta_mean"])
+    assert torch.allclose(
+        block("object_delta_scale"), torch.exp(output["object_delta_log_scale"])
+    )
+    expected_progress = torch.linalg.vector_norm(batch["state"][:, :3], dim=-1) - (
+        torch.linalg.vector_norm(
+            batch["state"][:, :3] - output["object_delta_mean"][:, :3], dim=-1
+        )
+    )
+    assert torch.allclose(block("predicted_goal_progress")[:, 0], expected_progress)
+    assert torch.allclose(
+        block("predicted_goal_progress_uncertainty")[:, 0],
+        output["predicted_goal_progress_uncertainty"],
+    )
+    assert torch.all(
+        block("predicted_goal_progress_uncertainty")[:, 0] > 0.0
+    )
 
 
 def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
@@ -534,13 +607,19 @@ def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
     linear = torch.nn.Linear(CANDIDATE_RANK_FEATURE_DIM, 1, bias=False)
     with torch.no_grad():
         linear.weight.zero_()
-        linear.weight[0, core.SEMANTIC_DIM] = 1.0
+        duration_start, _duration_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
+            "duration_log1p_mean"
+        ]
+        linear.weight[0, duration_start] = 1.0
         model.clock.body_beta.weight.zero_()
         model.clock.base_tau.weight.zero_()
         model.clock.base_tau.bias.zero_()
         model.clock.candidate.weight.zero_()
         model.clock.candidate.bias.zero_()
         model.clock.candidate.bias[0] = 1.0
+        model.duration_mean.weight.zero_()
+        model.duration_mean.bias.zero_()
+        model.duration_mean.weight[0, 0] = 1.0
     model.candidate_rank = linear
     batch = _model_batch(torch.tensor([1.0 / 15.0, 5.0 / 15.0]))
     batch["state"][1] = batch["state"][0]
@@ -548,6 +627,26 @@ def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
     output = model(batch)
     assert output["clock_hidden"][0, 0] != output["clock_hidden"][1, 0]
     assert output["candidate_rank_logit"][0] != output["candidate_rank_logit"][1]
+
+
+def test_duration_prediction_conditions_on_physical_event_age() -> None:
+    model = EffectAlignedSharedEventHead().eval()
+    with torch.no_grad():
+        for parameter in model.event_age_encoder.parameters():
+            parameter.zero_()
+        model.event_age_encoder[0].weight[0, 0] = 1.0
+        model.event_age_encoder[2].weight[0, 0] = 1.0
+        model.duration_mean.weight.zero_()
+        model.duration_mean.bias.zero_()
+        model.duration_mean.weight[0, 0] = 1.0
+    batch = _model_batch(torch.full((2,), 5.0 / 15.0))
+    batch["state"][1] = batch["state"][0]
+    batch["actions"][1] = batch["actions"][0]
+    batch["event_age_seconds"] = torch.tensor([0.0, 2.0])
+    output = model(batch)
+    assert output["duration_selected_log_mean"][0] != output[
+        "duration_selected_log_mean"
+    ][1]
 
 
 def test_rank_ensemble_standardizes_each_member_within_one_decision() -> None:
@@ -600,7 +699,7 @@ def _effect_loss(
         "action_available": torch.ones(4),
         "logical_group": ["piper|clean|one"] * 4,
     }
-    _total, pieces = _effect_aligned_loss(
+    _total, pieces = _candidate_rank_loss(
         output,
         batch,
         torch.ones(4),
@@ -622,10 +721,10 @@ def test_mixed_success_uses_group_listwise_success_probability_mass() -> None:
         terminal_goal_progress=[1000.0, -1000.0, 10.0, 5.0],
         scores=[5.0, 0.0, 0.0, 0.0],
     )
-    assert good["group_listwise_success_mass"] < bad[
-        "group_listwise_success_mass"
+    assert good["group_listwise_success_mass_balanced_rank"] < bad[
+        "group_listwise_success_mass_balanced_rank"
     ]
-    assert good["all_failure_dense_listwise"] == 0.0
+    assert good["all_failure_dense_soft_listwise_balanced_rank"] == 0.0
 
 
 def test_all_failure_dense_target_is_true_lexicographic_terminal_value() -> None:
@@ -643,10 +742,13 @@ def test_all_failure_dense_target_is_true_lexicographic_terminal_value() -> None
         terminal_goal_progress=[1000.0, -1000.0, 0.0, 0.0],
         scores=[5.0, 0.0, 0.0, 0.0],
     )
-    assert good["all_failure_dense_listwise"] < bad["all_failure_dense_listwise"]
+    assert good["all_failure_dense_soft_listwise_balanced_rank"] < bad[
+        "all_failure_dense_soft_listwise_balanced_rank"
+    ]
     assert torch.allclose(
-        good["candidate_ranking"],
-        DENSE_FAILURE_RANK_WEIGHT * good["all_failure_dense_listwise"],
+        good["candidate_ranking_balanced_rank"],
+        DENSE_FAILURE_RANK_WEIGHT
+        * good["all_failure_dense_soft_listwise_balanced_rank"],
     )
     no_object = _effect_loss(
         success=[0, 0, 0, 0],
@@ -655,10 +757,10 @@ def test_all_failure_dense_target_is_true_lexicographic_terminal_value() -> None
         scores=[0.0, 5.0, 0.0, 0.0],
         variant="no_object_effect",
     )
-    assert no_object["all_failure_dense_listwise"] == 0.0
+    assert no_object["all_failure_dense_soft_listwise_balanced_rank"] > 0.0
 
 
-def test_effect_bootstrap_repairs_missing_mixed_success_support(
+def test_effect_bootstrap_uses_one_plus_poisson_for_every_mixed_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rows = [
@@ -688,8 +790,93 @@ def test_effect_bootstrap_repairs_missing_mixed_success_support(
     assert weights.shape == (5, 8)
     assert all(item["positive_rows_with_nonzero_weight"] > 0 for item in audit)
     assert all(item["negative_rows_with_nonzero_weight"] > 0 for item in audit)
-    assert all(item["mixed_success_groups_with_nonzero_weight"] > 0 for item in audit)
-    assert all(item["deterministic_mixed_group_repairs"] == 1 for item in audit)
+    assert np.all(weights[:, :4] == 1.0)
+    assert np.all(weights[:, 4:] == 0.0)
+    assert all(item["mixed_success_groups_with_nonzero_weight"] == 1 for item in audit)
+    assert all(item["mixed_success_groups_total"] == 1 for item in audit)
+    assert all(item["mixed_weight_minimum"] == 1 for item in audit)
+    assert all(item["deterministic_mixed_group_repairs"] == 0 for item in audit)
+
+
+def test_dense_goal_progress_uses_frozen_soft_target_inside_max_event() -> None:
+    assert DENSE_GOAL_PROGRESS_TEMPERATURE_METERS == 0.02
+    scores = torch.zeros(4, requires_grad=True)
+    event = torch.tensor([2.0, 2.0, 1.0, 0.0])
+    progress = torch.tensor([0.0, 0.02, 1000.0, 1000.0])
+    loss = _dense_soft_listwise_loss(
+        scores, event, progress, ablation_variant="full"
+    )
+    loss.backward()
+    expected_target = torch.softmax(torch.tensor([0.0, 1.0]), dim=0)
+    assert torch.allclose(
+        scores.grad,
+        torch.tensor(
+            [
+                0.25 - expected_target[0],
+                0.25 - expected_target[1],
+                0.25,
+                0.25,
+            ]
+        ),
+    )
+    no_object_scores = torch.tensor([0.0, 0.0, 100.0, 100.0])
+    no_object = _dense_soft_listwise_loss(
+        no_object_scores,
+        event,
+        progress,
+        ablation_variant="no_object_effect",
+    )
+    expected_no_object = torch.logsumexp(no_object_scores, dim=0) - no_object_scores[
+        :2
+    ].mean()
+    assert torch.allclose(no_object, expected_no_object)
+
+
+def test_macro_balanced_rank_batches_include_mixed_without_group_duplicates() -> None:
+    rows: list[dict[str, object]] = []
+    weights: dict[str, float] = {}
+    specifications = []
+    for ordinal, (body, condition, event) in enumerate(
+        (
+            ("piper", "clean", 0),
+            ("piper", "randomized", 1),
+            ("franka", "clean", 2),
+            ("franka", "randomized", 3),
+        )
+    ):
+        specifications.append((f"{body}|{condition}|mixed-{ordinal}", body, condition, event, True))
+    for ordinal in range(8):
+        body = ("piper", "franka")[ordinal % 2]
+        condition = ("clean", "randomized")[(ordinal // 2) % 2]
+        specifications.append(
+            (f"{body}|{condition}|dense-{ordinal}", body, condition, ordinal % 4, False)
+        )
+    for group, body, _condition, event, mixed in specifications:
+        weights[group] = 1.0
+        for candidate in range(4):
+            rows.append(
+                {
+                    "logical_group": group,
+                    "body": body,
+                    "candidate_index": candidate,
+                    "current_event_id": event,
+                    "success": float(mixed and candidate == 0),
+                    "success_mask": 1.0,
+                }
+            )
+    sampler = MacroBalancedRankDecisionBatchSampler(
+        rows, batch_size=32, seed=19, positive_group_weight=weights
+    )
+    assert len(sampler) == 2
+    for batch in sampler:
+        groups = [str(rows[index]["logical_group"]) for index in batch[::4]]
+        assert len(groups) == len(set(groups))
+        assert any("|mixed-" in group for group in groups)
+        assert all(
+            [int(rows[index]["candidate_index"]) for index in batch[offset : offset + 4]]
+            == [0, 1, 2, 3]
+            for offset in range(0, len(batch), 4)
+        )
 
 
 class _FixedRankModel(torch.nn.Module):
@@ -772,18 +959,32 @@ def test_checkpoint_selection_prefers_mixed_success_before_dense_diagnostics() -
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
+    assert MODEL_FAMILY == "event_age_consequence_utility_shared_event_head_v5"
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
     assert torch.equal(
         success_only["candidate_rank_logit"], success_only["success_logit"]
     )
     no_time = EffectAlignedSharedEventHead("no_time_duration").eval()(batch)
+    duration_start = CANDIDATE_RANK_FEATURE_SCHEMA["duration_log1p_mean"][0]
+    duration_stop = CANDIDATE_RANK_FEATURE_SCHEMA["duration_log1p_scale"][1]
     assert torch.count_nonzero(
-        no_time["candidate_rank_features"][:, core.SEMANTIC_DIM:]
+        no_time["candidate_rank_features"][:, duration_start:duration_stop]
+    ) == 0
+    object_start = CANDIDATE_RANK_FEATURE_SCHEMA["object_delta_mean"][0]
+    object_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
+        "predicted_goal_progress_uncertainty"
+    ][1]
+    no_object = EffectAlignedSharedEventHead("no_object_effect").eval()(batch)
+    assert torch.count_nonzero(
+        no_object["candidate_rank_features"][:, object_start:object_stop]
     ) == 0
     full = EffectAlignedSharedEventHead("full").eval()(batch)
     assert torch.count_nonzero(
-        full["candidate_rank_features"][:, core.SEMANTIC_DIM:]
+        full["candidate_rank_features"][:, duration_start:duration_stop]
+    ) > 0
+    assert torch.count_nonzero(
+        full["candidate_rank_features"][:, object_start:object_stop]
     ) > 0
     assert set(ABLATION_VARIANTS) == {
         "success_only", "no_time_duration", "no_object_effect", "full"
@@ -819,6 +1020,14 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert summary_candidate_rank_contract("full")[
         "dt_has_numeric_score_path"
     ] is True
+    full_contract = checkpoint_candidate_rank_contract("full")
+    assert full_contract["direct_transitioned_or_clock_hidden_rank_path"] is False
+    assert full_contract["rank_inputs_are_detached_consequence_predictions"] is True
+    assert full_contract["rank_loss_updates_semantic_action_transition"] is False
+    assert full_contract["rank_loss_updates_consequence_predictors"] is False
+    assert full_contract["feature_schema"] == {
+        name: list(bounds) for name, bounds in CANDIDATE_RANK_FEATURE_SCHEMA.items()
+    }
 
 
 def _complete_ablation_audit() -> dict[str, object]:

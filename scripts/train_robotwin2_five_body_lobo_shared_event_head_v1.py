@@ -37,6 +37,7 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materia
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
+MODEL_FAMILY = "event_age_consequence_utility_shared_event_head_v5"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
 ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
@@ -52,7 +53,22 @@ SOURCE_EVENT_SAMPLING_HZ = 15.0
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 CANDIDATE_COUNT = 4
-CANDIDATE_RANK_FEATURE_DIM = core.SEMANTIC_DIM + 64 + 2
+CANDIDATE_RANK_FEATURE_SCHEMA = {
+    "post_event_probability": (0, 5),
+    "next_event_probability": (5, 10),
+    "success_probability": (10, 11),
+    "recovery_probability": (11, 12),
+    "duration_log1p_mean": (12, 13),
+    "duration_log1p_scale": (13, 14),
+    "object_delta_mean": (14, 20),
+    "object_delta_scale": (20, 26),
+    "predicted_goal_progress": (26, 27),
+    "predicted_goal_progress_uncertainty": (27, 28),
+}
+CANDIDATE_RANK_FEATURE_DIM = max(
+    stop for _start, stop in CANDIDATE_RANK_FEATURE_SCHEMA.values()
+)
+OBJECT_STUDENT_T_DOF = 3.0
 DENSE_FAILURE_RANK_WEIGHT = 0.1
 RANK_ENSEMBLE_STD_FLOOR = 1e-6
 STANDARDIZED_RANK_ENSEMBLE_CONTRACT = {
@@ -85,6 +101,13 @@ TERMINAL_SUPERVISION_CONTRACT = {
     "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
     "same_stage_progress_definition_as_formal_paired_runner": True,
+}
+EVENT_AGE_CONTRACT = {
+    "array": "event_age_seconds",
+    "semantics": "elapsed_physical_seconds_since_current_canonical_event_entry",
+    "clock_source": "counted_successful_sapien_scene_step_calls",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
 }
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": "etsf_robotwin2_candidate_branch_diagnostics_v1",
@@ -138,7 +161,10 @@ def ablation_contract(variant: str) -> dict[str, Any]:
         "dense_target_order": (
             "none"
             if variant == "success_only"
-            else "lexicographic_terminal_max_event_then_terminal_goal_progress"
+            else "strict_terminal_max_event_then_soft_goal_progress_temperature_0.02m"
+        ),
+        "training_streams": (
+            "uniform_proper_likelihood_plus_macro_balanced_rank_only"
         ),
         "rank_ensemble_aggregation": standardized_rank_ensemble_contract(),
         "same_seed_disjoint_split": True,
@@ -186,22 +212,63 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         feature_blocks = ["proper_success_logit_from_transitioned_semantic"]
     elif variant == "no_time_duration":
         feature_blocks = [
-            "transitioned_semantic_end_to_end",
-            "clock_hidden_forced_zero",
-            "current_event_duration_log_mean_forced_zero",
-            "current_event_duration_log_scale_forced_zero",
+            "post_event_probability",
+            "next_event_probability",
+            "success_probability",
+            "recovery_probability",
+            "duration_log1p_mean_forced_zero",
+            "duration_log1p_scale_forced_zero",
+            "object_delta_mean",
+            "object_delta_scale",
+            "predicted_goal_progress_from_state_relative_goal",
+            "predicted_goal_progress_uncertainty_from_object_student_t_scale",
+        ]
+    elif variant == "no_object_effect":
+        feature_blocks = [
+            "post_event_probability",
+            "next_event_probability",
+            "success_probability",
+            "recovery_probability",
+            "duration_log1p_mean",
+            "duration_log1p_scale",
+            "object_delta_mean_forced_zero",
+            "object_delta_scale_forced_zero",
+            "predicted_goal_progress_forced_zero",
+            "predicted_goal_progress_uncertainty_forced_zero",
         ]
     else:
         feature_blocks = [
-            "transitioned_semantic_end_to_end",
-            "clock_hidden_detached",
-            "current_event_duration_log_mean_detached",
-            "current_event_duration_log_scale_detached",
+            "post_event_probability",
+            "next_event_probability",
+            "success_probability",
+            "recovery_probability",
+            "duration_log1p_mean",
+            "duration_log1p_scale",
+            "object_delta_mean",
+            "object_delta_scale",
+            "predicted_goal_progress_from_state_relative_goal",
+            "predicted_goal_progress_uncertainty_from_object_student_t_scale",
         ]
     return {
         "feature_blocks": feature_blocks,
+        "feature_schema": {
+            name: list(bounds)
+            for name, bounds in CANDIDATE_RANK_FEATURE_SCHEMA.items()
+        },
         "feature_dim": CANDIDATE_RANK_FEATURE_DIM,
         "dt_has_numeric_score_path": variant not in {"success_only", "no_time_duration"},
+        "duration_conditions_on_physical_event_age": True,
+        "event_age_has_numeric_score_path": variant
+        not in {"success_only", "no_time_duration"},
+        "direct_transitioned_or_clock_hidden_rank_path": False,
+        "rank_inputs_are_detached_consequence_predictions": variant != "success_only",
+        "goal_progress_definition": (
+            "norm(state_relative_goal_xyz)-norm(state_relative_goal_xyz-"
+            "predicted_object_translation_mean)"
+        ),
+        "goal_progress_uncertainty_definition": (
+            "delta_method_radial_std_from_student_t3_object_translation_scale"
+        ),
         "pairwise_rank_loss_enabled": False,
         "group_listwise_success_mass_loss_enabled": variant != "success_only",
         "all_failure_dense_listwise_loss_enabled": variant != "success_only",
@@ -209,9 +276,19 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             0.0 if variant == "success_only" else DENSE_FAILURE_RANK_WEIGHT
         ),
         "dense_target_requires_full_continuation": True,
+        "dense_goal_progress_temperature_meters": (
+            None
+            if variant in {"success_only", "no_object_effect"}
+            else DENSE_GOAL_PROGRESS_TEMPERATURE_METERS
+        ),
+        "proper_and_rank_batches_are_separate": True,
+        "mixed_rank_bootstrap": "one_plus_poisson",
+        "dense_rank_bootstrap": "poisson",
+        "rank_macro_strata": "body_condition_current_event",
         "rank_ensemble_aggregation": standardized_rank_ensemble_contract(),
         "rank_loss_updates_clock_or_duration_heads": False,
-        "rank_loss_updates_semantic_action_transition": variant != "success_only",
+        "rank_loss_updates_semantic_action_transition": False,
+        "rank_loss_updates_consequence_predictors": False,
     }
 
 
@@ -221,9 +298,17 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
     checkpoint = checkpoint_candidate_rank_contract(variant)
     return {
         "candidate_score": ablation_contract(variant)["candidate_score"],
+        "feature_blocks": checkpoint["feature_blocks"],
+        "feature_dim": checkpoint["feature_dim"],
         "time_and_duration_effect_used": variant
         not in {"success_only", "no_time_duration"},
         "dt_has_numeric_score_path": checkpoint["dt_has_numeric_score_path"],
+        "duration_conditions_on_physical_event_age": checkpoint[
+            "duration_conditions_on_physical_event_age"
+        ],
+        "event_age_has_numeric_score_path": checkpoint[
+            "event_age_has_numeric_score_path"
+        ],
         "pairwise_rank_loss_enabled": checkpoint["pairwise_rank_loss_enabled"],
         "group_listwise_success_mass_loss_enabled": checkpoint[
             "group_listwise_success_mass_loss_enabled"
@@ -235,10 +320,31 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
             "all_failure_dense_listwise_weight"
         ],
         "dense_target_requires_full_continuation": True,
+        "dense_goal_progress_temperature_meters": checkpoint[
+            "dense_goal_progress_temperature_meters"
+        ],
+        "proper_and_rank_batches_are_separate": True,
+        "mixed_rank_bootstrap": "one_plus_poisson",
+        "dense_rank_bootstrap": "poisson",
+        "rank_macro_strata": "body_condition_current_event",
         "rank_ensemble_aggregation": standardized_rank_ensemble_contract(),
         "rank_loss_updates_clock_or_duration_heads": False,
         "rank_loss_updates_semantic_action_transition": checkpoint[
             "rank_loss_updates_semantic_action_transition"
+        ],
+        "rank_loss_updates_consequence_predictors": checkpoint[
+            "rank_loss_updates_consequence_predictors"
+        ],
+        "direct_transitioned_or_clock_hidden_rank_path": checkpoint[
+            "direct_transitioned_or_clock_hidden_rank_path"
+        ],
+        "rank_inputs_are_detached_consequence_predictions": checkpoint[
+            "rank_inputs_are_detached_consequence_predictions"
+        ],
+        "feature_schema": checkpoint["feature_schema"],
+        "goal_progress_definition": checkpoint["goal_progress_definition"],
+        "goal_progress_uncertainty_definition": checkpoint[
+            "goal_progress_uncertainty_definition"
         ],
     }
 CANONICAL_STATE_SCHEMA = canonical_adapter.STATE_SCHEMA
@@ -266,6 +372,7 @@ REQUIRED_ARRAYS = {
     "terminal_goal_distance",
     "terminal_goal_progress",
     "candidate_index",
+    "event_age_seconds",
     "dt",
 }
 
@@ -278,6 +385,12 @@ def standardized_rank_ensemble_contract() -> dict[str, Any]:
     """Return the frozen deployment aggregation contract without shared mutation."""
 
     return dict(STANDARDIZED_RANK_ENSEMBLE_CONTRACT)
+
+
+def event_age_contract() -> dict[str, Any]:
+    """Return the frozen physical event-age input contract."""
+
+    return dict(EVENT_AGE_CONTRACT)
 
 
 def aggregate_standardized_rank_scores(
@@ -575,6 +688,7 @@ def validate_body_manifest(
         or value.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or value.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
+        or value.get("event_age_contract") != EVENT_AGE_CONTRACT
         or value.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
     ):
@@ -649,6 +763,7 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
+        or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
         or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or binding.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
@@ -888,6 +1003,15 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
         arrays["dt"], 5.0 / SOURCE_EVENT_SAMPLING_HZ, atol=1e-6, rtol=0.0
     ):
         raise FiveBodyContractError(f"{path} planned dt is not fixed 5/15 seconds")
+    if np.any(arrays["event_age_seconds"] < 0.0) or not np.allclose(
+        arrays["event_age_seconds"],
+        arrays["event_age_seconds"][:1],
+        atol=1e-6,
+        rtol=0.0,
+    ):
+        raise FiveBodyContractError(
+            f"{path} candidates do not share one non-negative pre-action event age"
+        )
     if np.any(arrays["duration"] < 0):
         raise FiveBodyContractError(f"{path} contains invalid simulator duration")
     if not np.array_equal(
@@ -969,6 +1093,184 @@ class CompleteDecisionBatchSampler:
         return (len(self.decisions) + self.decisions_per_batch - 1) // self.decisions_per_batch
 
 
+class MacroBalancedRankDecisionBatchSampler:
+    """Build rank-only batches with sparse success comparisons in every batch.
+
+    Proper likelihoods use :class:`CompleteDecisionBatchSampler` and therefore
+    retain the empirical source distribution.  This sampler is used only by
+    the candidate-rank objective.  It alternates body/condition/current-event
+    strata, reserves half of each batch for mixed-success decisions when that
+    many distinct groups exist, and never repeats a logical decision within a
+    batch.  Sparse mixed decisions may be revisited across batches; that is the
+    intended oversampling needed to prevent dense failures from drowning the
+    success-changing supervision.
+    """
+
+    def __init__(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        batch_size: int,
+        seed: int,
+        positive_group_weight: Mapping[str, float],
+    ) -> None:
+        if batch_size < CANDIDATE_COUNT:
+            raise FiveBodyContractError("rank batch must fit one complete decision")
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            grouped[str(row["logical_group"])].append(index)
+
+        decisions: dict[str, list[int]] = {}
+        kinds: dict[str, str] = {}
+        strata: dict[str, tuple[str, str, int]] = {}
+        for group, indices in sorted(grouped.items()):
+            ordered = sorted(indices, key=lambda index: int(rows[index]["candidate_index"]))
+            if len(ordered) != CANDIDATE_COUNT or [
+                int(rows[index]["candidate_index"]) for index in ordered
+            ] != list(range(CANDIDATE_COUNT)):
+                raise FiveBodyContractError(f"incomplete rank decision {group}")
+            group_weights = {
+                float(positive_group_weight.get(group, 0.0)) for _index in ordered
+            }
+            if (
+                len(group_weights) != 1
+                or not all(math.isfinite(value) and value >= 0.0 for value in group_weights)
+            ):
+                raise FiveBodyContractError("rank bootstrap weight must be finite/group-constant")
+            if next(iter(group_weights)) <= 0.0:
+                continue
+            if not all(bool(rows[index]["success_mask"]) for index in ordered):
+                raise FiveBodyContractError("rank decision lacks complete success supervision")
+            outcomes = {float(rows[index]["success"]) for index in ordered}
+            if outcomes == {0.0, 1.0}:
+                kind = "mixed"
+            elif outcomes == {0.0}:
+                kind = "dense"
+            elif outcomes == {1.0}:
+                continue
+            else:
+                raise FiveBodyContractError("rank decision has non-binary success labels")
+            identity = group.split("|", 2)
+            body = str(rows[ordered[0]]["body"])
+            current_events = {int(rows[index]["current_event_id"]) for index in ordered}
+            if (
+                len(identity) != 3
+                or identity[0] != body
+                or identity[1] not in CONDITIONS
+                or len(current_events) != 1
+            ):
+                raise FiveBodyContractError("rank macro stratum identity changed")
+            decisions[group] = ordered
+            kinds[group] = kind
+            strata[group] = (body, identity[1], current_events.pop())
+
+        self.decisions = decisions
+        self.kinds = kinds
+        self.strata = strata
+        self.mixed_groups = sorted(group for group, kind in kinds.items() if kind == "mixed")
+        self.dense_groups = sorted(group for group, kind in kinds.items() if kind == "dense")
+        if not self.mixed_groups:
+            raise FiveBodyContractError(
+                "balanced rank sampler requires a positive-weight mixed-success decision"
+            )
+        self.decisions_per_batch = max(1, batch_size // CANDIDATE_COUNT)
+        self.batch_count = max(
+            1,
+            math.ceil(len(self.decisions) / self.decisions_per_batch),
+        )
+        self.seed = int(seed)
+        self.epoch = 0
+
+    @staticmethod
+    def _stratified_cycler(
+        groups: Sequence[str],
+        strata: Mapping[str, tuple[str, str, int]],
+        generator: random.Random,
+    ) -> Iterator[str]:
+        by_stratum: dict[tuple[str, str, int], list[str]] = defaultdict(list)
+        for group in groups:
+            by_stratum[strata[group]].append(group)
+        ordered_strata = sorted(by_stratum)
+        generator.shuffle(ordered_strata)
+        cursors = {stratum: 0 for stratum in ordered_strata}
+        for values in by_stratum.values():
+            generator.shuffle(values)
+        stratum_cursor = 0
+        while ordered_strata:
+            stratum = ordered_strata[stratum_cursor % len(ordered_strata)]
+            values = by_stratum[stratum]
+            cursor = cursors[stratum]
+            if cursor and cursor % len(values) == 0:
+                generator.shuffle(values)
+            yield values[cursor % len(values)]
+            cursors[stratum] = cursor + 1
+            stratum_cursor += 1
+
+    @staticmethod
+    def _draw_distinct(
+        cycler: Iterator[str],
+        *,
+        requested: int,
+        available_count: int,
+        used: set[str],
+    ) -> list[str]:
+        selected: list[str] = []
+        target = min(int(requested), max(0, int(available_count)))
+        attempts = 0
+        maximum_attempts = max(1, available_count * 4 + target * 4)
+        while len(selected) < target and attempts < maximum_attempts:
+            group = next(cycler)
+            attempts += 1
+            if group in used:
+                continue
+            used.add(group)
+            selected.append(group)
+        return selected
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        mixed = self._stratified_cycler(self.mixed_groups, self.strata, generator)
+        dense = (
+            self._stratified_cycler(self.dense_groups, self.strata, generator)
+            if self.dense_groups
+            else None
+        )
+        mixed_target = max(1, self.decisions_per_batch // 2)
+        for _batch in range(self.batch_count):
+            used: set[str] = set()
+            selected = self._draw_distinct(
+                mixed,
+                requested=mixed_target,
+                available_count=len(self.mixed_groups),
+                used=used,
+            )
+            if dense is not None:
+                selected.extend(
+                    self._draw_distinct(
+                        dense,
+                        requested=self.decisions_per_batch - len(selected),
+                        available_count=len(self.dense_groups),
+                        used=used,
+                    )
+                )
+            selected.extend(
+                self._draw_distinct(
+                    mixed,
+                    requested=self.decisions_per_batch - len(selected),
+                    available_count=len(self.mixed_groups),
+                    used=used,
+                )
+            )
+            if not selected or not any(self.kinds[group] == "mixed" for group in selected):
+                raise FiveBodyContractError("rank batch lost mixed-success supervision")
+            generator.shuffle(selected)
+            yield [index for group in selected for index in self.decisions[group]]
+
+    def __len__(self) -> int:
+        return self.batch_count
+
+
 class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
     """Shared event model with a scalar head trained for best-of-four choice."""
 
@@ -979,6 +1281,11 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         self.ablation_variant = ablation_variant
         self.register_buffer("state_mean", torch.zeros(core.STATE_DIM))
         self.register_buffer("state_std", torch.ones(core.STATE_DIM))
+        self.event_age_encoder = torch.nn.Sequential(
+            torch.nn.Linear(1, self.config.clock_dim),
+            torch.nn.Tanh(),
+            torch.nn.Linear(self.config.clock_dim, self.config.clock_dim),
+        )
         self.candidate_rank = torch.nn.Sequential(
             torch.nn.LayerNorm(CANDIDATE_RANK_FEATURE_DIM),
             torch.nn.Linear(CANDIDATE_RANK_FEATURE_DIM, core.SEMANTIC_DIM // 2),
@@ -1005,29 +1312,120 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             batch["state"] - self.state_mean
         ) / self.state_std
         output = super().forward(normalized_batch)
-        # Ranking sees semantic action effects, the dt-dependent isolated
-        # clock, and the current-event duration distribution.  The semantic
-        # block remains end-to-end so rank supervision can improve the shared
-        # state/action transition.  Clock/duration features are detached so
-        # rank loss cannot directly move their proper likelihood parameters.
-        clock_features = output["clock_hidden"].detach()
+
+        event_age = batch.get("event_age_seconds")
+        if (
+            not isinstance(event_age, torch.Tensor)
+            or event_age.shape != output["success_logit"].shape
+            or not bool(torch.isfinite(event_age).all())
+            or bool((event_age < 0.0).any())
+        ):
+            raise FiveBodyContractError(
+                "shared head requires one finite non-negative event_age_seconds per row"
+            )
+        age_clock_hidden = output["clock_hidden"] + self.event_age_encoder(
+            torch.log1p(event_age.to(output["clock_hidden"]))[:, None]
+        )
+        duration_log_mean = self.duration_mean(age_clock_hidden)
+        duration_log_scale = torch.clamp(
+            self.duration_scale(age_clock_hidden), -5.0, 2.0
+        )
+        current = batch["current_event_id"].long()[:, None]
+        output["clock_hidden"] = age_clock_hidden
+        output["duration_log_mean"] = duration_log_mean
+        output["duration_log_scale"] = duration_log_scale
+        output["duration_selected_log_mean"] = duration_log_mean.gather(
+            1, current
+        ).squeeze(1)
+        output["duration_selected_log_scale"] = duration_log_scale.gather(
+            1, current
+        ).squeeze(1)
+
+        # The deployed score is deliberately a function of predicted
+        # consequences, never a free projection of ``transitioned`` or
+        # ``clock_hidden``.  Detaching the complete feature vector keeps the
+        # proper event/outcome/effect likelihoods calibrated: listwise rank
+        # supervision learns how to combine their predictions, not how to
+        # rewrite them into an unconstrained latent critic.
+        post_probability = torch.softmax(output["post_event_logits"], dim=-1)
+        next_probability = torch.softmax(output["next_event_logits"], dim=-1)
+        success_probability = torch.sigmoid(output["success_logit"])[:, None]
+        recovery_probability = torch.sigmoid(output["recovery_logit"])[:, None]
         duration_features = torch.stack(
             (
-                output["duration_selected_log_mean"].detach(),
-                output["duration_selected_log_scale"].detach(),
+                output["duration_selected_log_mean"],
+                torch.exp(output["duration_selected_log_scale"]),
+            ),
+            dim=-1,
+        )
+        object_mean = output["object_delta_mean"]
+        object_scale = torch.exp(output["object_delta_log_scale"])
+        state = batch["state"]
+        if state.ndim != 2 or state.shape[-1] != core.STATE_DIM:
+            raise FiveBodyContractError(
+                "consequence rank utility requires one canonical 27-D root state"
+            )
+        relative_goal = state[:, :3].to(object_mean)
+        predicted_remaining = relative_goal - object_mean[:, :3]
+        current_distance = torch.linalg.vector_norm(relative_goal, dim=-1)
+        predicted_distance = torch.linalg.vector_norm(predicted_remaining, dim=-1)
+        predicted_goal_progress = current_distance - predicted_distance
+
+        # Delta-method radial uncertainty for the Student-t(3) translation
+        # effect.  At a zero predicted residual, fall back to the current goal
+        # direction; if both vectors are zero, use the isotropic RMS scale.
+        epsilon = torch.finfo(object_mean.dtype).eps**0.5
+        remaining_unit = predicted_remaining / predicted_distance[:, None].clamp_min(
+            epsilon
+        )
+        current_unit = relative_goal / current_distance[:, None].clamp_min(epsilon)
+        has_remaining_direction = predicted_distance > epsilon
+        direction = torch.where(
+            has_remaining_direction[:, None], remaining_unit, current_unit
+        )
+        has_direction = has_remaining_direction | (current_distance > epsilon)
+        translation_variance = object_scale[:, :3].square()
+        projected_variance = (direction.square() * translation_variance).sum(dim=-1)
+        isotropic_variance = translation_variance.mean(dim=-1)
+        radial_variance = torch.where(
+            has_direction, projected_variance, isotropic_variance
+        )
+        predicted_goal_progress_uncertainty = torch.sqrt(
+            OBJECT_STUDENT_T_DOF * radial_variance.clamp_min(0.0)
+        )
+
+        object_features = torch.cat(
+            (
+                object_mean,
+                object_scale,
+                predicted_goal_progress[:, None],
+                predicted_goal_progress_uncertainty[:, None],
             ),
             dim=-1,
         )
         if self.ablation_variant == "no_time_duration":
-            clock_features = torch.zeros_like(clock_features)
             duration_features = torch.zeros_like(duration_features)
+        if self.ablation_variant == "no_object_effect":
+            object_features = torch.zeros_like(object_features)
         rank_features = torch.cat(
             (
-                output["transitioned"],
-                clock_features,
+                post_probability,
+                next_probability,
+                success_probability,
+                recovery_probability,
                 duration_features,
+                object_features,
             ),
             dim=-1,
+        ).detach()
+        if rank_features.shape != (
+            output["success_logit"].shape[0],
+            CANDIDATE_RANK_FEATURE_DIM,
+        ):
+            raise FiveBodyContractError("consequence rank feature schema changed")
+        output["predicted_goal_progress"] = predicted_goal_progress
+        output["predicted_goal_progress_uncertainty"] = (
+            predicted_goal_progress_uncertainty
         )
         output["candidate_rank_features"] = rank_features
         output["candidate_rank_logit"] = (
@@ -1104,20 +1502,48 @@ def _dense_rank_components(
     return components
 
 
-def _lexicographic_preferred_mask(
-    components: Sequence[torch.Tensor], indices: Sequence[int]
+DENSE_GOAL_PROGRESS_TEMPERATURE_METERS = 0.02
+
+
+def _dense_soft_listwise_loss(
+    scores: torch.Tensor,
+    terminal_event_level: torch.Tensor,
+    terminal_goal_progress: torch.Tensor,
+    *,
+    ablation_variant: str,
 ) -> torch.Tensor:
-    if not components or not indices:
-        raise FiveBodyContractError("lexicographic ranking needs labels and candidates")
-    selected = torch.as_tensor(indices, device=components[0].device, dtype=torch.long)
-    preferred = torch.ones(len(indices), device=selected.device, dtype=torch.bool)
-    for component in components:
-        values = component[selected]
-        best = values[preferred].max()
-        preferred = preferred & torch.isclose(values, best, atol=1e-6, rtol=0.0)
-    if not bool(preferred.any()):
-        raise FiveBodyContractError("lexicographic target selected no candidate")
-    return preferred
+    """Strictly prefer the latest event, then softly rank metric progress.
+
+    Event level remains lexicographically absolute: target probability is zero
+    outside the maximum terminal-event level.  Within that level, the public
+    analytic near-goal scale (0.02 m) is the frozen softmax temperature.  This
+    avoids turning replay/numerical micrometre differences into a hard one-hot
+    label.  ``no_object_effect`` uses a uniform target over the maximum level.
+    """
+
+    if ablation_variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
+    if (
+        scores.ndim != 1
+        or terminal_event_level.shape != scores.shape
+        or terminal_goal_progress.shape != scores.shape
+        or not bool(torch.isfinite(scores).all())
+        or not bool(torch.isfinite(terminal_goal_progress).all())
+    ):
+        raise FiveBodyContractError("dense soft listwise target has invalid shape/value")
+    maximum_level = terminal_event_level.max()
+    maximum_mask = terminal_event_level == maximum_level
+    if not bool(maximum_mask.any()):
+        raise FiveBodyContractError("dense soft listwise target selected no event level")
+    if ablation_variant == "no_object_effect":
+        target = torch.full_like(scores[maximum_mask], 1.0 / int(maximum_mask.sum()))
+    else:
+        target = torch.softmax(
+            terminal_goal_progress[maximum_mask]
+            / DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
+            dim=0,
+        )
+    return -(target * torch.log_softmax(scores, dim=0)[maximum_mask]).sum()
 
 
 def _negative_log_probability_mass(
@@ -1140,25 +1566,17 @@ def _lexicographic_compare_values(
     return 0
 
 
-def _effect_aligned_loss(
+def _robust_object_effect_loss(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
     sample_weight: torch.Tensor,
     *,
     ablation_variant: str = "full",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Optimize robust object effects and deployment-aligned group choice.
-
-    Event, outcome, recovery and duration heads keep their unweighted proper
-    losses in ``compute_multitask_loss`` so their probabilities remain
-    interpretable.  This auxiliary objective only fixes the two pieces that
-    were misaligned with best-of-four inference.
-    """
-
-    labels = batch["success"].to(output["success_logit"])
+    """Student-t object likelihood for the uniform proper-likelihood stream."""
 
     # A Student-t(3) likelihood retains a calibrated scale head but prevents
-    # a few large object errors from dominating the ranking objective.
+    # a few large object errors from dominating the shared consequence model.
     object_scale = torch.exp(output["object_delta_log_scale"]).clamp_min(1e-4)
     standardized = (
         batch["object_delta"].to(output["object_delta_mean"])
@@ -1174,6 +1592,35 @@ def _effect_aligned_loss(
         * batch["action_available"].to(sample_weight)
         * batch["object_delta_mask"].to(sample_weight),
     )
+    if ablation_variant in {"success_only", "no_object_effect"}:
+        object_effect = object_effect * 0.0
+    total = 0.5 * object_effect
+    return total, {
+        "robust_object_effect_uniform_proper": object_effect,
+        "robust_object_effect_weighted_uniform_proper": total,
+    }
+
+
+def _candidate_rank_loss(
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    sample_weight: torch.Tensor,
+    *,
+    ablation_variant: str = "full",
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Deployment-aligned listwise loss for the balanced rank-only stream."""
+
+    labels = batch["success"].to(output["success_logit"])
+    score = output["candidate_rank_logit"]
+    if ablation_variant == "success_only":
+        zero = score.sum() * 0.0
+        return zero, {
+            "group_listwise_success_mass_balanced_rank": zero,
+            "all_failure_dense_soft_listwise_balanced_rank": zero,
+            "candidate_ranking_balanced_rank": zero,
+            "mixed_success_groups_in_batch": score.new_tensor(0),
+            "all_failure_dense_groups_in_batch": score.new_tensor(0),
+        }
 
     success_terms: list[torch.Tensor] = []
     success_weights: list[torch.Tensor] = []
@@ -1182,10 +1629,6 @@ def _effect_aligned_loss(
     by_group: dict[str, list[int]] = defaultdict(list)
     for index, group in enumerate(batch["logical_group"]):
         by_group[str(group)].append(index)
-    score = output["candidate_rank_logit"]
-    dense_components = _dense_rank_components(
-        batch, score, ablation_variant=ablation_variant
-    )
     mixed_success_groups = 0
     all_failure_dense_groups = 0
     for indices in by_group.values():
@@ -1193,8 +1636,31 @@ def _effect_aligned_loss(
             raise FiveBodyContractError("training batch split a candidate decision")
         selected = torch.as_tensor(indices, device=score.device, dtype=torch.long)
         group_scores = score[selected]
+        selected_weights = sample_weight[selected]
+        if not bool(torch.isfinite(selected_weights).all()) or bool(
+            (selected_weights < 0.0).any()
+        ):
+            raise FiveBodyContractError("rank batch has invalid bootstrap weight")
+        if not bool(
+            torch.allclose(
+                selected_weights,
+                selected_weights[:1].expand_as(selected_weights),
+                atol=0.0,
+                rtol=0.0,
+            )
+        ):
+            raise FiveBodyContractError("rank bootstrap weight changed within a decision")
+        group_weight = selected_weights[0]
+        # Outcome kind and support counters are defined only for positive-weight
+        # decisions.  A Poisson-zero dense group must not masquerade as a rank
+        # update in the training audit.
+        if float(group_weight.detach()) <= 0.0:
+            continue
+        if "success_mask" in batch and not bool(
+            (batch["success_mask"].to(score)[selected] > 0.5).all()
+        ):
+            raise FiveBodyContractError("rank decision lacks complete success supervision")
         successful = labels[selected] > 0.5
-        group_weight = sample_weight[selected].min()
         if bool(successful.any()) and bool((~successful).any()):
             success_terms.append(
                 _negative_log_probability_mass(group_scores, successful).reshape(())
@@ -1202,9 +1668,13 @@ def _effect_aligned_loss(
             success_weights.append(group_weight)
             mixed_success_groups += 1
         elif not bool(successful.any()):
-            preferred = _lexicographic_preferred_mask(dense_components, indices)
             dense_terms.append(
-                _negative_log_probability_mass(group_scores, preferred).reshape(())
+                _dense_soft_listwise_loss(
+                    group_scores,
+                    batch["terminal_max_event_id"].to(score)[selected].float(),
+                    batch["terminal_goal_progress"].to(score)[selected].float(),
+                    ablation_variant=ablation_variant,
+                ).reshape(())
             )
             dense_weights.append(group_weight)
             all_failure_dense_groups += 1
@@ -1221,19 +1691,10 @@ def _effect_aligned_loss(
     else:
         dense_ranking = score.sum() * 0.0
     ranking = success_ranking + DENSE_FAILURE_RANK_WEIGHT * dense_ranking
-    if ablation_variant == "success_only":
-        object_effect = object_effect * 0.0
-        ranking = ranking * 0.0
-        success_ranking = success_ranking * 0.0
-        dense_ranking = dense_ranking * 0.0
-    elif ablation_variant == "no_object_effect":
-        object_effect = object_effect * 0.0
-    total = 0.5 * object_effect + ranking
-    return total, {
-        "robust_object_effect": object_effect,
-        "group_listwise_success_mass": success_ranking,
-        "all_failure_dense_listwise": dense_ranking,
-        "candidate_ranking": ranking,
+    return ranking, {
+        "group_listwise_success_mass_balanced_rank": success_ranking,
+        "all_failure_dense_soft_listwise_balanced_rank": dense_ranking,
+        "candidate_ranking_balanced_rank": ranking,
         "mixed_success_groups_in_batch": score.new_tensor(mixed_success_groups),
         "all_failure_dense_groups_in_batch": score.new_tensor(
             all_failure_dense_groups
@@ -1529,7 +1990,7 @@ def materialize_source_rows(
 def effect_preserving_group_bootstrap_weights(
     rows: Sequence[Mapping[str, Any]], *, members: int, seed: int
 ) -> tuple[np.ndarray, list[dict[str, int]]]:
-    """Poisson group bootstrap with deterministic mixed-outcome preservation."""
+    """Use 1+Poisson for every mixed decision and Poisson for dense decisions."""
 
     group_order = [str(row["logical_group"]) for row in rows]
     weights = core.logical_group_bootstrap_weights(
@@ -1551,6 +2012,12 @@ def effect_preserving_group_bootstrap_weights(
         raise FiveBodyContractError(
             "effect-preserving bootstrap requires a mixed-success decision"
         )
+    # Every epistemic member sees every rare success-changing comparison.  The
+    # Poisson component still changes its relative influence across members;
+    # all-failure decisions retain the ordinary Poisson bootstrap, including
+    # genuine zero weights.
+    for group in mixed_groups:
+        weights[:, indices_by_group[group]] += 1.0
     audit: list[dict[str, int]] = []
     for member in range(members):
         active_mixed = [
@@ -1558,11 +2025,6 @@ def effect_preserving_group_bootstrap_weights(
             for group in mixed_groups
             if float(weights[member, indices_by_group[group][0]]) > 0.0
         ]
-        repaired = 0
-        if not active_mixed:
-            group = mixed_groups[(int(seed) + member) % len(mixed_groups)]
-            weights[member, indices_by_group[group]] = 1.0
-            repaired = 1
         active_indices = [
             index for index in range(len(rows)) if float(weights[member, index]) > 0.0
         ]
@@ -1588,7 +2050,9 @@ def effect_preserving_group_bootstrap_weights(
                 "positive_rows_with_nonzero_weight": int(positives),
                 "negative_rows_with_nonzero_weight": int(negatives),
                 "mixed_success_groups_with_nonzero_weight": int(active_mixed_count),
-                "deterministic_mixed_group_repairs": repaired,
+                "mixed_success_groups_total": len(mixed_groups),
+                "mixed_weight_minimum": 1,
+                "deterministic_mixed_group_repairs": 0,
             }
         )
     return weights.astype(np.float32, copy=False), audit
@@ -1677,11 +2141,19 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
     )
     device = torch.device(args.device)
     group_order = [str(row["logical_group"]) for row in train_rows]
-    bootstrap, bootstrap_support = effect_preserving_group_bootstrap_weights(
+    proper_bootstrap = core.logical_group_bootstrap_weights(
+        group_order, members=5, seed=args.split_seed
+    )
+    rank_bootstrap, bootstrap_support = effect_preserving_group_bootstrap_weights(
         train_rows, members=5, seed=args.split_seed
     )
-    group_weight = {
-        group: bootstrap[:, index].tolist() for index, group in enumerate(group_order)
+    proper_group_weight = {
+        group: proper_bootstrap[:, index].tolist()
+        for index, group in enumerate(group_order)
+    }
+    rank_group_weight = {
+        group: rank_bootstrap[:, index].tolist()
+        for index, group in enumerate(group_order)
     }
     source_negative_to_positive_ratio = float(
         (successes <= 0.5).sum() / (successes > 0.5).sum()
@@ -1716,41 +2188,75 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             lr=args.learning_rate,
             weight_decay=1e-4,
         )
-        loader = DataLoader(
+        proper_loader = DataLoader(
             train_dataset,
             batch_sampler=CompleteDecisionBatchSampler(
                 train_rows, batch_size=args.batch_size, seed=seed
             ),
             collate_fn=core.collate_rows,
         )
-        iterator = iter(loader)
+        rank_weight_for_member = {
+            group: float(weights[member]) for group, weights in rank_group_weight.items()
+        }
+        rank_loader = DataLoader(
+            train_dataset,
+            batch_sampler=MacroBalancedRankDecisionBatchSampler(
+                train_rows,
+                batch_size=args.batch_size,
+                seed=seed,
+                positive_group_weight=rank_weight_for_member,
+            ),
+            collate_fn=core.collate_rows,
+        )
+        proper_iterator = iter(proper_loader)
+        rank_iterator = iter(rank_loader)
         eval_records: dict[int, dict[str, Any]] = {}
         snapshot_paths: dict[int, Path] = {}
         for step in range(1, args.steps + 1):
             try:
-                raw = next(iterator)
+                proper_raw = next(proper_iterator)
             except StopIteration:
-                iterator = iter(loader)
-                raw = next(iterator)
-            batch = core._move_batch(raw, device)
-            weights = torch.tensor(
-                [group_weight[group][member] for group in raw["logical_group"]],
+                proper_iterator = iter(proper_loader)
+                proper_raw = next(proper_iterator)
+            try:
+                rank_raw = next(rank_iterator)
+            except StopIteration:
+                rank_iterator = iter(rank_loader)
+                rank_raw = next(rank_iterator)
+            proper_batch = core._move_batch(proper_raw, device)
+            rank_batch = core._move_batch(rank_raw, device)
+            proper_weights = torch.tensor(
+                [
+                    proper_group_weight[group][member]
+                    for group in proper_raw["logical_group"]
+                ],
                 device=device,
             )
-            prediction = model(batch)
+            rank_weights = torch.tensor(
+                [rank_group_weight[group][member] for group in rank_raw["logical_group"]],
+                device=device,
+            )
+            proper_prediction = model(proper_batch)
             multitask_loss, pieces = core.compute_multitask_loss(
-                prediction,
-                batch,
-                sample_weight=weights,
+                proper_prediction,
+                proper_batch,
+                sample_weight=proper_weights,
                 loss_weights=base_loss_weights,
             )
-            decision_loss, decision_pieces = _effect_aligned_loss(
-                prediction,
-                batch,
-                weights,
+            object_effect_loss, object_pieces = _robust_object_effect_loss(
+                proper_prediction,
+                proper_batch,
+                proper_weights,
                 ablation_variant=args.ablation_variant,
             )
-            loss = multitask_loss + decision_loss
+            rank_prediction = model(rank_batch)
+            decision_loss, decision_pieces = _candidate_rank_loss(
+                rank_prediction,
+                rank_batch,
+                rank_weights,
+                ablation_variant=args.ablation_variant,
+            )
+            loss = multitask_loss + object_effect_loss + decision_loss
             if not torch.isfinite(loss):
                 raise FiveBodyContractError("non-finite shared-head training loss")
             optimizer.zero_grad(set_to_none=True)
@@ -1776,6 +2282,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             metrics["train_objective_last"] = {
                 "total": float(loss.detach()),
                 **{name: float(value.detach()) for name, value in pieces.items() if name != "total"},
+                **{name: float(value.detach()) for name, value in object_pieces.items()},
                 **{name: float(value.detach()) for name, value in decision_pieces.items()},
             }
             snapshot = snapshot_root / (
@@ -1895,13 +2402,14 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 "held_out_body": args.held_out_body,
                 "source_bodies": preflight["source_bodies"],
                 "body_adapter": "single_shared_row_zero_heldout_parameters",
-                "model_family": "effect_aligned_time_aware_shared_event_head_v3",
+                "model_family": MODEL_FAMILY,
                 "ablation": ablation_contract(args.ablation_variant),
                 "candidate_rank_contract": checkpoint_candidate_rank_contract(
                     args.ablation_variant
                 ),
                 "canonical_state_schema": CANONICAL_STATE_SCHEMA,
                 "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
+                "event_age_contract": event_age_contract(),
                 "event_spec_sha256": EVENT_SPEC_SHA256,
                 "event_derivation_implementation_sha256": preflight[
                     "event_derivation_implementation_sha256"
@@ -1945,6 +2453,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         "source_bodies": preflight["source_bodies"],
         "canonical_state_schema": CANONICAL_STATE_SCHEMA,
         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
+        "event_age_contract": event_age_contract(),
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": preflight[
             "event_derivation_implementation_sha256"
@@ -2043,11 +2552,14 @@ __all__ = [
     "ABLATION_VARIANTS",
     "ACTOR_FORMAT", "BINDING_FORMAT", "BODIES", "CANONICAL_ACTION_SCHEMA",
     "CANONICAL_STATE_SCHEMA", "CANDIDATE_NOISE_CONTRACT",
-    "CANDIDATE_RANK_FEATURE_DIM", "BRANCH_DIAGNOSTIC_CONTRACT",
-    "CompleteDecisionBatchSampler", "DENSE_FAILURE_RANK_WEIGHT",
+    "CANDIDATE_RANK_FEATURE_DIM", "CANDIDATE_RANK_FEATURE_SCHEMA",
+    "BRANCH_DIAGNOSTIC_CONTRACT",
+    "CompleteDecisionBatchSampler", "MacroBalancedRankDecisionBatchSampler",
+    "DENSE_FAILURE_RANK_WEIGHT", "DENSE_GOAL_PROGRESS_TEMPERATURE_METERS",
     "CONDITIONS", "FORMAT",
     "EffectAlignedSharedEventHead", "FiveBodyContractError", "MANIFEST_FORMAT",
-    "EVENT_SPEC_SHA256", "MATERIALIZATION_FORMAT", "OBJECT_EFFECT_SCHEMA",
+    "EVENT_SPEC_SHA256", "MATERIALIZATION_FORMAT", "MODEL_FAMILY",
+    "OBJECT_EFFECT_SCHEMA", "EVENT_AGE_CONTRACT", "event_age_contract",
     "REQUIRED_ARRAYS",
     "STANDARDIZED_RANK_ENSEMBLE_CONTRACT",
     "TERMINAL_SUPERVISION_CONTRACT",

@@ -82,6 +82,13 @@ TERMINAL_SUPERVISION_CONTRACT = {
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
     "same_stage_progress_definition_as_formal_paired_runner": True,
 }
+EVENT_AGE_CONTRACT = {
+    "array": "event_age_seconds",
+    "semantics": "elapsed_physical_seconds_since_current_canonical_event_entry",
+    "clock_source": "counted_successful_sapien_scene_step_calls",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
+}
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": DIAGNOSTIC_FORMAT,
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
@@ -268,6 +275,33 @@ def derive_predicates_and_events(
         )
     except (analytic_event.AnalyticEventSpecError, ValueError) as error:
         raise BranchCollectionError(str(error)) from error
+
+
+def event_age_seconds(
+    events: np.ndarray, sim_times: np.ndarray, step: int | None = None
+) -> float:
+    """Return physical time elapsed since entry into the current event."""
+
+    event_values = np.asarray(events, dtype=np.int64).reshape(-1)
+    time_values = np.asarray(sim_times, dtype=np.float64).reshape(-1)
+    if (
+        len(event_values) == 0
+        or event_values.shape != time_values.shape
+        or not np.isfinite(time_values).all()
+        or np.any(np.diff(time_values) < -1e-12)
+    ):
+        raise BranchCollectionError("event age requires aligned monotone physical time")
+    selected = len(event_values) - 1 if step is None else int(step)
+    if selected < 0 or selected >= len(event_values):
+        raise BranchCollectionError("event age step is outside the observed trajectory")
+    current = int(event_values[selected])
+    entry = selected
+    while entry > 0 and int(event_values[entry - 1]) == current:
+        entry -= 1
+    age = float(time_values[selected] - time_values[entry])
+    if not np.isfinite(age) or age < -1e-9:
+        raise BranchCollectionError("derived event age is invalid")
+    return max(age, 0.0)
 
 
 def _image_chw(value: Any) -> torch.Tensor:
@@ -719,6 +753,7 @@ def materialize_group(
         prefix, prefix_times, names, False, calibration
     )
     current_event = int(prefix_events[-1])
+    root_event_age = event_age_seconds(prefix_events, prefix_times)
     state = _state27(
         poses=prefix,
         names=names,
@@ -838,6 +873,7 @@ def materialize_group(
         "terminal_goal_distance": np.asarray(terminal_goal_distance, dtype=np.float32),
         "terminal_goal_progress": np.asarray(terminal_goal_progress, dtype=np.float32),
         "candidate_index": np.arange(count, dtype=np.int64),
+        "event_age_seconds": np.full(count, root_event_age, dtype=np.float32),
         # ``dt`` is an execution-time critic input, not an outcome.  Keep it
         # equal across the four candidates and known before execution; only
         # event ``duration`` above uses counted simulator seconds.
@@ -927,6 +963,34 @@ def materialize_branch_diagnostics(
     return arrays
 
 
+def resolve_query_contract(
+    requested: Sequence[int], declared: Sequence[int] | None
+) -> tuple[list[int], list[int]]:
+    """Separate resumable work lanes from the immutable manifest universe."""
+
+    requested_queries = sorted(int(value) for value in requested)
+    manifest_queries = sorted(
+        int(value) for value in (requested if declared is None else declared)
+    )
+    if (
+        not requested_queries
+        or not manifest_queries
+        or requested_queries[0] < 0
+        or manifest_queries[0] < 0
+    ):
+        raise BranchCollectionError("root query indices must be non-negative")
+    if (
+        len(set(requested_queries)) != len(requested_queries)
+        or len(set(manifest_queries)) != len(manifest_queries)
+    ):
+        raise BranchCollectionError("root query indices must be unique")
+    if not set(requested_queries).issubset(manifest_queries):
+        raise BranchCollectionError(
+            "requested root queries must be a subset of the manifest query universe"
+        )
+    return requested_queries, manifest_queries
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--body", choices=BODIES, required=True)
@@ -939,6 +1003,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-start", type=int, default=2026081000)
     parser.add_argument("--seed-count", type=int, default=50)
     parser.add_argument("--root-query-indices", nargs="+", type=int, default=[0, 10, 20, 30])
+    parser.add_argument(
+        "--manifest-root-query-indices",
+        nargs="+",
+        type=int,
+        help=(
+            "Immutable query-index universe recorded in the manifest.  A resume "
+            "invocation may request a subset via --root-query-indices, but may "
+            "not change this universe."
+        ),
+    )
     parser.add_argument("--action-exec-steps", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
@@ -951,10 +1025,10 @@ def main() -> None:
         raise BranchCollectionError("real branch collection requires remote RTX 4090 CUDA")
     if args.seed_count <= 0 or args.action_exec_steps <= 0:
         raise BranchCollectionError("seed-count/action-exec-steps must be positive")
-    if not args.root_query_indices or min(args.root_query_indices) < 0:
-        raise BranchCollectionError("root query indices must be non-negative")
-    if len(set(args.root_query_indices)) != len(args.root_query_indices):
-        raise BranchCollectionError("root query indices must be unique")
+    requested_queries, manifest_queries = resolve_query_contract(
+        args.root_query_indices,
+        args.manifest_root_query_indices,
+    )
     for path in (
         args.actor_checkpoint,
         args.vlm_metadata_path,
@@ -1030,10 +1104,11 @@ def main() -> None:
             or manifest.get("body") != args.body
             or manifest.get("actor_checkpoint") != str(args.actor_checkpoint.resolve())
             or manifest.get("candidate_count") != CANDIDATE_COUNT
-            or manifest.get("root_query_indices") != sorted(args.root_query_indices)
+            or manifest.get("root_query_indices") != manifest_queries
             or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
             or manifest.get("terminal_supervision_contract")
             != TERMINAL_SUPERVISION_CONTRACT
+            or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
             or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
             or manifest.get("branch_diagnostic_contract")
             != BRANCH_DIAGNOSTIC_CONTRACT
@@ -1053,7 +1128,7 @@ def main() -> None:
             "candidate_zero_is_actor_baseline": True,
             "same_ordered_candidate_set_for_baseline_and_etsf": True,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
-            "root_query_indices": sorted(args.root_query_indices),
+            "root_query_indices": manifest_queries,
             "schema_adapter": {
                 "kind": "analytic_label_free_canonical_v1",
                 "trainable": False,
@@ -1108,6 +1183,7 @@ def main() -> None:
                 "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
             },
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "event_age_contract": EVENT_AGE_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "event_spec_sha256": EVENT_SPEC_SHA256,
@@ -1120,7 +1196,7 @@ def main() -> None:
         task_args = _load_task_args(args.robotwin_root, args.body, condition)
         task_args["step_lim"] = args.max_steps
         for seed in seeds:
-            for root_query in sorted(args.root_query_indices):
+            for root_query in requested_queries:
                 group_id = f"{condition}|seed={seed}|query={root_query}"
                 if group_id in existing_ids:
                     continue

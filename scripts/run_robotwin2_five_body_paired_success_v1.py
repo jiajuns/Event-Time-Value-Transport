@@ -19,6 +19,7 @@ import gc
 import hashlib
 import inspect
 import json
+import math
 import os
 import random
 import sys
@@ -400,6 +401,7 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         != current_event_implementation_sha
         or summary.get("candidate_rank_contract")
         != shared_head.summary_candidate_rank_contract("full")
+        or summary.get("event_age_contract") != shared_head.event_age_contract()
         or summary.get("ablation") != shared_head.ablation_contract("full")
         or summary.get("trainer_file_sha256") != current_trainer_sha
         or not isinstance(ensemble_selection, Mapping)
@@ -477,8 +479,9 @@ def load_ensemble(
             != shared_head.CANONICAL_STATE_SCHEMA
             or checkpoint.get("canonical_action_schema")
             != shared_head.CANONICAL_ACTION_SCHEMA
-            or checkpoint.get("model_family")
-            != "effect_aligned_time_aware_shared_event_head_v3"
+            or checkpoint.get("event_age_contract")
+            != shared_head.event_age_contract()
+            or checkpoint.get("model_family") != shared_head.MODEL_FAMILY
             or checkpoint.get("candidate_rank_contract")
             != shared_head.checkpoint_candidate_rank_contract("full")
             or checkpoint.get("ablation") != shared_head.ablation_contract("full")
@@ -514,6 +517,7 @@ def scoring_batch(
     current_ee: np.ndarray,
     candidates: np.ndarray,
     current_event: int,
+    event_age_seconds: float,
     action_exec_steps: int,
     dt: float,
     device: torch.device,
@@ -527,6 +531,8 @@ def scoring_batch(
         raise PairedExecutionError("formal actor control interval is fixed to 1/15 second")
     if not 0 <= current_event <= STAGE_DENOMINATOR:
         raise PairedExecutionError("current event id is outside 0..4")
+    if not np.isfinite(event_age_seconds) or event_age_seconds < 0.0:
+        raise PairedExecutionError("current event age must be finite and non-negative")
     expected_event_onehot = np.zeros(STAGE_DENOMINATOR + 1, dtype=np.float32)
     expected_event_onehot[current_event] = 1.0
     if not np.array_equal(
@@ -556,6 +562,12 @@ def scoring_batch(
         ),
         "current_event_id": torch.full(
             (CANDIDATE_COUNT,), current_event, dtype=torch.long, device=device
+        ),
+        "event_age_seconds": torch.full(
+            (CANDIDATE_COUNT,),
+            float(event_age_seconds),
+            dtype=torch.float32,
+            device=device,
         ),
     }
     return batch
@@ -643,7 +655,7 @@ def canonical_state_at(
     names: Sequence[str],
     ee_action: np.ndarray,
     calibration: Mapping[str, Any],
-) -> tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int, float]:
     predicates, events = collector.derive_predicates_and_events(
         trajectory, sim_times, names, False, calibration
     )
@@ -658,7 +670,7 @@ def canonical_state_at(
         predicates=predicates,
         calibration=calibration,
     )
-    return state, int(events[-1])
+    return state, int(events[-1]), collector.event_age_seconds(events, sim_times)
 
 
 def reset_identity(snapshot: Mapping[str, Any]) -> str:
@@ -829,12 +841,13 @@ def execute_rollout(
                     snapshot=initial_snapshot,
                     candidates=candidates,
                 )
+            current_event_age: float | None = None
             if method == "actor_baseline":
                 selected = 0
                 score_record = None
             elif method == "etsf_best_of_4":
                 trajectory_array = np.stack(trajectory).astype(np.float32)
-                state, current_event = canonical_state_at(
+                state, current_event, current_event_age = canonical_state_at(
                     trajectory=trajectory_array,
                     sim_times=np.asarray(sim_times, dtype=np.float64),
                     names=names,
@@ -848,6 +861,7 @@ def execute_rollout(
                         current_ee=current_ee,
                         candidates=candidates,
                         current_event=current_event,
+                        event_age_seconds=current_event_age,
                         action_exec_steps=action_exec_steps,
                         dt=dt,
                         device=device,
@@ -888,6 +902,9 @@ def execute_rollout(
                         collector._sim_time(task) - first_chunk_start_seconds
                     ),
                     "critic_scores": score_record,
+                    "event_age_seconds": (
+                        None if score_record is None else float(current_event_age)
+                    ),
                 }
             )
             query_index += 1
@@ -976,13 +993,24 @@ def _validate_rollout_decisions(
             raise PairedExecutionError(f"{method} decision identity changed")
         scores = decision.get("critic_scores")
         if method == "actor_baseline":
-            if decision["selected_candidate_index"] != 0 or scores is not None:
+            if (
+                decision["selected_candidate_index"] != 0
+                or scores is not None
+                or decision.get("event_age_seconds") is not None
+            ):
                 raise PairedExecutionError(
                     "actor baseline must execute candidate zero without critic scores"
                 )
             continue
         if not isinstance(scores, Mapping):
             raise PairedExecutionError("ETSF decision lacks five-member critic scores")
+        if (
+            not isinstance(decision.get("event_age_seconds"), (int, float))
+            or isinstance(decision.get("event_age_seconds"), bool)
+            or not math.isfinite(float(decision["event_age_seconds"]))
+            or float(decision["event_age_seconds"]) < 0.0
+        ):
+            raise PairedExecutionError("ETSF decision lacks a valid pre-action event age")
         raw = np.asarray(scores.get("candidate_rank_score_members"), dtype=np.float64)
         recorded = np.asarray(
             scores.get("candidate_rank_score_standardized_ensemble"),
@@ -1305,6 +1333,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fps": args.fps,
         "actor_training_dataset_fps": ACTOR_DATASET_FPS,
         "planned_first_chunk_seconds": PLANNED_DT_SECONDS,
+        "event_age_contract": shared_head.event_age_contract(),
         "instruction": args.instruction,
         "runtime_binding": implementation_binding(robotwin_root),
         "no_training": True,
