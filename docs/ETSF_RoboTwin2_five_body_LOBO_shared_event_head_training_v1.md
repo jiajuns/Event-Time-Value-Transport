@@ -149,6 +149,34 @@ python scripts/train_robotwin2_five_body_lobo_shared_event_head_v1.py \
 `task_success_evaluation_authorized=false` 是刻意的：后续还需 label-blind live forward、同序候选
 commitment 和完整 paired simulator result，不能用 critic AUC/Brier 替代任务成功率。
 
+## 完整 8000 分支离线消融
+
+`run_robotwin2_five_body_lobo_offline_ablation_v1.py` 只接受完整的
+`2000 decision × 4 candidate = 8000` 分支 binding，并固定运行四个 variant：
+
+- `success_only`：只训练 proper success BCE，直接按 success logit 选候选；
+- `no_time_duration`：关闭 duration loss，并把 rank 的 clock/duration 输入置零；
+- `no_object_effect`：关闭 robust object-effect loss 和 rank target 的 geometric progress；
+- `full`：正式完整共享头。
+
+四者使用完全相同的 requested-seed-disjoint split、五折、五成员 seed、每成员 3000 step、eval
+间隔、batch 和学习率，不提供小样本或缩减预算开关。每折仍只以另外四个 source body 的
+validation 选 checkpoint。入口先完成全部 `4 variant × 5 fold = 20` 次 source-only 训练与选模，
+然后才打开 held-out body payload 做只读 posthoc 评估；heldout 指标既不回流 checkpoint，也不选
+variant。输出同时保留 source-validation 五成员均值和真正 heldout-body 五折结果。heldout 的
+best-of-4 `ΔSR`、selected/oracle SR、pairwise accuracy 按正式推理方式先平均五成员 rank score 再
+选候选；success/event/duration/object 预测指标为五成员逐模型指标的算术均值，明确不是
+ensemble-calibrated 指标。最终 equal-fold macro 跨五个 heldout body 等权计算。
+禁用头的预测指标只作 descriptive 输出，不进入该 variant 的 checkpoint tie-break；例如
+`success_only` 的 diagnostic tie-break 只允许 success Brier，不能借 event/duration/object 标签选模。
+
+```bash
+python3 scripts/run_robotwin2_five_body_lobo_offline_ablation_v1.py \
+  --binding /ABS/full8000_training_binding.json \
+  --binding-sha256 FULL_BINDING_SHA256 \
+  --output /ABS/new/full8000_lobo_ablation
+```
+
 ## 完整 8000 分支到五折训练的远程 watcher
 
 `watch_robotwin2_five_body_branches_to_lobo_training_v1.py` 是正式的断 SSH 后处理入口。它在

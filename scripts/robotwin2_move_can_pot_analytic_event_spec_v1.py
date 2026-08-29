@@ -231,6 +231,18 @@ def goal_vector(
     return moving, (goal - moving).astype(np.float32)
 
 
+def _elapsed_at_least(start: float, end: float, threshold: float) -> bool:
+    """Compare simulator durations without absolute-time cancellation noise."""
+
+    elapsed = end - start
+    tolerance = (
+        64.0
+        * np.finfo(np.float64).eps
+        * max(abs(start), abs(end), abs(threshold), 1.0)
+    )
+    return bool(elapsed + tolerance >= threshold)
+
+
 def derive_predicates_and_events(
     poses: np.ndarray,
     sim_times: np.ndarray,
@@ -271,17 +283,16 @@ def derive_predicates_and_events(
     ]
     stationary = np.zeros(len(poses), dtype=bool)
     for step in range(1, len(poses)):
-        start = step
-        while (
-            start > 0
-            and near[start]
-            and speed[start] <= THRESHOLDS["stationary_speed_m_per_s"]
-        ):
-            start -= 1
+        for start in range(step, -1, -1):
             if (
-                near[start]
-                and sim_times[step] - sim_times[start]
-                >= THRESHOLDS["stationary_window_seconds"]
+                not near[start]
+                or speed[start] > THRESHOLDS["stationary_speed_m_per_s"]
+            ):
+                break
+            if _elapsed_at_least(
+                float(sim_times[start]),
+                float(sim_times[step]),
+                THRESHOLDS["stationary_window_seconds"],
             ):
                 stationary[step] = True
                 break

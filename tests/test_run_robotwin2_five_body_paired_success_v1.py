@@ -328,23 +328,31 @@ def test_analytic_events_and_state27_goal_are_identical_offline_and_online() -> 
         ROOT / "configs/robotwin2_move_can_pot_five_body_analytic_event_spec_v1.json"
     )
     _spec, calibration = runner.analytic_event.load_event_spec(spec_path)
-    poses = np.zeros((5, 2, 7), dtype=np.float32)
-    poses[:, 0, 0] = [-0.30, -0.28, -0.18, -0.18, -0.18]
+    poses = np.zeros((6, 2, 7), dtype=np.float32)
+    poses[:, 0, 0] = [-0.30, -0.28, -0.18, -0.18, -0.18, -0.18]
     poses[:, :, 2] = 0.74
     poses[:, :, 3] = 1.0
-    times = np.asarray([0.0, 0.1, 0.2, 0.31, 0.41], dtype=np.float64)
+    times = np.asarray([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float64)
     predicates, events = runner.collector.derive_predicates_and_events(
         poses, times, ["can", "pot"], False, calibration
     )
-    assert events.tolist() == [0, 1, 2, 2, 3]
+    # The high arrival speed at t=0.2 is part of that closed stationary window,
+    # so e4 begins only after a full low-speed [0.3, 0.5] interval.
+    assert events.tolist() == [0, 1, 2, 2, 2, 3]
+    _shifted_predicates, shifted_events = (
+        runner.collector.derive_predicates_and_events(
+            poses, times + 1.0, ["can", "pot"], False, calibration
+        )
+    )
+    assert shifted_events.tolist() == events.tolist()
     _predicates, terminal = runner.collector.derive_predicates_and_events(
         poses, times, ["can", "pot"], True, calibration
     )
-    assert terminal.tolist() == [0, 1, 2, 2, 4]
+    assert terminal.tolist() == [0, 1, 2, 2, 2, 4]
     ee = np.zeros(16, dtype=np.float32)
     ee[3] = ee[11] = 1.0
     offline = runner.collector._state27(
-        poses=poses, names=["can", "pot"], step=4,
+        poses=poses, names=["can", "pot"], step=5,
         initial_moving_position=poses[0, 0, :3], ee_action=ee,
         event=int(events[-1]), predicates=predicates, calibration=calibration,
     )

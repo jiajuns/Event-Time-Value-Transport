@@ -52,6 +52,121 @@ BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 CANDIDATE_COUNT = 4
 CANDIDATE_RANK_FEATURE_DIM = core.SEMANTIC_DIM + 64 + 2
+ABLATION_VARIANTS = (
+    "success_only",
+    "no_time_duration",
+    "no_object_effect",
+    "full",
+)
+
+
+def ablation_contract(variant: str) -> dict[str, Any]:
+    if variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {variant!r}")
+    return {
+        "variant": variant,
+        "candidate_score": (
+            "proper_success_logit"
+            if variant == "success_only"
+            else "pairwise_candidate_rank_logit"
+        ),
+        "multitask_heads_enabled": (
+            ["success"]
+            if variant == "success_only"
+            else [
+                "post_event",
+                "next_event",
+                *([] if variant == "no_time_duration" else ["duration"]),
+                "success",
+                "recovery",
+            ]
+        ),
+        "time_duration_rank_features_enabled": variant
+        not in {"success_only", "no_time_duration"},
+        "object_effect_loss_and_rank_target_enabled": variant
+        not in {"success_only", "no_object_effect"},
+        "same_seed_disjoint_split": True,
+        "heldout_labels_used_for_training_or_selection": False,
+    }
+
+
+def ablation_selection_components(
+    components: Mapping[str, float], variant: str
+) -> dict[str, float]:
+    allowed = {
+        "success_only": {"success_brier_ratio"},
+        "no_time_duration": {
+            "post_event_macro_error_ratio",
+            "next_event_macro_error_ratio",
+            "success_brier_ratio",
+            "object_rmse_ratio",
+        },
+        "no_object_effect": {
+            "post_event_macro_error_ratio",
+            "next_event_macro_error_ratio",
+            "observed_duration_mae_ratio",
+            "success_brier_ratio",
+        },
+        "full": set(components),
+    }
+    if variant not in allowed:
+        raise FiveBodyContractError(f"unknown ablation variant {variant!r}")
+    selected = {
+        name: float(value) for name, value in components.items() if name in allowed[variant]
+    }
+    if not selected:
+        raise FiveBodyContractError(
+            f"{variant} has no enabled validation diagnostic for checkpoint selection"
+        )
+    return selected
+
+
+def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
+    """Describe the score path saved in one selected checkpoint."""
+
+    if variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {variant!r}")
+    if variant == "success_only":
+        feature_blocks = ["proper_success_logit_from_transitioned_semantic"]
+    elif variant == "no_time_duration":
+        feature_blocks = [
+            "transitioned_semantic_end_to_end",
+            "clock_hidden_forced_zero",
+            "current_event_duration_log_mean_forced_zero",
+            "current_event_duration_log_scale_forced_zero",
+        ]
+    else:
+        feature_blocks = [
+            "transitioned_semantic_end_to_end",
+            "clock_hidden_detached",
+            "current_event_duration_log_mean_detached",
+            "current_event_duration_log_scale_detached",
+        ]
+    return {
+        "feature_blocks": feature_blocks,
+        "feature_dim": CANDIDATE_RANK_FEATURE_DIM,
+        "dt_has_numeric_score_path": variant not in {"success_only", "no_time_duration"},
+        "pairwise_rank_loss_enabled": variant != "success_only",
+        "rank_loss_updates_clock_or_duration_heads": False,
+        "rank_loss_updates_semantic_action_transition": variant != "success_only",
+    }
+
+
+def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
+    """Describe rank supervision without claiming disabled ablation paths."""
+
+    checkpoint = checkpoint_candidate_rank_contract(variant)
+    return {
+        "candidate_score": ablation_contract(variant)["candidate_score"],
+        "time_and_duration_effect_used": variant
+        not in {"success_only", "no_time_duration"},
+        "dt_has_numeric_score_path": checkpoint["dt_has_numeric_score_path"],
+        "pairwise_rank_loss_enabled": checkpoint["pairwise_rank_loss_enabled"],
+        "rank_loss_updates_clock_or_duration_heads": False,
+        "rank_loss_updates_semantic_action_transition": checkpoint[
+            "rank_loss_updates_semantic_action_transition"
+        ],
+    }
 CANONICAL_STATE_SCHEMA = canonical_adapter.STATE_SCHEMA
 CANONICAL_ACTION_SCHEMA = canonical_adapter.ACTION_SCHEMA
 REQUIRED_ARRAYS = {
@@ -670,8 +785,11 @@ class CompleteDecisionBatchSampler:
 class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
     """Shared event model with a scalar head trained for best-of-four choice."""
 
-    def __init__(self) -> None:
+    def __init__(self, ablation_variant: str = "full") -> None:
+        if ablation_variant not in ABLATION_VARIANTS:
+            raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
         super().__init__(core.ModelConfig(body_count=1, action_schema_count=1))
+        self.ablation_variant = ablation_variant
         self.register_buffer("state_mean", torch.zeros(core.STATE_DIM))
         self.register_buffer("state_std", torch.ones(core.STATE_DIM))
         self.candidate_rank = torch.nn.Sequential(
@@ -705,17 +823,31 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         # block remains end-to-end so rank supervision can improve the shared
         # state/action transition.  Clock/duration features are detached so
         # rank loss cannot directly move their proper likelihood parameters.
+        clock_features = output["clock_hidden"].detach()
+        duration_features = torch.stack(
+            (
+                output["duration_selected_log_mean"].detach(),
+                output["duration_selected_log_scale"].detach(),
+            ),
+            dim=-1,
+        )
+        if self.ablation_variant == "no_time_duration":
+            clock_features = torch.zeros_like(clock_features)
+            duration_features = torch.zeros_like(duration_features)
         rank_features = torch.cat(
             (
                 output["transitioned"],
-                output["clock_hidden"].detach(),
-                output["duration_selected_log_mean"].detach()[:, None],
-                output["duration_selected_log_scale"].detach()[:, None],
+                clock_features,
+                duration_features,
             ),
             dim=-1,
         )
         output["candidate_rank_features"] = rank_features
-        output["candidate_rank_logit"] = self.candidate_rank(rank_features).squeeze(-1)
+        output["candidate_rank_logit"] = (
+            output["success_logit"]
+            if self.ablation_variant == "success_only"
+            else self.candidate_rank(rank_features).squeeze(-1)
+        )
         return output
 
 
@@ -723,6 +855,8 @@ def _effect_aligned_loss(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
     sample_weight: torch.Tensor,
+    *,
+    ablation_variant: str = "full",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Optimize robust object effects and within-root ordering.
 
@@ -761,6 +895,8 @@ def _effect_aligned_loss(
     relative_start = batch["state"][:, 0:3].to(output["candidate_rank_logit"])
     relative_end = relative_start + batch["object_delta"][:, 3:6].to(relative_start)
     goal_progress = relative_start.norm(dim=-1) - relative_end.norm(dim=-1)
+    if ablation_variant == "no_object_effect":
+        goal_progress = torch.zeros_like(goal_progress)
     # Lexicographic target: task success first, then event stage, then geometric
     # progress.  The large fixed gaps prevent a partial-progress failure from
     # outranking any successful candidate.
@@ -786,6 +922,11 @@ def _effect_aligned_loss(
         )
     else:
         ranking = score.sum() * 0.0
+    if ablation_variant == "success_only":
+        object_effect = object_effect * 0.0
+        ranking = ranking * 0.0
+    elif ablation_variant == "no_object_effect":
+        object_effect = object_effect * 0.0
     total = 0.5 * object_effect + ranking
     return total, {
         "robust_object_effect": object_effect,
@@ -874,11 +1015,15 @@ def evaluate_candidate_ranking(
     macro_selected = float(
         np.mean([row["selected_success_rate"] for row in units.values()])
     )
+    macro_oracle = float(
+        np.mean([row["oracle_success_rate"] for row in units.values()])
+    )
     return {
         **global_metrics,
         "body_condition_units": units,
         "macro_delta_success_rate": macro_delta,
         "macro_selected_success_rate": macro_selected,
+        "macro_oracle_success_rate": macro_oracle,
         "pairwise_accuracy": float(pair_correct / pair_total) if pair_total else None,
         "pairwise_comparisons": pair_total,
     }
@@ -991,12 +1136,17 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
     )
     base_loss_weights = dict(core.DEFAULT_LOSS_WEIGHTS)
     base_loss_weights["object"] = 0.0
+    if args.ablation_variant == "success_only":
+        base_loss_weights = {name: 0.0 for name in base_loss_weights}
+        base_loss_weights["success"] = 1.0
+    elif args.ablation_variant == "no_time_duration":
+        base_loss_weights["duration"] = 0.0
     members = []
     for member, seed in enumerate(args.ensemble_seeds):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        model = EffectAlignedSharedEventHead().to(device)
+        model = EffectAlignedSharedEventHead(args.ablation_variant).to(device)
         model.action.set_normalization(
             torch.as_tensor(action_mean, device=device),
             torch.as_tensor(action_std, device=device),
@@ -1041,7 +1191,10 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 loss_weights=base_loss_weights,
             )
             decision_loss, decision_pieces = _effect_aligned_loss(
-                prediction, batch, weights
+                prediction,
+                batch,
+                weights,
+                ablation_variant=args.ablation_variant,
             )
             loss = multitask_loss + decision_loss
             if not torch.isfinite(loss):
@@ -1059,8 +1212,13 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             diagnostic_score, components = core.validation_selection_score(
                 metrics, validation_baseline
             )
+            selection_components = ablation_selection_components(
+                components, args.ablation_variant
+            )
+            diagnostic_score = float(np.mean(list(selection_components.values())))
             metrics["diagnostic_multitask_score"] = diagnostic_score
             metrics["diagnostic_multitask_components"] = components
+            metrics["checkpoint_selection_diagnostic_components"] = selection_components
             metrics["train_objective_last"] = {
                 "total": float(loss.detach()),
                 **{name: float(value.detach()) for name, value in pieces.items() if name != "total"},
@@ -1091,18 +1249,10 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                         "source_bodies": preflight["source_bodies"],
                         "body_adapter": "single_shared_row_zero_heldout_parameters",
                         "model_family": "effect_aligned_time_aware_shared_event_head_v3",
-                        "candidate_rank_contract": {
-                            "feature_blocks": [
-                                "transitioned_semantic_end_to_end",
-                                "clock_hidden_detached",
-                                "current_event_duration_log_mean_detached",
-                                "current_event_duration_log_scale_detached",
-                            ],
-                            "feature_dim": CANDIDATE_RANK_FEATURE_DIM,
-                            "dt_has_numeric_score_path": True,
-                            "rank_loss_updates_clock_or_duration_heads": False,
-                            "rank_loss_updates_semantic_action_transition": True,
-                        },
+                        "ablation": ablation_contract(args.ablation_variant),
+                        "candidate_rank_contract": checkpoint_candidate_rank_contract(
+                            args.ablation_variant
+                        ),
                         "canonical_state_schema": CANONICAL_STATE_SCHEMA,
                         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
                         "event_spec_sha256": EVENT_SPEC_SHA256,
@@ -1144,11 +1294,16 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         "event_derivation_implementation_sha256": preflight[
             "event_derivation_implementation_sha256"
         ],
-        "candidate_rank_contract": {
-            "time_and_duration_effect_used": True,
-            "dt_has_numeric_score_path": True,
-            "rank_loss_updates_clock_or_duration_heads": False,
-            "rank_loss_updates_semantic_action_transition": True,
+        "candidate_rank_contract": summary_candidate_rank_contract(
+            args.ablation_variant
+        ),
+        "ablation": ablation_contract(args.ablation_variant),
+        "training_budget": {
+            "steps_per_member": args.steps,
+            "eval_every_steps": args.eval_every,
+            "batch_size_rows": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "ensemble_members": len(args.ensemble_seeds),
         },
         "mixed_outcome_source_decisions": mixed_outcome_decisions,
         "source_negative_to_positive_ratio": source_negative_to_positive_ratio,
@@ -1184,6 +1339,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument(
+        "--ablation-variant", choices=ABLATION_VARIANTS, default="full"
+    )
+    parser.add_argument(
         "--ensemble-seeds", nargs=5, type=int,
         default=[20260901, 20260902, 20260903, 20260904, 20260905],
     )
@@ -1211,14 +1369,17 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ABLATION_VARIANTS",
     "ACTOR_FORMAT", "BINDING_FORMAT", "BODIES", "CANONICAL_ACTION_SCHEMA",
     "CANONICAL_STATE_SCHEMA", "CompleteDecisionBatchSampler",
     "CONDITIONS", "FORMAT",
     "EffectAlignedSharedEventHead", "FiveBodyContractError", "MANIFEST_FORMAT",
     "EVENT_SPEC_SHA256", "MATERIALIZATION_FORMAT",
-    "build_preflight_receipt", "canonical_sha256", "load_binding",
+    "ablation_contract", "ablation_selection_components",
+    "build_preflight_receipt", "canonical_sha256",
+    "checkpoint_candidate_rank_contract", "load_binding",
     "evaluate_candidate_ranking", "materialize_source_rows", "sha256_file",
-    "sha256_tree", "source_group_split",
+    "sha256_tree", "source_group_split", "summary_candidate_rank_contract",
     "validate_actor_authority", "validate_body_manifest",
     "validate_materialization_receipt",
 ]

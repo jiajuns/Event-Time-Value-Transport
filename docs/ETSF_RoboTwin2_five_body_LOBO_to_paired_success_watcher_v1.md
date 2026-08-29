@@ -23,11 +23,11 @@ stderr 由服务器 `nohup` 写入固定 watcher log，runner/evaluator 另有�
   `4df5b7242d1c7bf8e3f5dac65c0eb4376043dbf6c60ef2633d086ab06e7e3aee`；
 - 唯一 event derivation module 为
   `robotwin2_move_can_pot_analytic_event_spec_v1.py`，文件 SHA 为
-  `06d0abd896a3bfd7d0ae96141a0753dadcca5d42a42faaa0e2024ed6a7f00d46`；
+  `d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9`；
 - 每折 `training_summary.json` 必须同时声明这两个 SHA，runner execution contract 也必须声明同一
   module SHA 与 `training_and_online_event_implementation_identical=true`。
 
-正式 runner SHA 固定为 `068dce8c…`，v2 evaluator SHA 固定为 `01181e82…`；watcher 会在 CUDA
+正式 runner SHA 固定为 `1c6fa9eb…`，v2 evaluator SHA 固定为 `01181e82…`；watcher 会在 CUDA
 或 simulator 启动前逐文件复核。远程部署必须使用新的只读代码目录，不得把旧 event spec、旧
 runner 或已有 dirty artifact 复制成正式授权。
 

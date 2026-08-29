@@ -397,12 +397,8 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         or summary.get("event_derivation_implementation_sha256")
         != current_event_implementation_sha
         or summary.get("candidate_rank_contract")
-        != {
-            "time_and_duration_effect_used": True,
-            "dt_has_numeric_score_path": True,
-            "rank_loss_updates_clock_or_duration_heads": False,
-            "rank_loss_updates_semantic_action_transition": True,
-        }
+        != shared_head.summary_candidate_rank_contract("full")
+        or summary.get("ablation") != shared_head.ablation_contract("full")
     ):
         raise PairedExecutionError(f"LOBO fold summary contract changed for {body}")
     members = summary.get("members")
@@ -464,18 +460,8 @@ def load_ensemble(
             or checkpoint.get("model_family")
             != "effect_aligned_time_aware_shared_event_head_v3"
             or checkpoint.get("candidate_rank_contract")
-            != {
-                "feature_blocks": [
-                    "transitioned_semantic_end_to_end",
-                    "clock_hidden_detached",
-                    "current_event_duration_log_mean_detached",
-                    "current_event_duration_log_scale_detached",
-                ],
-                "feature_dim": shared_head.CANDIDATE_RANK_FEATURE_DIM,
-                "dt_has_numeric_score_path": True,
-                "rank_loss_updates_clock_or_duration_heads": False,
-                "rank_loss_updates_semantic_action_transition": True,
-            }
+            != shared_head.checkpoint_candidate_rank_contract("full")
+            or checkpoint.get("ablation") != shared_head.ablation_contract("full")
             or checkpoint.get("heldout_rows_used_for_training_normalization_or_selection") != 0
             or checkpoint.get("action_stem_count") != 1
             or checkpoint.get("member") != item["member"]

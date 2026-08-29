@@ -16,8 +16,10 @@ if str(SCRIPTS) not in sys.path:
 import train_multibody_canonical_event_world_model as core  # noqa: E402
 import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E402
+import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
 import verify_robotwin2_move_can_pot_public_materialization_v1 as verifier  # noqa: E402
 from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
+    ABLATION_VARIANTS,
     ACTOR_FORMAT,
     BINDING_FORMAT,
     BODIES,
@@ -34,13 +36,17 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     SOURCE_EVENT_SAMPLING_HZ,
     TASK,
     FiveBodyContractError,
+    ablation_contract,
+    ablation_selection_components,
     build_preflight_receipt,
     canonical_sha256,
+    checkpoint_candidate_rank_contract,
     load_binding,
     materialize_source_rows,
     sha256_file,
     sha256_tree,
     source_group_split,
+    summary_candidate_rank_contract,
 )
 
 
@@ -512,3 +518,233 @@ def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
     output = model(batch)
     assert output["clock_hidden"][0, 0] != output["clock_hidden"][1, 0]
     assert output["candidate_rank_logit"][0] != output["candidate_rank_logit"][1]
+
+
+def test_ablation_variants_change_only_declared_score_features() -> None:
+    batch = _model_batch(torch.full((4,), 5.0 / 15.0))
+    success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
+    assert torch.equal(
+        success_only["candidate_rank_logit"], success_only["success_logit"]
+    )
+    no_time = EffectAlignedSharedEventHead("no_time_duration").eval()(batch)
+    assert torch.count_nonzero(
+        no_time["candidate_rank_features"][:, core.SEMANTIC_DIM:]
+    ) == 0
+    full = EffectAlignedSharedEventHead("full").eval()(batch)
+    assert torch.count_nonzero(
+        full["candidate_rank_features"][:, core.SEMANTIC_DIM:]
+    ) > 0
+    assert set(ABLATION_VARIANTS) == {
+        "success_only", "no_time_duration", "no_object_effect", "full"
+    }
+    assert ablation_contract("no_object_effect")[
+        "object_effect_loss_and_rank_target_enabled"
+    ] is False
+    components = {
+        "post_event_macro_error_ratio": 1.0,
+        "next_event_macro_error_ratio": 1.0,
+        "observed_duration_mae_ratio": 1.0,
+        "success_brier_ratio": 1.0,
+        "object_rmse_ratio": 1.0,
+    }
+    assert set(ablation_selection_components(components, "success_only")) == {
+        "success_brier_ratio"
+    }
+    assert "observed_duration_mae_ratio" not in ablation_selection_components(
+        components, "no_time_duration"
+    )
+    assert "object_rmse_ratio" not in ablation_selection_components(
+        components, "no_object_effect"
+    )
+    assert checkpoint_candidate_rank_contract("no_time_duration")[
+        "dt_has_numeric_score_path"
+    ] is False
+    assert summary_candidate_rank_contract("success_only")[
+        "pairwise_rank_loss_enabled"
+    ] is False
+    assert summary_candidate_rank_contract("full")[
+        "dt_has_numeric_score_path"
+    ] is True
+
+
+def _complete_ablation_audit() -> dict[str, object]:
+    manifests = {}
+    for body in BODIES:
+        groups = []
+        for condition in ablation.trainer.CONDITIONS:
+            for query in ablation.QUERY_INDICES:
+                for ordinal in range(ablation.SEEDS_PER_CONDITION_QUERY):
+                    groups.append(
+                        {
+                            "condition": condition,
+                            "root_query_index": query,
+                            "requested_seed": 2026081000 + ordinal,
+                        }
+                    )
+        manifests[body] = {"groups": groups}
+    return {"manifests": manifests}
+
+
+def _ablation_validation_metrics(offset: float) -> dict[str, object]:
+    return {
+        "candidate_ranking": {
+            "macro_delta_success_rate": 0.1 + offset,
+            "macro_selected_success_rate": 0.5 + offset,
+            "macro_oracle_success_rate": 0.8,
+            "pairwise_accuracy": 0.6 + offset,
+        },
+        "success_brier": 0.2,
+        "success_auroc": 0.7,
+        "post_event": {"macro_f1": 0.5, "accuracy": 0.6},
+        "next_event": {"macro_f1": 0.4, "accuracy": 0.5},
+        "observed_duration_mae": 0.3,
+        "observed_duration_nll": 0.4,
+        "object_rmse": 0.05,
+        "object_nll": 0.1,
+    }
+
+
+def _ablation_fold_summary(body: str, variant: str, offset: float) -> dict[str, object]:
+    return {
+        "status": "source_only_checkpoint_selection_complete",
+        "held_out_body": body,
+        "source_bodies": [item for item in BODIES if item != body],
+        "ablation": ablation_contract(variant),
+        "candidate_rank_contract": summary_candidate_rank_contract(variant),
+        "training_budget": {
+            "steps_per_member": 3000,
+            "eval_every_steps": 100,
+            "batch_size_rows": 64,
+            "learning_rate": 3e-4,
+            "ensemble_members": 5,
+        },
+        "heldout_labels_used_for_normalization_training_or_selection": False,
+        "heldout_group_npz_opened": 0,
+        "preflight": {"split_unit": "body_condition_requested_seed_all_queries"},
+        "members": [
+            {
+                "member": member,
+                "seed": seed,
+                "source_validation": _ablation_validation_metrics(offset),
+            }
+            for member, seed in enumerate(ablation.ENSEMBLE_SEEDS)
+        ],
+    }
+
+
+def test_ablation_entry_requires_exact_full_8000_branches() -> None:
+    audit = _complete_ablation_audit()
+    receipt = ablation.validate_complete_inventory(audit)
+    assert receipt["decisions"] == 2000
+    assert receipt["branches"] == 8000
+    audit["manifests"]["piper"]["groups"].pop()
+    with pytest.raises(ablation.AblationError, match="exactly 400"):
+        ablation.validate_complete_inventory(audit)
+
+
+def test_ablation_entry_freezes_same_budget_for_all_20_runs(tmp_path: Path) -> None:
+    commands = [
+        ablation.fold_command(
+            python_executable="python3",
+            binding=tmp_path / "binding.json",
+            binding_sha256="a" * 64,
+            output=tmp_path / variant / body,
+            held_out_body=body,
+            variant=variant,
+        )
+        for variant in ablation.VARIANTS
+        for body in BODIES
+    ]
+    assert len(commands) == 20
+    for command in commands:
+        assert command[command.index("--steps") + 1] == "3000"
+        assert command[command.index("--eval-every") + 1] == "100"
+        assert command[command.index("--batch-size") + 1] == "64"
+        assert command[command.index("--split-seed") + 1] == "20260901"
+        assert command[command.index("--ensemble-seeds") + 1 :] == [
+            str(seed) for seed in ablation.ENSEMBLE_SEEDS
+        ]
+
+
+def test_ablation_entry_reports_every_fold_macro_and_prediction_metric() -> None:
+    summaries = {
+        variant: {
+            body: _ablation_fold_summary(body, variant, 0.01 * variant_index)
+            for body in BODIES
+        }
+        for variant_index, variant in enumerate(ablation.VARIANTS)
+    }
+    result = ablation.aggregate_variants(summaries)
+    for variant in ablation.VARIANTS:
+        assert len(result[variant]["folds"]) == 5
+        assert set(result[variant]["equal_fold_macro"]) == set(ablation.METRICS)
+        assert result[variant]["equal_fold_macro"]["oracle_success_rate"] == 0.8
+    assert result["full"]["equal_fold_macro"][
+        "best_of_4_delta_success_rate"
+    ] > result["success_only"]["equal_fold_macro"][
+        "best_of_4_delta_success_rate"
+    ]
+    heldout = {
+        variant: {
+            body: {
+                "held_out_body": body,
+                "metrics": {
+                    name: 0.1 + 0.01 * variant_index for name in ablation.METRICS
+                },
+            }
+            for body in BODIES
+        }
+        for variant_index, variant in enumerate(ablation.VARIANTS)
+    }
+    heldout_result = ablation.aggregate_posthoc_heldout(heldout)
+    for variant in ablation.VARIANTS:
+        assert len(heldout_result[variant]["folds"]) == 5
+        assert set(heldout_result[variant]["equal_fold_macro"]) == set(
+            ablation.METRICS
+        )
+
+
+def test_ablation_posthoc_heldout_uses_frozen_five_member_rank_ensemble(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    audit = load_binding(binding, digest)
+    variant = "full"
+    heldout = "franka"
+    summary = _ablation_fold_summary(heldout, variant, 0.0)
+    for member, item in enumerate(summary["members"]):
+        model = EffectAlignedSharedEventHead(variant).eval()
+        checkpoint_path = tmp_path / f"ablation-member-{member}.pt"
+        torch.save(
+            {
+                "format": ablation.trainer.FORMAT,
+                "model": model.state_dict(),
+                "member": member,
+                "seed": ablation.ENSEMBLE_SEEDS[member],
+                "held_out_body": heldout,
+                "ablation": ablation_contract(variant),
+                "candidate_rank_contract": checkpoint_candidate_rank_contract(
+                    variant
+                ),
+                "heldout_rows_used_for_training_normalization_or_selection": 0,
+            },
+            checkpoint_path,
+        )
+        item["checkpoint"] = str(checkpoint_path)
+        item["checkpoint_sha256"] = sha256_file(checkpoint_path)
+    monkeypatch.setattr(ablation, "DECISIONS_PER_BODY", 4)
+    result = ablation.evaluate_posthoc_heldout_fold(
+        summary,
+        audit,
+        held_out_body=heldout,
+        variant=variant,
+        device=torch.device("cpu"),
+    )
+    assert result["heldout_decisions"] == 4
+    assert result["heldout_branches"] == 16
+    assert result["heldout_labels_used_for_training_checkpoint_or_variant_selection"] is False
+    assert set(result["metrics"]) == set(ablation.METRICS)
+    assert result["candidate_metric_aggregation"].startswith("mean_five_frozen")
+    assert result["prediction_metric_aggregation"].endswith(
+        "not_ensemble_calibrated"
+    )
