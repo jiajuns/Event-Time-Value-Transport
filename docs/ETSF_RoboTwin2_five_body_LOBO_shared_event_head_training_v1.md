@@ -177,6 +177,11 @@ python3 scripts/run_robotwin2_five_body_lobo_offline_ablation_v1.py \
   --output /ABS/new/full8000_lobo_ablation
 ```
 
+远端 `watch_robotwin2_five_body_postformal_ablation_v1.py` 只负责顺序调度：它必须先看到正式
+`1000 pair / 2000 rollout` 报告完整落盘并释放 RTX 4090，才会调用上述完整消融入口。该 watcher
+没有小样本、少折、少成员或缩短 step 的参数；它不改评分、不选 variant，也不把消融结果混入
+已经冻结的正式 paired 实验。
+
 ## 完整 8000 分支到五折训练的远程 watcher
 
 `watch_robotwin2_five_body_branches_to_lobo_training_v1.py` 是正式的断 SSH 后处理入口。它在
