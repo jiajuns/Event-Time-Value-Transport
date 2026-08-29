@@ -25,6 +25,10 @@ PYTHON = Path("/home/user/etsf_stage0/.venv_lerobot_smolvla_v044/bin/python")
 TRAIN = Path("/home/user/etsf_stage0/.venv_lerobot_smolvla_v044/bin/lerobot-train")
 BASE_MODEL = Path("/home/user/etsf_smolvla_models/smolvla_base_c83c3163")
 VLM_METADATA = Path("/home/user/etsf_stage0/offline_assets/smolvlm2_500m_metadata")
+OFFLINE_BASE_MODEL = Path(
+    "/home/user/etsf_smolvla_models/"
+    "smolvla_base_c83c3163_offline_smolvlm_metadata_v1"
+)
 OUTPUT_ROOT = Path(
     "/home/user/etsf_smolvla_models/"
     "smolvla_robotwin2_move_can_pot_5emb_ee16_full2750_20k_20260830"
@@ -62,6 +66,62 @@ RENAME_MAP = {
 
 def compact_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def prepare_offline_base_model() -> None:
+    """Create a read-only checkpoint view whose tokenizer is local.
+
+    Model tensors are hard-linked to the reviewed base checkpoint, so this
+    neither downloads nor duplicates the 900 MB weight file.  Only the small
+    processor JSON is materialized with its tokenizer path rewritten.
+    """
+
+    processor_name = "policy_preprocessor.json"
+
+    def validate() -> None:
+        value = json.loads((OFFLINE_BASE_MODEL / processor_name).read_text())
+        tokenizer_steps = [
+            step
+            for step in value.get("steps", [])
+            if step.get("registry_name") == "tokenizer_processor"
+        ]
+        if (
+            len(tokenizer_steps) != 1
+            or tokenizer_steps[0].get("config", {}).get("tokenizer_name")
+            != str(VLM_METADATA)
+            or not os.path.samefile(
+                OFFLINE_BASE_MODEL / "model.safetensors",
+                BASE_MODEL / "model.safetensors",
+            )
+        ):
+            raise RuntimeError("offline SmolVLA checkpoint view changed")
+
+    if OFFLINE_BASE_MODEL.exists():
+        validate()
+        return
+    temporary = Path(str(OFFLINE_BASE_MODEL) + ".partial")
+    if temporary.exists():
+        raise FileExistsError(f"incomplete offline checkpoint view exists: {temporary}")
+    shutil.copytree(BASE_MODEL, temporary, copy_function=os.link)
+    processor_path = temporary / processor_name
+    value = json.loads(processor_path.read_text(encoding="utf-8"))
+    tokenizer_steps = [
+        step
+        for step in value.get("steps", [])
+        if step.get("registry_name") == "tokenizer_processor"
+    ]
+    if len(tokenizer_steps) != 1:
+        raise RuntimeError("base SmolVLA processor has no unique tokenizer step")
+    tokenizer_steps[0]["config"]["tokenizer_name"] = str(VLM_METADATA)
+    # Break the hard link before writing so the reviewed source checkpoint is
+    # never modified.
+    processor_path.unlink()
+    processor_path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    for path in temporary.iterdir():
+        path.chmod(0o444)
+    temporary.chmod(0o555)
+    os.replace(temporary, OFFLINE_BASE_MODEL)
+    validate()
 
 
 def write_state(status: str, **extra: object) -> None:
@@ -138,7 +198,7 @@ def conversion_command() -> list[str]:
 def training_command() -> list[str]:
     return [
         str(TRAIN),
-        f"--policy.path={BASE_MODEL}",
+        f"--policy.path={OFFLINE_BASE_MODEL}",
         # The complete SmolVLA checkpoint below supplies every VLM weight.
         # Construct the identical architecture from the reviewed local
         # config/tokenizer bundle, then let policy.from_pretrained load the
@@ -197,6 +257,7 @@ def main() -> int:
             raise FileNotFoundError(required)
     if OUTPUT_ROOT.exists():
         raise FileExistsError(f"training output already exists: {OUTPUT_ROOT}")
+    prepare_offline_base_model()
     if DATASET_ROOT.exists():
         dataset_contract = validate_dataset()
         conversion_exit_code = 0
@@ -239,7 +300,7 @@ def main() -> int:
             dataset_contract=dataset_contract,
             dataset_reused_after_strict_validation=dataset_reused_after_strict_validation,
             offline_vlm_metadata=str(VLM_METADATA),
-            offline_checkpoint_weights=str(BASE_MODEL / "model.safetensors"),
+            offline_checkpoint_weights=str(OFFLINE_BASE_MODEL / "model.safetensors"),
             free_bytes_before_training=free_bytes,
             training_pid=training.pid,
             training_command=train,
