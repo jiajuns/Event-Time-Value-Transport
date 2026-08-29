@@ -55,6 +55,7 @@ NATIVE_EE_DIM = 16
 STAGE_DENOMINATOR = 4
 ACTOR_DATASET_FPS = 15.0
 ACTION_EXEC_STEPS = 5
+QUERY_CANONICALIZATION_STEPS = 1
 MINIMUM_CANDIDATE_HORIZON = ACTION_EXEC_STEPS
 PLANNED_DT_SECONDS = ACTION_EXEC_STEPS / ACTOR_DATASET_FPS
 PREREGISTRATION_SHA256 = evaluator.APPROVED_PREREGISTRATION_SHA256
@@ -402,6 +403,8 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         or summary.get("candidate_rank_contract")
         != shared_head.summary_candidate_rank_contract("full")
         or summary.get("event_age_contract") != shared_head.event_age_contract()
+        or summary.get("terminal_horizon_contract")
+        != shared_head.terminal_horizon_contract()
         or summary.get("ablation") != shared_head.ablation_contract("full")
         or summary.get("trainer_file_sha256") != current_trainer_sha
         or not isinstance(ensemble_selection, Mapping)
@@ -481,6 +484,8 @@ def load_ensemble(
             != shared_head.CANONICAL_ACTION_SCHEMA
             or checkpoint.get("event_age_contract")
             != shared_head.event_age_contract()
+            or checkpoint.get("terminal_horizon_contract")
+            != shared_head.terminal_horizon_contract()
             or checkpoint.get("model_family") != shared_head.MODEL_FAMILY
             or checkpoint.get("candidate_rank_contract")
             != shared_head.checkpoint_candidate_rank_contract("full")
@@ -518,6 +523,7 @@ def scoring_batch(
     candidates: np.ndarray,
     current_event: int,
     event_age_seconds: float,
+    remaining_action_budget: int,
     action_exec_steps: int,
     dt: float,
     device: torch.device,
@@ -533,6 +539,8 @@ def scoring_batch(
         raise PairedExecutionError("current event id is outside 0..4")
     if not np.isfinite(event_age_seconds) or event_age_seconds < 0.0:
         raise PairedExecutionError("current event age must be finite and non-negative")
+    if isinstance(remaining_action_budget, bool) or remaining_action_budget <= 0:
+        raise PairedExecutionError("remaining action budget must be a positive integer")
     expected_event_onehot = np.zeros(STAGE_DENOMINATOR + 1, dtype=np.float32)
     expected_event_onehot[current_event] = 1.0
     if not np.array_equal(
@@ -569,6 +577,12 @@ def scoring_batch(
             dtype=torch.float32,
             device=device,
         ),
+        "remaining_action_budget": torch.full(
+            (CANDIDATE_COUNT,),
+            float(remaining_action_budget),
+            dtype=torch.float32,
+            device=device,
+        ),
     }
     return batch
 
@@ -586,6 +600,11 @@ def score_candidates(
     next_rows = []
     duration_mean_rows = []
     duration_scale_rows = []
+    terminal_event_rows = []
+    terminal_goal_mean_rows = []
+    terminal_goal_scale_rows = []
+    regression_rows = []
+    joint_recovery_rows = []
     for model in models:
         output = model(batch)
         rank_rows.append(output["candidate_rank_logit"].detach().cpu().numpy())
@@ -598,15 +617,39 @@ def score_candidates(
         duration_scale_rows.append(
             output["duration_selected_log_scale"].detach().cpu().numpy()
         )
+        terminal_event_rows.append(
+            torch.softmax(output["terminal_event_logits"], -1).cpu().numpy()
+        )
+        terminal_goal_mean_rows.append(
+            output["terminal_goal_progress_mean"].detach().cpu().numpy()
+        )
+        terminal_goal_scale_rows.append(
+            output["terminal_goal_progress_log_scale"].detach().cpu().numpy()
+        )
+        regression_rows.append(
+            output["regression_probability"].detach().cpu().numpy()
+        )
+        joint_recovery_rows.append(
+            output["joint_recovery_probability"].detach().cpu().numpy()
+        )
     ranks = np.stack(rank_rows)
     success = np.stack(success_rows)
     post = np.stack(post_rows)
     following = np.stack(next_rows)
     duration_mean = np.stack(duration_mean_rows)
     duration_scale = np.stack(duration_scale_rows)
+    terminal_event = np.stack(terminal_event_rows)
+    terminal_goal_mean = np.stack(terminal_goal_mean_rows)
+    terminal_goal_scale = np.stack(terminal_goal_scale_rows)
+    regression = np.stack(regression_rows)
+    joint_recovery = np.stack(joint_recovery_rows)
     if not all(
         np.isfinite(value).all()
-        for value in (ranks, success, post, following, duration_mean, duration_scale)
+        for value in (
+            ranks, success, post, following, duration_mean, duration_scale,
+            terminal_event, terminal_goal_mean, terminal_goal_scale,
+            regression, joint_recovery,
+        )
     ):
         raise PairedExecutionError("LOBO ensemble produced a non-finite score")
     standardized = shared_head.aggregate_standardized_rank_scores(
@@ -636,6 +679,21 @@ def score_candidates(
         "candidate_next_event_probability_mean": following.mean(axis=0).astype(float).tolist(),
         "candidate_duration_log_mean_members": duration_mean.astype(float).tolist(),
         "candidate_duration_log_scale_members": duration_scale.astype(float).tolist(),
+        "candidate_terminal_event_probability_mean": (
+            terminal_event.mean(axis=0).astype(float).tolist()
+        ),
+        "candidate_terminal_goal_progress_mean_members": (
+            terminal_goal_mean.astype(float).tolist()
+        ),
+        "candidate_terminal_goal_progress_log_scale_members": (
+            terminal_goal_scale.astype(float).tolist()
+        ),
+        "candidate_regression_probability_mean": (
+            regression.mean(axis=0).astype(float).tolist()
+        ),
+        "candidate_joint_recovery_probability_mean": (
+            joint_recovery.mean(axis=0).astype(float).tolist()
+        ),
     }
 
 
@@ -699,7 +757,9 @@ def prepare_initial_commitment(
     task = collector._new_task(task_class, task_args, seed, instruction)
     try:
         names, objects = collector.discover_pose_objects(task, required_names)
-        before = capture_reset_snapshot(task, names, objects)
+        reset_snapshot = capture_reset_snapshot(task, names, objects)
+        task.scene.step()
+        canonical_snapshot = capture_reset_snapshot(task, names, objects)
         candidates = validate_candidates(
             collector.generate_candidates(
                 policy=policy,
@@ -714,12 +774,12 @@ def prepare_initial_commitment(
             )
         )
         after = capture_reset_snapshot(task, names, objects)
-        if before != after:
+        if canonical_snapshot != after:
             raise PairedExecutionError(
                 "initial candidate generation changed observable simulator state"
             )
         base = {
-            "format": "etsf_robotwin2_initial_candidate_commitment_v1",
+            "format": "etsf_robotwin2_initial_candidate_commitment_v2",
             "heldout_body": body,
             "condition": condition,
             "requested_seed": seed,
@@ -730,8 +790,11 @@ def prepare_initial_commitment(
             "candidate_horizon": int(candidates.shape[1]),
             "candidate_shape": list(candidates.shape),
             "ordered_candidate_set_sha256": array_sha256(candidates),
-            "reset_snapshot": before,
-            "reset_identity_sha256": reset_identity(before),
+            "reset_snapshot": reset_snapshot,
+            "reset_identity_sha256": reset_identity(reset_snapshot),
+            "canonical_query_snapshot": canonical_snapshot,
+            "canonical_query_identity_sha256": reset_identity(canonical_snapshot),
+            "query_canonicalization_steps": QUERY_CANONICALIZATION_STEPS,
             "candidate_generation_advanced_simulator": False,
         }
         return {**base, "commitment_sha256": canonical_sha256(base)}
@@ -745,12 +808,13 @@ def verify_initial_commitment(
     body: str,
     condition: str,
     seed: int,
-    snapshot: Mapping[str, Any],
+    reset_snapshot: Mapping[str, Any],
+    canonical_query_snapshot: Mapping[str, Any],
     candidates: np.ndarray,
 ) -> None:
     base = {key: value for key, value in commitment.items() if key != "commitment_sha256"}
     if (
-        commitment.get("format") != "etsf_robotwin2_initial_candidate_commitment_v1"
+        commitment.get("format") != "etsf_robotwin2_initial_candidate_commitment_v2"
         or commitment.get("heldout_body") != body
         or commitment.get("condition") != condition
         or commitment.get("requested_seed") != seed
@@ -761,8 +825,13 @@ def verify_initial_commitment(
         or commitment.get("candidate_horizon") != int(candidates.shape[1])
         or commitment.get("candidate_shape") != list(candidates.shape)
         or commitment.get("ordered_candidate_set_sha256") != array_sha256(candidates)
-        or commitment.get("reset_snapshot") != snapshot
-        or commitment.get("reset_identity_sha256") != reset_identity(snapshot)
+        or commitment.get("reset_snapshot") != reset_snapshot
+        or commitment.get("reset_identity_sha256") != reset_identity(reset_snapshot)
+        or commitment.get("canonical_query_snapshot") != canonical_query_snapshot
+        or commitment.get("canonical_query_identity_sha256")
+        != reset_identity(canonical_query_snapshot)
+        or commitment.get("query_canonicalization_steps")
+        != QUERY_CANONICALIZATION_STEPS
         or commitment.get("candidate_generation_advanced_simulator") is not False
         or commitment.get("commitment_sha256") != canonical_sha256(base)
     ):
@@ -801,7 +870,6 @@ def execute_rollout(
         required_names.add(anchor)
     task = collector._new_task(task_class, task_args, seed, instruction)
     decisions = []
-    action_error = None
     try:
         names, objects = collector.discover_pose_objects(task, required_names)
         initial_poses = collector.read_poses(objects)
@@ -810,9 +878,18 @@ def execute_rollout(
         trajectory = [initial_poses]
         sim_times = [collector._sim_time(task)]
         initial_identity = reset_identity(initial_snapshot)
+        initial_canonical_snapshot: Mapping[str, Any] | None = None
         query_index = 0
         while not collector._episode_done(task, max_steps):
+            # Match the collector's fresh-scene contact-cache reconstruction.
+            # The step is applied identically to both paired methods, advances
+            # no formal actor action, and is included in event age/trajectory.
+            task.scene.step()
+            collector._append_physical_observation(
+                task, objects, trajectory, sim_times
+            )
             current_ee = collector.current_ee_action16(task)
+            pre_candidate_snapshot = capture_reset_snapshot(task, names, objects)
             candidates = validate_candidates(
                 collector.generate_candidates(
                     policy=policy,
@@ -829,16 +906,18 @@ def execute_rollout(
             candidate_sha = array_sha256(candidates)
             if query_index == 0:
                 post_candidate_snapshot = capture_reset_snapshot(task, names, objects)
-                if post_candidate_snapshot != initial_snapshot:
+                if post_candidate_snapshot != pre_candidate_snapshot:
                     raise PairedExecutionError(
                         "method initial candidate generation changed simulator state"
                     )
+                initial_canonical_snapshot = pre_candidate_snapshot
                 verify_initial_commitment(
                     initial_commitment,
                     body=body,
                     condition=condition,
                     seed=seed,
-                    snapshot=initial_snapshot,
+                    reset_snapshot=initial_snapshot,
+                    canonical_query_snapshot=pre_candidate_snapshot,
                     candidates=candidates,
                 )
             current_event_age: float | None = None
@@ -862,6 +941,8 @@ def execute_rollout(
                         candidates=candidates,
                         current_event=current_event,
                         event_age_seconds=current_event_age,
+                        remaining_action_budget=max_steps
+                        - int(getattr(task, "take_action_cnt", 0)),
                         action_exec_steps=action_exec_steps,
                         dt=dt,
                         device=device,
@@ -875,17 +956,11 @@ def execute_rollout(
             for action in candidates[selected, :action_exec_steps]:
                 if collector._episode_done(task, max_steps):
                     break
-                before = collector._sim_time(task)
-                try:
-                    task.take_action(action, action_type="ee")
-                except Exception as error:
-                    if collector._sim_time(task) > before:
-                        executed += 1
-                        collector._append_physical_observation(
-                            task, objects, trajectory, sim_times
-                        )
-                    action_error = f"{type(error).__name__}: {error}"
-                    break
+                # Ordinary CuRobo planning failure is represented by RoboTwin
+                # as a valid ``Fail`` plan without raising.  Any Python
+                # exception is a simulator/runtime protocol failure and must
+                # abort the formal pair rather than become binary failure.
+                task.take_action(action, action_type="ee")
                 executed += 1
                 collector._append_physical_observation(
                     task, objects, trajectory, sim_times
@@ -908,8 +983,6 @@ def execute_rollout(
                 }
             )
             query_index += 1
-            if action_error is not None:
-                break
         success = bool(getattr(task, "eval_success", False))
         if not success:
             # A checker exception is a protocol/runtime failure, not evidence
@@ -932,6 +1005,7 @@ def execute_rollout(
             "resolved_seed": seed,
             "initial_reset_identity_sha256": initial_identity,
             "initial_reset_snapshot": initial_snapshot,
+            "initial_canonical_query_snapshot": initial_canonical_snapshot,
             "initial_candidate_commitment_sha256": initial_commitment[
                 "commitment_sha256"
             ],
@@ -945,7 +1019,7 @@ def execute_rollout(
             "physical_sim_seconds": collector._sim_time(task) - sim_times[0],
             "sim_timestep_seconds": float(task.scene.timestep_seconds),
             "policy_query_count": len(decisions),
-            "action_execution_error": action_error,
+            "action_execution_error": None,
             "decisions": decisions,
         }
     finally:
@@ -964,6 +1038,7 @@ def _validate_rollout_decisions(
         or rollout["binary_success"] not in (0, 1)
         or type(rollout.get("max_event_id")) is not int
         or not 0 <= rollout["max_event_id"] <= STAGE_DENOMINATOR
+        or rollout.get("action_execution_error") is not None
     ):
         raise PairedExecutionError(f"{method} rollout identity/outcome changed")
     expected_progress = (
@@ -1071,6 +1146,7 @@ def validate_pair_record(
         or value.get("method_order") != expected["method_order"]
         or value.get("same_resolved_reset") is not True
         or value.get("same_complete_observable_reset_snapshot") is not True
+        or value.get("same_canonical_query0_snapshot") is not True
         or value.get("same_initial_candidate_set") is not True
         or not isinstance(value.get("attempt_sha256"), str)
         or not isinstance(value.get("initial_candidate_commitment_sha256"), str)
@@ -1119,9 +1195,15 @@ def materialize_pair(
         == etsf.get("initial_reset_snapshot")
         == commitment.get("reset_snapshot")
     )
+    same_canonical_snapshot = bool(
+        baseline.get("initial_canonical_query_snapshot")
+        == etsf.get("initial_canonical_query_snapshot")
+        == commitment.get("canonical_query_snapshot")
+    )
     same_reset = bool(
         baseline["tracked_object_names"] == etsf["tracked_object_names"]
         and same_snapshot
+        and same_canonical_snapshot
         and baseline["initial_reset_identity_sha256"]
         == etsf["initial_reset_identity_sha256"]
         == commitment.get("reset_identity_sha256")
@@ -1150,6 +1232,7 @@ def materialize_pair(
         "initial_candidate_commitment_sha256": commitment_sha,
         "same_resolved_reset": same_reset,
         "same_complete_observable_reset_snapshot": same_snapshot,
+        "same_canonical_query0_snapshot": same_canonical_snapshot,
         "same_initial_candidate_set": same_initial_candidates,
         "discordance": (
             "actor_only"
@@ -1239,12 +1322,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise PairedExecutionError("formal paired execution requires remote RTX 4090 CUDA")
     if args.action_exec_steps != ACTION_EXEC_STEPS:
         raise PairedExecutionError("formal paired execution fixes action-exec-steps=5")
-    if args.max_steps <= 0 or args.fps <= 0:
-        raise PairedExecutionError("max-steps/fps must be positive")
+    if args.max_steps != shared_head.TERMINAL_HORIZON_CONTRACT[
+        "formal_episode_action_steps"
+    ]:
+        raise PairedExecutionError("formal paired execution fixes max-steps=200")
+    if args.fps <= 0:
+        raise PairedExecutionError("fps must be positive")
     if args.fps != ACTOR_DATASET_FPS:
         raise PairedExecutionError(
             "formal EE16 actor timing is fixed to its 15 Hz training dataset"
         )
+    if args.instruction != collector.DEFAULT_INSTRUCTION:
+        raise PairedExecutionError("formal paired execution fixes the actor instruction")
     inputs = (
         args.actor_checkpoint, args.vlm_metadata_path, args.robotwin_root,
         args.event_spec, args.preregistration,
@@ -1333,6 +1422,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fps": args.fps,
         "actor_training_dataset_fps": ACTOR_DATASET_FPS,
         "planned_first_chunk_seconds": PLANNED_DT_SECONDS,
+        "query_canonicalization": {
+            "raw_scene_steps_before_each_candidate_generation": (
+                QUERY_CANONICALIZATION_STEPS
+            ),
+            "formal_action_count_advanced": False,
+            "physical_time_and_event_age_advanced": True,
+            "same_as_training_fresh_scene_branch_root": True,
+        },
         "event_age_contract": shared_head.event_age_contract(),
         "instruction": args.instruction,
         "runtime_binding": implementation_binding(robotwin_root),

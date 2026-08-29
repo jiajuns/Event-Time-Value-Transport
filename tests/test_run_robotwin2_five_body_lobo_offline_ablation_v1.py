@@ -38,14 +38,14 @@ def test_inventory_is_full_and_uses_late_episode_queries() -> None:
         manifests[body] = {"groups": groups}
     audit = {"manifests": manifests}
     receipt = ablation.validate_complete_inventory(audit)
-    assert ablation.QUERY_INDICES == (0, 10, 20, 30)
-    assert receipt["root_query_indices"] == [0, 10, 20, 30]
+    assert ablation.QUERY_INDICES == tuple(range(40))
+    assert receipt["root_query_indices"] == list(range(40))
     assert receipt["decisions"] == 2_000
     assert receipt["branches"] == 8_000
 
     audit["manifests"][ablation.trainer.BODIES[0]]["groups"][0][
         "root_query_index"
-    ] = 5
+    ] = 40
     with pytest.raises(ablation.AblationError):
         ablation.validate_complete_inventory(audit)
 
@@ -87,13 +87,20 @@ class _PerfectPredictionModel(torch.nn.Module):
         recovery = batch["recovery"].float()
         post = batch["post_event_id"].long()
         following = batch["next_event_id"].long()
+        terminal_event = batch["terminal_max_event_id"].long()
+        terminal_goal = batch["terminal_goal_progress"].float()
+        current_event = batch["current_event_id"].long()
         object_delta = batch["object_delta"].float()
         duration = batch["duration"].float()
         count = len(success)
         post_logits = torch.full((count, 5), -7.0, dtype=torch.float32)
         next_logits = torch.full((count, 5), -7.0, dtype=torch.float32)
+        terminal_logits = torch.full((count, 5), -7.0, dtype=torch.float32)
         post_logits[torch.arange(count), post] = 7.0 + self.member_offset
         next_logits[torch.arange(count), following] = 7.0 + self.member_offset
+        terminal_logits[torch.arange(count), terminal_event] = (
+            7.0 + self.member_offset
+        )
         # Candidate score is monotone with success; exact ties use the same
         # lowest-index convention as ensemble success argmax.
         rank = 5.0 * success
@@ -108,6 +115,17 @@ class _PerfectPredictionModel(torch.nn.Module):
             "recovery_logit": (recovery * 2.0 - 1.0) * (7.0 + self.member_offset),
             "object_delta_mean": object_delta + self.member_offset * 0.001,
             "object_delta_log_scale": torch.full_like(object_delta, -3.0),
+            "terminal_event_logits": terminal_logits,
+            "terminal_goal_progress_mean": (
+                terminal_goal + self.member_offset * 0.001
+            ),
+            "terminal_goal_progress_log_scale": torch.full_like(
+                terminal_goal, -3.0
+            ),
+            "regression_probability": (post < current_event).float(),
+            "joint_recovery_probability": (
+                (post < current_event).float() * recovery
+            ),
         }
 
 
@@ -125,6 +143,7 @@ def _prediction_batch() -> dict[str, object]:
         + ["piper|randomized|randomized|seed=2026081002|query=10"] * 4,
         "candidate_index": torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]),
         "post_event_id": torch.tensor([0, 1, 2, 3, 1, 2, 3, 4]),
+        "current_event_id": torch.tensor([1, 1, 2, 3, 2, 2, 3, 4]),
         "post_event_mask": torch.ones(count),
         "next_event_id": torch.tensor([1, 2, 3, 4, 0, 1, 2, 3]),
         "next_event_mask": torch.ones(count),
@@ -138,6 +157,10 @@ def _prediction_batch() -> dict[str, object]:
         "action_available": torch.ones(count),
         "object_delta": object_delta,
         "object_delta_mask": torch.ones(count),
+        "terminal_max_event_id": torch.tensor([1, 2, 2, 4, 2, 3, 4, 4]),
+        "terminal_event_mask": torch.ones(count),
+        "terminal_goal_progress": torch.linspace(-0.04, 0.12, count),
+        "terminal_goal_progress_mask": torch.ones(count),
     }
 
 
@@ -169,9 +192,13 @@ def test_deployed_ensemble_prediction_metrics_cover_all_heads_and_uncertainty() 
         "success",
         "post_event",
         "next_event",
+        "terminal_event",
         "duration",
         "object",
+        "terminal_goal_progress",
         "recovery",
+        "regression",
+        "joint_recovery",
     }
     assert result["statistical_units"]["dependence_cluster_unit"].endswith(
         "all_query_decisions_and_candidates"
@@ -218,10 +245,10 @@ def test_posthoc_macro_is_equal_fold_and_keeps_risk_coverage() -> None:
     fold_metrics = dict(prediction["metrics"])
     fold_metrics.update(
         {
-            "best_of_4_delta_success_rate": 0.1,
-            "selected_success_rate": 0.6,
-            "oracle_success_rate": 0.8,
-            "pairwise_accuracy": 0.75,
+            "one_deviation_best_of_4_success_gain": 0.1,
+            "one_deviation_branch_selected_success_rate": 0.6,
+            "one_deviation_branch_oracle_success_rate": 0.8,
+            "one_deviation_branch_pairwise_accuracy": 0.75,
         }
     )
     assert set(fold_metrics) == set(ablation.POSTHOC_ENSEMBLE_METRICS)
@@ -239,7 +266,7 @@ def test_posthoc_macro_is_equal_fold_and_keeps_risk_coverage() -> None:
     }
     summary = ablation.aggregate_posthoc_heldout(evaluations)
     assert summary["full"]["equal_fold_macro"][
-        "best_of_4_delta_success_rate"
+        "one_deviation_best_of_4_success_gain"
     ] == pytest.approx(0.1)
     assert summary["full"]["uncertainty_risk_coverage_equal_fold_macro"][
         "success"

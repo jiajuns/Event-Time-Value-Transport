@@ -1,5 +1,10 @@
 # RoboTwin2 五本体 LOBO 共享事件头训练入口 v1
 
+> 2026-08-30 更新：当前生产模型已经升级为 v6 终局后果共享头。网络、36 维 consequence
+> utility、fresh-scene 同根分叉和完整效果协议以
+> `docs/ETSF_RoboTwin2_shared_head_v6_terminal_consequence_design_zh.md` 为准。本文保留训练入口、
+> binding 和早期 v2--v5 演进背景；下文出现的 v5/28 维描述不再是最新生产结构。
+
 入口：`scripts/train_robotwin2_five_body_lobo_shared_event_head_v1.py`。
 
 ## 目标与结论边界
@@ -76,7 +81,7 @@ SmolVLA/Hugging Face 目录 checkpoint 则按有序相对路径、字节数和�
   object loss 推到上千并拖坏 shared trunk；
 - 五个成员不再各自挑一个 raw-logit 最优 checkpoint。每个成员保存相同 eval step 的 source-only
   快照，然后用正式部署同一个 decision 内标准化五成员 ensemble 联合选择一个共同 step；主键为
-  body×condition 宏平均 best-of-4 `ΔSR`，其次依次为 mixed-success decision 的选中成功率和
+  body×condition 宏平均 one-deviation branch success gain（不等同闭环 `ΔSR`），其次依次为 mixed-success decision 的选中成功率和
   success-changing pair accuracy；只有这些同分时才看全失败 dense continuation 排序，五成员六头
   复合预测分数均值最后破同分；
 - `dt`、duration 与 `event_age_seconds` 都使用计数 simulator step 得到的物理秒。事件年龄是“当前规范
@@ -116,7 +121,7 @@ logical group 绝不在同一 batch 重复。该重采样只作用于 utility li
 这里 `N` 必须严格等于 4，四行的 state 与 current event 必须相同。否则无法形成同根排序监督，
 训练入口直接拒绝，而不是退化为随机逐行 batch。
 source validation 按 `(body, condition, requested_seed)` 切分；同一 reset seed 的全部 query 必须留在
-同一 lane，不能把 query 0/10/20/30 拆到 train/validation 后虚高 checkpoint-selection `ΔSR`。
+同一 lane，不能把同一 seed 的多个 query 拆到 train/validation 后虚高 one-deviation 选模指标。
 
 候选 rank 只拼接显式 consequence prediction。planned `dt=5/15` 与当前物理事件年龄先经过隔离
 clock 形成 proper current-event duration 分布，再以该分布的 mean/scale 间接进入 utility；`transitioned` 和
@@ -243,16 +248,16 @@ python3 scripts/run_robotwin2_five_body_lobo_offline_ablation_v1.py \
 ## 完整 8000 分支到五折训练的远程 watcher
 
 `watch_robotwin2_five_body_branches_to_lobo_training_v1.py` 是正式的断 SSH 后处理入口。它在
-CPU 上等待五个 manifest 达到精确的 `5 body × 2 condition × 50 seed × 4 query = 2000`
+CPU 上等待五个 manifest 达到精确的 `5 body × 2 condition × 40 query × 5 seed = 2000`
 decision，并逐个核验四候选 `candidate_index=[0,1,2,3]`、NPZ member/shape/dtype、正 planned `dt`、payload
 SHA 和无额外文件。watcher 不解释 success/event 等结果数组；每折真正打开的 payload 仍只来自
 另外四个 source body。等待期间不持有 GPU，完整采集且 4090 空闲后才顺序启动五折，每折固定
 5 个 ensemble member、每 member 3000 step。
 
-四个 query 固定为 `0/10/20/30`，覆盖 `max_steps=200` 闭环的早/中/后段，而不是只采前
-15 个 policy query。若某个预定 seed 在 query 前已经 terminal，collector 可从
+四十个 query 固定为 `0..39`，完整覆盖 `max_steps=200`、每次执行 5 个 action 的全部剩余预算。
+若某个预定 seed 在 query 前已经 terminal，collector 可从
 `[2026081000, 2026090000)` 的开发区间补一个新 seed；watcher 验证的是每个
-`body×condition×query` 恰好 50 个唯一开发 seed，而不是错误要求五个本体都保留同一段连续 seed。
+`body×condition×query` 恰好 5 个唯一开发 seed，而不是错误要求五个本体都保留同一段连续 seed。
 正式 paired evaluation 的 `2026090000..2026090099` 不在这个区间内。
 
 本次远程正式链路采用：

@@ -34,6 +34,8 @@ def _core(path: Path) -> np.ndarray:
             arrays[name] = np.arange(count, dtype=np.int64)
         elif name == "dt":
             arrays[name] = np.full(count, 5.0 / 15.0, dtype=np.float32)
+        elif name == "remaining_action_budget":
+            arrays[name] = np.full(count, 150, dtype=np.float32)
         elif name in watcher.INTEGER_ARRAYS:
             arrays[name] = np.zeros(count, dtype=np.int64)
         else:
@@ -58,7 +60,7 @@ def test_diagnostic_values_and_action_rms_are_fully_replayed(tmp_path: Path) -> 
     np.savez(
         diagnostic_path,
         first_executed=np.asarray([5, 4, 3, 0], dtype=np.int64),
-        branch_error=np.asarray([False, False, True, False], dtype=bool),
+        branch_error=np.asarray([False, False, False, False], dtype=bool),
         candidate_action_pairwise_rms=_pairwise(actions),
     )
     watcher.validate_diagnostic_npz(

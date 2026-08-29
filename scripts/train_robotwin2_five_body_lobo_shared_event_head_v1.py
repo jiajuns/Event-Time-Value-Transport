@@ -37,7 +37,7 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materia
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
-MODEL_FAMILY = "event_age_consequence_utility_shared_event_head_v5"
+MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v6"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
 ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
@@ -45,6 +45,7 @@ MATERIALIZATION_FORMAT = public_materialization.FORMAT
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
+DEFAULT_INSTRUCTION = "Move the can to the side of the pot."
 PREREGISTRATION_SHA256 = (
     "75fc9c6e487e60c3ff274a2fb8c90f6a738b30999b9e74e00c98a54f1dce52ee"
 )
@@ -57,19 +58,30 @@ CANDIDATE_RANK_FEATURE_SCHEMA = {
     "post_event_probability": (0, 5),
     "next_event_probability": (5, 10),
     "success_probability": (10, 11),
-    "recovery_probability": (11, 12),
-    "duration_log1p_mean": (12, 13),
-    "duration_log1p_scale": (13, 14),
-    "object_delta_mean": (14, 20),
-    "object_delta_scale": (20, 26),
-    "predicted_goal_progress": (26, 27),
-    "predicted_goal_progress_uncertainty": (27, 28),
+    "regression_probability": (11, 12),
+    "joint_recovery_probability": (12, 13),
+    "duration_log1p_mean": (13, 14),
+    "duration_log1p_scale": (14, 15),
+    "object_delta_mean": (15, 21),
+    "object_delta_scale": (21, 27),
+    "predicted_goal_progress": (27, 28),
+    "predicted_goal_progress_uncertainty": (28, 29),
+    "terminal_event_probability": (29, 34),
+    "terminal_goal_progress_mean": (34, 35),
+    "terminal_goal_progress_scale": (35, 36),
 }
 CANDIDATE_RANK_FEATURE_DIM = max(
     stop for _start, stop in CANDIDATE_RANK_FEATURE_SCHEMA.values()
 )
 OBJECT_STUDENT_T_DOF = 3.0
+TERMINAL_PROGRESS_STUDENT_T_DOF = 3.0
+TERMINAL_EVENT_LOSS_WEIGHT = 0.5
+TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT = 0.5
 DENSE_FAILURE_RANK_WEIGHT = 0.1
+ONE_DEVIATION_ESTIMAND = (
+    "one_candidate_deviation_then_frozen_actor_continuation_not_"
+    "recursive_closed_loop_delta_success_rate"
+)
 RANK_ENSEMBLE_STD_FLOOR = 1e-6
 STANDARDIZED_RANK_ENSEMBLE_CONTRACT = {
     "format": "etsf_within_decision_standardized_rank_ensemble_v1",
@@ -96,10 +108,20 @@ OBJECT_EFFECT_SCHEMA = {
     "redundant_relative_goal_delta_removed": True,
 }
 TERMINAL_SUPERVISION_CONTRACT = {
-    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_max_event_id": (
+        "maximum_canonical_event_from_candidate_root_through_continuation"
+    ),
+    "terminal_event_mask": "finite_horizon_terminal_event_is_valid",
     "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
     "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "terminal_goal_progress_mask": "finite_horizon_terminal_goal_is_valid",
+    "terminal_stop_reason_id": {
+        "success": 0,
+        "formal_action_limit": 1,
+    },
+    "planner_status_failure_without_exception": "valid_finite_horizon_outcome",
+    "action_execution_exception": "invalidate_complete_four_candidate_decision",
     "same_stage_progress_definition_as_formal_paired_runner": True,
 }
 EVENT_AGE_CONTRACT = {
@@ -109,10 +131,35 @@ EVENT_AGE_CONTRACT = {
     "available_before_candidate_execution": True,
     "same_value_for_all_candidates_at_one_root": True,
 }
+TERMINAL_HORIZON_CONTRACT = {
+    "array": "remaining_action_budget",
+    "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
+    "conditions_only_terminal_consequence_heads": True,
+    "direct_rank_path": False,
+    "formal_episode_action_steps": 200,
+    "formal_actor_query_stride_actions": 5,
+    "development_remaining_action_budgets": list(range(200, 0, -5)),
+}
+BRANCH_ROOT_SNAPSHOT_CONTRACT = {
+    "format": "etsf_sapien_explicit_fresh_scene_branch_root_v1",
+    "physics_state": "keyed_rigid_articulation_drive_task_render_rng_snapshot",
+    "candidate_scene_isolation": "one_fresh_scene_per_candidate",
+    "contact_cache_reconstruction": "one_counted_raw_scene_step",
+    "derived_articulation_qacc": (
+        "recorded_for_provenance_not_required_pre_step_then_recomputed_and_"
+        "strictly_hashed_after_canonicalization_step"
+    ),
+    "simulation_clock_restored": True,
+    "task_counters_restored": ["take_action_cnt", "eval_success"],
+    "rng_restored": ["python", "numpy", "torch_cpu", "torch_cuda"],
+    "reset_and_action_prefix_replay_used_for_candidates": False,
+}
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": "etsf_robotwin2_candidate_branch_diagnostics_v1",
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
-    "branch_error": "boolean_execution_or_continuation_exception",
+    "branch_error": "all_false_execution_exception_invalidates_complete_decision",
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
     ),
@@ -144,9 +191,17 @@ def ablation_contract(variant: str) -> dict[str, Any]:
                 *([] if variant == "no_time_duration" else ["duration"]),
                 "success",
                 "recovery",
+                "terminal_event",
+                *(
+                    []
+                    if variant == "no_object_effect"
+                    else ["terminal_goal_progress"]
+                ),
             ]
         ),
         "time_duration_rank_features_enabled": variant
+        not in {"success_only", "no_time_duration"},
+        "terminal_horizon_context_enabled": variant
         not in {"success_only", "no_time_duration"},
         "object_effect_loss_and_rank_target_enabled": variant
         not in {"success_only", "no_object_effect"},
@@ -215,39 +270,51 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             "post_event_probability",
             "next_event_probability",
             "success_probability",
-            "recovery_probability",
+            "regression_probability_from_post_event_distribution",
+            "joint_recovery_probability",
             "duration_log1p_mean_forced_zero",
             "duration_log1p_scale_forced_zero",
             "object_delta_mean",
             "object_delta_scale",
             "predicted_goal_progress_from_state_relative_goal",
             "predicted_goal_progress_uncertainty_from_object_student_t_scale",
+            "terminal_event_probability",
+            "terminal_goal_progress_mean",
+            "terminal_goal_progress_scale",
         ]
     elif variant == "no_object_effect":
         feature_blocks = [
             "post_event_probability",
             "next_event_probability",
             "success_probability",
-            "recovery_probability",
+            "regression_probability_from_post_event_distribution",
+            "joint_recovery_probability",
             "duration_log1p_mean",
             "duration_log1p_scale",
             "object_delta_mean_forced_zero",
             "object_delta_scale_forced_zero",
             "predicted_goal_progress_forced_zero",
             "predicted_goal_progress_uncertainty_forced_zero",
+            "terminal_event_probability",
+            "terminal_goal_progress_mean_forced_zero",
+            "terminal_goal_progress_scale_forced_zero",
         ]
     else:
         feature_blocks = [
             "post_event_probability",
             "next_event_probability",
             "success_probability",
-            "recovery_probability",
+            "regression_probability_from_post_event_distribution",
+            "joint_recovery_probability",
             "duration_log1p_mean",
             "duration_log1p_scale",
             "object_delta_mean",
             "object_delta_scale",
             "predicted_goal_progress_from_state_relative_goal",
             "predicted_goal_progress_uncertainty_from_object_student_t_scale",
+            "terminal_event_probability",
+            "terminal_goal_progress_mean",
+            "terminal_goal_progress_scale",
         ]
     return {
         "feature_blocks": feature_blocks,
@@ -257,7 +324,11 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         },
         "feature_dim": CANDIDATE_RANK_FEATURE_DIM,
         "dt_has_numeric_score_path": variant not in {"success_only", "no_time_duration"},
-        "duration_conditions_on_physical_event_age": True,
+        "duration_conditions_on_physical_event_age": variant
+        not in {"success_only", "no_time_duration"},
+        "terminal_consequences_condition_on_remaining_action_budget": variant
+        not in {"success_only", "no_time_duration"},
+        "remaining_action_budget_has_direct_rank_path": False,
         "event_age_has_numeric_score_path": variant
         not in {"success_only", "no_time_duration"},
         "direct_transitioned_or_clock_hidden_rank_path": False,
@@ -289,6 +360,8 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "rank_loss_updates_clock_or_duration_heads": False,
         "rank_loss_updates_semantic_action_transition": False,
         "rank_loss_updates_consequence_predictors": False,
+        "terminal_event_loss": "proper_categorical_cross_entropy_uniform_stream",
+        "terminal_goal_progress_loss": "proper_student_t3_nll_uniform_stream",
     }
 
 
@@ -308,6 +381,12 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ],
         "event_age_has_numeric_score_path": checkpoint[
             "event_age_has_numeric_score_path"
+        ],
+        "terminal_consequences_condition_on_remaining_action_budget": checkpoint[
+            "terminal_consequences_condition_on_remaining_action_budget"
+        ],
+        "remaining_action_budget_has_direct_rank_path": checkpoint[
+            "remaining_action_budget_has_direct_rank_path"
         ],
         "pairwise_rank_loss_enabled": checkpoint["pairwise_rank_loss_enabled"],
         "group_listwise_success_mass_loss_enabled": checkpoint[
@@ -341,6 +420,10 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "rank_inputs_are_detached_consequence_predictions": checkpoint[
             "rank_inputs_are_detached_consequence_predictions"
         ],
+        "terminal_event_loss": checkpoint["terminal_event_loss"],
+        "terminal_goal_progress_loss": checkpoint[
+            "terminal_goal_progress_loss"
+        ],
         "feature_schema": checkpoint["feature_schema"],
         "goal_progress_definition": checkpoint["goal_progress_definition"],
         "goal_progress_uncertainty_definition": checkpoint[
@@ -368,11 +451,15 @@ REQUIRED_ARRAYS = {
     "object_delta",
     "object_delta_mask",
     "terminal_max_event_id",
+    "terminal_event_mask",
     "terminal_stage_progress",
     "terminal_goal_distance",
     "terminal_goal_progress",
+    "terminal_goal_progress_mask",
+    "terminal_stop_reason_id",
     "candidate_index",
     "event_age_seconds",
+    "remaining_action_budget",
     "dt",
 }
 
@@ -391,6 +478,12 @@ def event_age_contract() -> dict[str, Any]:
     """Return the frozen physical event-age input contract."""
 
     return dict(EVENT_AGE_CONTRACT)
+
+
+def terminal_horizon_contract() -> dict[str, Any]:
+    """Return the pre-action finite-horizon conditioning contract."""
+
+    return dict(TERMINAL_HORIZON_CONTRACT)
 
 
 def aggregate_standardized_rank_scores(
@@ -614,6 +707,7 @@ def validate_body_manifest(
         or value.get("dataset_repo") != DATASET_REPO
         or value.get("dataset_revision") != DATASET_REVISION
         or value.get("task") != TASK
+        or value.get("instruction") != DEFAULT_INSTRUCTION
         or value.get("body") != expected_body
     ):
         raise FiveBodyContractError(f"canonical manifest identity mismatch for {expected_body}")
@@ -678,7 +772,8 @@ def validate_body_manifest(
         "action_mask_source": "planned_first_chunk_not_executed_count",
         "executed_action_count_used_for_action_mask": False,
         "executed_action_count_used_for_sim_time_accounting_only": True,
-        "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
+        "planner_status_fail_is_a_valid_action_outcome": True,
+        "python_execution_exception_invalidates_complete_decision": True,
     }:
         raise FiveBodyContractError(
             f"{expected_body} censors planned candidates after execution"
@@ -689,6 +784,9 @@ def validate_body_manifest(
         or value.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or value.get("event_age_contract") != EVENT_AGE_CONTRACT
+        or value.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or value.get("branch_root_snapshot_contract")
+        != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or value.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
     ):
@@ -714,6 +812,9 @@ def validate_body_manifest(
             or isinstance(item.get("requested_seed"), bool)
             or not isinstance(item.get("requested_seed"), int)
             or not _is_sha(item.get("sha256"))
+            or not _is_sha(item.get("branch_root_snapshot_sha256"))
+            or not _is_sha(item.get("branch_root_restorable_snapshot_sha256"))
+            or not _is_sha(item.get("canonical_root_snapshot_sha256"))
             or item.get("diagnostic_format")
             != BRANCH_DIAGNOSTIC_CONTRACT["format"]
             or not _is_sha(item.get("diagnostics_sha256"))
@@ -759,11 +860,15 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         or binding.get("dataset_repo") != DATASET_REPO
         or binding.get("dataset_revision") != DATASET_REVISION
         or binding.get("task") != TASK
+        or binding.get("instruction") != DEFAULT_INSTRUCTION
         or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
         or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
+        or binding.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or binding.get("branch_root_snapshot_contract")
+        != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or binding.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
@@ -953,10 +1058,14 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
     if np.any((arrays["current_event_id"] < 0) | (arrays["current_event_id"] >= 5)):
         raise FiveBodyContractError(f"{path} current event ids are invalid")
     terminal_event = arrays["terminal_max_event_id"]
+    terminal_event_mask = arrays["terminal_event_mask"]
+    terminal_goal_mask = arrays["terminal_goal_progress_mask"]
     if (
         not np.array_equal(terminal_event, terminal_event.astype(np.int64))
         or np.any((terminal_event < 0) | (terminal_event >= 5))
         or np.any(terminal_event < arrays["current_event_id"])
+        or np.any((terminal_event_mask < 0.0) | (terminal_event_mask > 1.0))
+        or np.any((terminal_goal_mask < 0.0) | (terminal_goal_mask > 1.0))
     ):
         raise FiveBodyContractError(f"{path} terminal max event ids are invalid")
     terminal_stage_progress = arrays["terminal_stage_progress"]
@@ -1012,13 +1121,42 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
         raise FiveBodyContractError(
             f"{path} candidates do not share one non-negative pre-action event age"
         )
-    if np.any(arrays["duration"] < 0):
-        raise FiveBodyContractError(f"{path} contains invalid simulator duration")
-    if not np.array_equal(
-        np.asarray(arrays["duration_mask"] > 0.5), arrays["duration"] > 0.0
+    if np.any(arrays["remaining_action_budget"] <= 0.0) or not np.allclose(
+        arrays["remaining_action_budget"],
+        arrays["remaining_action_budget"][:1],
+        atol=0.0,
+        rtol=0.0,
     ):
         raise FiveBodyContractError(
-            f"{path} duration mask is not tied to positive simulator exposure"
+            f"{path} candidates do not share one positive remaining action budget"
+        )
+    if not np.all(np.isin(
+        arrays["remaining_action_budget"],
+        TERMINAL_HORIZON_CONTRACT["development_remaining_action_budgets"],
+    )):
+        raise FiveBodyContractError(
+            f"{path} remaining action budget is outside the formal query grid"
+        )
+    stop_reason = arrays["terminal_stop_reason_id"]
+    if not np.array_equal(stop_reason, stop_reason.astype(np.int64)) or np.any(
+        (stop_reason < 0) | (stop_reason > 1)
+    ):
+        raise FiveBodyContractError(f"{path} terminal stop reason is invalid")
+    if np.any(arrays["duration"] < 0):
+        raise FiveBodyContractError(f"{path} contains invalid simulator duration")
+    expected_duration_mask = (
+        (arrays["duration"] > 0.0)
+        & (
+            (arrays["duration_observed"] > 0.5)
+            | np.isin(arrays["terminal_stop_reason_id"], [0, 1])
+        )
+    )
+    if not np.array_equal(
+        np.asarray(arrays["duration_mask"] > 0.5), expected_duration_mask
+    ):
+        raise FiveBodyContractError(
+            f"{path} duration mask mixes execution-error censoring with "
+            "administrative finite-horizon censoring"
         )
     horizon = arrays["actions"].shape[1]
     planned_mask = np.arange(horizon) < 5
@@ -1286,6 +1424,14 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             torch.nn.Tanh(),
             torch.nn.Linear(self.config.clock_dim, self.config.clock_dim),
         )
+        self.terminal_context_encoder = torch.nn.Sequential(
+            torch.nn.Linear(2, core.SEMANTIC_DIM),
+            torch.nn.Tanh(),
+            torch.nn.Linear(core.SEMANTIC_DIM, core.SEMANTIC_DIM),
+        )
+        self.terminal_event = torch.nn.Linear(core.SEMANTIC_DIM, 5)
+        self.terminal_goal_progress_mean = torch.nn.Linear(core.SEMANTIC_DIM, 1)
+        self.terminal_goal_progress_scale = torch.nn.Linear(core.SEMANTIC_DIM, 1)
         self.candidate_rank = torch.nn.Sequential(
             torch.nn.LayerNorm(CANDIDATE_RANK_FEATURE_DIM),
             torch.nn.Linear(CANDIDATE_RANK_FEATURE_DIM, core.SEMANTIC_DIM // 2),
@@ -1341,6 +1487,50 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             1, current
         ).squeeze(1)
 
+        remaining_budget = batch.get("remaining_action_budget")
+        if (
+            not isinstance(remaining_budget, torch.Tensor)
+            or remaining_budget.shape != event_age.shape
+            or not bool(torch.isfinite(remaining_budget).all())
+            or bool((remaining_budget <= 0.0).any())
+        ):
+            raise FiveBodyContractError(
+                "terminal consequence heads require one finite positive "
+                "remaining_action_budget per row"
+            )
+        terminal_context = torch.stack(
+            (
+                torch.log1p(event_age.to(output["transitioned"])),
+                torch.log1p(remaining_budget.to(output["transitioned"])),
+            ),
+            dim=-1,
+        )
+        if self.ablation_variant == "no_time_duration":
+            terminal_context = torch.zeros_like(terminal_context)
+        terminal_hidden = output["transitioned"] + self.terminal_context_encoder(
+            terminal_context
+        )
+        terminal_event_logits = self.terminal_event(terminal_hidden)
+        event_levels = torch.arange(
+            terminal_event_logits.shape[-1], device=terminal_event_logits.device
+        )[None]
+        terminal_event_logits = terminal_event_logits.masked_fill(
+            event_levels < current, -1e4
+        )
+        terminal_goal_progress_mean = self.terminal_goal_progress_mean(
+            terminal_hidden
+        ).squeeze(-1)
+        terminal_goal_progress_log_scale = torch.clamp(
+            self.terminal_goal_progress_scale(terminal_hidden).squeeze(-1),
+            -7.0,
+            2.0,
+        )
+        output["terminal_event_logits"] = terminal_event_logits
+        output["terminal_goal_progress_mean"] = terminal_goal_progress_mean
+        output["terminal_goal_progress_log_scale"] = (
+            terminal_goal_progress_log_scale
+        )
+
         # The deployed score is deliberately a function of predicted
         # consequences, never a free projection of ``transitioned`` or
         # ``clock_hidden``.  Detaching the complete feature vector keeps the
@@ -1350,7 +1540,23 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         post_probability = torch.softmax(output["post_event_logits"], dim=-1)
         next_probability = torch.softmax(output["next_event_logits"], dim=-1)
         success_probability = torch.sigmoid(output["success_logit"])[:, None]
-        recovery_probability = torch.sigmoid(output["recovery_logit"])[:, None]
+        # Recovery is conditional on an operational regression.  Compose the
+        # conditional head with the predicted post-event distribution so the
+        # deployed feature is the identifiable joint consequence.  At e0 the
+        # regression and joint-recovery probabilities are exactly zero.
+        event_index = torch.arange(
+            post_probability.shape[-1], device=post_probability.device
+        )[None]
+        regression_probability = (
+            post_probability * (event_index < current).to(post_probability)
+        ).sum(dim=-1, keepdim=True)
+        joint_recovery_probability = regression_probability * torch.sigmoid(
+            output["recovery_logit"]
+        )[:, None]
+        output["regression_probability"] = regression_probability.squeeze(-1)
+        output["joint_recovery_probability"] = (
+            joint_recovery_probability.squeeze(-1)
+        )
         duration_features = torch.stack(
             (
                 output["duration_selected_log_mean"],
@@ -1403,18 +1609,32 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             ),
             dim=-1,
         )
+        terminal_event_probability = torch.softmax(terminal_event_logits, dim=-1)
+        terminal_progress_features = torch.stack(
+            (
+                terminal_goal_progress_mean,
+                torch.exp(terminal_goal_progress_log_scale),
+            ),
+            dim=-1,
+        )
         if self.ablation_variant == "no_time_duration":
             duration_features = torch.zeros_like(duration_features)
         if self.ablation_variant == "no_object_effect":
             object_features = torch.zeros_like(object_features)
+            terminal_progress_features = torch.zeros_like(
+                terminal_progress_features
+            )
         rank_features = torch.cat(
             (
                 post_probability,
                 next_probability,
                 success_probability,
-                recovery_probability,
+                regression_probability,
+                joint_recovery_probability,
                 duration_features,
                 object_features,
+                terminal_event_probability,
+                terminal_progress_features,
             ),
             dim=-1,
         ).detach()
@@ -1484,6 +1704,125 @@ class StandardizedRankEnsemble(torch.nn.Module):
                 member_scores[:, selected]
             )
         return {"candidate_rank_logit": aggregate}
+
+
+@torch.no_grad()
+def evaluate_terminal_consequences(
+    model: EffectAlignedSharedEventHead,
+    loader: DataLoader,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Report accuracy/calibration of finite-horizon proper consequences."""
+
+    model.eval()
+    collected: dict[str, list[np.ndarray]] = defaultdict(list)
+    for raw in loader:
+        batch = core._move_batch(raw, device)
+        output = model(batch)
+        tensors = {
+            "event_label": batch["terminal_max_event_id"],
+            "event_mask": batch["terminal_event_mask"],
+            "event_probability": torch.softmax(
+                output["terminal_event_logits"], dim=-1
+            ),
+            "goal_label": batch["terminal_goal_progress"],
+            "goal_mask": batch["terminal_goal_progress_mask"],
+            "goal_mean": output["terminal_goal_progress_mean"],
+            "goal_log_scale": output["terminal_goal_progress_log_scale"],
+            "post_label": batch["post_event_id"],
+            "post_mask": batch["post_event_mask"],
+            "current_event": batch["current_event_id"],
+            "recovery_label": batch["recovery"],
+            "regression_probability": output["regression_probability"],
+            "joint_recovery_probability": output[
+                "joint_recovery_probability"
+            ],
+        }
+        for name, tensor in tensors.items():
+            collected[name].append(tensor.detach().cpu().numpy())
+    values = {name: np.concatenate(parts) for name, parts in collected.items()}
+
+    event_mask = values["event_mask"] > 0.5
+    event_label = values["event_label"][event_mask].astype(np.int64)
+    event_probability = values["event_probability"][event_mask]
+    event_prediction = event_probability.argmax(axis=-1)
+    event_nll = -np.log(
+        np.clip(event_probability[np.arange(len(event_label)), event_label], 1e-12, 1.0)
+    )
+    event_onehot = np.eye(5, dtype=np.float64)[event_label]
+
+    goal_mask = values["goal_mask"] > 0.5
+    goal_label = values["goal_label"][goal_mask].astype(np.float64)
+    goal_mean = values["goal_mean"][goal_mask].astype(np.float64)
+    goal_log_scale = values["goal_log_scale"][goal_mask].astype(np.float64)
+    goal_scale = np.exp(goal_log_scale).clip(min=1e-5)
+    goal_standardized = (goal_label - goal_mean) / goal_scale
+    dof = TERMINAL_PROGRESS_STUDENT_T_DOF
+    goal_normalizer = (
+        math.lgamma(dof / 2.0)
+        + 0.5 * math.log(dof * math.pi)
+        - math.lgamma((dof + 1.0) / 2.0)
+    )
+    goal_nll = (
+        goal_log_scale
+        + 0.5 * (dof + 1.0) * np.log1p(np.square(goal_standardized) / dof)
+        + goal_normalizer
+    )
+    central_90_t3 = 2.3533634348018264
+
+    regression_mask = values["post_mask"] > 0.5
+    regression_label = (
+        values["post_label"] < values["current_event"]
+    ).astype(np.float64)[regression_mask]
+    recovery_label = (
+        (values["recovery_label"] > 0.5)
+        & (values["post_label"] < values["current_event"])
+    ).astype(np.float64)[regression_mask]
+
+    def binary_metrics(labels: np.ndarray, probabilities: np.ndarray) -> dict[str, Any]:
+        probabilities = np.clip(probabilities.astype(np.float64), 1e-12, 1.0 - 1e-12)
+        return {
+            "support": int(len(labels)),
+            "positive": int((labels > 0.5).sum()),
+            "brier": float(np.mean(np.square(probabilities - labels))),
+            "nll": float(
+                np.mean(
+                    -labels * np.log(probabilities)
+                    - (1.0 - labels) * np.log1p(-probabilities)
+                )
+            ),
+        }
+
+    event_metrics = core._event_metrics(event_label, event_prediction)
+    return {
+        "terminal_event": {
+            **event_metrics,
+            "support": int(len(event_label)),
+            "class_counts": np.bincount(event_label, minlength=5).tolist(),
+            "nll": float(np.mean(event_nll)),
+            "multiclass_brier": float(
+                np.mean(np.sum(np.square(event_probability - event_onehot), axis=-1))
+            ),
+            "ordinal_mae": float(np.mean(np.abs(event_prediction - event_label))),
+        },
+        "terminal_goal_progress": {
+            "support": int(len(goal_label)),
+            "mae_meters": float(np.mean(np.abs(goal_mean - goal_label))),
+            "rmse_meters": float(np.sqrt(np.mean(np.square(goal_mean - goal_label)))),
+            "student_t3_nll": float(np.mean(goal_nll)),
+            "central_90_coverage": float(
+                np.mean(np.abs(goal_label - goal_mean) <= central_90_t3 * goal_scale)
+            ),
+        },
+        "regression": binary_metrics(
+            regression_label,
+            values["regression_probability"][regression_mask],
+        ),
+        "joint_recovery": binary_metrics(
+            recovery_label,
+            values["joint_recovery_probability"][regression_mask],
+        ),
+    }
 
 
 def _dense_rank_components(
@@ -1601,6 +1940,68 @@ def _robust_object_effect_loss(
     }
 
 
+def _terminal_consequence_loss(
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    sample_weight: torch.Tensor,
+    *,
+    ablation_variant: str = "full",
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Proper finite-horizon consequence losses on the uniform stream only."""
+
+    if ablation_variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
+    event_rows = torch.nn.functional.cross_entropy(
+        output["terminal_event_logits"],
+        batch["terminal_max_event_id"].long(),
+        reduction="none",
+    )
+    event_weight = (
+        sample_weight
+        * batch["action_available"].to(sample_weight)
+        * batch["terminal_event_mask"].to(sample_weight)
+    )
+    terminal_event = core._weighted_mean(event_rows, event_weight)
+
+    goal_target = batch["terminal_goal_progress"].to(
+        output["terminal_goal_progress_mean"]
+    )
+    goal_mean = output["terminal_goal_progress_mean"]
+    goal_log_scale = output["terminal_goal_progress_log_scale"]
+    goal_scale = torch.exp(goal_log_scale).clamp_min(1e-5)
+    standardized = (goal_target - goal_mean) / goal_scale
+    dof = TERMINAL_PROGRESS_STUDENT_T_DOF
+    normalizer = (
+        math.lgamma(dof / 2.0)
+        + 0.5 * math.log(dof * math.pi)
+        - math.lgamma((dof + 1.0) / 2.0)
+    )
+    goal_rows = (
+        goal_log_scale
+        + 0.5 * (dof + 1.0) * torch.log1p(standardized.square() / dof)
+        + normalizer
+    )
+    goal_weight = (
+        sample_weight
+        * batch["action_available"].to(sample_weight)
+        * batch["terminal_goal_progress_mask"].to(sample_weight)
+    )
+    terminal_goal = core._weighted_mean(goal_rows, goal_weight)
+
+    if ablation_variant == "success_only":
+        terminal_event = terminal_event * 0.0
+    if ablation_variant in {"success_only", "no_object_effect"}:
+        terminal_goal = terminal_goal * 0.0
+    weighted_event = TERMINAL_EVENT_LOSS_WEIGHT * terminal_event
+    weighted_goal = TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT * terminal_goal
+    return weighted_event + weighted_goal, {
+        "terminal_event_uniform_proper": terminal_event,
+        "terminal_goal_progress_uniform_proper": terminal_goal,
+        "terminal_event_weighted_uniform_proper": weighted_event,
+        "terminal_goal_progress_weighted_uniform_proper": weighted_goal,
+    }
+
+
 def _candidate_rank_loss(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
@@ -1668,6 +2069,19 @@ def _candidate_rank_loss(
             success_weights.append(group_weight)
             mixed_success_groups += 1
         elif not bool(successful.any()):
+            if not bool(
+                (
+                    batch["terminal_event_mask"].to(score)[selected] > 0.5
+                ).all()
+            ) or not bool(
+                (
+                    batch["terminal_goal_progress_mask"].to(score)[selected]
+                    > 0.5
+                ).all()
+            ):
+                raise FiveBodyContractError(
+                    "dense rank decision lacks complete terminal supervision"
+                )
             dense_terms.append(
                 _dense_soft_listwise_loss(
                     group_scores,
@@ -1811,7 +2225,7 @@ def evaluate_candidate_ranking(
             "decision_groups": len(rows),
             "baseline_success_rate": baseline,
             "selected_success_rate": selected,
-            "delta_success_rate": selected - baseline,
+            "one_deviation_branch_success_gain": selected - baseline,
             "oracle_success_rate": float(
                 np.mean([float(row["oracle_success"]) for row in rows])
             ),
@@ -1909,7 +2323,14 @@ def evaluate_candidate_ranking(
         values = [row[name] for row in units.values() if row.get(name) is not None]
         return float(np.mean([float(value) for value in values])) if values else None
 
-    macro_delta = float(np.mean([row["delta_success_rate"] for row in units.values()]))
+    macro_gain = float(
+        np.mean(
+            [
+                row["one_deviation_branch_success_gain"]
+                for row in units.values()
+            ]
+        )
+    )
     macro_selected = float(
         np.mean([row["selected_success_rate"] for row in units.values()])
     )
@@ -1921,7 +2342,8 @@ def evaluate_candidate_ranking(
     return {
         **global_metrics,
         "body_condition_units": units,
-        "macro_delta_success_rate": macro_delta,
+        "macro_one_deviation_branch_success_gain": macro_gain,
+        "estimand": ONE_DEVIATION_ESTIMAND,
         "macro_selected_success_rate": macro_selected,
         "macro_oracle_success_rate": macro_oracle,
         "macro_delta_terminal_stage_progress": macro(
@@ -1964,7 +2386,7 @@ def candidate_checkpoint_selection_key(
         return -float(value)
 
     return (
-        maximize(ranking["macro_delta_success_rate"]),
+        maximize(ranking["macro_one_deviation_branch_success_gain"]),
         maximize(ranking.get("macro_mixed_success_selection_accuracy")),
         maximize(ranking.get("macro_mixed_success_pairwise_accuracy")),
         maximize(ranking.get("macro_dense_progress_selection_accuracy")),
@@ -2249,6 +2671,12 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 proper_weights,
                 ablation_variant=args.ablation_variant,
             )
+            terminal_loss, terminal_pieces = _terminal_consequence_loss(
+                proper_prediction,
+                proper_batch,
+                proper_weights,
+                ablation_variant=args.ablation_variant,
+            )
             rank_prediction = model(rank_batch)
             decision_loss, decision_pieces = _candidate_rank_loss(
                 rank_prediction,
@@ -2256,7 +2684,12 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 rank_weights,
                 ablation_variant=args.ablation_variant,
             )
-            loss = multitask_loss + object_effect_loss + decision_loss
+            loss = (
+                multitask_loss
+                + object_effect_loss
+                + terminal_loss
+                + decision_loss
+            )
             if not torch.isfinite(loss):
                 raise FiveBodyContractError("non-finite shared-head training loss")
             optimizer.zero_grad(set_to_none=True)
@@ -2266,6 +2699,9 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             if step % args.eval_every and step != args.steps:
                 continue
             metrics = core.evaluate_validation_model(model, validation_loader, device)
+            metrics["terminal_consequences"] = evaluate_terminal_consequences(
+                model, validation_loader, device
+            )
             metrics["candidate_ranking"] = evaluate_candidate_ranking(
                 model, validation_loader, device
             )
@@ -2283,6 +2719,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 "total": float(loss.detach()),
                 **{name: float(value.detach()) for name, value in pieces.items() if name != "total"},
                 **{name: float(value.detach()) for name, value in object_pieces.items()},
+                **{name: float(value.detach()) for name, value in terminal_pieces.items()},
                 **{name: float(value.detach()) for name, value in decision_pieces.items()},
             }
             snapshot = snapshot_root / (
@@ -2410,6 +2847,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 "canonical_state_schema": CANONICAL_STATE_SCHEMA,
                 "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
                 "event_age_contract": event_age_contract(),
+                "terminal_horizon_contract": terminal_horizon_contract(),
                 "event_spec_sha256": EVENT_SPEC_SHA256,
                 "event_derivation_implementation_sha256": preflight[
                     "event_derivation_implementation_sha256"
@@ -2423,7 +2861,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 "state_normalization": state_normalization,
                 "preflight_logical_sha256": preflight["logical_sha256"],
                 "validation": member_validation,
-                "deployment_homomorphic_ensemble_source_validation": (
+                "one_deviation_ensemble_source_validation": (
                     best_ensemble_ranking
                 ),
             },
@@ -2454,6 +2892,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         "canonical_state_schema": CANONICAL_STATE_SCHEMA,
         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
         "event_age_contract": event_age_contract(),
+        "terminal_horizon_contract": terminal_horizon_contract(),
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": preflight[
             "event_derivation_implementation_sha256"
@@ -2475,7 +2914,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         "ensemble_bootstrap_effect_support": bootstrap_support,
         "success_probability_training_loss": "unweighted_proper_binary_cross_entropy",
         "checkpoint_selection_primary": (
-            "deployment_homomorphic_five_member_standardized_ensemble_source_validation"
+            "five_member_standardized_one_deviation_source_validation_surrogate"
         ),
         "ensemble_checkpoint_selection": {
             "common_step_required_for_all_five_members": True,

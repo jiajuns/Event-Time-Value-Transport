@@ -4,7 +4,8 @@
 This remote-only continuation watcher is deliberately effect-oriented: once
 the public-data actor training watcher reports a real completed checkpoint, it
 freezes that exact state16/action16 actor into a signed five-body authority,
-collects 50 complete decisions for every body/condition/query stratum, and
+collects five complete decisions at every one of the 40 online query budgets
+for each body/condition stratum, and
 materializes the strict LOBO training binding.  It never opens protected
 internal HDF/label payloads and it performs no local training.
 """
@@ -16,14 +17,16 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
 
-FORMAT = "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v2_analytic"
+FORMAT = "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v3_terminal_snapshot"
 ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
@@ -31,12 +34,13 @@ RECEIPT_FORMAT = "etsf_robotwin2_five_body_complete_branch_collection_receipt_v1
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
+DEFAULT_INSTRUCTION = "Move the can to the side of the pot."
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
-ROOT_QUERIES = (0, 10, 20, 30)
+ROOT_QUERIES = tuple(range(40))
 CANDIDATE_COUNT = 4
-TARGET_PER_CONDITION_QUERY = 50
-BASE_SEED_START = 2026081000
+TARGET_PER_CONDITION_QUERY = 5
+BASE_SEED_START = 2026082000
 BASE_SEED_COUNT = 50
 SUPPLEMENTAL_SEED_START = BASE_SEED_START + BASE_SEED_COUNT
 FORMAL_EVALUATION_SEED_START = 2026090000
@@ -70,10 +74,20 @@ CANDIDATE_NOISE_CONTRACT = {
     "candidate_zero_legacy_noise_unchanged": True,
 }
 TERMINAL_SUPERVISION_CONTRACT = {
-    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_max_event_id": (
+        "maximum_canonical_event_from_candidate_root_through_continuation"
+    ),
+    "terminal_event_mask": "finite_horizon_terminal_event_is_valid",
     "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
     "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "terminal_goal_progress_mask": "finite_horizon_terminal_goal_is_valid",
+    "terminal_stop_reason_id": {
+        "success": 0,
+        "formal_action_limit": 1,
+    },
+    "planner_status_failure_without_exception": "valid_finite_horizon_outcome",
+    "action_execution_exception": "invalidate_complete_four_candidate_decision",
     "same_stage_progress_definition_as_formal_paired_runner": True,
 }
 EVENT_AGE_CONTRACT = {
@@ -83,10 +97,37 @@ EVENT_AGE_CONTRACT = {
     "available_before_candidate_execution": True,
     "same_value_for_all_candidates_at_one_root": True,
 }
+TERMINAL_HORIZON_CONTRACT = {
+    "array": "remaining_action_budget",
+    "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
+    "conditions_only_terminal_consequence_heads": True,
+    "direct_rank_path": False,
+    "formal_episode_action_steps": MAX_STEPS,
+    "formal_actor_query_stride_actions": ACTION_EXEC_STEPS,
+    "development_remaining_action_budgets": list(
+        range(MAX_STEPS, 0, -ACTION_EXEC_STEPS)
+    ),
+}
+BRANCH_ROOT_SNAPSHOT_CONTRACT = {
+    "format": "etsf_sapien_explicit_fresh_scene_branch_root_v1",
+    "physics_state": "keyed_rigid_articulation_drive_task_render_rng_snapshot",
+    "candidate_scene_isolation": "one_fresh_scene_per_candidate",
+    "contact_cache_reconstruction": "one_counted_raw_scene_step",
+    "derived_articulation_qacc": (
+        "recorded_for_provenance_not_required_pre_step_then_recomputed_and_"
+        "strictly_hashed_after_canonicalization_step"
+    ),
+    "simulation_clock_restored": True,
+    "task_counters_restored": ["take_action_cnt", "eval_success"],
+    "rng_restored": ["python", "numpy", "torch_cpu", "torch_cuda"],
+    "reset_and_action_prefix_replay_used_for_candidates": False,
+}
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": DIAGNOSTIC_FORMAT,
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
-    "branch_error": "boolean_execution_or_continuation_exception",
+    "branch_error": "all_false_execution_exception_invalidates_complete_decision",
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
     ),
@@ -103,25 +144,25 @@ ACTOR_CHECKPOINT = HOME_ROOT / (
     "checkpoints/020000/pretrained_model"
 )
 OUTPUT_ROOT = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic"
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot"
 )
 WATCHER_STATE = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
     "watcher_state.json"
 )
 WATCHER_PID = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
     "watcher.pid"
 )
 WATCHER_LOG = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
     "watcher.log"
 )
 ACTOR_AUTHORITY = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee16_actor_authority_full8000_20260830_v2_analytic.json"
+    "etsf_robotwin2_fivebody_ee16_actor_authority_full8000_20260830_v3_terminal_snapshot.json"
 )
 TRAINING_BINDING = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
     "binding.json"
 )
 MATERIALIZATION_RECEIPT = HOME_ROOT / (
@@ -139,6 +180,7 @@ LEROBOT_SITE = HOME_ROOT / (
 ETSF_SITE = HOME_ROOT / (
     "anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages"
 )
+_STATE_WRITE_LOCK = threading.Lock()
 
 
 class ContinuationError(RuntimeError):
@@ -210,7 +252,8 @@ def write_state(status: str, **extra: Any) -> None:
         "expected_candidate_branches": EXPECTED_TOTAL_BRANCHES,
         **extra,
     }
-    atomic_json(WATCHER_STATE, payload)
+    with _STATE_WRITE_LOCK:
+        atomic_json(WATCHER_STATE, payload)
 
 
 def signed(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -349,6 +392,7 @@ def freeze_actor_authority(
             "base_index*101) mod (2**63-1); odd candidates negate the draw"
         ),
         "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+        "instruction": DEFAULT_INSTRUCTION,
         "conditions": list(CONDITIONS),
         "root_query_indices": list(ROOT_QUERIES),
         "action_exec_steps": ACTION_EXEC_STEPS,
@@ -356,9 +400,9 @@ def freeze_actor_authority(
         "base_development_seed_start": BASE_SEED_START,
         "base_development_seed_count": BASE_SEED_COUNT,
         "supplemental_seed_rule": (
-            "same_condition_and_query_until_50_complete_decisions_per_stratum"
+            "same_condition_and_query_until_5_complete_decisions_per_stratum"
         ),
-        "formal_evaluation_seed_lower_bound_exclusive": FORMAL_EVALUATION_SEED_START,
+        "formal_evaluation_seed_lower_bound_inclusive": FORMAL_EVALUATION_SEED_START,
         "critic_dt_semantics": "planned_first_candidate_chunk_seconds",
         "planned_dt_seconds": ACTION_EXEC_STEPS / 15.0,
         "event_duration_time_source": "scene.step_count_times_scene.get_timestep",
@@ -370,6 +414,8 @@ def freeze_actor_authority(
         "object_effect_schema": OBJECT_EFFECT_SCHEMA,
         "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
         "event_age_contract": EVENT_AGE_CONTRACT,
+        "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+        "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
         "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
         "wall_clock_used_as_physical_time": False,
     }
@@ -402,6 +448,7 @@ def freeze_actor_authority(
         {
             "format": ACTOR_FORMAT,
             "task": TASK,
+            "instruction": DEFAULT_INSTRUCTION,
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "public_expert_episode_count": 2750,
@@ -573,14 +620,20 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("dataset_repo") != DATASET_REPO
         or value.get("dataset_revision") != DATASET_REVISION
         or value.get("task") != TASK
+        or value.get("instruction") != DEFAULT_INSTRUCTION
         or value.get("body") != body
         or value.get("actor_checkpoint") != str(ACTOR_CHECKPOINT)
         or value.get("candidate_count") != CANDIDATE_COUNT
+        or value.get("action_exec_steps") != ACTION_EXEC_STEPS
+        or value.get("max_episode_action_steps") != MAX_STEPS
         or value.get("root_query_indices") != list(ROOT_QUERIES)
         or value.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or value.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or value.get("event_age_contract") != EVENT_AGE_CONTRACT
+        or value.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or value.get("branch_root_snapshot_contract")
+        != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or value.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or value.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
@@ -615,8 +668,16 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
                 "stationary_speed_m_per_s"
             ],
         }
-        or value.get("candidate_action_contract", {}).get("planned_action_horizon")
-        != ACTION_EXEC_STEPS
+        or value.get("candidate_action_contract")
+        != {
+            "critic_observation_time": "before_candidate_execution",
+            "planned_action_horizon": ACTION_EXEC_STEPS,
+            "action_mask_source": "planned_first_chunk_not_executed_count",
+            "executed_action_count_used_for_action_mask": False,
+            "executed_action_count_used_for_sim_time_accounting_only": True,
+            "planner_status_fail_is_a_valid_action_outcome": True,
+            "python_execution_exception_invalidates_complete_decision": True,
+        }
     ):
         raise ContinuationError(f"manifest static contract mismatch for {body}")
     groups = value.get("groups")
@@ -627,15 +688,24 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(item, Mapping):
             raise ContinuationError(f"manifest group is invalid for {body}")
         identity = str(item.get("group_id", ""))
+        snapshot_hashes = (
+            item.get("branch_root_snapshot_sha256"),
+            item.get("branch_root_restorable_snapshot_sha256"),
+            item.get("canonical_root_snapshot_sha256"),
+        )
         if (
             not identity
             or identity in identities
             or item.get("diagnostic_format") != DIAGNOSTIC_FORMAT
             or not isinstance(item.get("diagnostics_path"), str)
             or not isinstance(item.get("diagnostics_sha256"), str)
+            or any(
+                not isinstance(value, str) or len(value) != 64
+                for value in snapshot_hashes
+            )
         ):
             raise ContinuationError(
-                f"manifest group identity/diagnostic binding is invalid for {body}"
+                f"manifest group identity/snapshot/diagnostic binding is invalid for {body}"
             )
         identities.add(identity)
     return value
@@ -678,18 +748,23 @@ def load_progress(body: str) -> dict[str, int]:
 
 
 def fill_body(static: Mapping[str, Any], body: str) -> dict[str, Any]:
-    # The collector is idempotent by group identity.  Always replay this
-    # command so a process/host interruption resumes every unmaterialized base
-    # seed rather than silently replacing an unfinished base lane.
-    run_collector(
-        static,
-        body=body,
-        conditions=CONDITIONS,
-        seed_start=BASE_SEED_START,
-        seed_count=BASE_SEED_COUNT,
-        queries=ROOT_QUERIES,
-        phase="base_50_seeds",
-    )
+    # Ten blocks of five seeds × four adjacent queries give every online
+    # remaining budget exactly five development decisions per condition while
+    # retaining the original 200-decision/body-condition total.  The collector
+    # is idempotent by group identity, so replaying a block resumes safely.
+    query_block_size = 4
+    seed_count_per_block = TARGET_PER_CONDITION_QUERY
+    for block_start in range(0, len(ROOT_QUERIES), query_block_size):
+        block_index = block_start // query_block_size
+        run_collector(
+            static,
+            body=body,
+            conditions=CONDITIONS,
+            seed_start=BASE_SEED_START + block_index * seed_count_per_block,
+            seed_count=seed_count_per_block,
+            queries=ROOT_QUERIES[block_start : block_start + query_block_size],
+            phase=f"base_uniform_budget_block_{block_index:02d}",
+        )
     manifest = load_manifest(body, static)
     counts = stratum_counts(manifest)
     gaps = {
@@ -766,6 +841,8 @@ def finalize_body_manifest(
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
+            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "actor_binding": {
@@ -829,10 +906,13 @@ def freeze_training_binding(
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
+            "instruction": DEFAULT_INSTRUCTION,
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
+            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "heldout_labels_may_train_fit_calibrate_or_select": False,
@@ -883,19 +963,33 @@ def main() -> int:
         actor_authority_file_sha256=actor_authority_sha,
     )
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    body_manifests: dict[str, dict[str, Any]] = {}
-    for index, body in enumerate(BODIES):
+    def collect_body(body: str) -> tuple[str, dict[str, Any]]:
         completed = body_already_complete(body, static)
-        body_manifests[body] = completed or fill_body(static, body)
-        write_state(
-            "body_complete",
-            completed_body=body,
-            completed_body_index=index,
-            completed_bodies=list(body_manifests),
-            completed_candidate_branches=sum(
-                value["candidate_branches"] for value in body_manifests.values()
-            ),
-        )
+        return body, completed or fill_body(static, body)
+
+    completed_by_body: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="body-collector") as pool:
+        futures = []
+        for index, body in enumerate(BODIES):
+            futures.append(pool.submit(collect_body, body))
+            if index + 1 < len(BODIES):
+                time.sleep(20.0)
+        for future in as_completed(futures):
+            body, manifest = future.result()
+            completed_by_body[body] = manifest
+            write_state(
+                "body_complete",
+                completed_body=body,
+                completed_bodies=[
+                    value for value in BODIES if value in completed_by_body
+                ],
+                completed_candidate_branches=sum(
+                    value["candidate_branches"]
+                    for value in completed_by_body.values()
+                ),
+                max_parallel_body_collectors=2,
+            )
+    body_manifests = {body: completed_by_body[body] for body in BODIES}
     receipt = signed(
         {
             "format": RECEIPT_FORMAT,
@@ -910,6 +1004,8 @@ def main() -> int:
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
+            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "output_root": str(OUTPUT_ROOT),

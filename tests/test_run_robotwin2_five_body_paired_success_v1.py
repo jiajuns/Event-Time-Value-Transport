@@ -39,8 +39,11 @@ def _snapshot() -> dict:
 
 def _commitment() -> dict:
     snapshot = _snapshot()
+    canonical_snapshot = copy.deepcopy(snapshot)
+    canonical_snapshot["simulator_clock"]["physical_step_count"] = 1
+    canonical_snapshot["simulator_clock"]["sim_seconds"] = 0.01
     base = {
-        "format": "etsf_robotwin2_initial_candidate_commitment_v1",
+        "format": "etsf_robotwin2_initial_candidate_commitment_v2",
         "heldout_body": "piper",
         "condition": "clean",
         "requested_seed": runner.SEED_BASE,
@@ -53,6 +56,11 @@ def _commitment() -> dict:
         "ordered_candidate_set_sha256": "b" * 64,
         "reset_snapshot": snapshot,
         "reset_identity_sha256": runner.reset_identity(snapshot),
+        "canonical_query_snapshot": canonical_snapshot,
+        "canonical_query_identity_sha256": runner.reset_identity(
+            canonical_snapshot
+        ),
+        "query_canonicalization_steps": runner.QUERY_CANONICALIZATION_STEPS,
         "candidate_generation_advanced_simulator": False,
     }
     return {**base, "commitment_sha256": runner.canonical_sha256(base)}
@@ -85,6 +93,9 @@ def _rollout(method: str, success: int, progress: float) -> dict:
         "resolved_seed": runner.SEED_BASE,
         "initial_reset_identity_sha256": commitment["reset_identity_sha256"],
         "initial_reset_snapshot": commitment["reset_snapshot"],
+        "initial_canonical_query_snapshot": commitment[
+            "canonical_query_snapshot"
+        ],
         "initial_candidate_commitment_sha256": commitment["commitment_sha256"],
         "tracked_object_names": ["can"],
         "initial_object_poses": [[0.0] * 7],
@@ -148,6 +159,11 @@ def test_scoring_uses_equal_member_scale_not_raw_logit_magnitude() -> None:
                 "next_event_logits": event_logits,
                 "duration_selected_log_mean": zeros,
                 "duration_selected_log_scale": zeros,
+                "terminal_event_logits": event_logits,
+                "terminal_goal_progress_mean": zeros,
+                "terminal_goal_progress_log_scale": zeros,
+                "regression_probability": zeros,
+                "joint_recovery_probability": zeros,
             }
 
     # One large-scale member prefers candidate 0; four equal-weight members
@@ -189,6 +205,7 @@ def test_scoring_batch_uses_planned_first_five_tokens_at_actor_15hz() -> None:
         candidates=candidates,
         current_event=0,
         event_age_seconds=0.4,
+        remaining_action_budget=180,
         action_exec_steps=5,
         dt=1.0 / runner.ACTOR_DATASET_FPS,
         device=torch.device("cpu"),
@@ -198,6 +215,9 @@ def test_scoring_batch_uses_planned_first_five_tokens_at_actor_15hz() -> None:
     assert not batch["action_mask"][:, 5:].any()
     assert torch.allclose(batch["dt"], torch.full((4,), 5.0 / 15.0))
     assert torch.allclose(batch["event_age_seconds"], torch.full((4,), 0.4))
+    assert torch.allclose(
+        batch["remaining_action_budget"], torch.full((4,), 180.0)
+    )
 
 
 def test_pair_records_discordance_and_requires_same_initial_candidates() -> None:
@@ -221,6 +241,7 @@ def test_pair_records_discordance_and_requires_same_initial_candidates() -> None
     assert pair["discordance"] == "etsf_only"
     assert pair["same_resolved_reset"] is True
     assert pair["same_complete_observable_reset_snapshot"] is True
+    assert pair["same_canonical_query0_snapshot"] is True
     assert pair["same_initial_candidate_set"] is True
     runner.validate_pair_record(pair, expected)
     corrupted = copy.deepcopy(pair)

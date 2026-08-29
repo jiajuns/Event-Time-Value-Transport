@@ -44,33 +44,33 @@ GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
 
 HOME_ROOT = Path("/home/user")
 UPSTREAM_STATE = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_paired_success_full2000_20260830_v2_analytic."
+    "etsf_robotwin2_fivebody_paired_success_full2000_20260830_v3_terminal_snapshot."
     "watcher_state.json"
 )
 BINDING = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v2_analytic."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
     "binding.json"
 )
 OUTPUT_ROOT = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v1"
+    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v3_terminal_snapshot"
 )
 WATCHER_STATE = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v1.watcher_state.json"
+    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v3_terminal_snapshot.watcher_state.json"
 )
 WATCHER_PID = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v1.watcher.pid"
+    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v3_terminal_snapshot.watcher.pid"
 )
 WATCHER_LOCK = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v1.watcher.lock"
+    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v3_terminal_snapshot.watcher.lock"
 )
 WATCHER_LOG = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v1.watcher.log"
+    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v3_terminal_snapshot.watcher.log"
 )
 RUNNER_LOG = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v1.run.log"
+    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v3_terminal_snapshot.run.log"
 )
 RUN_EXIT = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v1.run.exit"
+    "etsf_robotwin2_fivebody_lobo_ablation_full8000_20260830_v3_terminal_snapshot.run.exit"
 )
 TRAINING_PYTHON = HOME_ROOT / "anaconda3/envs/ETSF_RoboTwin/bin/python"
 

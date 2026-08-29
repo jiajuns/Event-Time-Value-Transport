@@ -46,7 +46,7 @@ EXPECTED_EVENT_MODULE_SHA256 = (
     "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
 )
 EXPECTED_RUNNER_SHA256 = (
-    "c8e44199d693f4d27ee2ec31ffffb60dc5fa9082049d42c6653fb0a68c8e93c3"
+    "b1a9a23e068d7b277c674bf2a759893655d5183ef023113860c303424f2a3c8d"
 )
 EXPECTED_EVALUATOR_SHA256 = (
     "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"
@@ -171,7 +171,7 @@ class FormalPaths:
 def formal_paths(code_root: Path | None = None) -> FormalPaths:
     home = Path("/home/user")
     paired_prefix = home / (
-        "etsf_robotwin2_fivebody_paired_success_full2000_20260830_v2_analytic"
+        "etsf_robotwin2_fivebody_paired_success_full2000_20260830_v3_terminal_snapshot"
     )
     resolved_code = (code_root or Path(__file__).resolve().parent).resolve()
     return FormalPaths(
@@ -179,13 +179,13 @@ def formal_paths(code_root: Path | None = None) -> FormalPaths:
         code_root=resolved_code,
         upstream_state=home
         / (
-            "etsf_robotwin2_fivebody_lobo_full8000_20260830_v2_analytic."
+            "etsf_robotwin2_fivebody_lobo_full8000_20260830_v3_terminal_snapshot."
             "watcher_state.json"
         ),
         upstream_run_exit=home
-        / "etsf_robotwin2_fivebody_lobo_full8000_20260830_v2_analytic.run.exit",
+        / "etsf_robotwin2_fivebody_lobo_full8000_20260830_v3_terminal_snapshot.run.exit",
         lobo_root=home
-        / "etsf_robotwin2_fivebody_lobo_shared_head_full8000_20260830_v2_analytic",
+        / "etsf_robotwin2_fivebody_lobo_shared_head_full8000_20260830_v3_terminal_snapshot",
         actor_checkpoint=home
         / (
             "etsf_smolvla_models/"

@@ -52,7 +52,7 @@ def test_single_query_resume_preserves_full_manifest_query_universe() -> None:
         [30], watcher.ROOT_QUERIES
     )
     assert requested == [30]
-    assert declared == [0, 10, 20, 30]
+    assert declared == list(range(40))
     command = watcher.collector_command(
         {"collector": Path("/code/collector.py")},
         body="piper",
@@ -64,10 +64,12 @@ def test_single_query_resume_preserves_full_manifest_query_universe() -> None:
     active = command.index("--root-query-indices")
     universe = command.index("--manifest-root-query-indices")
     assert command[active + 1 : universe] == ["30"]
-    assert command[universe + 1 : universe + 5] == ["0", "10", "20", "30"]
+    assert command[universe + 1 : universe + 41] == [
+        str(query) for query in range(40)
+    ]
 
     with pytest.raises(collector.BranchCollectionError):
-        collector.resolve_query_contract([31], watcher.ROOT_QUERIES)
+        collector.resolve_query_contract([40], watcher.ROOT_QUERIES)
 
 
 def _pose(x: float, quaternion: np.ndarray | None = None) -> np.ndarray:
@@ -116,6 +118,7 @@ def _root_and_outcomes() -> tuple[dict, list[dict]]:
         "root_ee_action": current,
         "prefix_trajectory": prefix,
         "prefix_sim_times": np.asarray([0.0], dtype=np.float64),
+        "remaining_action_budget": 200,
         "candidates": np.stack([_candidate(index) for index in range(4)]),
     }
     quarter_turn_z = np.asarray(
@@ -124,7 +127,7 @@ def _root_and_outcomes() -> tuple[dict, list[dict]]:
     specifications = (
         (_trajectory([0.30, 0.28]), [0.0, 0.10], False, 5, None),
         (_trajectory([0.30, 0.18], quarter_turn_z), [0.0, 0.10], True, 5, None),
-        (_trajectory([0.30]), [0.0], False, 0, "RuntimeError: infeasible"),
+        (_trajectory([0.30]), [0.0], False, 0, None),
         (_trajectory([0.30, 0.18, 0.18, 0.18]), [0.0, 0.05, 0.10, 0.35], False, 5, None),
     )
     outcomes = []
@@ -138,6 +141,9 @@ def _root_and_outcomes() -> tuple[dict, list[dict]]:
                 "first_executed": executed,
                 "success": success,
                 "branch_error": error,
+                "terminal_stop_reason_id": (
+                    0 if success else 2 if error is not None else 1
+                ),
             }
         )
     return root, outcomes
@@ -175,9 +181,18 @@ def test_materialization_keeps_terminal_endpoints_and_se3_object_effect() -> Non
         arrays["object_delta"][1, 3:], [0.0, 0.0, np.pi / 2.0], atol=1e-5
     )
     np.testing.assert_array_equal(arrays["event_age_seconds"], np.zeros(4))
+    np.testing.assert_array_equal(
+        arrays["remaining_action_budget"], np.full(4, 200.0)
+    )
+    assert arrays["terminal_stop_reason_id"].tolist() == [1, 0, 1, 1]
     assert collector.OBJECT_EFFECT_SCHEMA == watcher.OBJECT_EFFECT_SCHEMA
     assert collector.TERMINAL_SUPERVISION_CONTRACT == watcher.TERMINAL_SUPERVISION_CONTRACT
     assert collector.EVENT_AGE_CONTRACT == watcher.EVENT_AGE_CONTRACT
+    assert collector.TERMINAL_HORIZON_CONTRACT == watcher.TERMINAL_HORIZON_CONTRACT
+    assert (
+        collector.BRANCH_ROOT_SNAPSHOT_CONTRACT
+        == watcher.BRANCH_ROOT_SNAPSHOT_CONTRACT
+    )
 
 
 def test_event_age_uses_physical_time_since_latest_event_entry() -> None:
@@ -187,17 +202,68 @@ def test_event_age_uses_physical_time_since_latest_event_entry() -> None:
     assert collector.event_age_seconds(events, times) == pytest.approx(0.0)
 
 
-def test_branch_diagnostics_capture_infeasibility_and_action_coverage() -> None:
+def test_restore_hash_excludes_only_derived_qacc() -> None:
+    base = {
+        "articulations": {
+            "robot": {
+                "qpos": [0.1, 0.2],
+                "qvel": [0.3, 0.4],
+                "qacc": [5.0, -7.0],
+                "qf": [0.5, 0.6],
+            }
+        },
+        "simulation_step_count": 31,
+    }
+    changed_qacc = {
+        **base,
+        "articulations": {
+            "robot": {**base["articulations"]["robot"], "qacc": [0.0, 0.0]}
+        },
+    }
+    assert collector.branch_root_snapshot_sha256(base) != (
+        collector.branch_root_snapshot_sha256(changed_qacc)
+    )
+    assert collector.branch_root_restorable_snapshot_sha256(base) == (
+        collector.branch_root_restorable_snapshot_sha256(changed_qacc)
+    )
+    changed_qvel = {
+        **base,
+        "articulations": {
+            "robot": {**base["articulations"]["robot"], "qvel": [0.3, 0.5]}
+        },
+    }
+    assert collector.branch_root_restorable_snapshot_sha256(base) != (
+        collector.branch_root_restorable_snapshot_sha256(changed_qvel)
+    )
+
+
+def test_materialization_rejects_action_execution_exceptions() -> None:
+    root, outcomes = _root_and_outcomes()
+    outcomes[2] = {
+        **outcomes[2],
+        "branch_error": "RuntimeError: simulator failure",
+        "terminal_stop_reason_id": 2,
+    }
+    with pytest.raises(collector.BranchCollectionError):
+        collector.materialize_group(
+            root=root,
+            outcomes=outcomes,
+            calibration=_calibration(),
+            action_exec_steps=5,
+        )
+
+
+def test_branch_diagnostics_capture_action_coverage_without_runtime_failures() -> None:
     root, outcomes = _root_and_outcomes()
     arrays = collector.materialize_branch_diagnostics(
         root=root, outcomes=outcomes, action_exec_steps=5
     )
     assert arrays["first_executed"].tolist() == [5, 5, 0, 5]
-    assert arrays["branch_error"].tolist() == [False, False, True, False]
+    assert arrays["branch_error"].tolist() == [False, False, False, False]
     distances = arrays["candidate_action_pairwise_rms"]
     assert distances.shape == (4, 4)
     np.testing.assert_allclose(distances, distances.T)
     np.testing.assert_allclose(np.diag(distances), 0.0)
     assert np.all(distances[np.triu_indices(4, 1)] > 0.0)
     assert collector.BRANCH_DIAGNOSTIC_CONTRACT == watcher.BRANCH_DIAGNOSTIC_CONTRACT
-    assert watcher.ROOT_QUERIES == (0, 10, 20, 30)
+    assert watcher.ROOT_QUERIES == tuple(range(40))

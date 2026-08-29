@@ -319,6 +319,19 @@ def test_censored_duration_loss_is_finite_and_differentiable() -> None:
     assert mean.grad is not None and torch.isfinite(mean.grad).all()
     assert log_scale.grad is not None and torch.isfinite(log_scale.grad).all()
 
+    extreme_mean = torch.tensor([0.0], requires_grad=True)
+    extreme = censored_lognormal_loss(
+        extreme_mean,
+        torch.tensor([-2.0]),
+        torch.tensor([8.0]),
+        torch.tensor([0.0]),
+    ).sum()
+    extreme.backward()
+    assert torch.isfinite(extreme)
+    assert extreme_mean.grad is not None
+    assert torch.isfinite(extreme_mean.grad).all()
+    assert torch.count_nonzero(extreme_mean.grad) == 1
+
 
 def test_group_split_is_stratified_deterministic_and_label_free() -> None:
     descriptors = [

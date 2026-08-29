@@ -44,6 +44,7 @@ COLLECTOR_FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v1"
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
+DEFAULT_INSTRUCTION = "Move the can to the side of the pot."
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 STATE_SCHEMA = "dual_ee_object_relative_state_27d_v2"
@@ -51,14 +52,12 @@ ACTION_SCHEMA = "dual_ee_se3_gripper_delta_14d_v2"
 EVENTS = ("e0", "e12", "e3", "e4", "eK")
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
 CANDIDATE_COUNT = 4
-SEED_START = 2026081000
+SEED_START = 2026082000
 DEVELOPMENT_SEED_STOP = 2026090000
-SEEDS_PER_CONDITION_QUERY = 50
-# Four equally budgeted roots span the full 200-control-step episode instead
-# of concentrating all branch supervision in the first half.  With five
-# executed actions per policy query, query 30 observes late/recovery states
-# while the existing supplemental-seed logic fills terminal-root gaps.
-QUERY_INDICES = (0, 10, 20, 30)
+SEEDS_PER_CONDITION_QUERY = 5
+# Preserve exactly 200 decisions per body/condition while covering every
+# remaining-budget value used by the formal five-action online scorer.
+QUERY_INDICES = tuple(range(40))
 CANDIDATE_NOISE_CONTRACT = {
     "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
     "candidate_indices": [0, 1, 2, 3],
@@ -67,10 +66,20 @@ CANDIDATE_NOISE_CONTRACT = {
     "candidate_zero_legacy_noise_unchanged": True,
 }
 TERMINAL_SUPERVISION_CONTRACT = {
-    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_max_event_id": (
+        "maximum_canonical_event_from_candidate_root_through_continuation"
+    ),
+    "terminal_event_mask": "finite_horizon_terminal_event_is_valid",
     "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
     "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "terminal_goal_progress_mask": "finite_horizon_terminal_goal_is_valid",
+    "terminal_stop_reason_id": {
+        "success": 0,
+        "formal_action_limit": 1,
+    },
+    "planner_status_failure_without_exception": "valid_finite_horizon_outcome",
+    "action_execution_exception": "invalidate_complete_four_candidate_decision",
     "same_stage_progress_definition_as_formal_paired_runner": True,
 }
 EVENT_AGE_CONTRACT = {
@@ -79,6 +88,31 @@ EVENT_AGE_CONTRACT = {
     "clock_source": "counted_successful_sapien_scene_step_calls",
     "available_before_candidate_execution": True,
     "same_value_for_all_candidates_at_one_root": True,
+}
+TERMINAL_HORIZON_CONTRACT = {
+    "array": "remaining_action_budget",
+    "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
+    "conditions_only_terminal_consequence_heads": True,
+    "direct_rank_path": False,
+    "formal_episode_action_steps": 200,
+    "formal_actor_query_stride_actions": 5,
+    "development_remaining_action_budgets": list(range(200, 0, -5)),
+}
+BRANCH_ROOT_SNAPSHOT_CONTRACT = {
+    "format": "etsf_sapien_explicit_fresh_scene_branch_root_v1",
+    "physics_state": "keyed_rigid_articulation_drive_task_render_rng_snapshot",
+    "candidate_scene_isolation": "one_fresh_scene_per_candidate",
+    "contact_cache_reconstruction": "one_counted_raw_scene_step",
+    "derived_articulation_qacc": (
+        "recorded_for_provenance_not_required_pre_step_then_recomputed_and_"
+        "strictly_hashed_after_canonicalization_step"
+    ),
+    "simulation_clock_restored": True,
+    "task_counters_restored": ["take_action_cnt", "eval_success"],
+    "rng_restored": ["python", "numpy", "torch_cpu", "torch_cuda"],
+    "reset_and_action_prefix_replay_used_for_candidates": False,
 }
 OBJECT_EFFECT_SCHEMA = {
     "format": "etsf_robotwin2_moving_object_se3_effect_6d_v1",
@@ -97,7 +131,7 @@ DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v1"
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": DIAGNOSTIC_FORMAT,
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
-    "branch_error": "boolean_execution_or_continuation_exception",
+    "branch_error": "all_false_execution_exception_invalidates_complete_decision",
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
     ),
@@ -127,11 +161,15 @@ REQUIRED_ARRAYS = {
     "object_delta",
     "object_delta_mask",
     "terminal_max_event_id",
+    "terminal_event_mask",
     "terminal_stage_progress",
     "terminal_goal_distance",
     "terminal_goal_progress",
+    "terminal_goal_progress_mask",
+    "terminal_stop_reason_id",
     "candidate_index",
     "event_age_seconds",
+    "remaining_action_budget",
     "dt",
 }
 FLOAT_ARRAYS = {
@@ -151,12 +189,15 @@ FLOAT_ARRAYS = {
     "terminal_stage_progress",
     "terminal_goal_distance",
     "terminal_goal_progress",
+    "terminal_event_mask",
+    "terminal_goal_progress_mask",
     "event_age_seconds",
+    "remaining_action_budget",
     "dt",
 }
 INTEGER_ARRAYS = {
     "current_event_id", "post_event_id", "next_event_id",
-    "terminal_max_event_id", "candidate_index"
+    "terminal_max_event_id", "terminal_stop_reason_id", "candidate_index"
 }
 DIAGNOSTIC_ARRAYS = {
     "first_executed",
@@ -405,6 +446,26 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                 raise LoboWatcherError(
                     f"decision candidates do not share one pre-action event age: {path}"
                 )
+            with archive.open("remaining_action_budget.npy") as stream:
+                header = read_npy_header(stream, f"{path}:remaining_action_budget")
+                byte_order = "<" if header["descr"] == "<f4" else "="
+                remaining_budget = struct.unpack(
+                    byte_order + "4f",
+                    _read_exact(stream, 16, "remaining_action_budget"),
+                )
+            if any(
+                not math.isfinite(value) or value <= 0.0
+                for value in remaining_budget
+            ) or any(value != remaining_budget[0] for value in remaining_budget[1:]):
+                raise LoboWatcherError(
+                    f"decision candidates do not share one positive remaining budget: {path}"
+                )
+            if remaining_budget[0] not in TERMINAL_HORIZON_CONTRACT[
+                "development_remaining_action_budgets"
+            ]:
+                raise LoboWatcherError(
+                    f"decision remaining budget is outside the formal query grid: {path}"
+                )
             with archive.open("actions.npy") as stream:
                 header = read_npy_header(stream, f"{path}:actions")
                 byte_order = "<" if header["descr"] == "<f4" else "="
@@ -435,6 +496,7 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
     return {
         "candidate_count": 4,
         "action_horizon": horizon,
+        "remaining_action_budget": float(remaining_budget[0]),
         "candidate_action_pairwise_rms": pairwise_rms,
     }
 
@@ -490,9 +552,10 @@ def validate_diagnostic_npz(
             with archive.open("branch_error.npy") as stream:
                 read_npy_header(stream, f"{path}:branch_error")
                 branch_error = _read_exact(stream, CANDIDATE_COUNT, "branch_error")
-                if stream.read(1) or any(value not in (0, 1) for value in branch_error):
+                if stream.read(1) or any(value != 0 for value in branch_error):
                     raise LoboWatcherError(
-                        f"diagnostic branch_error is not a strict bool payload: {path}"
+                        "action execution exceptions must invalidate the complete "
+                        f"decision instead of reaching diagnostics: {path}"
                     )
             with archive.open("candidate_action_pairwise_rms.npy") as stream:
                 header = read_npy_header(
@@ -613,7 +676,7 @@ def reject_irrecoverable_progress(progress: Mapping[str, Any]) -> None:
                 key = f"{condition}|query={query}"
                 if int(units.get(key, 0)) > SEEDS_PER_CONDITION_QUERY:
                     raise LoboWatcherError(
-                        f"{body}/{key} contains more than 50 declared decisions"
+                        f"{body}/{key} contains more than five declared decisions"
                     )
 
 
@@ -650,6 +713,7 @@ def validate_complete_collection(
             or manifest.get("dataset_repo") != DATASET_REPO
             or manifest.get("dataset_revision") != DATASET_REVISION
             or manifest.get("task") != TASK
+            or manifest.get("instruction") != DEFAULT_INSTRUCTION
             or manifest.get("body") != body
             or manifest.get("status")
             != "complete_400_decisions_1600_candidate_branches"
@@ -657,6 +721,8 @@ def validate_complete_collection(
             or len(manifest["collector_file_sha256"]) != 64
             or manifest.get("actor_checkpoint") != str(actor_checkpoint)
             or manifest.get("candidate_count") != CANDIDATE_COUNT
+            or manifest.get("action_exec_steps") != 5
+            or manifest.get("max_episode_action_steps") != 200
             or manifest.get("candidate_zero_is_actor_baseline") is not True
             or manifest.get("same_ordered_candidate_set_for_baseline_and_etsf") is not True
             or manifest.get("root_query_indices") != list(QUERY_INDICES)
@@ -664,6 +730,10 @@ def validate_complete_collection(
             or manifest.get("terminal_supervision_contract")
             != TERMINAL_SUPERVISION_CONTRACT
             or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
+            or manifest.get("terminal_horizon_contract")
+            != TERMINAL_HORIZON_CONTRACT
+            or manifest.get("branch_root_snapshot_contract")
+            != BRANCH_ROOT_SNAPSHOT_CONTRACT
             or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
             or manifest.get("branch_diagnostic_contract")
             != BRANCH_DIAGNOSTIC_CONTRACT
@@ -714,7 +784,8 @@ def validate_complete_collection(
                 "action_mask_source": "planned_first_chunk_not_executed_count",
                 "executed_action_count_used_for_action_mask": False,
                 "executed_action_count_used_for_sim_time_accounting_only": True,
-                "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
+                "planner_status_fail_is_a_valid_action_outcome": True,
+                "python_execution_exception_invalidates_complete_decision": True,
             }
         ):
             raise LoboWatcherError(f"{body} manifest violates the canonical collection contract")
@@ -782,6 +853,11 @@ def validate_complete_collection(
             )
             relative = item.get("path")
             diagnostics_relative = item.get("diagnostics_path")
+            snapshot_hashes = (
+                item.get("branch_root_snapshot_sha256"),
+                item.get("branch_root_restorable_snapshot_sha256"),
+                item.get("canonical_root_snapshot_sha256"),
+            )
             if (
                 item.get("condition") != condition
                 or item.get("requested_seed") != seed
@@ -794,6 +870,10 @@ def validate_complete_collection(
                 != f"groups/{expected_diagnostic_filename}"
                 or not isinstance(item.get("diagnostics_sha256"), str)
                 or len(item["diagnostics_sha256"]) != 64
+                or any(
+                    not isinstance(value, str) or len(value) != 64
+                    for value in snapshot_hashes
+                )
             ):
                 raise LoboWatcherError(f"{body}/{group_id} identity fields changed")
             payload = branches_root / body / str(relative)
@@ -802,6 +882,10 @@ def validate_complete_collection(
             except ValueError as error:
                 raise LoboWatcherError(f"{body}/{group_id} payload escapes body root") from error
             decision = validate_decision_npz(payload, str(item["sha256"]))
+            if decision["remaining_action_budget"] != 200.0 - 5.0 * query:
+                raise LoboWatcherError(
+                    f"{body}/{group_id} remaining budget disagrees with query index"
+                )
             diagnostics_payload = branches_root / body / str(diagnostics_relative)
             try:
                 diagnostics_payload.resolve().relative_to(
@@ -830,7 +914,7 @@ def validate_complete_collection(
             for query in QUERY_INDICES
         ):
             raise LoboWatcherError(
-                f"{body} does not contain 50 unique development seeds per condition/query"
+                f"{body} does not contain five unique development seeds per condition/query"
             )
         disk_paths = {
             path.relative_to(branches_root / body).as_posix()
@@ -893,6 +977,8 @@ def validate_complete_collection(
         "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
         "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
         "event_age_contract": EVENT_AGE_CONTRACT,
+        "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+        "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
         "object_effect_schema": OBJECT_EFFECT_SCHEMA,
         "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
         "manifest_bindings": manifest_bindings,
@@ -1012,8 +1098,12 @@ def summarize_fold(
             "source_negative_to_positive_ratio"
         ),
         "source_validation": {
-            "macro_best_of_4_delta_success_rate": numeric_summary(
-                nested_values(members, "candidate_ranking", "macro_delta_success_rate")
+            "macro_one_deviation_branch_success_gain": numeric_summary(
+                nested_values(
+                    members,
+                    "candidate_ranking",
+                    "macro_one_deviation_branch_success_gain",
+                )
             ),
             "macro_selected_success_rate": numeric_summary(
                 nested_values(members, "candidate_ranking", "macro_selected_success_rate")
@@ -1059,7 +1149,7 @@ def summarize_fold(
                 "support_by_member": nested_values(members, "object_support"),
             },
         },
-        "deployment_homomorphic_ensemble_source_validation": (
+        "one_deviation_ensemble_source_validation": (
             ensemble_selection["selected_ensemble_candidate_ranking"]
         ),
         "ensemble_common_selection_step": ensemble_selection["selected_step"],
@@ -1120,6 +1210,7 @@ def validate_existing_authorities(
         is not True
         or sampling_contract.get("candidate_noise_contract")
         != CANDIDATE_NOISE_CONTRACT
+        or sampling_contract.get("instruction") != DEFAULT_INSTRUCTION
         or sampling_contract.get("conditions") != list(CONDITIONS)
         or sampling_contract.get("root_query_indices") != list(QUERY_INDICES)
         or sampling_contract.get("action_exec_steps") != 5
@@ -1131,6 +1222,10 @@ def validate_existing_authorities(
         or sampling_contract.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or sampling_contract.get("event_age_contract") != EVENT_AGE_CONTRACT
+        or sampling_contract.get("terminal_horizon_contract")
+        != TERMINAL_HORIZON_CONTRACT
+        or sampling_contract.get("branch_root_snapshot_contract")
+        != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or sampling_contract.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
         or not isinstance(actors, Mapping)
@@ -1191,11 +1286,15 @@ def validate_existing_authorities(
         or binding.get("dataset_repo") != DATASET_REPO
         or binding.get("dataset_revision") != DATASET_REVISION
         or binding.get("task") != TASK
+        or binding.get("instruction") != DEFAULT_INSTRUCTION
         or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
         or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
+        or binding.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or binding.get("branch_root_snapshot_contract")
+        != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
         or binding.get("branch_diagnostic_contract") != BRANCH_DIAGNOSTIC_CONTRACT
         or binding.get("heldout_labels_may_train_fit_calibrate_or_select") is not False
@@ -1421,8 +1520,8 @@ def main() -> int:
         )
 
     macro_deltas = [
-        row["deployment_homomorphic_ensemble_source_validation"][
-            "macro_delta_success_rate"
+        row["one_deviation_ensemble_source_validation"][
+            "macro_one_deviation_branch_success_gain"
         ]
         for row in fold_results
     ]
@@ -1462,7 +1561,7 @@ def main() -> int:
             "fold_count": len(fold_results),
             "members_per_fold": 5,
             "steps_per_member": 3000,
-            "source_validation_fold_mean_macro_best_of_4_delta_success_rate": numeric_summary(
+            "source_validation_fold_mean_macro_one_deviation_branch_success_gain": numeric_summary(
                 macro_deltas
             ),
             "heldout_labels_used_for_training_normalization_or_selection": False,
@@ -1480,8 +1579,8 @@ def main() -> int:
         completed_folds=list(BODIES),
         final_summary=str(final_path),
         final_summary_file_sha256=sha256_file(final_path),
-        source_validation_fold_mean_macro_best_of_4_delta_success_rate=final[
-            "source_validation_fold_mean_macro_best_of_4_delta_success_rate"
+        source_validation_fold_mean_macro_one_deviation_branch_success_gain=final[
+            "source_validation_fold_mean_macro_one_deviation_branch_success_gain"
         ],
         gpu=gpu,
     )

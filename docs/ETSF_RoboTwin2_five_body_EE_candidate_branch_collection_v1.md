@@ -1,5 +1,9 @@
 # RoboTwin2 五本体 EE 候选分支采集 v1
 
+> 历史文档提示：下文保留早期 4-query/prefix-replay 方案，不再是当前生产采集协议。
+> 当前 40-query、fresh-scene snapshot 与终局后果监督以
+> `docs/ETSF_RoboTwin2_shared_head_v6_terminal_consequence_design_zh.md` 为准。
+
 入口：`scripts/collect_robotwin2_five_body_ee_candidate_branches_v1.py`。
 
 该入口为共享事件头生成真正的 critic 监督，而不是把官方 expert 正样本冒充成成败数据。五个本体

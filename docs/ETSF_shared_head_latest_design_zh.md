@@ -1,5 +1,9 @@
 # ETSF 跨本体共享头：最新设计、训练监督、迁移与证据协议
 
+> 历史文档提示：本文记录的是 2026-08-28 Source63/r16 路线，不再代表当前生产设计。
+> 当前五本体 v6 终局后果共享头、完整监督数据和闭环效果协议请以
+> `docs/ETSF_RoboTwin2_shared_head_v6_terminal_consequence_design_zh.md` 为准。
+
 > 版本：2026-08-28 r16 数据审计与 post-r16 P0 设计对齐版。本文以当前 Source63 因果历史训练器、Piper embodiment adapter、Formal190 完整外层嵌套选择、严格 rank 数值合同、actor-visible causal observer 和 evaluation400 v4 root-observed 证据合同为准。本文严格区分“r16 已冻结并物化的真实源数据”“post-r16 P0 代码已经实现并通过定向回归”“仅供合同测试的 reference predictor”“尚未部署的新代码”和“尚未获得的真实成功率结论”。
 
 当前结论先写在前面：共享头已经是一个可训练、可迁移、接口上可插拔的动作条件事件模型，但“跨本体后提高任务成功率”仍是待验证假设，不是已经得到的实验结论。r16 causal-observer 数据已经物化，却存在严重类别不平衡和结构性缺类；其 calibration/validation 分别只有 10/14 个独立组，远低于风险控制所需的 73 组，因此当前数据无论训练 loss 多低都不能晋升。远端 r16 尚未开始 GPU 参数更新，post-r16 P0 训练与 root-observed 改动也尚未重新冻结部署；Piper 目标 development300 尚未获准采集，Formal190 与 evaluation400 均未执行。

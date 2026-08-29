@@ -4,8 +4,9 @@
 The collector is intentionally operational rather than a data-contract tool:
 it loads one frozen 16-D EE SmolVLA actor, creates four fixed-flow-noise action
 candidates at several fixed query indices, executes each candidate after an
-identical reset/replayed baseline prefix, and writes one four-row canonical
-NPZ plus a non-trainable diagnostic sidecar per decision.  Events, terminal
+explicitly restored fresh-scene root snapshot plus one canonical physics step,
+and writes one four-row canonical NPZ plus a non-trainable diagnostic sidecar
+per decision.  Events, terminal
 progress, SE(3) object effects and success are derived from the simulator
 trajectory, never from the public expert archive.
 
@@ -17,6 +18,7 @@ the five embodiments are run sequentially because they share one GPU.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import inspect
 import json
@@ -49,6 +51,8 @@ CANONICAL_ACTION_DIM = 14
 STATE_DIM = 27
 OBJECT_DELTA_DIM = 6
 SOURCE_EVENT_SAMPLING_HZ = 15.0
+FORMAL_ACTION_EXEC_STEPS = 5
+FORMAL_MAX_STEPS = 200
 DEFAULT_INSTRUCTION = "Move the can to the side of the pot."
 CANONICAL_EVENTS = ("e0", "e12", "e3", "e4", "eK")
 EVENT_TO_ID = {name: index for index, name in enumerate(CANONICAL_EVENTS)}
@@ -76,10 +80,20 @@ CANDIDATE_NOISE_CONTRACT = {
     "candidate_zero_legacy_noise_unchanged": True,
 }
 TERMINAL_SUPERVISION_CONTRACT = {
-    "terminal_max_event_id": "maximum_canonical_event_over_full_continuation",
+    "terminal_max_event_id": (
+        "maximum_canonical_event_from_candidate_root_through_continuation"
+    ),
+    "terminal_event_mask": "finite_horizon_terminal_event_is_valid",
     "terminal_stage_progress": "one_if_success_else_terminal_max_event_id_div_4",
     "terminal_goal_distance": "euclidean_goal_residual_at_full_continuation_terminal",
     "terminal_goal_progress": "root_goal_distance_minus_terminal_goal_distance",
+    "terminal_goal_progress_mask": "finite_horizon_terminal_goal_is_valid",
+    "terminal_stop_reason_id": {
+        "success": 0,
+        "formal_action_limit": 1,
+    },
+    "planner_status_failure_without_exception": "valid_finite_horizon_outcome",
+    "action_execution_exception": "invalidate_complete_four_candidate_decision",
     "same_stage_progress_definition_as_formal_paired_runner": True,
 }
 EVENT_AGE_CONTRACT = {
@@ -89,10 +103,37 @@ EVENT_AGE_CONTRACT = {
     "available_before_candidate_execution": True,
     "same_value_for_all_candidates_at_one_root": True,
 }
+TERMINAL_HORIZON_CONTRACT = {
+    "array": "remaining_action_budget",
+    "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+    "available_before_candidate_execution": True,
+    "same_value_for_all_candidates_at_one_root": True,
+    "conditions_only_terminal_consequence_heads": True,
+    "direct_rank_path": False,
+    "formal_episode_action_steps": FORMAL_MAX_STEPS,
+    "formal_actor_query_stride_actions": FORMAL_ACTION_EXEC_STEPS,
+    "development_remaining_action_budgets": list(
+        range(FORMAL_MAX_STEPS, 0, -FORMAL_ACTION_EXEC_STEPS)
+    ),
+}
+BRANCH_ROOT_SNAPSHOT_CONTRACT = {
+    "format": "etsf_sapien_explicit_fresh_scene_branch_root_v1",
+    "physics_state": "keyed_rigid_articulation_drive_task_render_rng_snapshot",
+    "candidate_scene_isolation": "one_fresh_scene_per_candidate",
+    "contact_cache_reconstruction": "one_counted_raw_scene_step",
+    "derived_articulation_qacc": (
+        "recorded_for_provenance_not_required_pre_step_then_recomputed_and_"
+        "strictly_hashed_after_canonicalization_step"
+    ),
+    "simulation_clock_restored": True,
+    "task_counters_restored": ["take_action_cnt", "eval_success"],
+    "rng_restored": ["python", "numpy", "torch_cpu", "torch_cuda"],
+    "reset_and_action_prefix_replay_used_for_candidates": False,
+}
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": DIAGNOSTIC_FORMAT,
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
-    "branch_error": "boolean_execution_or_continuation_exception",
+    "branch_error": "all_false_execution_exception_invalidates_complete_decision",
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
     ),
@@ -144,6 +185,461 @@ class SimulationClockScene:
             object.__setattr__(self, name, value)
         else:
             setattr(self._scene, name, value)
+
+
+TASK_SNAPSHOT_FIELDS = (
+    "take_action_cnt",
+    "eval_success",
+    "plan_success",
+    "left_cnt",
+    "right_cnt",
+    "stage_success_tag",
+    "FRAME_IDX",
+    "step_lim",
+    "left_js",
+    "right_js",
+)
+ROBOT_SNAPSHOT_FIELDS = (
+    "left_gripper_val",
+    "right_gripper_val",
+    "left_js",
+    "right_js",
+)
+
+
+def _pose7(value: Any) -> np.ndarray:
+    return np.asarray([*value.p, *value.q], dtype=np.float64)
+
+
+def _sapien_pose(value: Sequence[float]) -> Any:
+    import sapien
+
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != (7,) or not np.isfinite(array).all():
+        raise BranchCollectionError("snapshot contains an invalid SAPIEN pose")
+    return sapien.Pose(p=array[:3], q=array[3:])
+
+
+def _component_key(component: Any) -> str:
+    entity = component.entity
+    same_type = [
+        value
+        for value in entity.components
+        if type(value) is type(component)
+        and str(getattr(value, "name", "")) == str(getattr(component, "name", ""))
+    ]
+    occurrence = same_type.index(component)
+    return "|".join(
+        (
+            str(entity.per_scene_id),
+            str(entity.name),
+            f"{type(component).__module__}.{type(component).__name__}",
+            str(getattr(component, "name", "")),
+            str(occurrence),
+        )
+    )
+
+
+def _articulation_key(articulation: Any) -> str:
+    return canonical_sha256(
+        {
+            "name": str(articulation.name),
+            "dof": int(articulation.dof),
+            "links": [
+                [int(link.entity.per_scene_id), str(link.entity.name), str(link.name)]
+                for link in articulation.links
+            ],
+            "joints": [str(joint.name) for joint in articulation.joints],
+        }
+    )
+
+
+def _scene_inventory(native_scene: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "per_scene_id": int(entity.per_scene_id),
+            "name": str(entity.name),
+            "components": [
+                [
+                    f"{type(component).__module__}.{type(component).__name__}",
+                    str(getattr(component, "name", "")),
+                ]
+                for component in entity.components
+            ],
+        }
+        for entity in native_scene.entities
+    ]
+
+
+def _jsonable_snapshot(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable_snapshot(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable_snapshot(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise BranchCollectionError(
+        f"snapshot field has unsupported type {type(value).__name__}"
+    )
+
+
+def branch_root_snapshot_sha256(snapshot: Mapping[str, Any]) -> str:
+    return canonical_sha256(_jsonable_snapshot(snapshot))
+
+
+def branch_root_restorable_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only independent state that the SAPIEN API can restore.
+
+    ``qacc`` is the acceleration derived during the previous PhysX solve.
+    SAPIEN 3 exposes a setter, but a fresh articulation immediately reports a
+    recomputed/cache value instead of the supplied value.  It is retained in
+    the full provenance snapshot, excluded only from the pre-step restore
+    equality check, and included again in the strict post-canonicalization
+    snapshot hash.
+    """
+
+    value = copy.deepcopy(_jsonable_snapshot(snapshot))
+    for articulation in value.get("articulations", {}).values():
+        articulation.pop("qacc", None)
+    return value
+
+
+def branch_root_restorable_snapshot_sha256(snapshot: Mapping[str, Any]) -> str:
+    return canonical_sha256(branch_root_restorable_snapshot(snapshot))
+
+
+def branch_root_snapshot_section_sha256(
+    snapshot: Mapping[str, Any]
+) -> dict[str, str]:
+    return {
+        str(name): canonical_sha256(_jsonable_snapshot(value))
+        for name, value in snapshot.items()
+    }
+
+
+def branch_root_snapshot_difference_summary(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+    *,
+    sections: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Return compact field-level diagnostics for an inexact restore.
+
+    Snapshot hashes remain the fast equality check.  When one differs, this
+    summary identifies the actual state variable instead of encouraging a
+    blind tolerance increase.
+    """
+
+    selected = list(sections) if sections is not None else sorted(expected)
+    differences: dict[str, Any] = {}
+
+    def visit(path: str, left: Any, right: Any) -> None:
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            if set(left) != set(right):
+                differences[path] = {
+                    "missing": sorted(set(left).difference(right)),
+                    "unexpected": sorted(set(right).difference(left)),
+                }
+            for key in sorted(set(left).intersection(right), key=str):
+                visit(f"{path}.{key}" if path else str(key), left[key], right[key])
+            return
+        if isinstance(left, (list, tuple, np.ndarray, torch.Tensor)) and isinstance(
+            right, (list, tuple, np.ndarray, torch.Tensor)
+        ):
+            try:
+                left_array = np.asarray(_jsonable_snapshot(left))
+                right_array = np.asarray(_jsonable_snapshot(right))
+            except (TypeError, ValueError):
+                if _jsonable_snapshot(left) != _jsonable_snapshot(right):
+                    differences[path] = "non_numeric_sequence_changed"
+                return
+            if left_array.shape != right_array.shape:
+                differences[path] = {
+                    "expected_shape": list(left_array.shape),
+                    "observed_shape": list(right_array.shape),
+                }
+                return
+            if left_array.dtype.kind in "biufc" and right_array.dtype.kind in "biufc":
+                left_numeric = left_array.astype(np.float64, copy=False)
+                right_numeric = right_array.astype(np.float64, copy=False)
+                delta = np.abs(left_numeric - right_numeric)
+                if not np.array_equal(left_numeric, right_numeric):
+                    flat_index = int(np.argmax(delta)) if delta.size else 0
+                    differences[path] = {
+                        "max_abs": float(delta.reshape(-1)[flat_index]) if delta.size else 0.0,
+                        "argmax": [
+                            int(index)
+                            for index in np.unravel_index(flat_index, delta.shape)
+                        ]
+                        if delta.size
+                        else [],
+                        "expected_at_argmax": float(left_numeric.reshape(-1)[flat_index]) if delta.size else None,
+                        "observed_at_argmax": float(right_numeric.reshape(-1)[flat_index]) if delta.size else None,
+                    }
+                return
+            if left_array.tolist() != right_array.tolist():
+                differences[path] = "sequence_changed"
+            return
+        if _jsonable_snapshot(left) != _jsonable_snapshot(right):
+            differences[path] = {
+                "expected": _jsonable_snapshot(left),
+                "observed": _jsonable_snapshot(right),
+            }
+
+    for section in selected:
+        if section not in expected or section not in observed:
+            differences[section] = "section_missing"
+        else:
+            visit(section, expected[section], observed[section])
+    return differences
+
+
+def capture_branch_root_snapshot(task: Any) -> dict[str, Any]:
+    """Capture an explicit state that can be restored into a fresh scene."""
+
+    scene = task.scene
+    if not isinstance(scene, SimulationClockScene):
+        raise BranchCollectionError("branch snapshot requires the simulation clock proxy")
+    native_scene = scene._scene
+    dynamic: dict[str, Any] = {}
+    drives: dict[str, Any] = {}
+    render: dict[str, Any] = {}
+    static_entity_pose: dict[str, Any] = {}
+    for entity in native_scene.entities:
+        physical_types = {type(component).__name__ for component in entity.components}
+        if not physical_types.intersection(
+            {"PhysxRigidDynamicComponent", "PhysxArticulationLinkComponent"}
+        ):
+            static_entity_pose[str(entity.per_scene_id)] = _pose7(entity.pose)
+        for component in entity.components:
+            name = type(component).__name__
+            key = _component_key(component)
+            if name == "PhysxRigidDynamicComponent":
+                kinematic = bool(component.get_kinematic())
+                dynamic[key] = {
+                    "pose": _pose7(component.get_pose()),
+                    "linear_velocity": np.asarray(
+                        component.get_linear_velocity(), dtype=np.float64
+                    ),
+                    "angular_velocity": np.asarray(
+                        component.get_angular_velocity(), dtype=np.float64
+                    ),
+                    "kinematic": kinematic,
+                    "kinematic_target": (
+                        _pose7(component.get_kinematic_target())
+                        if kinematic
+                        else None
+                    ),
+                    "sleeping": bool(
+                        component.is_sleeping()
+                        if callable(component.is_sleeping)
+                        else component.is_sleeping
+                    ),
+                }
+            elif name == "PhysxDriveComponent":
+                linear_target, angular_target = component.get_drive_velocity_target()
+                drives[key] = {
+                    "pose": _pose7(component.get_pose()),
+                    "drive_target": _pose7(component.get_drive_target()),
+                    "drive_linear_velocity_target": np.asarray(
+                        linear_target, dtype=np.float64
+                    ),
+                    "drive_angular_velocity_target": np.asarray(
+                        angular_target, dtype=np.float64
+                    ),
+                }
+            elif "RenderCameraComponent" in name or "LightComponent" in name:
+                row = {
+                    "local_pose": _pose7(component.get_local_pose()),
+                    "enabled": bool(
+                        component.is_enabled()
+                        if callable(component.is_enabled)
+                        else component.is_enabled
+                    ),
+                }
+                if "LightComponent" in name:
+                    row["color"] = np.asarray(component.get_color(), dtype=np.float64)
+                render[key] = row
+
+    articulations: dict[str, Any] = {}
+    for articulation in native_scene.get_all_articulations():
+        root = articulation.root
+        articulations[_articulation_key(articulation)] = {
+            "root_pose": _pose7(articulation.get_root_pose()),
+            "root_linear_velocity": np.asarray(
+                articulation.get_root_linear_velocity(), dtype=np.float64
+            ),
+            "root_angular_velocity": np.asarray(
+                articulation.get_root_angular_velocity(), dtype=np.float64
+            ),
+            "qpos": np.asarray(articulation.get_qpos(), dtype=np.float64),
+            "qvel": np.asarray(articulation.get_qvel(), dtype=np.float64),
+            "qacc": np.asarray(articulation.get_qacc(), dtype=np.float64),
+            "qf": np.asarray(articulation.get_qf(), dtype=np.float64),
+            "joint_names": [str(joint.name) for joint in articulation.active_joints],
+            "joint_drive_target": np.asarray(
+                [joint.get_drive_target() for joint in articulation.active_joints],
+                dtype=np.float64,
+            ),
+            "joint_drive_velocity_target": np.asarray(
+                [joint.get_drive_velocity_target() for joint in articulation.active_joints],
+                dtype=np.float64,
+            ),
+            "sleeping": bool(root.sleeping),
+        }
+    task_fields = {
+        name: copy.deepcopy(getattr(task, name))
+        for name in TASK_SNAPSHOT_FIELDS
+        if hasattr(task, name)
+    }
+    robot = getattr(task, "robot", None)
+    robot_fields = {
+        name: copy.deepcopy(getattr(robot, name))
+        for name in ROBOT_SNAPSHOT_FIELDS
+        if robot is not None and hasattr(robot, name)
+    }
+    import sapien
+
+    return {
+        "format": "etsf_sapien_explicit_fresh_scene_root_snapshot_v1",
+        "sapien_version": str(sapien.__version__),
+        "timestep_seconds": float(scene.timestep_seconds),
+        "inventory": _scene_inventory(native_scene),
+        "static_entity_pose": static_entity_pose,
+        "dynamic": dynamic,
+        "articulations": articulations,
+        "drives": drives,
+        "render": {
+            "ambient_light": np.asarray(native_scene.ambient_light, dtype=np.float64),
+            "components": render,
+        },
+        "simulation_step_count": int(scene.step_count),
+        "task_fields": task_fields,
+        "robot_fields": robot_fields,
+        "python_rng": copy.deepcopy(random.getstate()),
+        "numpy_rng": copy.deepcopy(np.random.get_state()),
+        "torch_cpu_rng": torch.random.get_rng_state().clone(),
+        "torch_cuda_rng": [state.clone() for state in torch.cuda.get_rng_state_all()],
+    }
+
+
+def restore_branch_root_snapshot(task: Any, snapshot: Mapping[str, Any]) -> None:
+    """Restore an explicit root into an independently constructed scene."""
+
+    scene = task.scene
+    if not isinstance(scene, SimulationClockScene):
+        raise BranchCollectionError("branch restore requires the simulation clock proxy")
+    import sapien
+
+    native_scene = scene._scene
+    if (
+        snapshot.get("format")
+        != "etsf_sapien_explicit_fresh_scene_root_snapshot_v1"
+        or snapshot.get("sapien_version") != str(sapien.__version__)
+        or not np.isclose(
+            float(snapshot["timestep_seconds"]),
+            float(scene.timestep_seconds),
+            atol=1e-12,
+            rtol=0.0,
+        )
+        or snapshot.get("inventory") != _scene_inventory(native_scene)
+    ):
+        raise BranchCollectionError("fresh scene inventory/timestep differs from root")
+
+    entities = {str(entity.per_scene_id): entity for entity in native_scene.entities}
+    components = {
+        _component_key(component): component
+        for entity in native_scene.entities
+        for component in entity.components
+    }
+    articulations = {
+        _articulation_key(articulation): articulation
+        for articulation in native_scene.get_all_articulations()
+    }
+    if set(articulations) != set(snapshot["articulations"]):
+        raise BranchCollectionError("fresh articulation inventory differs from root")
+
+    for entity_id, pose in snapshot["static_entity_pose"].items():
+        entities[entity_id].pose = _sapien_pose(pose)
+    for key, value in snapshot["articulations"].items():
+        articulation = articulations[key]
+        if [str(joint.name) for joint in articulation.active_joints] != value[
+            "joint_names"
+        ]:
+            raise BranchCollectionError("fresh articulation joint ordering changed")
+        articulation.set_root_pose(_sapien_pose(value["root_pose"]))
+        articulation.set_qpos(np.asarray(value["qpos"]))
+        articulation.set_qvel(np.asarray(value["qvel"]))
+        articulation.set_qf(np.asarray(value["qf"]))
+        articulation.set_root_linear_velocity(
+            np.asarray(value["root_linear_velocity"])
+        )
+        articulation.set_root_angular_velocity(
+            np.asarray(value["root_angular_velocity"])
+        )
+        for index, joint in enumerate(articulation.active_joints):
+            joint.set_drive_target(
+                float(np.asarray(value["joint_drive_target"][index]).reshape(-1)[0])
+            )
+            joint.set_drive_velocity_target(
+                float(
+                    np.asarray(
+                        value["joint_drive_velocity_target"][index]
+                    ).reshape(-1)[0]
+                )
+            )
+    for key, value in snapshot["dynamic"].items():
+        component = components[key]
+        component.set_kinematic(bool(value["kinematic"]))
+        component.set_pose(_sapien_pose(value["pose"]))
+        component.set_linear_velocity(np.asarray(value["linear_velocity"]))
+        component.set_angular_velocity(np.asarray(value["angular_velocity"]))
+        if value["kinematic_target"] is not None:
+            component.set_kinematic_target(_sapien_pose(value["kinematic_target"]))
+    for key, value in snapshot["drives"].items():
+        component = components[key]
+        component.set_pose(_sapien_pose(value["pose"]))
+        component.set_drive_target(_sapien_pose(value["drive_target"]))
+        component.set_drive_velocity_target(
+            np.asarray(value["drive_linear_velocity_target"]),
+            np.asarray(value["drive_angular_velocity_target"]),
+        )
+    native_scene.set_ambient_light(snapshot["render"]["ambient_light"])
+    for key, value in snapshot["render"]["components"].items():
+        component = components[key]
+        component.set_local_pose(_sapien_pose(value["local_pose"]))
+        if "color" in value:
+            component.set_color(np.asarray(value["color"]))
+        (component.enable if value["enabled"] else component.disable)()
+    for name, value in snapshot["task_fields"].items():
+        setattr(task, name, copy.deepcopy(value))
+    robot = getattr(task, "robot", None)
+    for name, value in snapshot["robot_fields"].items():
+        setattr(robot, name, copy.deepcopy(value))
+    for side in ("left_planner", "right_planner"):
+        planner = getattr(robot, side, None)
+        motion_gen = getattr(planner, "motion_gen", None)
+        if motion_gen is not None:
+            motion_gen.reset(reset_seed=True)
+    random.setstate(copy.deepcopy(snapshot["python_rng"]))
+    np.random.set_state(copy.deepcopy(snapshot["numpy_rng"]))
+    torch.random.set_rng_state(snapshot["torch_cpu_rng"].clone())
+    torch.cuda.set_rng_state_all(
+        [state.clone() for state in snapshot["torch_cuda_rng"]]
+    )
+    object.__setattr__(scene, "step_count", int(snapshot["simulation_step_count"]))
+    for key, value in snapshot["articulations"].items():
+        root = articulations[key].root
+        root.put_to_sleep() if value["sleeping"] else root.wake_up()
+    for key, value in snapshot["dynamic"].items():
+        component = components[key]
+        component.put_to_sleep() if value["sleeping"] else component.wake_up()
 
 
 def sha256_file(path: Path) -> str:
@@ -501,7 +997,7 @@ def _append_physical_observation(
 ) -> None:
     now = _sim_time(task)
     if now <= sim_times[-1]:
-        raise BranchCollectionError("EE action advanced no physical simulator steps")
+        raise BranchCollectionError("simulator operation advanced no physical steps")
     trajectory.append(read_poses(objects))
     sim_times.append(now)
 
@@ -528,7 +1024,6 @@ def _root_prefix(
     device: torch.device,
 ) -> dict[str, Any] | None:
     task = _new_task(task_class, args, seed, instruction)
-    prefix_chunks: list[np.ndarray] = []
     try:
         names, objects = discover_pose_objects(task, required_pose_names)
         trajectory = [read_poses(objects)]
@@ -536,6 +1031,11 @@ def _root_prefix(
         for query_index in range(root_query):
             if _episode_done(task, max_steps):
                 return None
+            # The live paired policy scores after the same one-step contact
+            # cache canonicalization at every actor query.  Reproduce it for
+            # every historical prefix query, not only the sampled root.
+            task.scene.step()
+            _append_physical_observation(task, objects, trajectory, sim_times)
             chunk = generate_candidates(
                 policy=policy,
                 preprocessor=preprocessor,
@@ -547,7 +1047,6 @@ def _root_prefix(
                 candidate_count=1,
                 device=device,
             )[0]
-            prefix_chunks.append(chunk[:action_exec_steps].copy())
             for action in chunk[:action_exec_steps]:
                 if _episode_done(task, max_steps):
                     break
@@ -555,154 +1054,283 @@ def _root_prefix(
                 _append_physical_observation(task, objects, trajectory, sim_times)
         if _episode_done(task, max_steps):
             return None
-        current = current_ee_action16(task)
-        root_pose = read_poses(objects)
+        remaining_action_budget = max_steps - int(
+            getattr(task, "take_action_cnt", 0)
+        )
+        if remaining_action_budget <= 0:
+            raise BranchCollectionError(
+                "non-terminal branch root has no remaining action budget"
+            )
+        snapshot = capture_branch_root_snapshot(task)
+        snapshot_sha = branch_root_snapshot_sha256(snapshot)
+        restorable_snapshot_sha = branch_root_restorable_snapshot_sha256(snapshot)
+    finally:
+        task.close_env(clear_cache=False)
+
+    # Generate the candidate set in its own restored scene.  The single raw
+    # PhysX step rebuilds contact manifolds identically in this reference and
+    # in every candidate scene; it is part of the observed prefix clock.
+    reference = _new_task(task_class, args, seed, instruction)
+    try:
+        restore_branch_root_snapshot(reference, snapshot)
+        restored_snapshot = capture_branch_root_snapshot(reference)
+        if (
+            branch_root_restorable_snapshot_sha256(restored_snapshot)
+            != restorable_snapshot_sha
+        ):
+            expected_restorable = branch_root_restorable_snapshot(snapshot)
+            observed_restorable = branch_root_restorable_snapshot(
+                restored_snapshot
+            )
+            expected_sections = branch_root_snapshot_section_sha256(
+                expected_restorable
+            )
+            observed_sections = branch_root_snapshot_section_sha256(
+                observed_restorable
+            )
+            changed = {
+                name: [expected_sections[name], observed_sections.get(name)]
+                for name in expected_sections
+                if expected_sections[name] != observed_sections.get(name)
+            }
+            details = branch_root_snapshot_difference_summary(
+                expected_restorable,
+                observed_restorable,
+                sections=changed,
+            )
+            raise BranchCollectionError(
+                "fresh scene did not reproduce the saved root; changed_sections="
+                + json.dumps(changed, sort_keys=True)
+                + "; differences="
+                + json.dumps(details, sort_keys=True)
+            )
+        reference.scene.step()
+        reference_names, reference_objects = discover_pose_objects(
+            reference, required_pose_names
+        )
+        if list(reference_names) != list(names):
+            raise BranchCollectionError("tracked object registry changed after restore")
+        trajectory.append(read_poses(reference_objects))
+        sim_times.append(_sim_time(reference))
+        root_pose = trajectory[-1].copy()
+        current = current_ee_action16(reference)
+        canonical_snapshot_sha = branch_root_snapshot_sha256(
+            capture_branch_root_snapshot(reference)
+        )
         candidates = generate_candidates(
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
-            task=task,
+            task=reference,
             instruction=instruction,
             scene_seed=seed,
             query_index=root_query,
             candidate_count=CANDIDATE_COUNT,
             device=device,
         )
-        return {
-            "object_names": names,
-            "root_object_poses": root_pose,
-            "root_ee_action": current,
-            "prefix_chunks": prefix_chunks,
-            "prefix_trajectory": np.stack(trajectory),
-            "prefix_sim_times": np.asarray(sim_times, dtype=np.float64),
-            "root_sim_steps": int(task.scene.step_count),
-            "sim_timestep_seconds": float(task.scene.timestep_seconds),
-            "candidates": candidates,
-        }
+        root_sim_steps = int(reference.scene.step_count)
+        sim_timestep_seconds = float(reference.scene.timestep_seconds)
     finally:
-        task.close_env(clear_cache=False)
+        reference.close_env(clear_cache=False)
+    return {
+        "branch_root_snapshot": snapshot,
+        "branch_root_snapshot_sha256": snapshot_sha,
+        "branch_root_restorable_snapshot_sha256": restorable_snapshot_sha,
+        "canonical_root_snapshot_sha256": canonical_snapshot_sha,
+        "object_names": names,
+        "root_object_poses": root_pose,
+        "root_ee_action": current,
+        "prefix_trajectory": np.stack(trajectory),
+        "prefix_sim_times": np.asarray(sim_times, dtype=np.float64),
+        "root_sim_steps": root_sim_steps,
+        "sim_timestep_seconds": sim_timestep_seconds,
+        "remaining_action_budget": int(remaining_action_budget),
+        "candidates": candidates,
+    }
 
 
-def _evaluate_candidate(
+def _execute_candidate_from_restored_root(
     *,
-    task_class: Any,
-    args: Mapping[str, Any],
+    task: Any,
+    objects: Sequence[Any],
+    root: Mapping[str, Any],
     policy: Any,
     preprocessor: Any,
     postprocessor: Any,
     instruction: str,
     seed: int,
     root_query: int,
-    prefix_chunks: Sequence[np.ndarray],
+    candidate: np.ndarray,
+    action_exec_steps: int,
+    max_steps: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    trajectory = [
+        np.asarray(value, dtype=np.float32).copy()
+        for value in np.asarray(root["prefix_trajectory"])
+    ]
+    sim_times = [float(value) for value in np.asarray(root["prefix_sim_times"])]
+    root_step = len(trajectory) - 1
+    first_executed = 0
+    terminal_stop_reason_id = 1
+    for action in candidate[:action_exec_steps]:
+        if _episode_done(task, max_steps):
+            break
+        # RoboTwin reports an ordinary CuRobo planning failure by returning a
+        # ``Fail`` plan and advancing the formal action; that is a valid policy
+        # outcome.  A Python exception here instead signals broken collection
+        # infrastructure and must invalidate the complete four-candidate root.
+        task.take_action(action, action_type="ee")
+        first_executed += 1
+        _append_physical_observation(task, objects, trajectory, sim_times)
+    post_step = len(trajectory) - 1
+    query_index = root_query + 1
+    while not _episode_done(task, max_steps):
+        # Match the recursive live policy: every future actor query begins at
+        # the same one-step canonicalized simulator time used for scoring.
+        task.scene.step()
+        _append_physical_observation(task, objects, trajectory, sim_times)
+        # Policy/observation/runtime generation failures are collection
+        # failures, not negative action outcomes.  They invalidate the whole
+        # decision and intentionally propagate to the caller.
+        continuation = generate_candidates(
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            task=task,
+            instruction=instruction,
+            scene_seed=seed,
+            query_index=query_index,
+            candidate_count=1,
+            device=device,
+        )[0]
+        for action in continuation[:action_exec_steps]:
+            if _episode_done(task, max_steps):
+                break
+            task.take_action(action, action_type="ee")
+            _append_physical_observation(task, objects, trajectory, sim_times)
+        query_index += 1
+    success = bool(getattr(task, "eval_success", False))
+    if not success:
+        success = bool(task.check_success())
+    if success:
+        terminal_stop_reason_id = 0
+    return {
+        "trajectory": np.stack(trajectory),
+        "sim_times": np.asarray(sim_times, dtype=np.float64),
+        "root_step": root_step,
+        "post_step": post_step,
+        "first_executed": first_executed,
+        "sim_timestep_seconds": float(task.scene.timestep_seconds),
+        "success": success,
+        "branch_error": None,
+        "terminal_stop_reason_id": terminal_stop_reason_id,
+    }
+
+
+def _evaluate_candidate(
+    *,
+    task_class: Any,
+    args: Mapping[str, Any],
+    root: Mapping[str, Any],
+    policy: Any,
+    preprocessor: Any,
+    postprocessor: Any,
+    instruction: str,
+    seed: int,
+    root_query: int,
     candidate: np.ndarray,
     action_exec_steps: int,
     max_steps: int,
     required_pose_names: set[str],
-    expected_names: Sequence[str],
-    expected_root_pose: np.ndarray,
-    expected_root_ee: np.ndarray,
-    expected_root_sim_steps: int,
-    expected_sim_timestep_seconds: float,
     device: torch.device,
 ) -> dict[str, Any]:
+    """Evaluate one candidate in an independently restored fresh scene."""
+
     task = _new_task(task_class, args, seed, instruction)
     try:
-        names, objects = discover_pose_objects(task, required_pose_names)
-        if list(names) != list(expected_names):
-            raise BranchCollectionError("tracked object registry changed during reset")
-        trajectory = [read_poses(objects)]
-        sim_times = [_sim_time(task)]
-        for chunk in prefix_chunks:
-            for action in chunk:
-                if _episode_done(task, max_steps):
-                    raise BranchCollectionError("baseline prefix terminated during replay")
-                task.take_action(action, action_type="ee")
-                _append_physical_observation(task, objects, trajectory, sim_times)
-        root_step = len(trajectory) - 1
-        if int(task.scene.step_count) != int(expected_root_sim_steps):
-            raise BranchCollectionError("physical step count changed across prefix replay")
-        if not np.isclose(
-            float(task.scene.timestep_seconds),
-            float(expected_sim_timestep_seconds),
-            atol=1e-12,
-            rtol=0.0,
+        restore_branch_root_snapshot(task, root["branch_root_snapshot"])
+        restored_snapshot = capture_branch_root_snapshot(task)
+        if (
+            branch_root_restorable_snapshot_sha256(restored_snapshot)
+            != root["branch_root_restorable_snapshot_sha256"]
         ):
-            raise BranchCollectionError("simulator timestep changed across prefix replay")
-        if not np.allclose(trajectory[-1], expected_root_pose, atol=2e-5, rtol=0.0):
-            raise BranchCollectionError("object state changed across identical prefix replay")
-        if not np.allclose(current_ee_action16(task), expected_root_ee, atol=2e-5, rtol=0.0):
-            raise BranchCollectionError("robot state changed across identical prefix replay")
-
-        first_executed = 0
-        branch_error = None
-        try:
-            for action in candidate[:action_exec_steps]:
-                if _episode_done(task, max_steps):
-                    break
-                before = _sim_time(task)
-                try:
-                    task.take_action(action, action_type="ee")
-                except Exception:
-                    if _sim_time(task) > before:
-                        first_executed += 1
-                        _append_physical_observation(task, objects, trajectory, sim_times)
-                    raise
-                first_executed += 1
-                _append_physical_observation(task, objects, trajectory, sim_times)
-        except Exception as error:  # an infeasible candidate is a real failed branch
-            branch_error = f"{type(error).__name__}: {error}"
-        post_step = len(trajectory) - 1
-        query_index = root_query + 1
-        while branch_error is None and not _episode_done(task, max_steps):
-            try:
-                continuation = generate_candidates(
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    task=task,
-                    instruction=instruction,
-                    scene_seed=seed,
-                    query_index=query_index,
-                    candidate_count=1,
-                    device=device,
-                )[0]
-                for action in continuation[:action_exec_steps]:
-                    if _episode_done(task, max_steps):
-                        break
-                    before = _sim_time(task)
-                    try:
-                        task.take_action(action, action_type="ee")
-                    except Exception:
-                        if _sim_time(task) > before:
-                            _append_physical_observation(task, objects, trajectory, sim_times)
-                        raise
-                    _append_physical_observation(task, objects, trajectory, sim_times)
-                query_index += 1
-            except Exception as error:
-                branch_error = f"{type(error).__name__}: {error}"
-                break
-        success = bool(getattr(task, "eval_success", False))
-        if not success:
-            try:
-                success = bool(task.check_success())
-            except Exception:
-                # A candidate that already raised during execution is a real
-                # negative branch.  Otherwise an unreadable task outcome is
-                # not a negative label and must invalidate the sample instead
-                # of injecting false supervision into ranking.
-                if branch_error is None:
-                    raise
-                success = False
-        return {
-            "trajectory": np.stack(trajectory),
-            "sim_times": np.asarray(sim_times, dtype=np.float64),
-            "root_step": root_step,
-            "post_step": post_step,
-            "first_executed": first_executed,
-            "sim_timestep_seconds": float(task.scene.timestep_seconds),
-            "success": success,
-            "branch_error": branch_error,
-        }
+            expected_restorable = branch_root_restorable_snapshot(
+                root["branch_root_snapshot"]
+            )
+            observed_restorable = branch_root_restorable_snapshot(
+                restored_snapshot
+            )
+            expected_sections = branch_root_snapshot_section_sha256(
+                expected_restorable
+            )
+            observed_sections = branch_root_snapshot_section_sha256(
+                observed_restorable
+            )
+            changed = {
+                name: [expected_sections[name], observed_sections.get(name)]
+                for name in expected_sections
+                if expected_sections[name] != observed_sections.get(name)
+            }
+            details = branch_root_snapshot_difference_summary(
+                expected_restorable,
+                observed_restorable,
+                sections=changed,
+            )
+            raise BranchCollectionError(
+                "fresh candidate scene changed the saved root; changed_sections="
+                + json.dumps(changed, sort_keys=True)
+                + "; differences="
+                + json.dumps(details, sort_keys=True)
+            )
+        task.scene.step()
+        names, objects = discover_pose_objects(task, required_pose_names)
+        if list(names) != list(root["object_names"]):
+            raise BranchCollectionError("fresh candidate object registry changed")
+        if (
+            branch_root_snapshot_sha256(capture_branch_root_snapshot(task))
+            != root["canonical_root_snapshot_sha256"]
+            or int(task.scene.step_count) != int(root["root_sim_steps"])
+            or not np.isclose(
+                float(task.scene.timestep_seconds),
+                float(root["sim_timestep_seconds"]),
+                atol=1e-12,
+                rtol=0.0,
+            )
+            or not np.allclose(
+                read_poses(objects),
+                root["root_object_poses"],
+                atol=2e-5,
+                rtol=0.0,
+            )
+            or not np.allclose(
+                current_ee_action16(task),
+                root["root_ee_action"],
+                atol=2e-5,
+                rtol=0.0,
+            )
+        ):
+            raise BranchCollectionError(
+                "fresh candidate canonical root differs from candidate-generation root"
+            )
+        # Match the observation/render call made while generating the frozen
+        # candidate set without invoking the actor again.
+        task.get_obs()
+        return _execute_candidate_from_restored_root(
+            task=task,
+            objects=objects,
+            root=root,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            instruction=instruction,
+            seed=seed,
+            root_query=root_query,
+            candidate=candidate,
+            action_exec_steps=action_exec_steps,
+            max_steps=max_steps,
+            device=device,
+        )
     finally:
         task.close_env(clear_cache=False)
 
@@ -744,6 +1372,10 @@ def materialize_group(
 ) -> dict[str, np.ndarray]:
     if len(outcomes) != CANDIDATE_COUNT or len(root["candidates"]) != CANDIDATE_COUNT:
         raise BranchCollectionError("materialization requires exactly four complete branches")
+    if any(outcome.get("branch_error") is not None for outcome in outcomes):
+        raise BranchCollectionError(
+            "action execution exceptions invalidate the complete candidate decision"
+        )
     names = list(root["object_names"])
     moving_index = names.index(str(calibration["moving"]))
     prefix = np.asarray(root["prefix_trajectory"], dtype=np.float32)
@@ -779,9 +1411,12 @@ def materialize_group(
     object_delta = []
     object_delta_mask = []
     terminal_max_event = []
+    terminal_event_mask = []
     terminal_stage_progress = []
     terminal_goal_distance = []
     terminal_goal_progress = []
+    terminal_goal_progress_mask = []
+    terminal_stop_reason = []
     for candidate, outcome in zip(root["candidates"], outcomes):
         action = canonical_action_chunk(root["root_ee_action"], candidate)
         # The critic scores the proposal before execution, so it must see the
@@ -823,7 +1458,10 @@ def materialize_group(
             trajectory[root_step, moving_index, 3:7],
             trajectory[post_step, moving_index, 3:7],
         )
-        maximum_event = int(events.max())
+        # This head predicts consequences that remain changeable by the
+        # candidate.  Prefix achievements before the branch root are common
+        # to all four candidates and must not enter the action target.
+        maximum_event = int(events[root_step:].max())
         branch_success = bool(outcome["success"])
         actions.append(action)
         masks.append(mask)
@@ -835,19 +1473,25 @@ def materialize_group(
         # A zero-step planning failure has no temporal exposure.  Keep its
         # success/ranking/zero-object-effect supervision, but do not turn a
         # vacuous censored duration at t=0 into a clock gradient.
-        duration_mask.append(float(duration_seconds) > 0.0)
+        duration_mask.append(
+            float(duration_seconds) > 0.0
+            and (observed or outcome.get("branch_error") is None)
+        )
         success.append(branch_success)
         recovery.append(recovered)
         recovery_mask.append(regressed)
         object_delta.append(np.r_[moving_post - moving_start, moving_rotation_delta])
         object_delta_mask.append(True)
         terminal_max_event.append(maximum_event)
+        terminal_event_mask.append(True)
         terminal_stage_progress.append(
             1.0 if branch_success else maximum_event / float(len(CANONICAL_EVENTS) - 1)
         )
         terminal_distance = float(np.linalg.norm(relative_terminal))
         terminal_goal_distance.append(terminal_distance)
         terminal_goal_progress.append(float(np.linalg.norm(relative_start)) - terminal_distance)
+        terminal_goal_progress_mask.append(True)
+        terminal_stop_reason.append(int(outcome["terminal_stop_reason_id"]))
 
     count = CANDIDATE_COUNT
     arrays = {
@@ -869,11 +1513,19 @@ def materialize_group(
         "object_delta": np.asarray(object_delta, dtype=np.float32),
         "object_delta_mask": np.asarray(object_delta_mask, dtype=np.float32),
         "terminal_max_event_id": np.asarray(terminal_max_event, dtype=np.int64),
+        "terminal_event_mask": np.asarray(terminal_event_mask, dtype=np.float32),
         "terminal_stage_progress": np.asarray(terminal_stage_progress, dtype=np.float32),
         "terminal_goal_distance": np.asarray(terminal_goal_distance, dtype=np.float32),
         "terminal_goal_progress": np.asarray(terminal_goal_progress, dtype=np.float32),
+        "terminal_goal_progress_mask": np.asarray(
+            terminal_goal_progress_mask, dtype=np.float32
+        ),
+        "terminal_stop_reason_id": np.asarray(terminal_stop_reason, dtype=np.int64),
         "candidate_index": np.arange(count, dtype=np.int64),
         "event_age_seconds": np.full(count, root_event_age, dtype=np.float32),
+        "remaining_action_budget": np.full(
+            count, int(root["remaining_action_budget"]), dtype=np.float32
+        ),
         # ``dt`` is an execution-time critic input, not an outcome.  Keep it
         # equal across the four candidates and known before execution; only
         # event ``duration`` above uses counted simulator seconds.
@@ -1002,7 +1654,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=list(CONDITIONS))
     parser.add_argument("--seed-start", type=int, default=2026081000)
     parser.add_argument("--seed-count", type=int, default=50)
-    parser.add_argument("--root-query-indices", nargs="+", type=int, default=[0, 10, 20, 30])
+    parser.add_argument(
+        "--root-query-indices", nargs="+", type=int, default=list(range(40))
+    )
     parser.add_argument(
         "--manifest-root-query-indices",
         nargs="+",
@@ -1013,8 +1667,10 @@ def parse_args() -> argparse.Namespace:
             "not change this universe."
         ),
     )
-    parser.add_argument("--action-exec-steps", type=int, default=5)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument(
+        "--action-exec-steps", type=int, default=FORMAL_ACTION_EXEC_STEPS
+    )
+    parser.add_argument("--max-steps", type=int, default=FORMAL_MAX_STEPS)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     return parser.parse_args()
 
@@ -1025,6 +1681,18 @@ def main() -> None:
         raise BranchCollectionError("real branch collection requires remote RTX 4090 CUDA")
     if args.seed_count <= 0 or args.action_exec_steps <= 0:
         raise BranchCollectionError("seed-count/action-exec-steps must be positive")
+    if (
+        args.action_exec_steps != FORMAL_ACTION_EXEC_STEPS
+        or args.max_steps != FORMAL_MAX_STEPS
+    ):
+        raise BranchCollectionError(
+            "formal consequence collection is fixed to five-action queries "
+            "and a 200-action episode"
+        )
+    if args.instruction != DEFAULT_INSTRUCTION:
+        raise BranchCollectionError(
+            "formal consequence collection fixes the actor instruction"
+        )
     requested_queries, manifest_queries = resolve_query_contract(
         args.root_query_indices,
         args.manifest_root_query_indices,
@@ -1103,12 +1771,19 @@ def main() -> None:
             or manifest.get("format") != MANIFEST_FORMAT
             or manifest.get("body") != args.body
             or manifest.get("actor_checkpoint") != str(args.actor_checkpoint.resolve())
+            or manifest.get("instruction") != DEFAULT_INSTRUCTION
             or manifest.get("candidate_count") != CANDIDATE_COUNT
             or manifest.get("root_query_indices") != manifest_queries
+            or manifest.get("action_exec_steps") != args.action_exec_steps
+            or manifest.get("max_episode_action_steps") != args.max_steps
             or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
             or manifest.get("terminal_supervision_contract")
             != TERMINAL_SUPERVISION_CONTRACT
             or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
+            or manifest.get("terminal_horizon_contract")
+            != TERMINAL_HORIZON_CONTRACT
+            or manifest.get("branch_root_snapshot_contract")
+            != BRANCH_ROOT_SNAPSHOT_CONTRACT
             or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
             or manifest.get("branch_diagnostic_contract")
             != BRANCH_DIAGNOSTIC_CONTRACT
@@ -1123,8 +1798,11 @@ def main() -> None:
             "task": TASK,
             "body": args.body,
             "actor_checkpoint": str(args.actor_checkpoint.resolve()),
+            "instruction": DEFAULT_INSTRUCTION,
             "actor_checkpoint_tree_or_file_sha256_recorded_separately": True,
             "candidate_count": CANDIDATE_COUNT,
+            "action_exec_steps": int(args.action_exec_steps),
+            "max_episode_action_steps": int(args.max_steps),
             "candidate_zero_is_actor_baseline": True,
             "same_ordered_candidate_set_for_baseline_and_etsf": True,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
@@ -1180,10 +1858,13 @@ def main() -> None:
                 "action_mask_source": "planned_first_chunk_not_executed_count",
                 "executed_action_count_used_for_action_mask": False,
                 "executed_action_count_used_for_sim_time_accounting_only": True,
-                "zero_step_infeasible_candidate_keeps_failure_and_action_binding": True,
+                "planner_status_fail_is_a_valid_action_outcome": True,
+                "python_execution_exception_invalidates_complete_decision": True,
             },
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
+            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
             "event_spec_sha256": EVENT_SPEC_SHA256,
@@ -1226,22 +1907,17 @@ def main() -> None:
                     _evaluate_candidate(
                         task_class=task_class,
                         args=task_args,
+                        root=root,
                         policy=policy,
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                         instruction=args.instruction,
                         seed=seed,
                         root_query=root_query,
-                        prefix_chunks=root["prefix_chunks"],
                         candidate=candidate,
                         action_exec_steps=args.action_exec_steps,
                         max_steps=args.max_steps,
                         required_pose_names=required_pose_names,
-                        expected_names=root["object_names"],
-                        expected_root_pose=root["root_object_poses"],
-                        expected_root_ee=root["root_ee_action"],
-                        expected_root_sim_steps=root["root_sim_steps"],
-                        expected_sim_timestep_seconds=root["sim_timestep_seconds"],
                         device=device,
                     )
                     for candidate in root["candidates"]
@@ -1270,6 +1946,15 @@ def main() -> None:
                     "condition": condition,
                     "requested_seed": int(seed),
                     "root_query_index": int(root_query),
+                    "branch_root_snapshot_sha256": root[
+                        "branch_root_snapshot_sha256"
+                    ],
+                    "branch_root_restorable_snapshot_sha256": root[
+                        "branch_root_restorable_snapshot_sha256"
+                    ],
+                    "canonical_root_snapshot_sha256": root[
+                        "canonical_root_snapshot_sha256"
+                    ],
                     "path": f"groups/{filename}",
                     "sha256": sha256_file(path),
                     "diagnostic_format": DIAGNOSTIC_FORMAT,

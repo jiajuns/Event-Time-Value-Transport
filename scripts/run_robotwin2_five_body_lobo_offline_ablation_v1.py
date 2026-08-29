@@ -31,8 +31,8 @@ import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer
 FORMAT = "etsf_robotwin2_five_body_lobo_offline_ablation_v1"
 STATUS = "complete_frozen_checkpoint_posthoc_heldout_ablation"
 VARIANTS = trainer.ABLATION_VARIANTS
-QUERY_INDICES = (0, 10, 20, 30)
-SEEDS_PER_CONDITION_QUERY = 50
+QUERY_INDICES = tuple(range(40))
+SEEDS_PER_CONDITION_QUERY = 5
 DECISIONS_PER_BODY = 400
 TOTAL_DECISIONS = 2000
 TOTAL_BRANCHES = 8000
@@ -78,7 +78,7 @@ def validate_complete_inventory(audit: Mapping[str, Any]) -> dict[str, Any]:
             for condition in trainer.CONDITIONS
             for query in QUERY_INDICES
         } or any(len(seeds) != SEEDS_PER_CONDITION_QUERY for seeds in units.values()):
-            raise AblationError(f"{body} is not complete 2x4x50")
+            raise AblationError(f"{body} is not complete 2x40x5")
         bodies[body] = {
             "decisions": len(groups),
             "branches": len(groups) * trainer.CANDIDATE_COUNT,
@@ -141,10 +141,19 @@ def _member_mean(members: Sequence[Mapping[str, Any]], *path: str) -> float | No
 
 
 METRICS = {
-    "best_of_4_delta_success_rate": ("candidate_ranking", "macro_delta_success_rate"),
-    "selected_success_rate": ("candidate_ranking", "macro_selected_success_rate"),
-    "oracle_success_rate": ("candidate_ranking", "macro_oracle_success_rate"),
-    "pairwise_accuracy": ("candidate_ranking", "pairwise_accuracy"),
+    "one_deviation_best_of_4_success_gain": (
+        "candidate_ranking",
+        "macro_one_deviation_branch_success_gain",
+    ),
+    "one_deviation_branch_selected_success_rate": (
+        "candidate_ranking", "macro_selected_success_rate"
+    ),
+    "one_deviation_branch_oracle_success_rate": (
+        "candidate_ranking", "macro_oracle_success_rate"
+    ),
+    "one_deviation_branch_pairwise_accuracy": (
+        "candidate_ranking", "pairwise_accuracy"
+    ),
     "success_brier": ("success_brier",),
     "success_auroc": ("success_auroc",),
     "post_event_macro_f1": ("post_event", "macro_f1"),
@@ -155,16 +164,28 @@ METRICS = {
     "duration_observed_nll": ("observed_duration_nll",),
     "object_rmse": ("object_rmse",),
     "object_nll": ("object_nll",),
+    "terminal_event_accuracy": (
+        "terminal_consequences", "terminal_event", "accuracy"
+    ),
+    "terminal_event_nll": (
+        "terminal_consequences", "terminal_event", "nll"
+    ),
+    "terminal_goal_progress_mae_meters": (
+        "terminal_consequences", "terminal_goal_progress", "mae_meters"
+    ),
+    "terminal_goal_progress_student_t3_nll": (
+        "terminal_consequences", "terminal_goal_progress", "student_t3_nll"
+    ),
 }
 
 # These are predictions made by the same five-member ensemble used for
 # deployment, rather than an arithmetic mean of five separately scored models.
 # Candidate-ranking metrics are added from ``evaluate_candidate_ranking`` below.
 POSTHOC_ENSEMBLE_METRICS = (
-    "best_of_4_delta_success_rate",
-    "selected_success_rate",
-    "oracle_success_rate",
-    "pairwise_accuracy",
+    "one_deviation_best_of_4_success_gain",
+    "one_deviation_branch_selected_success_rate",
+    "one_deviation_branch_oracle_success_rate",
+    "one_deviation_branch_pairwise_accuracy",
     "success_brier",
     "success_nll",
     "success_ece_10bin",
@@ -175,14 +196,30 @@ POSTHOC_ENSEMBLE_METRICS = (
     "next_event_macro_f1",
     "next_event_accuracy",
     "next_event_mixture_nll",
+    "terminal_event_macro_f1",
+    "terminal_event_accuracy",
+    "terminal_event_mixture_nll",
+    "terminal_event_multiclass_brier",
+    "terminal_event_confidence_ece_10bin",
+    "terminal_event_ordinal_mae",
     "duration_mixture_mae_seconds",
     "duration_mixture_nll_log1p",
     "duration_mixture_observed_nll_log1p",
     "duration_mixture_censored_nll_log1p",
     "object_mixture_rmse",
     "object_student_t3_mixture_nll",
+    "terminal_goal_progress_mixture_mae_meters",
+    "terminal_goal_progress_mixture_rmse_meters",
+    "terminal_goal_progress_student_t3_mixture_nll",
+    "terminal_goal_progress_mixture_90_coverage",
+    "terminal_goal_progress_mixture_90_coverage_abs_error",
+    "terminal_goal_progress_mixture_90_interval_mean_width_meters",
     "recovery_brier",
     "recovery_average_precision",
+    "regression_brier",
+    "regression_nll",
+    "joint_recovery_brier",
+    "joint_recovery_nll",
     "rank_success_argmax_disagreement_rate",
     "rank_success_pairwise_disagreement_rate",
     "rank_selected_failure_aurc",
@@ -190,24 +227,34 @@ POSTHOC_ENSEMBLE_METRICS = (
     "success_error_aurc",
     "post_event_error_aurc",
     "next_event_error_aurc",
+    "terminal_event_error_aurc",
     "duration_error_aurc",
     "object_error_aurc",
+    "terminal_goal_progress_error_aurc",
     "recovery_error_aurc",
+    "regression_error_aurc",
+    "joint_recovery_error_aurc",
 )
 POSTHOC_METRIC_DIRECTIONS = {
     name: (
+        "target_is_0.90"
+        if name == "terminal_goal_progress_mixture_90_coverage"
+        else
         "higher_is_better"
         if name
         in {
-            "best_of_4_delta_success_rate",
-            "selected_success_rate",
-            "oracle_success_rate",
-            "pairwise_accuracy",
+            "one_deviation_best_of_4_success_gain",
+            "one_deviation_branch_selected_success_rate",
+            "one_deviation_branch_oracle_success_rate",
+            "one_deviation_branch_pairwise_accuracy",
             "success_auroc",
             "post_event_macro_f1",
             "post_event_accuracy",
             "next_event_macro_f1",
             "next_event_accuracy",
+            "terminal_event_macro_f1",
+            "terminal_event_accuracy",
+            "terminal_goal_progress_mixture_90_coverage",
             "recovery_average_precision",
         }
         else "lower_is_better"
@@ -363,6 +410,32 @@ def _logmeanexp(values: np.ndarray, axis: int = 0) -> np.ndarray:
     return np.squeeze(result, axis=axis)
 
 
+def _student_t3_cdf(value: np.ndarray) -> np.ndarray:
+    scaled = np.asarray(value, dtype=np.float64) / math.sqrt(3.0)
+    return 0.5 + (
+        np.arctan(scaled) + scaled / (1.0 + np.square(scaled))
+    ) / math.pi
+
+
+def _student_t3_mixture_quantile(
+    means: np.ndarray, scales: np.ndarray, probability: float
+) -> np.ndarray:
+    """Exact scalar quantile of an equal five-component Student-t(3) mixture."""
+
+    if not 0.0 < probability < 1.0:
+        raise ValueError("mixture quantile probability must be inside (0,1)")
+    means = np.asarray(means, dtype=np.float64)
+    scales = np.asarray(scales, dtype=np.float64)
+    lower = np.min(means - 100.0 * scales, axis=0)
+    upper = np.max(means + 100.0 * scales, axis=0)
+    for _ in range(64):
+        midpoint = 0.5 * (lower + upper)
+        cdf = _student_t3_cdf((midpoint[None] - means) / scales).mean(axis=0)
+        lower = np.where(cdf < probability, midpoint, lower)
+        upper = np.where(cdf < probability, upper, midpoint)
+    return 0.5 * (lower + upper)
+
+
 def _binary_ece(
     labels: np.ndarray, probabilities: np.ndarray, bins: int = ECE_BINS
 ) -> tuple[float | None, list[dict[str, Any]]]:
@@ -503,6 +576,11 @@ def evaluate_deployed_ensemble_predictions(
             "recovery_mask": batch["recovery_mask"] * batch["action_available"],
             "object": batch["object_delta"],
             "object_mask": batch["object_delta_mask"] * batch["action_available"],
+            "terminal_event_label": batch["terminal_max_event_id"],
+            "terminal_event_mask": batch["terminal_event_mask"],
+            "terminal_goal_label": batch["terminal_goal_progress"],
+            "terminal_goal_mask": batch["terminal_goal_progress_mask"],
+            "current_event": batch["current_event_id"],
         }.items():
             value_parts[name].append(tensor.detach().cpu().numpy())
         for name, tensors in {
@@ -528,6 +606,22 @@ def evaluate_deployed_ensemble_predictions(
             "object_mean": [output["object_delta_mean"] for output in outputs],
             "object_log_scale": [
                 output["object_delta_log_scale"] for output in outputs
+            ],
+            "terminal_event_probability": [
+                torch.softmax(output["terminal_event_logits"], -1)
+                for output in outputs
+            ],
+            "terminal_goal_mean": [
+                output["terminal_goal_progress_mean"] for output in outputs
+            ],
+            "terminal_goal_log_scale": [
+                output["terminal_goal_progress_log_scale"] for output in outputs
+            ],
+            "regression_probability": [
+                output["regression_probability"] for output in outputs
+            ],
+            "joint_recovery_probability": [
+                output["joint_recovery_probability"] for output in outputs
             ],
         }.items():
             member_parts[name].append(
@@ -561,7 +655,7 @@ def evaluate_deployed_ensemble_predictions(
     event_results: dict[str, dict[str, Any]] = {}
     event_uncertainty: dict[str, np.ndarray] = {}
     event_errors: dict[str, np.ndarray] = {}
-    for prefix in ("post", "next"):
+    for prefix in ("post", "next", "terminal_event"):
         mask = values[f"{prefix}_mask"] > 0.5
         labels = values[f"{prefix}_label"][mask].astype(np.int64)
         member_probability = members[f"{prefix}_probability"][:, mask]
@@ -579,12 +673,22 @@ def evaluate_deployed_ensemble_predictions(
             mixture_entropy - member_entropy.mean(axis=0), 0.0
         )
         errors = (prediction != labels).astype(np.float64)
+        confidence_ece, _confidence_bins = _binary_ece(
+            (prediction == labels).astype(np.float64),
+            probability.max(axis=-1),
+        )
+        onehot = np.eye(5, dtype=np.float64)[labels]
         event_results[prefix] = {
             "support": len(labels),
             "class_counts": np.bincount(labels, minlength=5).tolist(),
             "macro_f1": _macro_f1(labels, prediction),
             "accuracy": _mean_or_none(prediction == labels),
             "mixture_nll": _mean_or_none(-np.log(np.clip(selected_probability, epsilon, 1.0))),
+            "multiclass_brier": _mean_or_none(
+                np.sum(np.square(probability - onehot), axis=-1)
+            ),
+            "confidence_ece_10bin": confidence_ece,
+            "ordinal_mae": _mean_or_none(np.abs(prediction - labels)),
         }
         event_uncertainty[prefix] = js_divergence
         event_errors[prefix] = errors
@@ -608,11 +712,8 @@ def evaluate_deployed_ensemble_predictions(
         - 0.5 * math.log(2.0 * math.pi)
     )
     duration_observed_nll_rows = -_logmeanexp(normal_log_pdf, axis=0)
-    survival = (
-        0.5
-        * torch.erfc(torch.from_numpy(duration_z) / math.sqrt(2.0))
-    ).numpy()
-    censored_nll_rows = -np.log(np.clip(survival.mean(axis=0), epsilon, 1.0))
+    log_survival = torch.special.log_ndtr(-torch.from_numpy(duration_z)).numpy()
+    censored_nll_rows = -_logmeanexp(log_survival, axis=0)
     duration_all_nll = np.where(
         values["duration_observed"] > 0.5,
         duration_observed_nll_rows,
@@ -645,6 +746,45 @@ def evaluate_deployed_ensemble_predictions(
     object_nll_rows = -_logmeanexp(object_log_pdf.sum(axis=-1), axis=0) / object_log_pdf.shape[-1]
     object_uncertainty = object_mu.var(axis=0).mean(axis=-1)
 
+    terminal_goal_mask = values["terminal_goal_mask"] > 0.5
+    terminal_goal_label = values["terminal_goal_label"][terminal_goal_mask].astype(
+        np.float64
+    )
+    terminal_goal_mu = members["terminal_goal_mean"][:, terminal_goal_mask].astype(
+        np.float64
+    )
+    terminal_goal_scale = np.exp(
+        members["terminal_goal_log_scale"][:, terminal_goal_mask].astype(np.float64)
+    ).clip(1e-5)
+    terminal_goal_prediction = terminal_goal_mu.mean(axis=0)
+    terminal_goal_standardized = (
+        terminal_goal_label[None] - terminal_goal_mu
+    ) / terminal_goal_scale
+    terminal_goal_log_pdf = (
+        student_log_constant
+        - np.log(terminal_goal_scale)
+        - (STUDENT_T_DF + 1.0)
+        / 2.0
+        * np.log1p(np.square(terminal_goal_standardized) / STUDENT_T_DF)
+    )
+    terminal_goal_nll_rows = -_logmeanexp(terminal_goal_log_pdf, axis=0)
+    terminal_goal_lower = _student_t3_mixture_quantile(
+        terminal_goal_mu, terminal_goal_scale, 0.05
+    )
+    terminal_goal_upper = _student_t3_mixture_quantile(
+        terminal_goal_mu, terminal_goal_scale, 0.95
+    )
+    terminal_goal_error = np.square(
+        terminal_goal_prediction - terminal_goal_label
+    )
+    terminal_goal_uncertainty = (
+        (
+            3.0 * np.square(terminal_goal_scale)
+            + np.square(terminal_goal_mu)
+        ).mean(axis=0)
+        - np.square(terminal_goal_prediction)
+    ).clip(min=0.0)
+
     recovery_mask = values["recovery_mask"] > 0.5
     recovery_label = values["recovery"][recovery_mask].astype(np.float64)
     recovery_member = members["recovery_probability"][:, recovery_mask]
@@ -652,6 +792,34 @@ def evaluate_deployed_ensemble_predictions(
     recovery_error = np.square(recovery_probability - recovery_label)
     recovery_precision_recall = _binary_precision_recall_curve(
         recovery_label, recovery_probability
+    )
+    regression_mask = values["post_mask"] > 0.5
+    regression_label = (
+        values["post_label"] < values["current_event"]
+    ).astype(np.float64)[regression_mask]
+    regression_member = members["regression_probability"][:, regression_mask]
+    regression_probability = regression_member.mean(axis=0)
+    regression_brier = np.square(regression_probability - regression_label)
+    joint_recovery_label = (
+        (values["recovery"] > 0.5)
+        & (values["post_label"] < values["current_event"])
+    ).astype(np.float64)[regression_mask]
+    joint_recovery_member = members["joint_recovery_probability"][:, regression_mask]
+    joint_recovery_probability = joint_recovery_member.mean(axis=0)
+    joint_recovery_brier = np.square(
+        joint_recovery_probability - joint_recovery_label
+    )
+    regression_nll = (
+        -regression_label
+        * np.log(np.clip(regression_probability, epsilon, 1.0))
+        - (1.0 - regression_label)
+        * np.log(np.clip(1.0 - regression_probability, epsilon, 1.0))
+    )
+    joint_recovery_nll = (
+        -joint_recovery_label
+        * np.log(np.clip(joint_recovery_probability, epsilon, 1.0))
+        - (1.0 - joint_recovery_label)
+        * np.log(np.clip(1.0 - joint_recovery_probability, epsilon, 1.0))
     )
 
     by_group: dict[str, list[int]] = defaultdict(list)
@@ -737,6 +905,12 @@ def evaluate_deployed_ensemble_predictions(
             error_kind="ensemble_argmax_zero_one_error",
             uncertainty_kind="next_event_probability_jensen_shannon_divergence",
         ),
+        "terminal_event": _risk_coverage(
+            event_errors["terminal_event"],
+            event_uncertainty["terminal_event"],
+            error_kind="ensemble_argmax_zero_one_error",
+            uncertainty_kind="terminal_event_probability_jensen_shannon_divergence",
+        ),
         "duration": _risk_coverage(
             np.abs(duration_prediction[duration_observed] - duration[duration_observed]),
             duration_uncertainty[duration_observed],
@@ -749,11 +923,29 @@ def evaluate_deployed_ensemble_predictions(
             error_kind="mean_squared_object_delta_error_per_row",
             uncertainty_kind="mean_dimension_five_member_object_mean_population_variance",
         ),
+        "terminal_goal_progress": _risk_coverage(
+            terminal_goal_error,
+            terminal_goal_uncertainty,
+            error_kind="squared_terminal_goal_progress_error_meters2",
+            uncertainty_kind="five_member_student_t3_mixture_variance_meters2",
+        ),
         "recovery": _risk_coverage(
             recovery_error,
             recovery_member.var(axis=0) if recovery_member.size else np.asarray([]),
             error_kind="ensemble_probability_brier_row",
             uncertainty_kind="five_member_recovery_probability_population_variance",
+        ),
+        "regression": _risk_coverage(
+            regression_brier,
+            regression_member.var(axis=0),
+            error_kind="ensemble_probability_brier_row",
+            uncertainty_kind="five_member_regression_probability_population_variance",
+        ),
+        "joint_recovery": _risk_coverage(
+            joint_recovery_brier,
+            joint_recovery_member.var(axis=0),
+            error_kind="ensemble_probability_brier_row",
+            uncertainty_kind="five_member_joint_recovery_probability_population_variance",
         ),
     }
     requested_seed_clusters = {
@@ -770,6 +962,20 @@ def evaluate_deployed_ensemble_predictions(
         "next_event_macro_f1": event_results["next"]["macro_f1"],
         "next_event_accuracy": event_results["next"]["accuracy"],
         "next_event_mixture_nll": event_results["next"]["mixture_nll"],
+        "terminal_event_macro_f1": event_results["terminal_event"]["macro_f1"],
+        "terminal_event_accuracy": event_results["terminal_event"]["accuracy"],
+        "terminal_event_mixture_nll": event_results["terminal_event"][
+            "mixture_nll"
+        ],
+        "terminal_event_multiclass_brier": event_results["terminal_event"][
+            "multiclass_brier"
+        ],
+        "terminal_event_confidence_ece_10bin": event_results[
+            "terminal_event"
+        ]["confidence_ece_10bin"],
+        "terminal_event_ordinal_mae": event_results["terminal_event"][
+            "ordinal_mae"
+        ],
         "duration_mixture_mae_seconds": _mean_or_none(
             np.abs(duration_prediction[duration_observed] - duration[duration_observed])
         ),
@@ -788,10 +994,45 @@ def evaluate_deployed_ensemble_predictions(
             else None
         ),
         "object_student_t3_mixture_nll": _mean_or_none(object_nll_rows),
+        "terminal_goal_progress_mixture_mae_meters": _mean_or_none(
+            np.abs(terminal_goal_prediction - terminal_goal_label)
+        ),
+        "terminal_goal_progress_mixture_rmse_meters": (
+            float(np.sqrt(np.mean(terminal_goal_error)))
+            if len(terminal_goal_error)
+            else None
+        ),
+        "terminal_goal_progress_student_t3_mixture_nll": _mean_or_none(
+            terminal_goal_nll_rows
+        ),
+        "terminal_goal_progress_mixture_90_coverage": _mean_or_none(
+            (terminal_goal_label >= terminal_goal_lower)
+            & (terminal_goal_label <= terminal_goal_upper)
+        ),
+        "terminal_goal_progress_mixture_90_coverage_abs_error": (
+            None
+            if not len(terminal_goal_label)
+            else abs(
+                float(
+                    np.mean(
+                        (terminal_goal_label >= terminal_goal_lower)
+                        & (terminal_goal_label <= terminal_goal_upper)
+                    )
+                )
+                - 0.90
+            )
+        ),
+        "terminal_goal_progress_mixture_90_interval_mean_width_meters": (
+            _mean_or_none(terminal_goal_upper - terminal_goal_lower)
+        ),
         "recovery_brier": _mean_or_none(recovery_error),
         "recovery_average_precision": recovery_precision_recall[
             "average_precision"
         ],
+        "regression_brier": _mean_or_none(regression_brier),
+        "regression_nll": _mean_or_none(regression_nll),
+        "joint_recovery_brier": _mean_or_none(joint_recovery_brier),
+        "joint_recovery_nll": _mean_or_none(joint_recovery_nll),
         "rank_success_argmax_disagreement_rate": _mean_or_none(
             np.asarray(rank_success_disagreement)
         ),
@@ -803,10 +1044,39 @@ def evaluate_deployed_ensemble_predictions(
         "success_error_aurc": risk["success"]["aurc"],
         "post_event_error_aurc": risk["post_event"]["aurc"],
         "next_event_error_aurc": risk["next_event"]["aurc"],
+        "terminal_event_error_aurc": risk["terminal_event"]["aurc"],
         "duration_error_aurc": risk["duration"]["aurc"],
         "object_error_aurc": risk["object"]["aurc"],
+        "terminal_goal_progress_error_aurc": risk[
+            "terminal_goal_progress"
+        ]["aurc"],
         "recovery_error_aurc": risk["recovery"]["aurc"],
+        "regression_error_aurc": risk["regression"]["aurc"],
+        "joint_recovery_error_aurc": risk["joint_recovery"]["aurc"],
     }
+    variant = str(getattr(models[0], "ablation_variant", "full"))
+    if variant == "success_only":
+        for name in (
+            "terminal_event_macro_f1",
+            "terminal_event_accuracy",
+            "terminal_event_mixture_nll",
+            "terminal_event_multiclass_brier",
+            "terminal_event_confidence_ece_10bin",
+            "terminal_event_ordinal_mae",
+            "terminal_event_error_aurc",
+        ):
+            metrics[name] = None
+    if variant in {"success_only", "no_object_effect"}:
+        for name in (
+            "terminal_goal_progress_mixture_mae_meters",
+            "terminal_goal_progress_mixture_rmse_meters",
+            "terminal_goal_progress_student_t3_mixture_nll",
+            "terminal_goal_progress_mixture_90_coverage",
+            "terminal_goal_progress_mixture_90_coverage_abs_error",
+            "terminal_goal_progress_mixture_90_interval_mean_width_meters",
+            "terminal_goal_progress_error_aurc",
+        ):
+            metrics[name] = None
     return {
         "metrics": metrics,
         "support": {
@@ -820,11 +1090,15 @@ def evaluate_deployed_ensemble_predictions(
             },
             "post_event": event_results["post"],
             "next_event": event_results["next"],
+            "terminal_event": event_results["terminal_event"],
             "duration": {
                 "observed": int(duration_observed.sum()),
                 "censored": int((duration_mask & ~duration_observed).sum()),
             },
             "object_rows": len(object_label),
+            "terminal_goal_progress_rows": len(terminal_goal_label),
+            "regression_rows": len(regression_label),
+            "joint_recovery_rows": len(joint_recovery_label),
             "recovery": {
                 "rows": len(recovery_label),
                 "positive": int((recovery_label > 0.5).sum()),
@@ -897,6 +1171,7 @@ def summarize_fold(
         "source_bodies": summary.get("source_bodies"),
         "member_count": len(members),
         "evaluation_role": "source_validation_used_for_checkpoint_selection",
+        "candidate_ranking_estimand": trainer.ONE_DEVIATION_ESTIMAND,
         "metric_aggregation": "arithmetic_mean_of_five_selected_members",
         "metrics": {
             name: _member_mean(members, *path) for name, path in METRICS.items()
@@ -987,16 +1262,18 @@ def evaluate_posthoc_heldout_fold(
     metrics = dict(prediction["metrics"])
     metrics.update(
         {
-            "best_of_4_delta_success_rate": _as_finite_float(
-                ranking["macro_delta_success_rate"]
+            "one_deviation_best_of_4_success_gain": _as_finite_float(
+                ranking["macro_one_deviation_branch_success_gain"]
             ),
-            "selected_success_rate": _as_finite_float(
+            "one_deviation_branch_selected_success_rate": _as_finite_float(
                 ranking["macro_selected_success_rate"]
             ),
-            "oracle_success_rate": _as_finite_float(
+            "one_deviation_branch_oracle_success_rate": _as_finite_float(
                 ranking["macro_oracle_success_rate"]
             ),
-            "pairwise_accuracy": _as_finite_float(ranking["pairwise_accuracy"]),
+            "one_deviation_branch_pairwise_accuracy": _as_finite_float(
+                ranking["pairwise_accuracy"]
+            ),
         }
     )
     if set(metrics) != set(POSTHOC_ENSEMBLE_METRICS):
@@ -1009,6 +1286,7 @@ def evaluate_posthoc_heldout_fold(
         "held_out_body": held_out_body,
         "source_bodies": summary.get("source_bodies"),
         "evaluation_role": "posthoc_heldout_only_after_all_checkpoint_selection",
+        "candidate_ranking_estimand": ranking["estimand"],
         "heldout_decisions": len(groups),
         "heldout_branches": len(rows),
         "candidate_metric_aggregation": trainer.STANDARDIZED_RANK_ENSEMBLE_CONTRACT,
@@ -1043,6 +1321,7 @@ def aggregate_variants(
             macro[name] = statistics.fmean(present) if present else None
         result[variant] = {
             "ablation": trainer.ablation_contract(variant),
+            "candidate_ranking_estimand": trainer.ONE_DEVIATION_ESTIMAND,
             "folds": folds,
             "equal_fold_macro": macro,
         }
@@ -1130,6 +1409,7 @@ def aggregate_posthoc_heldout(
             macro[name] = statistics.fmean(present) if present else None
         result[variant] = {
             "ablation": trainer.ablation_contract(variant),
+            "candidate_ranking_estimand": trainer.ONE_DEVIATION_ESTIMAND,
             "folds": folds,
             "equal_fold_macro": macro,
             "metric_folds_with_support": {
@@ -1163,7 +1443,13 @@ def aggregate_posthoc_heldout(
                 else (
                     result[variant]["equal_fold_macro"][name] - baseline[name]
                     if POSTHOC_METRIC_DIRECTIONS[name] == "higher_is_better"
-                    else baseline[name] - result[variant]["equal_fold_macro"][name]
+                    else (
+                        abs(baseline[name] - 0.90)
+                        - abs(result[variant]["equal_fold_macro"][name] - 0.90)
+                        if POSTHOC_METRIC_DIRECTIONS[name] == "target_is_0.90"
+                        else baseline[name]
+                        - result[variant]["equal_fold_macro"][name]
+                    )
                 )
             )
             for name in POSTHOC_ENSEMBLE_METRICS

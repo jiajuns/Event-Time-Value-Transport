@@ -845,8 +845,10 @@ def censored_lognormal_loss(
     scale = torch.exp(log_scale).clamp_min(1e-4)
     z = (target - mean) / scale
     observed_nll = 0.5 * z.square() + log_scale + 0.5 * math.log(2.0 * math.pi)
-    survival = 0.5 * torch.erfc(z / math.sqrt(2.0))
-    censored_nll = -torch.log(survival.clamp_min(1e-8))
+    # Stable Gaussian log-survival.  A fixed probability clamp makes the
+    # censored objective exactly flat for moderately large z and discards the
+    # gradient from long right-censored event durations.
+    censored_nll = -torch.special.log_ndtr(-z)
     return torch.where(observed.bool(), observed_nll, censored_nll)
 
 
