@@ -2,9 +2,9 @@
 """Collect an independent scripted-root/frozen-actor RoboTwin2 supplement.
 
 For each pre-registered scene seed, the public ``move_can_pot.play_once``
-expert advances the simulator only until the first physical sample satisfying
-analytic event e3 and the first non-terminal sample satisfying e4 have been
-snapshotted.  The expert is then discarded.  Each snapshot starts a new
+expert advances the simulator only until the first physical samples satisfying
+analytic events e12/e3 and the first non-terminal sample satisfying e4 have
+been snapshotted.  The expert is then discarded.  Each snapshot starts a new
 frozen-actor decision with four real flow-noise candidates and actor-only
 continuation under a label-blind, seed-bound horizon.
 
@@ -36,9 +36,9 @@ import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
 import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
 
 
-FORMAT = "etsf_robotwin2_scripted_expert_root_actor_branches_v1"
-MANIFEST_FORMAT = "etsf_robotwin2_proper_world_supplement_manifest_v1"
-TARGET_EVENTS = ("e3", "e4")
+FORMAT = "etsf_robotwin2_scripted_expert_root_actor_branches_v2"
+MANIFEST_FORMAT = "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
+TARGET_EVENTS = ("e12", "e3", "e4")
 HORIZON_SCHEDULE = (10, 25, 50, 100, 200)
 RESERVE_SEED_START = 2026081000
 RESERVE_SEEDS_PER_SLOT = 16
@@ -50,7 +50,7 @@ RESERVE_SEED_STOP_EXCLUSIVE = (
     * RESERVE_SEEDS_PER_SLOT
 )
 FORMAL_PRIMARY_SEED_START = 2026082000
-ROOT_NOISE_QUERY_INDEX = {"e3": 2, "e4": 3}
+ROOT_NOISE_QUERY_INDEX = {"e12": 1, "e3": 2, "e4": 3}
 EXPECTED_DECISIONS_PER_BODY = (
     len(base.CONDITIONS) * len(TARGET_EVENTS) * len(HORIZON_SCHEDULE)
 )
@@ -58,6 +58,7 @@ EXPECTED_BRANCHES_PER_BODY = EXPECTED_DECISIONS_PER_BODY * base.CANDIDATE_COUNT
 EXPECTED_FIVE_BODY_DECISIONS = EXPECTED_DECISIONS_PER_BODY * len(base.BODIES)
 EXPECTED_FIVE_BODY_BRANCHES = EXPECTED_BRANCHES_PER_BODY * len(base.BODIES)
 SUPPLEMENT_PROPER_LOSS_WEIGHT = 0.25
+SUPPLEMENT_RANK_LOSS_WEIGHT = 0.25
 SUPPLEMENT_USAGE_CONTRACT = {
     "outer_lobo_source_train_only": True,
     "multitask_proper_loss": True,
@@ -65,7 +66,12 @@ SUPPLEMENT_USAGE_CONTRACT = {
     "terminal_event_proper_loss": True,
     "terminal_goal_progress_proper_loss": True,
     "normalization_or_baseline_fit": False,
-    "candidate_rank_or_utility_loss": False,
+    "candidate_rank_or_utility_loss": True,
+    "candidate_rank_or_utility_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
+    "candidate_rank_updates": (
+        "bounded_monotone_utility_only_from_detached_consequence_features"
+    ),
+    "semantic_comparative_loss": False,
     "source_validation_or_checkpoint_selection": False,
     "calibration": False,
     "heldout_payload_access": False,
@@ -90,8 +96,8 @@ ROOT_SELECTION_CONTRACT = {
     "adjacent_same_event_frames_used_as_additional_roots": False,
     "e4_must_be_nonterminal_simulator_success": True,
     "root_selection_reads_actor_branch_outcomes": False,
-    "pair_acceptance": (
-        "both_e3_e4_exist_and_fresh_restore_canonicalize_before_any_actor_"
+    "triplet_acceptance": (
+        "e12_e3_e4_all_exist_and_fresh_restore_canonicalize_before_any_actor_"
         "candidate_outcome"
     ),
     "missing_target_policy": (
@@ -109,7 +115,7 @@ HORIZON_CONTRACT = {
         "body_condition_horizon_slot_has_pre_registered_ordered_reserve_"
         "seeds_before_any_rollout"
     ),
-    "same_horizon_for_e3_and_e4_of_one_seed": True,
+    "same_horizon_for_e12_e3_e4_of_one_seed": True,
     "new_actor_branch_take_action_count_at_root": 0,
     "remaining_action_budget_at_root_equals_bound_horizon": True,
     "expert_physics_steps_or_planner_frames_used_to_compute_horizon": False,
@@ -119,7 +125,7 @@ HORIZON_CONTRACT = {
 RESERVE_ROSTER_CONTRACT = {
     "scope": "body_local_condition_local_horizon_slot_local",
     "ordered_reserve_seeds_per_slot": RESERVE_SEEDS_PER_SLOT,
-    "selection": "first_complete_canonicalizable_e3_e4_pair",
+    "selection": "first_complete_canonicalizable_e12_e3_e4_triplet",
     "selection_occurs_before_actor_candidate_outcomes": True,
     "rejected_attempts_are_audited": True,
     "rejected_seed_candidate_outcomes_executed": False,
@@ -130,7 +136,7 @@ RESERVE_ROSTER_CONTRACT = {
     "reserve_seed_stop_exclusive": RESERVE_SEED_STOP_EXCLUSIVE,
     "formal_primary_seed_start": FORMAL_PRIMARY_SEED_START,
 }
-ROOT_PAIR_BUNDLE_FORMAT = "etsf_robotwin2_scripted_root_pair_resume_bundle_v1"
+ROOT_PAIR_BUNDLE_FORMAT = "etsf_robotwin2_scripted_root_triplet_resume_bundle_v2"
 ACTOR_BRANCH_CONTRACT = {
     "candidate_count": base.CANDIDATE_COUNT,
     "candidate_generator": (
@@ -152,7 +158,7 @@ class ScriptedRootCollectionError(base.BranchCollectionError):
 
 
 class _AllRequestedRootsCaptured(RuntimeError):
-    """Private control-flow sentinel used to stop the expert after e4 capture."""
+    """Private control-flow sentinel used to stop the expert after all roots."""
 
 
 def horizon_slot_key(condition: str, horizon_slot: int) -> str:
@@ -315,7 +321,7 @@ def normalize_snapshot_for_actor_branch(
 
 
 class ScriptedRootObserver:
-    """Observe every expert physics step and freeze the first e3/e4 roots."""
+    """Observe each expert physics step and freeze first e12/e3/e4 roots."""
 
     def __init__(
         self,
@@ -340,53 +346,6 @@ class ScriptedRootObserver:
         self.expert_move_index = -1
         self.expert_dense_segment_index = -1
 
-    def _current_target(self) -> str | None:
-        """Cheap exact prefilter matching the frozen analytic e3/e4 definition."""
-
-        poses = np.asarray(self.trajectory, dtype=np.float32)
-        times = np.asarray(self.sim_times, dtype=np.float64)
-        step = len(poses) - 1
-        moving_index = self.names.index(str(self.calibration["moving"]))
-        _moving, relative = analytic_event.goal_vector(
-            poses, self.names, step, self.calibration
-        )
-        near = bool(
-            np.linalg.norm(relative)
-            <= float(self.calibration["thresholds"]["near_goal_euclidean_m"])
-        )
-        if not near:
-            return None
-        position = poses[:, moving_index, :3].astype(np.float64)
-        speed = np.r_[
-            0.0,
-            np.linalg.norm(np.diff(position, axis=0), axis=1) / np.diff(times),
-        ]
-        stationary = False
-        speed_threshold = float(
-            self.calibration["thresholds"]["stationary_speed_m_per_s"]
-        )
-        window = float(self.calibration["thresholds"]["stationary_window_seconds"])
-        for start in range(step, -1, -1):
-            _moving_at_start, relative_at_start = analytic_event.goal_vector(
-                poses, self.names, start, self.calibration
-            )
-            if (
-                np.linalg.norm(relative_at_start)
-                > float(self.calibration["thresholds"]["near_goal_euclidean_m"])
-                or speed[start] > speed_threshold
-            ):
-                break
-            elapsed = float(times[step] - times[start])
-            tolerance = (
-                64.0
-                * np.finfo(np.float64).eps
-                * max(abs(float(times[step])), abs(float(times[start])), window, 1.0)
-            )
-            if elapsed + tolerance >= window:
-                stationary = True
-                break
-        return "e4" if stationary else "e3"
-
     def record_physics_step(self) -> None:
         now = base._sim_time(self.task)
         if now <= self.sim_times[-1]:
@@ -395,10 +354,6 @@ class ScriptedRootObserver:
             )
         self.trajectory.append(base.read_poses(self.objects))
         self.sim_times.append(now)
-        target = self._current_target()
-        if target is None or target in self.roots:
-            return
-
         simulator_success = bool(self.task.check_success())
         poses = np.stack(self.trajectory)
         times = np.asarray(self.sim_times, dtype=np.float64)
@@ -413,13 +368,12 @@ class ScriptedRootObserver:
         except (analytic_event.AnalyticEventSpecError, ValueError) as error:
             raise ScriptedRootCollectionError(str(error)) from error
         observed_event = str(analytic_event.EVENT_NAMES[int(events[-1])])
-        if observed_event != target:
-            if observed_event == "eK":
-                self.terminal_target_rejections[target] += 1
-                return
-            raise ScriptedRootCollectionError(
-                f"incremental expert event {target} disagrees with analytic {observed_event}"
-            )
+        if observed_event == "eK":
+            self.terminal_target_rejections["e4"] += 1
+            return
+        if observed_event not in TARGET_EVENTS or observed_event in self.roots:
+            return
+        target = observed_event
         if simulator_success:
             self.terminal_target_rejections[target] += 1
             return
@@ -809,12 +763,14 @@ def _root_pair_bundle_relative(
 def _root_pair_fingerprint(capture: Mapping[str, Any]) -> dict[str, str]:
     roots = capture.get("roots")
     if not isinstance(roots, Mapping) or set(roots) != set(TARGET_EVENTS):
-        raise ScriptedRootCollectionError("root-pair bundle is not a complete pair")
+        raise ScriptedRootCollectionError(
+            "root-triplet bundle is not a complete triplet"
+        )
     result: dict[str, str] = {}
     for target in TARGET_EVENTS:
         root = roots[target]
         if not isinstance(root, Mapping):
-            raise ScriptedRootCollectionError("root-pair entry is invalid")
+            raise ScriptedRootCollectionError("root-triplet entry is invalid")
         snapshot = root.get("branch_root_snapshot")
         observed = base.branch_root_snapshot_sha256(snapshot)
         if (
@@ -822,7 +778,9 @@ def _root_pair_fingerprint(capture: Mapping[str, Any]) -> dict[str, str]:
             or root.get("branch_root_snapshot_sha256") != observed
             or not isinstance(root.get("object_names"), list)
         ):
-            raise ScriptedRootCollectionError("root-pair snapshot contract changed")
+            raise ScriptedRootCollectionError(
+                "root-triplet snapshot contract changed"
+            )
         result[target] = observed
     return result
 
@@ -837,7 +795,9 @@ def _validate_root_pair_bundle(
     seed: int,
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise ScriptedRootCollectionError("root-pair resume bundle is not a mapping")
+        raise ScriptedRootCollectionError(
+            "root-triplet resume bundle is not a mapping"
+        )
     capture = value.get("capture")
     if (
         value.get("format") != ROOT_PAIR_BUNDLE_FORMAT
@@ -852,14 +812,16 @@ def _validate_root_pair_bundle(
         or capture.get("expert_plan_success") is not True
         or value.get("actor_candidate_outcomes_executed_before_bundle") is not False
     ):
-        raise ScriptedRootCollectionError("root-pair resume bundle identity changed")
+        raise ScriptedRootCollectionError(
+            "root-triplet resume bundle identity changed"
+        )
     for target in TARGET_EVENTS:
         root = capture["roots"].get(target)
         if (
             not isinstance(root, Mapping)
             or root.get("remaining_action_budget") != horizon
         ):
-            raise ScriptedRootCollectionError("root-pair horizon changed")
+            raise ScriptedRootCollectionError("root-triplet horizon changed")
     _root_pair_fingerprint(capture)
     return dict(value)
 
@@ -875,10 +837,14 @@ def load_root_pair_bundle(
     seed: int,
 ) -> tuple[dict[str, Any], str]:
     if not path.is_file() or path.is_symlink():
-        raise ScriptedRootCollectionError("root-pair resume bundle is missing/symbolic")
+        raise ScriptedRootCollectionError(
+            "root-triplet resume bundle is missing/symbolic"
+        )
     observed_sha = base.sha256_file(path)
     if expected_sha256 is not None and observed_sha != expected_sha256:
-        raise ScriptedRootCollectionError("root-pair resume bundle SHA-256 mismatch")
+        raise ScriptedRootCollectionError(
+            "root-triplet resume bundle SHA-256 mismatch"
+        )
     value = torch.load(path, map_location="cpu", weights_only=False)
     return (
         _validate_root_pair_bundle(
@@ -897,7 +863,7 @@ def persist_root_pair_bundle_create_once(
     path: Path,
     value: Mapping[str, Any],
 ) -> tuple[dict[str, Any], str, bool]:
-    """Atomically create a restorable pair; never overwrite a prior root."""
+    """Atomically create a restorable triplet; never overwrite a prior root."""
 
     identity = {
         key: value[key]
@@ -911,7 +877,7 @@ def persist_root_pair_bundle_create_once(
     }
     if path.is_symlink() or path.parent.is_symlink():
         raise ScriptedRootCollectionError(
-            "root-pair bundle path may not contain a symbolic link"
+            "root-triplet bundle path may not contain a symbolic link"
         )
     if path.exists():
         existing, observed_sha = load_root_pair_bundle(
@@ -927,13 +893,13 @@ def persist_root_pair_bundle_create_once(
             value["capture"]
         ):
             raise ScriptedRootCollectionError(
-                "existing root-pair bundle differs for the same roster seed"
+                "existing root-triplet bundle differs for the same roster seed"
             )
         return existing, observed_sha, False
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".partial-{os.getpid()}")
     if temporary.exists() or temporary.is_symlink():
-        raise ScriptedRootCollectionError("stale root-pair partial exists")
+        raise ScriptedRootCollectionError("stale root-triplet partial exists")
     try:
         with temporary.open("xb") as stream:
             torch.save(dict(value), stream)
@@ -1051,8 +1017,8 @@ def validate_completed_design_metadata(
             or selected_attempt.get("requested_seed") != selected_seed
             or selected_attempt.get("selected_before_actor_candidate_outcomes")
             is not True
-            or not isinstance(selected_attempt.get("root_pair_bundle_sha256"), str)
-            or len(selected_attempt["root_pair_bundle_sha256"]) != 64
+            or not isinstance(selected_attempt.get("root_triplet_bundle_sha256"), str)
+            or len(selected_attempt["root_triplet_bundle_sha256"]) != 64
         ):
             raise ScriptedRootCollectionError("selected reserve attempt is incomplete")
         allowed_attempt_ids = {
@@ -1251,13 +1217,14 @@ def main() -> None:
         "candidate_count": base.CANDIDATE_COUNT,
         "action_exec_steps": base.FORMAL_ACTION_EXEC_STEPS,
         "supplement_role": (
-            "expert_event_root_proper_world_model_source_train_only"
+            "expert_event_root_proper_world_and_utility_rank_source_train_only"
         ),
         "root_policy": "robotwin_scripted_expert",
         "candidate_and_continuation_policy": (
             "same_frozen_native_actor_as_primary_binding"
         ),
         "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        "rank_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
         "usage_contract": SUPPLEMENT_USAGE_CONTRACT,
         "expert_root_provenance_contract": EXPERT_ROOT_PROVENANCE_CONTRACT,
         "root_selection_contract": ROOT_SELECTION_CONTRACT,
@@ -1430,7 +1397,7 @@ def main() -> None:
                     continue
                 if previous.get("status") not in {
                     "roots_observed_before_actor_outcomes",
-                    "selected_pair_before_actor_outcomes",
+                    "selected_triplet_before_actor_outcomes",
                     "complete",
                 }:
                     raise ScriptedRootCollectionError(
@@ -1443,9 +1410,9 @@ def main() -> None:
             bundle_path = output / bundle_relative
             if bundle_path.exists():
                 expected_bundle_sha = (
-                    str(previous.get("root_pair_bundle_sha256"))
+                    str(previous.get("root_triplet_bundle_sha256"))
                     if isinstance(previous, Mapping)
-                    and previous.get("root_pair_bundle_sha256") is not None
+                    and previous.get("root_triplet_bundle_sha256") is not None
                     else None
                 )
                 bundle, bundle_sha = load_root_pair_bundle(
@@ -1666,11 +1633,11 @@ def main() -> None:
                     "horizon_slot": horizon_slot,
                     "requested_seed": seed,
                     "pre_registered_horizon": horizon,
-                    "status": "selected_pair_before_actor_outcomes",
+                    "status": "selected_triplet_before_actor_outcomes",
                     "selected_before_actor_candidate_outcomes": True,
                     "actor_candidate_outcomes_executed_before_selection": False,
-                    "root_pair_bundle_path": bundle_relative.as_posix(),
-                    "root_pair_bundle_sha256": bundle_sha,
+                    "root_triplet_bundle_path": bundle_relative.as_posix(),
+                    "root_triplet_bundle_sha256": bundle_sha,
                 }
             )
             selected_seed_by_slot[slot_key] = seed
@@ -1684,7 +1651,7 @@ def main() -> None:
             manifest["reserve_exhausted_slot"] = slot_key
             _manifest_logical_write(manifest_path, manifest)
             raise ScriptedRootCollectionError(
-                f"ordered reserve exhausted before a complete root pair: {slot_key}"
+                f"ordered reserve exhausted before a complete root triplet: {slot_key}"
             )
 
         expected_group_ids = [
@@ -1805,7 +1772,7 @@ def main() -> None:
             item = existing_groups.get(group_id)
             if not isinstance(item, Mapping):
                 raise ScriptedRootCollectionError(
-                    "selected pair did not produce both event groups"
+                    "selected triplet did not produce all event groups"
                 )
             verify_existing_group_files(output, item)
         attempt["status"] = "complete"

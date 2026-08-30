@@ -538,12 +538,22 @@ def inspect_fold_training_regime(
                     or any(character not in "0123456789abcdef" for character in binding_sha)
                     or supplement.get("proper_loss_weight")
                     != shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
+                    or supplement.get("rank_loss_weight")
+                    != shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
+                    or supplement.get("rank_or_utility_loss_weight")
+                    != shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
                     or supplement.get("usage_contract")
                     != shared_head.SUPPLEMENT_USAGE_CONTRACT
-                    or source_groups != 80
-                    or source_rows != 320
-                    or heldout_groups != 20
-                    or supplement.get("rank_or_utility_rows_used") != 0
+                    or source_groups != 120
+                    or source_rows != 480
+                    or heldout_groups != 30
+                    or supplement.get("rank_or_utility_rows_used") != 480
+                    or supplement.get(
+                        "rank_or_utility_groups_with_real_comparative_supervision",
+                        0,
+                    )
+                    <= 0
+                    or supplement.get("semantic_comparative_rows_used") != 0
                     or supplement.get("normalization_rows_used") != 0
                     or supplement.get("source_validation_rows_used") != 0
                     or supplement.get("checkpoint_selection_rows_used") != 0

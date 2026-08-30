@@ -3,7 +3,7 @@
 
 The per-body raw manifests are already canonical supplement manifests.  This
 materializer validates the body-local ordered reserve resolution without
-opening transition NPZ payloads, requires the complete 5 x 2 x 2 x 5 selected
+opening transition NPZ payloads, requires the complete 5 x 2 x 3 x 5 selected
 design, rejects primary-reset seed overlap, and writes the single signed
 binding consumed by the trainer.
 """
@@ -20,7 +20,7 @@ import collect_robotwin2_scripted_expert_root_actor_branches_v1 as collector
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer
 
 
-FORMAT = "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v1"
+FORMAT = "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v2"
 
 
 class SupplementBindingError(RuntimeError):
@@ -119,7 +119,7 @@ def _validate_complete_design(
         return collector.validate_completed_design_metadata(value, body=body)
     except collector.ScriptedRootCollectionError as error:
         raise SupplementBindingError(
-            f"{body} supplement is not the complete ordered-reserve 20-decision design: {error}"
+            f"{body} supplement is not the complete ordered-reserve 30-decision design: {error}"
         ) from error
 
 
@@ -242,6 +242,7 @@ def build_binding(
         "primary_binding_file_sha256": primary_sha,
         "actor_authority_sha256": actor_authority_sha,
         "proper_loss_weight": trainer.SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        "rank_loss_weight": trainer.SUPPLEMENT_RANK_LOSS_WEIGHT,
         "usage_contract": trainer.SUPPLEMENT_USAGE_CONTRACT,
         "expert_root_provenance_contract": trainer.EXPERT_ROOT_PROVENANCE_CONTRACT,
         "body_manifests": body_bindings,

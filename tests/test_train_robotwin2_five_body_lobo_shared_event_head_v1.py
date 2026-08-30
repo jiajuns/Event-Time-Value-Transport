@@ -28,8 +28,10 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     _robust_object_effect_loss,
     _semantic_comparative_loss,
     _semantic_comparative_active_parameters,
+    _supplement_candidate_rank_loss,
     _supplement_proper_world_model_loss,
     _terminal_consequence_loss,
+    _terminal_event_ordinal_rps_rows,
     ABLATION_VARIANTS,
     ACTOR_FORMAT,
     BINDING_FORMAT,
@@ -66,6 +68,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     SEMANTIC_COMPARATIVE_GRADIENT_BUDGET,
     SEMANTIC_GRADIENT_SCALE_CAP,
     TERMINAL_FILM_MODULATION_BOUND,
+    TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT,
     TERMINAL_SUPERVISION_CONTRACT,
     SOURCE_EVENT_SAMPLING_HZ,
     SUPPLEMENT_ACTOR_BRANCH_CONTRACT,
@@ -73,7 +76,9 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     SUPPLEMENT_COLLECTOR_FORMAT,
     SUPPLEMENT_HORIZON_CONTRACT,
     SUPPLEMENT_MANIFEST_FORMAT,
+    SUPPLEMENT_MATERIALIZER_FORMAT,
     SUPPLEMENT_PROPER_LOSS_WEIGHT,
+    SUPPLEMENT_RANK_LOSS_WEIGHT,
     SUPPLEMENT_RESERVE_ROSTER_CONTRACT,
     SUPPLEMENT_ROOT_SELECTION_CONTRACT,
     SUPPLEMENT_USAGE_CONTRACT,
@@ -491,10 +496,10 @@ def _supplement_fixture(
                     "pre_registered_horizon": horizon,
                     "selected_before_actor_candidate_outcomes": True,
                     "actor_candidate_outcomes_executed_before_selection": False,
-                    "root_pair_bundle_sha256": "5" * 64,
+                    "root_triplet_bundle_sha256": "5" * 64,
                 }
             )
-            for root_event, event_name in ((2, "e3"), (3, "e4")):
+            for root_event, event_name in ((1, "e12"), (2, "e3"), (3, "e4")):
                 name = (
                     f"supplement-{body}-{condition}-h{slot}-{event_name}-"
                     f"seed{selected_seed}.npz"
@@ -520,7 +525,9 @@ def _supplement_fixture(
                         "scripted_root_event_id": root_event,
                         "root_event_id": root_event,
                         "pre_registered_horizon": horizon,
-                        "candidate_noise_query_index": {2: 2, 3: 3}[root_event],
+                        "candidate_noise_query_index": {1: 1, 2: 2, 3: 3}[
+                            root_event
+                        ],
                         "raw_expert_snapshot_sha256": "0" * 64,
                         "branch_root_snapshot_sha256": "1" * 64,
                         "branch_root_restorable_snapshot_sha256": "2" * 64,
@@ -553,7 +560,7 @@ def _supplement_fixture(
             },
             "selected_seed_by_slot": selected_seed_by_slot,
             "attempts": attempts,
-            "target_events": ["e3", "e4"],
+            "target_events": ["e12", "e3", "e4"],
             "collector_file_sha256": "8" * 64,
             "base_collector_file_sha256": "9" * 64,
             "actor_checkpoint_tree_or_file_sha256": actor_authority["actors"][body][
@@ -564,13 +571,14 @@ def _supplement_fixture(
             "candidate_count": 4,
             "action_exec_steps": 5,
             "supplement_role": (
-                "expert_event_root_proper_world_model_source_train_only"
+                "expert_event_root_proper_world_and_utility_rank_source_train_only"
             ),
             "root_policy": "robotwin_scripted_expert",
             "candidate_and_continuation_policy": (
                 "same_frozen_native_actor_as_primary_binding"
             ),
             "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+            "rank_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
             "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
             "expert_root_provenance_contract": dict(
                 EXPERT_ROOT_PROVENANCE_CONTRACT
@@ -633,19 +641,17 @@ def _supplement_fixture(
             "primary_binding_file_sha256": primary_binding_sha256,
             "actor_authority_sha256": actor_authority_sha256,
             "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+            "rank_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
             "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
             "expert_root_provenance_contract": dict(
                 EXPERT_ROOT_PROVENANCE_CONTRACT
             ),
             "body_manifests": body_bindings,
             "materializer_provenance": {
-                "format": (
-                    "etsf_robotwin2_scripted_expert_root_"
-                    "supplement_binding_materializer_v1"
-                ),
+                "format": SUPPLEMENT_MATERIALIZER_FORMAT,
                 "payload_npz_files_opened": 0,
-                "complete_decisions": 100,
-                "complete_branches": 400,
+                "complete_decisions": 150,
+                "complete_branches": 600,
                 "seed_overlap_with_primary": 0,
                 "selected_seed_count": 50,
                 "rejected_attempt_count": rejected_attempt_count,
@@ -675,6 +681,15 @@ def test_preflight_is_five_fold_source_only_and_payload_blind(
         assert receipt["model_body_rows"] == 1
         assert receipt["actor_frozen"] is True
         assert receipt["split_unit"] == "body_condition_requested_seed_all_queries"
+        assert receipt["supplement"]["enabled"] is False
+        assert receipt["supplement"]["proper_loss_weight"] == 0.0
+        assert receipt["supplement"]["rank_loss_weight"] == 0.0
+        assert receipt["supplement"]["rank_or_utility_rows_authorized"] == 0
+    assert trainer_entry.candidate_rank_supervision_inventory([]) == {
+        "mixed_success_groups": 0,
+        "informative_dense_groups": 0,
+        "rank_supervision_groups": 0,
+    }
 
 
 def test_source_split_keeps_all_queries_from_one_seed_in_one_lane() -> None:
@@ -841,8 +856,8 @@ def test_supplement_heldout_manifest_and_payload_are_zero_open(
         split_seed=23,
         supplement_audit=supplement,
     )
-    assert receipt["supplement"]["source_train_groups"] == 80
-    assert receipt["supplement"]["heldout_groups_deferred"] == 20
+    assert receipt["supplement"]["source_train_groups"] == 120
+    assert receipt["supplement"]["heldout_groups_deferred"] == 30
     assert receipt["supplement"]["heldout_manifest_file_opened"] == 0
     assert receipt["supplement"]["heldout_group_npz_opened"] == 0
 
@@ -908,7 +923,7 @@ def test_supplement_is_source_train_only_and_never_enters_validation(
     supplement_train, supplement_heldout = supplement_source_train_split(
         supplement, held_out_body="franka"
     )
-    assert supplement_heldout["declared_group_count"] == 20
+    assert supplement_heldout["declared_group_count"] == 30
     assert all(group["body"] != "franka" for group in supplement_train)
     assert all(
         group.get("source_role") == "proper_world_supplement"
@@ -926,8 +941,8 @@ def test_supplement_is_source_train_only_and_never_enters_validation(
     rows = materialize_supplement_rows(
         supplement_train, held_out_body="franka"
     )
-    assert len(rows) == 320
-    assert {int(row["current_event_id"]) for row in rows} == {2, 3}
+    assert len(rows) == 480
+    assert {int(row["current_event_id"]) for row in rows} == {1, 2, 3}
     assert all(
         "|proper-world-supplement|" in row["logical_group"] for row in rows
     )
@@ -939,7 +954,7 @@ def test_supplement_is_source_train_only_and_never_enters_validation(
     )
     assert receipt["supplement"]["source_validation_groups"] == 0
     assert receipt["supplement"]["normalization_rows_used"] == 0
-    assert receipt["supplement"]["rank_or_utility_rows_used"] == 0
+    assert receipt["supplement"]["rank_or_utility_rows_authorized"] == 480
 
 
 def test_supplement_seed_and_expert_root_contracts_fail_closed(
@@ -1088,6 +1103,50 @@ def test_supplement_fixed_lambda_updates_only_proper_world_objectives(
     assert any(parameter.grad is not None for parameter in model.semantic.parameters())
     assert all(
         parameter.grad is None for parameter in model.candidate_rank.parameters()
+    )
+
+
+def test_supplement_rank_fixed_lambda_updates_only_detached_utility(
+    tmp_path: Path,
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    primary = load_binding(binding, digest)
+    supplement_binding, supplement_digest = _supplement_fixture(
+        tmp_path, binding, digest
+    )
+    supplement = load_supplement_binding(
+        supplement_binding,
+        supplement_digest,
+        primary_audit=primary,
+        held_out_body="franka",
+    )
+    groups, _heldout = supplement_source_train_split(
+        supplement, held_out_body="franka"
+    )
+    rows = materialize_supplement_rows(groups[:1], held_out_body="franka")
+    mapping = {body: 0 for body in BODIES if body != "franka"}
+    dataset = core.TransitionDataset(rows, mapping)
+    batch = core.collate_rows([dataset[index] for index in range(4)])
+    model = EffectAlignedSharedEventHead().train()
+    output = model(batch)
+    loss, pieces = _supplement_candidate_rank_loss(
+        output,
+        batch,
+        torch.ones(4),
+    )
+    torch.testing.assert_close(
+        loss,
+        SUPPLEMENT_RANK_LOSS_WEIGHT
+        * pieces["supplement_candidate_rank_unweighted"],
+    )
+    loss.backward()
+    assert any(
+        parameter.grad is not None for parameter in model.candidate_rank.parameters()
+    )
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith("candidate_rank.")
     )
 
 
@@ -1278,6 +1337,12 @@ def test_terminal_proper_loss_updates_long_horizon_predictors_and_backbone() -> 
     loss.backward()
     assert torch.isfinite(loss)
     assert pieces["terminal_event_uniform_proper"].requires_grad
+    assert pieces["terminal_event_ordinal_rps_uniform_proper"].requires_grad
+    torch.testing.assert_close(
+        pieces["terminal_event_ordinal_rps_weighted_uniform_proper"],
+        TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT
+        * pieces["terminal_event_ordinal_rps_uniform_proper"],
+    )
     assert any(parameter.grad is not None for parameter in model.terminal_event.parameters())
     assert any(
         parameter.grad is not None
@@ -1285,6 +1350,24 @@ def test_terminal_proper_loss_updates_long_horizon_predictors_and_backbone() -> 
     )
     assert any(parameter.grad is not None for parameter in model.action.parameters())
     assert any(parameter.grad is not None for parameter in model.transition.parameters())
+
+
+def test_terminal_event_ordinal_rps_rewards_nearby_stage_mass_and_is_differentiable(
+) -> None:
+    target = torch.tensor([3], dtype=torch.long)
+    near_logits = torch.nn.Parameter(
+        torch.log(torch.tensor([[0.01, 0.01, 0.03, 0.85, 0.10]]))
+    )
+    far_logits = torch.log(
+        torch.tensor([[0.85, 0.03, 0.01, 0.01, 0.10]])
+    )
+    near = _terminal_event_ordinal_rps_rows(near_logits, target)
+    far = _terminal_event_ordinal_rps_rows(far_logits, target)
+    assert near.shape == (1,)
+    assert near.item() < far.item()
+    near.sum().backward()
+    assert near_logits.grad is not None
+    assert torch.isfinite(near_logits.grad).all()
 
 
 def test_semantic_comparative_loss_updates_terminal_locations_not_utility_or_scales(
@@ -1577,6 +1660,7 @@ def test_no_object_effect_strict_evaluation_does_not_require_goal_labels() -> No
     assert set(strict["components"]) == {
         "success_nll",
         "terminal_event_nll",
+        "terminal_event_ordinal_rps",
     }
     assert metrics["terminal_event"]["support"] == 8
     assert metrics["terminal_goal_progress"]["support"] == 0
@@ -2687,7 +2771,7 @@ def test_ensemble_seeds_must_be_five_distinct_integers(
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
-    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v9"
+    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v10"
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
     torch.testing.assert_close(
@@ -2811,8 +2895,12 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert full_contract["strict_proper_components"] == [
         "success_binary_nll",
         "terminal_event_categorical_nll_weight_0.5",
+        "terminal_event_ordinal_ranked_probability_score_weight_0.25",
         "terminal_goal_student_t3_nll_weight_0.5",
     ]
+    assert full_contract["terminal_stage_progress_loss"] == (
+        "terminal_event_cdf_ranked_probability_score_weight_0.25"
+    )
     assert full_contract["raw_world_frame_object_axes_in_rank_input"] is False
     assert full_contract["cross_feature_layer_normalization"] is False
     assert full_contract["feature_schema"] == {

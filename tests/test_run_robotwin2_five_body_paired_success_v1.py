@@ -536,16 +536,24 @@ def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None
                 supplement = {
                     "enabled": True,
                     "binding_file_sha256": supplement_sha,
-                    "proper_loss_weight": (
-                        runner.shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
-                    ),
+                        "proper_loss_weight": (
+                            runner.shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
+                        ),
+                        "rank_loss_weight": (
+                            runner.shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
+                        ),
+                        "rank_or_utility_loss_weight": (
+                            runner.shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
+                        ),
                     "usage_contract": dict(
                         runner.shared_head.SUPPLEMENT_USAGE_CONTRACT
                     ),
-                    "source_train_groups": 80,
-                    "source_train_rows": 320,
-                    "heldout_groups_deferred": 20,
-                    "rank_or_utility_rows_used": 0,
+                        "source_train_groups": 120,
+                        "source_train_rows": 480,
+                        "heldout_groups_deferred": 30,
+                        "rank_or_utility_rows_used": 480,
+                        "rank_or_utility_groups_with_real_comparative_supervision": 120,
+                        "semantic_comparative_rows_used": 0,
                     "normalization_rows_used": 0,
                     "source_validation_rows_used": 0,
                     "checkpoint_selection_rows_used": 0,

@@ -110,7 +110,7 @@ def _fake_snapshot(task: _ObserverTask) -> dict:
     }
 
 
-def test_observer_freezes_only_first_e3_and_e4_and_resets_actor_horizon() -> None:
+def test_observer_freezes_first_e12_e3_e4_and_resets_actor_horizon() -> None:
     task = _ObserverTask()
     can = _PoseObject(0.30)
     pot = _PoseObject(0.0)
@@ -123,19 +123,20 @@ def test_observer_freezes_only_first_e3_and_e4_and_resets_actor_horizon() -> Non
         snapshot_fn=_fake_snapshot,
     )
 
-    for step, x in enumerate((0.18, 0.18, 0.18), start=1):
+    for step, x in enumerate((0.25, 0.18, 0.18), start=1):
         task.scene.step_count = step
         can.x = x
         observer.record_physics_step()
-    assert set(observer.roots) == {"e3"}
-    assert observer.roots["e3"]["detector_sim_step"] == 1
+    assert set(observer.roots) == {"e12", "e3"}
+    assert observer.roots["e12"]["detector_sim_step"] == 1
+    assert observer.roots["e3"]["detector_sim_step"] == 2
 
-    task.scene.step_count = 4
+    task.scene.step_count = 5
     can.x = 0.18
     with pytest.raises(collector._AllRequestedRootsCaptured):
         observer.record_physics_step()
-    assert set(observer.roots) == {"e3", "e4"}
-    assert observer.roots["e4"]["detector_sim_step"] == 4
+    assert set(observer.roots) == {"e12", "e3", "e4"}
+    assert observer.roots["e4"]["detector_sim_step"] == 5
     for root in observer.roots.values():
         fields = root["branch_root_snapshot"]["task_fields"]
         assert fields == {
@@ -291,7 +292,7 @@ def test_root_pair_bundle_is_create_once_and_resumable(tmp_path: Path) -> None:
         path, value
     )
     assert created is True
-    assert persisted["capture"]["captured_targets"] == ["e3", "e4"]
+    assert persisted["capture"]["captured_targets"] == ["e12", "e3", "e4"]
     resumed, resumed_sha, created = collector.persist_root_pair_bundle_create_once(
         path, value
     )
@@ -339,14 +340,17 @@ def _manifest_header(
         "instruction": trainer.DEFAULT_INSTRUCTION,
         "body": body,
         "conditions": list(trainer.CONDITIONS),
-        "target_events": ["e3", "e4"],
-        "supplement_role": "expert_event_root_proper_world_model_source_train_only",
+        "target_events": ["e12", "e3", "e4"],
+        "supplement_role": (
+            "expert_event_root_proper_world_and_utility_rank_source_train_only"
+        ),
         "root_policy": "robotwin_scripted_expert",
         "candidate_and_continuation_policy": (
             "same_frozen_native_actor_as_primary_binding"
         ),
         "candidate_count": trainer.CANDIDATE_COUNT,
         "proper_loss_weight": trainer.SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        "rank_loss_weight": trainer.SUPPLEMENT_RANK_LOSS_WEIGHT,
         "usage_contract": dict(trainer.SUPPLEMENT_USAGE_CONTRACT),
         "expert_root_provenance_contract": dict(
             trainer.EXPERT_ROOT_PROVENANCE_CONTRACT
@@ -449,12 +453,12 @@ def _supplement_manifest(
                 "status": "complete",
                 "selected_before_actor_candidate_outcomes": True,
                 "actor_candidate_outcomes_executed_before_selection": False,
-                "root_pair_bundle_sha256": "9" * 64,
+                "root_triplet_bundle_sha256": "9" * 64,
             }
         )
-        for event in (2, 3):
+        for event in (1, 2, 3):
             stem = f"{condition}-slot{slot}-seed{seed}-e{event}"
-            event_name = {2: "e3", 3: "e4"}[event]
+            event_name = {1: "e12", 2: "e3", 3: "e4"}[event]
             groups.append(
                 {
                     "group_id": collector.reserve_group_id(
@@ -715,8 +719,8 @@ def test_five_body_materializer_emits_exact_trainer_binding_without_payload_open
     assert provenance["format"] == materializer.FORMAT
     assert provenance["payload_npz_files_opened"] == 0
     assert provenance["heldout_payload_npz_files_opened"] == 0
-    assert provenance["complete_decisions"] == 100
-    assert provenance["complete_branches"] == 400
+    assert provenance["complete_decisions"] == 150
+    assert provenance["complete_branches"] == 600
     assert provenance["selected_seed_count"] == 50
     assert provenance["rejected_attempt_count"] == 0
     assert provenance["seed_overlap_with_primary"] == 0
@@ -793,7 +797,7 @@ def test_checkpoint_tree_hash_exactly_matches_trainer_authority_hash(
     assert collector.sha256_path(checkpoint) == trainer.sha256_tree(checkpoint)[0]
 
 
-def test_collector_preserves_shared_proper_only_contract_and_exact_scale() -> None:
+def test_collector_preserves_shared_supplement_contract_and_exact_scale() -> None:
     assert collector.MANIFEST_FORMAT == trainer.SUPPLEMENT_MANIFEST_FORMAT
     assert collector.SUPPLEMENT_USAGE_CONTRACT == trainer.SUPPLEMENT_USAGE_CONTRACT
     assert (
@@ -803,6 +807,7 @@ def test_collector_preserves_shared_proper_only_contract_and_exact_scale() -> No
     assert collector.SUPPLEMENT_PROPER_LOSS_WEIGHT == (
         trainer.SUPPLEMENT_PROPER_LOSS_WEIGHT
     )
+    assert collector.SUPPLEMENT_RANK_LOSS_WEIGHT == trainer.SUPPLEMENT_RANK_LOSS_WEIGHT
     assert collector.HORIZON_SCHEDULE == trainer.SUPPLEMENT_HORIZON_SCHEDULE
     assert (
         collector.ACTOR_BRANCH_CONTRACT
@@ -810,5 +815,5 @@ def test_collector_preserves_shared_proper_only_contract_and_exact_scale() -> No
     )
     assert collector.RESERVE_SEED_STOP_EXCLUSIVE == 2026081800
     assert collector.RESERVE_SEED_STOP_EXCLUSIVE < collector.FORMAL_PRIMARY_SEED_START
-    assert collector.EXPECTED_FIVE_BODY_DECISIONS == 100
-    assert collector.EXPECTED_FIVE_BODY_BRANCHES == 400
+    assert collector.EXPECTED_FIVE_BODY_DECISIONS == 150
+    assert collector.EXPECTED_FIVE_BODY_BRANCHES == 600

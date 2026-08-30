@@ -2,15 +2,19 @@
 """Run a postformal N=8/16 actor-flow candidate-pool paired study.
 
 This experiment is deliberately separate from the preregistered best-of-four
-study.  By default every actor query draws exactly N flow-noise proposals and
-retains their original order (N=8 by default, optionally N=16).  A separately
-budgeted run may explicitly draw more than N proposals, in which case legacy
+study.  By default every actor query makes exactly N actor proposals using a
+two-language-by-N/2-independent-flow-noise factorial roster and retains their
+original order (N=8 by default, optionally N=16).  One language condition is
+the frozen runtime instruction; the other is an exact instruction from actor
+training.  A separately budgeted run may explicitly draw more than N
+proposals, in which case legacy
 proposal zero remains final candidate zero and the remaining N-1 proposals are
 selected with deterministic farthest-point sampling in the canonical
 first-five-action effect space.  Selection is label/outcome/critic blind.  The
 same frozen five-member LOBO critic then scores the retained candidates.
 
-The baseline always executes raw proposal zero.  Both methods use the same
+The baseline always executes raw proposal zero, which keeps both the legacy
+runtime instruction and legacy flow-noise draw.  Both methods use the same
 requested seed and reproduce the same initial reset, raw proposals and retained
 ordered pool.  This runner never mutates the formal four-candidate collector or
 its output root and must run only as a new postformal remote RTX-4090 job.
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import inspect
 import json
 import math
@@ -62,6 +67,18 @@ EVENT_SPEC_SHA256 = formal.EVENT_SPEC_SHA256
 REFERENCE_PREREGISTRATION_SHA256 = formal.PREREGISTRATION_SHA256
 REPORT_BOOTSTRAP_REPLICATES = 10_000
 REPORT_BOOTSTRAP_SEED = 20260908
+# This exact task string is task_index=0 in the frozen 2,750-episode LeRobot
+# actor-training dataset.  The public source is the ``seen[0]`` instruction of
+# ``aloha-agilex_clean/instructions/episode0.json`` at the pinned RoboTwin2
+# snapshot.  It is deliberately embedded here so the remote evaluation does
+# not read training payloads or depend on mutable external files.
+TRAINING_SEEN_INSTRUCTION = (
+    "Pick the brown top sauce can and position it next to the kitchenpot with "
+    "smooth metallic lid"
+)
+TRAINING_SEEN_INSTRUCTION_SHA256 = hashlib.sha256(
+    TRAINING_SEEN_INSTRUCTION.encode("utf-8")
+).hexdigest()
 
 
 class PostformalCandidatePoolError(RuntimeError):
@@ -128,6 +145,150 @@ def validate_candidates(
             f"{label} must be finite [{expected_count},H>=5,16]"
         )
     return value
+
+
+def postformal_make_noise(
+    config: Any,
+    scene_seed: int,
+    query_index: int,
+    flow_noise_index: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return deterministic independent flow noise while preserving candidate0.
+
+    Formal N=4 keeps the collector's antithetic contract.  This postformal
+    study retains the exact legacy candidate-zero draw and creates independent
+    standard-normal flow draws rather than deterministic negative pairs.  The
+    caller deliberately reuses each draw once across the two language
+    conditions so language OOD and flow-noise coverage share the fixed budget.
+    """
+
+    if isinstance(flow_noise_index, bool) or not isinstance(flow_noise_index, int):
+        raise PostformalCandidatePoolError("flow noise index must be an integer")
+    if flow_noise_index < 0:
+        raise PostformalCandidatePoolError("flow noise index must be non-negative")
+    if flow_noise_index == 0:
+        return collector.make_noise(
+            config, scene_seed, query_index, flow_noise_index, device
+        )
+    seed = int(
+        (
+            20260903
+            + int(scene_seed) * 1_000_003
+            + int(query_index) * 10_007
+            + int(flow_noise_index) * 101
+        )
+        % (2**63 - 1)
+    )
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return torch.randn(
+        (1, int(config.chunk_size), int(config.max_action_dim)),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+
+
+def candidate_instruction_roster(
+    runtime_instruction: str, raw_candidate_count: int
+) -> list[str]:
+    """Return a two-condition, outcome-blind language/noise factorial roster."""
+
+    if not isinstance(runtime_instruction, str) or not runtime_instruction.strip():
+        raise PostformalCandidatePoolError("runtime instruction must be non-empty")
+    if (
+        isinstance(raw_candidate_count, bool)
+        or not isinstance(raw_candidate_count, int)
+        or raw_candidate_count < 2
+        or raw_candidate_count % 2 != 0
+    ):
+        raise PostformalCandidatePoolError(
+            "language/noise candidate roster requires an even count >=2"
+        )
+    if runtime_instruction == TRAINING_SEEN_INSTRUCTION:
+        raise PostformalCandidatePoolError(
+            "runtime and actor-training-seen instruction conditions collapsed"
+        )
+    half = raw_candidate_count // 2
+    return [runtime_instruction] * half + [TRAINING_SEEN_INSTRUCTION] * half
+
+
+def flow_noise_index_roster(raw_candidate_count: int) -> list[int]:
+    """Pair both language conditions under the same independent flow draws."""
+
+    if (
+        isinstance(raw_candidate_count, bool)
+        or not isinstance(raw_candidate_count, int)
+        or raw_candidate_count < 2
+        or raw_candidate_count % 2 != 0
+    ):
+        raise PostformalCandidatePoolError(
+            "language/noise candidate roster requires an even count >=2"
+        )
+    half = raw_candidate_count // 2
+    return [index % half for index in range(raw_candidate_count)]
+
+
+def generate_postformal_flow_candidates(
+    *,
+    policy: Any,
+    preprocessor: Any,
+    postprocessor: Any,
+    task: Any,
+    instruction: str,
+    scene_seed: int,
+    query_index: int,
+    candidate_count: int,
+    device: torch.device,
+) -> np.ndarray:
+    """Run the frozen actor's real sampling path with independent flow draws."""
+
+    if isinstance(candidate_count, bool) or not isinstance(candidate_count, int):
+        raise PostformalCandidatePoolError("raw candidate count must be an integer")
+    if candidate_count < 2 or candidate_count % 2 != 0:
+        raise PostformalCandidatePoolError(
+            "raw candidate count must be even and at least two"
+        )
+    raw = collector.raw_policy_input(
+        task, list(policy.config.image_features), instruction
+    )
+    instruction_roster = candidate_instruction_roster(instruction, candidate_count)
+    noise_roster = flow_noise_index_roster(candidate_count)
+    processed_by_instruction = {}
+    for candidate_instruction in dict.fromkeys(instruction_roster):
+        candidate_raw = dict(raw)
+        candidate_raw["task"] = candidate_instruction
+        processed_by_instruction[candidate_instruction] = preprocessor(candidate_raw)
+    candidates = []
+    for candidate_index, (candidate_instruction, flow_noise_index) in enumerate(
+        zip(instruction_roster, noise_roster, strict=True)
+    ):
+        policy.reset()
+        noise = postformal_make_noise(
+            policy.config,
+            scene_seed,
+            query_index,
+            flow_noise_index,
+            device,
+        )
+        with torch.inference_mode():
+            normalized = policy.predict_action_chunk(
+                dict(processed_by_instruction[candidate_instruction]), noise=noise
+            )
+        actions = postprocessor(normalized)
+        if isinstance(actions, torch.Tensor):
+            actions = actions.detach().float().cpu().numpy()
+        actions = np.asarray(actions)
+        if actions.ndim == 3 and actions.shape[0] == 1:
+            actions = actions[0]
+        candidates.append(collector.normalize_ee_chunk(actions))
+    result = np.stack(candidates)
+    if not np.any(result[1:] != result[0]):
+        raise PostformalCandidatePoolError(
+            "independent flow-noise candidates collapsed to candidate zero"
+        )
+    return result
 
 
 def canonical_effect_embeddings(
@@ -239,6 +400,24 @@ def pool_selection_audit(
         "canonical_first_five_effects_sha256": array_sha256(effects),
         "embedding_shape": list(embeddings.shape),
         "selected_raw_proposal_indices": selected_indices,
+        "raw_candidate_instruction_conditions": [
+            "runtime_frozen_instruction"
+            if index < raw_count // 2
+            else "actor_training_seen_task_index_0"
+            for index in range(raw_count)
+        ],
+        "retained_candidate_instruction_conditions": [
+            (
+                "runtime_frozen_instruction"
+                if index < raw_count // 2
+                else "actor_training_seen_task_index_0"
+            )
+            for index in selected_indices
+        ],
+        "raw_candidate_flow_noise_indices": flow_noise_index_roster(raw_count),
+        "retained_candidate_flow_noise_indices": [
+            flow_noise_index_roster(raw_count)[index] for index in selected_indices
+        ],
         "legacy_raw_proposal_zero_is_final_candidate_zero": True,
         "subset_selection_applied": raw_count > candidate_count,
         "selection_algorithm": selection_algorithm,
@@ -272,7 +451,7 @@ def generate_candidate_pool(
     device: torch.device,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     raw_count = proposal_count(candidate_count, raw_proposal_count)
-    raw = collector.generate_candidates(
+    raw = generate_postformal_flow_candidates(
         policy=policy,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
@@ -296,16 +475,29 @@ def postformal_noise_contract(
 ) -> dict[str, Any]:
     raw_count = proposal_count(candidate_count, raw_proposal_count)
     indices = list(range(raw_count))
+    noise_indices = flow_noise_index_roster(raw_count)
     return {
-        "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
+        "distribution": (
+            "deterministic_independent_standard_normal_flow_draws_paired_across_"
+            "two_semantically_equivalent_instruction_conditions_each_marginal_N_0_I"
+        ),
         "raw_proposal_indices": indices,
-        "base_noise_indices": [index - index % 2 for index in indices],
-        "signs": [1 if index % 2 == 0 else -1 for index in indices],
+        "raw_proposal_flow_noise_indices": noise_indices,
+        "independent_flow_noise_draws": raw_count // 2,
+        "same_flow_noise_language_condition_pairs": [
+            [index, index + raw_count // 2] for index in range(raw_count // 2)
+        ],
         "seed_formula": (
             "(20260903 + scene_seed*1000003 + query_index*10007 + "
-            "base_noise_index*101) mod (2**63-1)"
+            "flow_noise_index*101) mod (2**63-1)"
         ),
         "candidate_zero_legacy_noise_unchanged": True,
+        "candidate_zero_uses_formal_collector_make_noise": True,
+        "same_seed_query_and_observation_reproduce_ordered_noise": True,
+        "actor_call_count_equals_raw_proposal_count": True,
+        "frozen_actor_weights_changed": False,
+        "formal_n4_antithetic_contract_changed": False,
+        "selection_reads_outcomes_events_or_critic_scores": False,
         "collector_make_noise_sha256": sha256_file(Path(inspect.getsourcefile(collector) or "")),
     }
 
@@ -321,6 +513,26 @@ def candidate_pool_contract(
         "default_executable_budget": "raw_proposal_count_equals_candidate_count",
         "subset_selection_applied": raw_count > candidate_count,
         "flow_noise_contract": postformal_noise_contract(candidate_count, raw_count),
+        "instruction_coverage_contract": {
+            "design": "two_instruction_conditions_crossed_with_identical_flow_noise_draws",
+            "runtime_instruction_condition": "execution_contract_instruction",
+            "actor_training_seen_condition": TRAINING_SEEN_INSTRUCTION,
+            "actor_training_seen_condition_utf8_sha256": (
+                TRAINING_SEEN_INSTRUCTION_SHA256
+            ),
+            "actor_training_seen_source": (
+                "frozen_actor_training_lerobot_tasks_parquet_task_index_0_and_"
+                "public_seen_instruction_episode0"
+            ),
+            "raw_candidate_instruction_conditions": [
+                "runtime_frozen_instruction"
+                if index < raw_count // 2
+                else "actor_training_seen_task_index_0"
+                for index in range(raw_count)
+            ],
+            "semantic_task_changed": False,
+            "reads_outcomes_events_or_critic_scores": False,
+        },
         "candidate_zero": "raw_proposal_zero_retained_as_final_candidate_zero",
         "effect_schema": collector.ACTION_SCHEMA,
         "effect_horizon_actions": ACTION_EXEC_STEPS,
@@ -332,6 +544,7 @@ def candidate_pool_contract(
         ),
         "selection_reads_outcomes_events_or_critic_scores": False,
         "additional_confidence_or_authorization_gate": False,
+        "actor_call_budget_increased_beyond_raw_proposal_count": False,
         "critic_checkpoint_or_weights_changed": False,
     }
 
@@ -1677,7 +1890,9 @@ __all__ = [
     "canonical_effect_embeddings",
     "evaluation_schedule",
     "greedy_farthest_point_indices",
+    "generate_postformal_flow_candidates",
     "method_name",
+    "postformal_make_noise",
     "pool_selection_audit",
     "proposal_count",
     "runtime_rank_ensemble_contract",

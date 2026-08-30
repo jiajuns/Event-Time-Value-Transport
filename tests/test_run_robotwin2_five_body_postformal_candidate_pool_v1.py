@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -70,6 +71,26 @@ def test_default_budget_is_raw_n_and_does_not_claim_subset_selection() -> None:
     assert contract["raw_proposal_count"] == 8
     assert contract["subset_selection_applied"] is False
     assert contract["selection"] == "identity_original_actor_order"
+    noise_contract = contract["flow_noise_contract"]
+    assert noise_contract["distribution"].startswith(
+        "deterministic_independent_standard_normal"
+    )
+    assert noise_contract["independent_flow_noise_draws"] == 4
+    assert noise_contract["raw_proposal_flow_noise_indices"] == [0, 1, 2, 3] * 2
+    assert noise_contract["same_flow_noise_language_condition_pairs"] == [
+        [0, 4],
+        [1, 5],
+        [2, 6],
+        [3, 7],
+    ]
+    assert noise_contract["candidate_zero_legacy_noise_unchanged"] is True
+    assert noise_contract["formal_n4_antithetic_contract_changed"] is False
+    assert noise_contract["selection_reads_outcomes_events_or_critic_scores"] is False
+    assert contract["actor_call_budget_increased_beyond_raw_proposal_count"] is False
+    language = contract["instruction_coverage_contract"]
+    assert language["actor_training_seen_condition"] == runner.TRAINING_SEEN_INSTRUCTION
+    assert language["semantic_task_changed"] is False
+    assert language["reads_outcomes_events_or_critic_scores"] is False
 
     raw = _proposals(8)
     retained, audit = runner.pool_selection_audit(
@@ -80,6 +101,116 @@ def test_default_budget_is_raw_n_and_does_not_claim_subset_selection() -> None:
     assert audit["subset_selection_applied"] is False
     assert audit["selection_algorithm"].startswith("identity_keep_original")
     assert audit["selection_reads_outcomes_events_or_critic_scores"] is False
+
+
+def test_independent_flow_draws_preserve_candidate_zero_and_remove_antithetic_pairs() -> None:
+    config = SimpleNamespace(chunk_size=6, max_action_dim=16)
+    device = torch.device("cpu")
+    kwargs = {"scene_seed": 6_200_031, "query_index": 11, "device": device}
+
+    observed = [
+        runner.postformal_make_noise(config, flow_noise_index=index, **kwargs)
+        for index in range(4)
+    ]
+    legacy_zero = runner.collector.make_noise(
+        config, kwargs["scene_seed"], kwargs["query_index"], 0, device
+    )
+    assert torch.equal(observed[0], legacy_zero)
+    for index, value in enumerate(observed):
+        replay = runner.postformal_make_noise(
+            config, flow_noise_index=index, **kwargs
+        )
+        assert torch.equal(value, replay)
+    assert all(
+        not torch.equal(observed[left], observed[right])
+        for left in range(4)
+        for right in range(left + 1, 4)
+    )
+    # The formal collector deterministically spends every odd slot on the
+    # negative of the preceding draw.  The postformal pool must not do that.
+    assert all(
+        not torch.equal(observed[index + 1], -observed[index])
+        for index in range(0, 4, 2)
+    )
+
+
+def test_candidate_generation_uses_actor_path_then_ee_canonicalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FrozenFakePolicy:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                image_features=("observation.images.cam_high",),
+                chunk_size=6,
+                max_action_dim=16,
+            )
+            self.noises: list[torch.Tensor] = []
+            self.processed_instructions: list[str] = []
+            self.reset_count = 0
+
+        def reset(self) -> None:
+            self.reset_count += 1
+
+        def predict_action_chunk(
+            self, processed: dict[str, object], *, noise: torch.Tensor
+        ) -> torch.Tensor:
+            assert processed["preprocessed"] == "same_observation"
+            self.processed_instructions.append(str(processed["task"]))
+            self.noises.append(noise.detach().clone())
+            # A fake frozen actor is enough to exercise the exact external-noise,
+            # postprocessor and EE-normalization plumbing without GPU inference.
+            result = noise[..., :16].clone()
+            if processed["task"] == runner.TRAINING_SEEN_INSTRUCTION:
+                result[..., 0] += 0.01
+            return result
+
+    raw_calls: list[tuple[object, list[str], str]] = []
+
+    def fake_raw_policy_input(
+        task: object, image_features: list[str], instruction: str
+    ) -> dict[str, str]:
+        raw_calls.append((task, image_features, instruction))
+        return {"raw": "same_observation"}
+
+    monkeypatch.setattr(runner.collector, "raw_policy_input", fake_raw_policy_input)
+    policy = FrozenFakePolicy()
+    task = object()
+    candidates = runner.generate_postformal_flow_candidates(
+        policy=policy,
+        preprocessor=lambda raw: {
+            "preprocessed": raw["raw"],
+            "task": raw["task"],
+        },
+        postprocessor=lambda value: value,
+        task=task,
+        instruction="move the object",
+        scene_seed=6_200_043,
+        query_index=3,
+        candidate_count=8,
+        device=torch.device("cpu"),
+    )
+
+    assert raw_calls == [
+        (task, ["observation.images.cam_high"], "move the object")
+    ]
+    assert policy.reset_count == 8
+    assert len(policy.noises) == 8
+    assert policy.processed_instructions == ["move the object"] * 4 + [
+        runner.TRAINING_SEEN_INSTRUCTION
+    ] * 4
+    assert candidates.shape == (8, 6, 16)
+    assert np.isfinite(candidates).all()
+    assert np.allclose(np.linalg.norm(candidates[:, :, 3:7], axis=-1), 1.0)
+    assert np.allclose(np.linalg.norm(candidates[:, :, 11:15], axis=-1), 1.0)
+    assert np.all((0.0 <= candidates[:, :, 7]) & (candidates[:, :, 7] <= 1.0))
+    assert np.all((0.0 <= candidates[:, :, 15]) & (candidates[:, :, 15] <= 1.0))
+    expected_zero = runner.collector.make_noise(
+        policy.config, 6_200_043, 3, 0, torch.device("cpu")
+    )
+    assert torch.equal(policy.noises[0], expected_zero)
+    assert not torch.equal(policy.noises[1], -policy.noises[0])
+    assert all(torch.equal(policy.noises[index], policy.noises[index + 4]) for index in range(4))
+    assert np.any(candidates[1:] != candidates[0])
 
 
 def test_explicit_oversampling_is_bounded_and_uses_blind_anchored_fps() -> None:

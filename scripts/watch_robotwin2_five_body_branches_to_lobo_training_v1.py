@@ -1070,11 +1070,16 @@ def summarize_fold(
             and supplement.get("binding_file_sha256")
             == expected_supplement_binding_sha256
             and supplement.get("proper_loss_weight") == 0.25
-            and supplement.get("source_train_groups") == 80
-            and supplement.get("source_train_rows") == 320
-            and supplement.get("heldout_groups_deferred") == 20
+            and supplement.get("rank_loss_weight") == 0.25
+            and supplement.get("rank_or_utility_loss_weight") == 0.25
+            and supplement.get("source_train_groups") == 120
+            and supplement.get("source_train_rows") == 480
+            and supplement.get("heldout_groups_deferred") == 30
             and supplement.get("source_validation_groups") == 0
-            and supplement.get("rank_or_utility_rows_used") == 0
+            and supplement.get("rank_or_utility_rows_used") == 480
+            and supplement.get("rank_or_utility_groups_with_real_comparative_supervision", 0)
+            > 0
+            and supplement.get("semantic_comparative_rows_used") == 0
             and supplement.get("normalization_rows_used") == 0
             and supplement.get("source_validation_rows_used") == 0
             and supplement.get("checkpoint_selection_rows_used") == 0

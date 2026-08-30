@@ -54,7 +54,7 @@ def _args(tmp_path: Path) -> SimpleNamespace:
     )
 
 
-def test_commands_bind_complete_supplement_and_both_full_candidate_studies(
+def test_commands_bind_complete_supplement_and_nested_candidate_study(
     tmp_path: Path,
 ) -> None:
     args = _args(tmp_path)
@@ -85,7 +85,8 @@ def test_commands_bind_complete_supplement_and_both_full_candidate_studies(
 
     n4 = watcher.paired_n4_command(args, supplement_sha)
     n8 = watcher.paired_n8_command(args, supplement_sha)
-    for command in (n4, n8):
+    nested = watcher.nested_n4_n8_command(args, supplement_sha)
+    for command in (n4, n8, nested):
         assert command[
             command.index("--required-supplement-binding-sha256") + 1
         ] == supplement_sha
@@ -93,6 +94,9 @@ def test_commands_bind_complete_supplement_and_both_full_candidate_studies(
     assert "--candidate-count" not in n4
     assert n8[n8.index("--candidate-count") + 1] == "8"
     assert n8[n8.index("--proposal-count") + 1] == "16"
+    assert nested[nested.index("--output") + 1] == str(args.augmented_n8_root)
+    assert "run_robotwin2_five_body_nested_n4_n8_paired_success_v1.py" in nested[1]
+    assert "--candidate-count" not in nested
     assert watcher.N8_RETAINED_CANDIDATE_COUNT == 8
     assert watcher.N8_RAW_PROPOSAL_COUNT == 16
 

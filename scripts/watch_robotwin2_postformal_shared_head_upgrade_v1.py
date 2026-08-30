@@ -5,11 +5,10 @@ This CPU-only detached watcher deliberately waits for the existing formal
 collection, C-only LOBO, paired-success study, and postformal ablation to finish
 before reserving the single RTX 4090.  It then runs, in order:
 
-1. the complete five-body 100-decision/400-branch scripted e3/e4 supplement;
+1. the complete five-body 150-decision/600-branch scripted e12/e3/e4 supplement;
 2. its immutable five-body binding;
 3. five strict C+supplement outer-LOBO folds;
-4. the full 1,000-pair enhanced best-of-4 study; and
-5. the full 1,000-pair enhanced best-of-8 postformal study.
+4. one full 1,000-initial-condition actor/N4/N8 shared-raw16 nested study.
 
 No formal collector, formal branch root, C-only fold, or formal result is
 modified.  Every enhanced evaluation explicitly requires the exact supplement
@@ -31,22 +30,24 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v1"
+FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2"
 UPSTREAM_FORMAT = "etsf_robotwin2_five_body_postformal_ablation_watcher_v1"
-SUPPLEMENT_MANIFEST_FORMAT = "etsf_robotwin2_proper_world_supplement_manifest_v1"
+SUPPLEMENT_MANIFEST_FORMAT = (
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
+)
 SUPPLEMENT_BINDING_FORMAT = (
-    "etsf_robotwin2_five_body_proper_world_supplement_binding_v1"
+    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v2"
 )
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
-TARGET_EVENTS = ("e3", "e4")
+TARGET_EVENTS = ("e12", "e3", "e4")
 SUPPLEMENT_HORIZONS = (10, 25, 50, 100, 200)
 SUPPLEMENT_RESERVE_SEED_START = 2026081000
 SUPPLEMENT_RESERVE_SEEDS_PER_SLOT = 16
 SUPPLEMENT_RESERVE_SEED_STOP_EXCLUSIVE = 2026081800
-EXPECTED_SUPPLEMENT_DECISIONS_PER_BODY = 20
-EXPECTED_SUPPLEMENT_DECISIONS = 100
-EXPECTED_SUPPLEMENT_BRANCHES = 400
+EXPECTED_SUPPLEMENT_DECISIONS_PER_BODY = 30
+EXPECTED_SUPPLEMENT_DECISIONS = 150
+EXPECTED_SUPPLEMENT_BRANCHES = 600
 N8_RETAINED_CANDIDATE_COUNT = 8
 N8_RAW_PROPOSAL_COUNT = 16
 EXPECTED_GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
@@ -463,6 +464,41 @@ def paired_n8_command(args: argparse.Namespace, supplement_sha256: str) -> list[
     ]
 
 
+def nested_n4_n8_command(
+    args: argparse.Namespace, supplement_sha256: str
+) -> list[str]:
+    """Run the strong shared-raw16 actor/N4/N8 comparison in one job."""
+
+    return [
+        str(args.robotwin_python),
+        str(
+            args.code_root
+            / "run_robotwin2_five_body_nested_n4_n8_paired_success_v1.py"
+        ),
+        "--actor-checkpoint",
+        str(args.actor_checkpoint),
+        "--vlm-metadata-path",
+        str(args.vlm_metadata),
+        "--robotwin-root",
+        str(args.robotwin_root),
+        "--event-spec",
+        str(args.event_spec),
+        "--reference-preregistration",
+        str(args.metrics_preregistration),
+        *fold_arguments(args),
+        "--required-supplement-binding-sha256",
+        supplement_sha256,
+        "--output",
+        str(args.augmented_n8_root),
+        "--action-exec-steps",
+        "5",
+        "--max-steps",
+        "200",
+        "--fps",
+        "15.0",
+    ]
+
+
 def evaluator_command(args: argparse.Namespace) -> list[str]:
     outcomes = args.augmented_n4_root / "paired_outcomes.json"
     return [
@@ -690,6 +726,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "watch_robotwin2_five_body_branches_to_lobo_training_v1.py",
         "run_robotwin2_five_body_paired_success_v1.py",
         "run_robotwin2_five_body_postformal_candidate_pool_v1.py",
+        "run_robotwin2_five_body_nested_n4_n8_paired_success_v1.py",
         "evaluate_robotwin2_cross_embodiment_paired_success_v1.py",
     )
     if any(
@@ -713,7 +750,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 environment=environment,
             )
         if not supplement_manifest_complete(manifest_path, body):
-            raise SharedHeadUpgradeError(f"{body} supplement did not complete 20 decisions")
+            raise SharedHeadUpgradeError(f"{body} supplement did not complete 30 decisions")
         completed_bodies.append(body)
         write_state(
             "supplement_body_complete",
@@ -737,7 +774,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         or binding.get("materializer_provenance", {}).get("complete_branches")
         != EXPECTED_SUPPLEMENT_BRANCHES
     ):
-        raise SharedHeadUpgradeError("supplement binding is not the complete 100/400 design")
+        raise SharedHeadUpgradeError("supplement binding is not the complete 150/600 design")
     supplement_sha256 = sha256_file(args.supplement_binding)
 
     run_stage(
@@ -750,43 +787,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.augmented_lobo_run_exit.read_text(encoding="utf-8").strip() != "0":
         raise SharedHeadUpgradeError("augmented LOBO did not finish successfully")
 
-    wait_idle("waiting_for_idle_rtx4090_before_augmented_n4")
+    wait_idle("waiting_for_idle_rtx4090_before_nested_actor_n4_n8")
     run_stage(
-        "running_complete_augmented_best_of_4_paired_evaluation",
-        paired_n4_command(args, supplement_sha256),
-        "augmented_n4_paired.log",
+        "running_complete_shared_raw16_nested_actor_n4_n8_evaluation",
+        nested_n4_n8_command(args, supplement_sha256),
+        "nested_actor_n4_n8_paired.log",
         cwd=args.robotwin_root,
         environment=environment,
     )
-    n4_outcomes = args.augmented_n4_root / "paired_outcomes.json"
-    n4_report = args.augmented_n4_root / "paired_success_report.json"
-    if not n4_outcomes.is_file():
-        raise SharedHeadUpgradeError("augmented N=4 runner did not produce outcomes")
-    if not n4_report.exists():
-        run_stage(
-            "evaluating_complete_augmented_best_of_4_outcomes",
-            evaluator_command(args),
-            "augmented_n4_evaluator.log",
-            cwd=args.code_root,
-            environment=os.environ.copy(),
+    nested_receipt = args.augmented_n8_root / "completion_receipt.json"
+    nested_report = args.augmented_n8_root / "nested_n4_n8_report.json"
+    if not nested_receipt.is_file() or nested_receipt.is_symlink():
+        raise SharedHeadUpgradeError(
+            "nested actor/N4/N8 runner did not complete 1000 triplets"
         )
-    if not n4_report.is_file() or n4_report.is_symlink():
-        raise SharedHeadUpgradeError("augmented N=4 evaluator did not produce a report")
-
-    wait_idle("waiting_for_idle_rtx4090_before_augmented_n8")
-    run_stage(
-        "running_complete_augmented_best_of_8_paired_evaluation",
-        paired_n8_command(args, supplement_sha256),
-        "augmented_n8_paired.log",
-        cwd=args.robotwin_root,
-        environment=environment,
-    )
-    n8_receipt = args.augmented_n8_root / "completion_receipt.json"
-    if not n8_receipt.is_file():
-        raise SharedHeadUpgradeError("augmented N=8 runner did not complete 1000 pairs")
-    n8_report = args.augmented_n8_root / "paired_candidate_pool_report.json"
-    if not n8_report.is_file() or n8_report.is_symlink():
-        raise SharedHeadUpgradeError("augmented N=8 runner did not produce a report")
+    if not nested_report.is_file() or nested_report.is_symlink():
+        raise SharedHeadUpgradeError(
+            "nested actor/N4/N8 runner did not produce its paired report"
+        )
 
     atomic_text(args.run_exit, "0\n")
     write_state(
@@ -795,12 +813,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         augmented_lobo_summary=str(
             args.augmented_lobo_root / "five_fold_training_summary.json"
         ),
-        augmented_n4_report=str(n4_report),
-        augmented_n4_report_file_sha256=sha256_file(n4_report),
-        augmented_n8_report=str(n8_report),
-        augmented_n8_report_file_sha256=sha256_file(n8_report),
-        completed_pairs_by_candidate_count={"4": 1000, "8": 1000},
-        completed_rollouts_by_candidate_count={"4": 2000, "8": 2000},
+        nested_actor_n4_n8_report=str(nested_report),
+        nested_actor_n4_n8_report_file_sha256=sha256_file(nested_report),
+        completed_initial_condition_triplets=1000,
+        completed_rollouts_by_method={"actor": 1000, "n4": 1000, "n8": 1000},
+        n4_is_exact_ordered_prefix_of_n8=True,
         gpu_reserved_by_watcher=False,
     )
     lock_stream.flush()
@@ -847,6 +864,7 @@ __all__ = [
     "N8_RAW_PROPOSAL_COUNT",
     "N8_RETAINED_CANDIDATE_COUNT",
     "materializer_command",
+    "nested_n4_n8_command",
     "paired_n4_command",
     "paired_n8_command",
     "supplement_collector_command",

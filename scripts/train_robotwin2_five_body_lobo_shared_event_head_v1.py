@@ -37,20 +37,20 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materia
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
-MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v9"
+MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v10"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
 SUPPLEMENT_BINDING_FORMAT = (
-    "etsf_robotwin2_five_body_proper_world_supplement_binding_v1"
+    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v2"
 )
 SUPPLEMENT_MANIFEST_FORMAT = (
-    "etsf_robotwin2_proper_world_supplement_manifest_v1"
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
 )
 SUPPLEMENT_COLLECTOR_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_actor_branches_v1"
+    "etsf_robotwin2_scripted_expert_root_actor_branches_v2"
 )
 SUPPLEMENT_MATERIALIZER_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v1"
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v2"
 )
 ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
 MATERIALIZATION_FORMAT = public_materialization.FORMAT
@@ -97,8 +97,10 @@ GOAL_PROGRESS_NORMALIZATION_METERS = 0.02
 OBJECT_STUDENT_T_DOF = 3.0
 TERMINAL_PROGRESS_STUDENT_T_DOF = 3.0
 TERMINAL_EVENT_LOSS_WEIGHT = 0.5
+TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT = 0.25
 TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT = 0.5
 SUPPLEMENT_PROPER_LOSS_WEIGHT = 0.25
+SUPPLEMENT_RANK_LOSS_WEIGHT = 0.25
 SUPPLEMENT_USAGE_CONTRACT = {
     "outer_lobo_source_train_only": True,
     "multitask_proper_loss": True,
@@ -106,7 +108,12 @@ SUPPLEMENT_USAGE_CONTRACT = {
     "terminal_event_proper_loss": True,
     "terminal_goal_progress_proper_loss": True,
     "normalization_or_baseline_fit": False,
-    "candidate_rank_or_utility_loss": False,
+    "candidate_rank_or_utility_loss": True,
+    "candidate_rank_or_utility_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
+    "candidate_rank_updates": (
+        "bounded_monotone_utility_only_from_detached_consequence_features"
+    ),
+    "semantic_comparative_loss": False,
     "source_validation_or_checkpoint_selection": False,
     "calibration": False,
     "heldout_payload_access": False,
@@ -121,7 +128,7 @@ EXPERT_ROOT_PROVENANCE_CONTRACT = {
     "fresh_branch_horizon_starts_at_root": True,
     "formal_actor_prefix_distribution_claimed": False,
 }
-SUPPLEMENT_TARGET_EVENTS = ("e3", "e4")
+SUPPLEMENT_TARGET_EVENTS = ("e12", "e3", "e4")
 SUPPLEMENT_HORIZON_SCHEDULE = (10, 25, 50, 100, 200)
 SUPPLEMENT_RESERVE_SEED_START = 2026081000
 SUPPLEMENT_RESERVE_SEEDS_PER_SLOT = 16
@@ -141,14 +148,14 @@ SUPPLEMENT_EXPECTED_DECISIONS_PER_BODY = (
 SUPPLEMENT_ROOT_SELECTION_CONTRACT = {
     "controller": "public_RoboTwin_move_can_pot.play_once",
     "observation_granularity": "every_successful_sapien_scene_step",
-    "targets": ["e3", "e4"],
+    "targets": list(SUPPLEMENT_TARGET_EVENTS),
     "selection": "first_physical_sample_whose_frozen_analytic_event_equals_target",
     "one_root_per_target_per_scene_seed": True,
     "adjacent_same_event_frames_used_as_additional_roots": False,
     "e4_must_be_nonterminal_simulator_success": True,
     "root_selection_reads_actor_branch_outcomes": False,
-    "pair_acceptance": (
-        "both_e3_e4_exist_and_fresh_restore_canonicalize_before_any_actor_"
+    "triplet_acceptance": (
+        "e12_e3_e4_all_exist_and_fresh_restore_canonicalize_before_any_actor_"
         "candidate_outcome"
     ),
     "missing_target_policy": (
@@ -166,7 +173,7 @@ SUPPLEMENT_HORIZON_CONTRACT = {
         "body_condition_horizon_slot_has_pre_registered_ordered_reserve_"
         "seeds_before_any_rollout"
     ),
-    "same_horizon_for_e3_and_e4_of_one_seed": True,
+    "same_horizon_for_e12_e3_e4_of_one_seed": True,
     "new_actor_branch_take_action_count_at_root": 0,
     "remaining_action_budget_at_root_equals_bound_horizon": True,
     "expert_physics_steps_or_planner_frames_used_to_compute_horizon": False,
@@ -176,7 +183,7 @@ SUPPLEMENT_HORIZON_CONTRACT = {
 SUPPLEMENT_RESERVE_ROSTER_CONTRACT = {
     "scope": "body_local_condition_local_horizon_slot_local",
     "ordered_reserve_seeds_per_slot": SUPPLEMENT_RESERVE_SEEDS_PER_SLOT,
-    "selection": "first_complete_canonicalizable_e3_e4_pair",
+    "selection": "first_complete_canonicalizable_e12_e3_e4_triplet",
     "selection_occurs_before_actor_candidate_outcomes": True,
     "rejected_attempts_are_audited": True,
     "rejected_seed_candidate_outcomes_executed": False,
@@ -570,6 +577,7 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             else [
                 "success_binary_nll",
                 "terminal_event_categorical_nll_weight_0.5",
+                "terminal_event_ordinal_ranked_probability_score_weight_0.25",
                 *(
                     []
                     if variant == "no_object_effect"
@@ -577,7 +585,13 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
                 ),
             ]
         ),
-        "terminal_event_loss": "proper_categorical_cross_entropy_uniform_stream",
+        "terminal_event_loss": (
+            "proper_categorical_cross_entropy_plus_strictly_proper_ordinal_"
+            "ranked_probability_score_uniform_stream"
+        ),
+        "terminal_stage_progress_loss": (
+            "terminal_event_cdf_ranked_probability_score_weight_0.25"
+        ),
         "terminal_goal_progress_loss": "proper_student_t3_nll_uniform_stream",
         "success_probability_definition": (
             "exact_terminal_event_probability_of_eK_with_shared_horizon_context"
@@ -695,6 +709,9 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
             "rank_inputs_are_detached_consequence_predictions"
         ],
         "terminal_event_loss": checkpoint["terminal_event_loss"],
+        "terminal_stage_progress_loss": checkpoint[
+            "terminal_stage_progress_loss"
+        ],
         "terminal_goal_progress_loss": checkpoint[
             "terminal_goal_progress_loss"
         ],
@@ -1394,7 +1411,7 @@ def _validate_supplement_reserve_design(
             or selected_attempt.get("pre_registered_horizon") != horizon
             or selected_attempt.get("selected_before_actor_candidate_outcomes")
             is not True
-            or not _is_sha(selected_attempt.get("root_pair_bundle_sha256"))
+            or not _is_sha(selected_attempt.get("root_triplet_bundle_sha256"))
         ):
             raise FiveBodyContractError(
                 "selected supplement reserve attempt is incomplete"
@@ -1418,7 +1435,7 @@ def _validate_supplement_reserve_design(
                 condition, slot, selected_seed, target
             )
             group = groups_by_id.get(expected_group_id)
-            event_id = {"e3": 2, "e4": 3}[target]
+            event_id = {"e12": 1, "e3": 2, "e4": 3}[target]
             if (
                 not isinstance(group, Mapping)
                 or group.get("condition") != condition
@@ -1478,11 +1495,12 @@ def validate_supplement_body_manifest(
         or value.get("candidate_count") != CANDIDATE_COUNT
         or value.get("action_exec_steps") != 5
         or value.get("supplement_role")
-        != "expert_event_root_proper_world_model_source_train_only"
+        != "expert_event_root_proper_world_and_utility_rank_source_train_only"
         or value.get("root_policy") != "robotwin_scripted_expert"
         or value.get("candidate_and_continuation_policy")
         != "same_frozen_native_actor_as_primary_binding"
         or value.get("proper_loss_weight") != SUPPLEMENT_PROPER_LOSS_WEIGHT
+        or value.get("rank_loss_weight") != SUPPLEMENT_RANK_LOSS_WEIGHT
         or value.get("usage_contract") != SUPPLEMENT_USAGE_CONTRACT
         or value.get("expert_root_provenance_contract")
         != EXPERT_ROOT_PROVENANCE_CONTRACT
@@ -1536,7 +1554,7 @@ def validate_supplement_body_manifest(
         slot = declared.get("horizon_slot")
         seed = declared.get("requested_seed")
         root_event = declared.get("scripted_root_event_id")
-        event_name = {2: "e3", 3: "e4"}.get(root_event)
+        event_name = {1: "e12", 2: "e3", 3: "e4"}.get(root_event)
         branch_horizon = declared.get("pre_registered_horizon")
         if (
             group_id in identities
@@ -1553,7 +1571,7 @@ def validate_supplement_body_manifest(
             or not isinstance(branch_horizon, int)
             or branch_horizon != SUPPLEMENT_HORIZON_SCHEDULE[slot]
             or declared.get("candidate_noise_query_index")
-            != {2: 2, 3: 3}[root_event]
+            != {1: 1, 2: 2, 3: 3}[root_event]
             or group_id
             != supplement_reserve_group_id(
                 str(condition), slot, seed, event_name
@@ -1610,6 +1628,7 @@ def validate_supplement_body_manifest(
             EXPERT_ROOT_PROVENANCE_CONTRACT
         ),
         "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        "rank_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
         **design,
     }
 
@@ -1746,14 +1765,17 @@ def load_supplement_binding(
         or not _is_sha(actor_authority_sha256)
         or binding.get("actor_authority_sha256") != actor_authority_sha256
         or binding.get("proper_loss_weight") != SUPPLEMENT_PROPER_LOSS_WEIGHT
+        or binding.get("rank_loss_weight") != SUPPLEMENT_RANK_LOSS_WEIGHT
         or binding.get("usage_contract") != SUPPLEMENT_USAGE_CONTRACT
         or binding.get("expert_root_provenance_contract")
         != EXPERT_ROOT_PROVENANCE_CONTRACT
         or not isinstance(materializer, Mapping)
         or materializer.get("format") != SUPPLEMENT_MATERIALIZER_FORMAT
         or materializer.get("payload_npz_files_opened") != 0
-        or materializer.get("complete_decisions") != 100
-        or materializer.get("complete_branches") != 400
+        or materializer.get("complete_decisions")
+        != len(BODIES) * SUPPLEMENT_EXPECTED_DECISIONS_PER_BODY
+        or materializer.get("complete_branches")
+        != len(BODIES) * SUPPLEMENT_EXPECTED_DECISIONS_PER_BODY * CANDIDATE_COUNT
         or materializer.get("seed_overlap_with_primary") != 0
         or materializer.get("selected_seed_count") != 50
         or isinstance(rejected_attempt_count, bool)
@@ -1773,7 +1795,7 @@ def load_supplement_binding(
         or materializer.get("heldout_payload_npz_files_opened") != 0
     ):
         raise FiveBodyContractError(
-            "supplement binding violates the source-train proper-only contract"
+            "supplement binding violates the source-train proper/rank contract"
         )
     body_bindings = binding.get("body_manifests")
     if not isinstance(body_bindings, Mapping) or set(body_bindings) != set(BODIES):
@@ -1793,7 +1815,7 @@ def load_supplement_binding(
             or not _is_sha(item.get("reserve_roster_sha256"))
             or isinstance(item.get("group_count"), bool)
             or not isinstance(item.get("group_count"), int)
-            or int(item["group_count"]) != 20
+            or int(item["group_count"]) != SUPPLEMENT_EXPECTED_DECISIONS_PER_BODY
         ):
             raise FiveBodyContractError(
                 f"supplement body manifest binding missing for {body}"
@@ -1909,6 +1931,7 @@ def load_supplement_binding(
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": implementations.pop(),
         "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        "rank_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
         "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
         "expert_root_provenance_contract": dict(
             EXPERT_ROOT_PROVENANCE_CONTRACT
@@ -2201,6 +2224,11 @@ def build_preflight_receipt(
                 if supplement_audit is not None
                 else 0.0
             ),
+            "rank_loss_weight": (
+                SUPPLEMENT_RANK_LOSS_WEIGHT
+                if supplement_audit is not None
+                else 0.0
+            ),
             "source_train_groups": len(supplement_training),
             "source_validation_groups": 0,
             "heldout_groups_deferred": int(
@@ -2213,7 +2241,9 @@ def build_preflight_receipt(
             "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
             "normalization_rows_used": 0,
             "baseline_fit_rows_used": 0,
-            "rank_or_utility_rows_used": 0,
+            "rank_or_utility_rows_authorized": (
+                len(supplement_training) * CANDIDATE_COUNT
+            ),
             "source_validation_rows_used": 0,
             "checkpoint_selection_rows_used": 0,
             "calibration_rows_used": 0,
@@ -3148,6 +3178,14 @@ def evaluate_terminal_consequences(
         np.clip(event_probability[np.arange(len(event_label)), event_label], 1e-12, 1.0)
     )
     event_onehot = np.eye(5, dtype=np.float64)[event_label]
+    event_cumulative_probability = np.cumsum(event_probability, axis=-1)[:, :-1]
+    event_observed_cumulative = (
+        event_label[:, None] <= np.arange(len(core.CANONICAL_EVENTS) - 1)[None]
+    ).astype(np.float64)
+    event_ordinal_rps = np.mean(
+        np.square(event_cumulative_probability - event_observed_cumulative),
+        axis=-1,
+    )
 
     goal_mask = values["goal_mask"] > 0.5
     goal_label = values["goal_label"][goal_mask].astype(np.float64)
@@ -3182,6 +3220,10 @@ def evaluate_terminal_consequences(
         raise FiveBodyContractError("strict proper validation group alignment changed")
     row_event_nll = np.full(len(logical_groups), np.nan, dtype=np.float64)
     row_event_nll[event_mask] = event_nll
+    row_event_ordinal_rps = np.full(
+        len(logical_groups), np.nan, dtype=np.float64
+    )
+    row_event_ordinal_rps[event_mask] = event_ordinal_rps
     row_goal_nll = np.full(len(logical_groups), np.nan, dtype=np.float64)
     row_goal_nll[goal_mask] = goal_nll
     by_group: dict[str, list[int]] = defaultdict(list)
@@ -3234,6 +3276,15 @@ def evaluate_terminal_consequences(
                 row_event_nll, values["event_mask"] > 0.5, "terminal event"
             )
             strict += TERMINAL_EVENT_LOSS_WEIGHT * event_component
+            event_ordinal_rps_component = supervised_mean(
+                row_event_ordinal_rps,
+                values["event_mask"] > 0.5,
+                "terminal event ordinal RPS",
+            )
+            strict += (
+                TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT
+                * event_ordinal_rps_component
+            )
         if variant not in {"success_only", "no_object_effect"}:
             goal_component = supervised_mean(
                 row_goal_nll, values["goal_mask"] > 0.5, "terminal goal"
@@ -3246,6 +3297,9 @@ def evaluate_terminal_consequences(
         if variant != "success_only":
             component_group_rows["terminal_event_nll"].append(
                 (unit, seed_cluster, event_component)
+            )
+            component_group_rows["terminal_event_ordinal_rps"].append(
+                (unit, seed_cluster, event_ordinal_rps_component)
             )
         if variant not in {"success_only", "no_object_effect"}:
             component_group_rows["terminal_goal_student_t3_nll"].append(
@@ -3325,6 +3379,9 @@ def evaluate_terminal_consequences(
             "multiclass_brier": float(
                 np.mean(np.sum(np.square(event_probability - event_onehot), axis=-1))
             ),
+            "ordinal_ranked_probability_score": float(
+                np.mean(event_ordinal_rps)
+            ),
             "ordinal_mae": float(np.mean(np.abs(event_prediction - event_label))),
         }
     else:
@@ -3335,6 +3392,7 @@ def evaluate_terminal_consequences(
             "accuracy": None,
             "nll": None,
             "multiclass_brier": None,
+            "ordinal_ranked_probability_score": None,
             "ordinal_mae": None,
         }
     if len(goal_label):
@@ -3501,6 +3559,44 @@ def _robust_object_effect_loss(
     }
 
 
+def _terminal_event_ordinal_rps_rows(
+    logits: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Strictly proper ordinal score over e0<e12<e3<e4<eK.
+
+    Categorical cross-entropy estimates the full terminal-event distribution but
+    treats all wrong classes alike.  The ranked probability score compares its
+    four cumulative probabilities with the observed cumulative event, allowing
+    abundant all-failure e0..e4 outcomes to share ordinal supervision without
+    inventing a success label or collapsing the distribution to its mean.
+    """
+
+    if (
+        logits.ndim != 2
+        or logits.shape[1] != len(core.CANONICAL_EVENTS)
+        or target.shape != (logits.shape[0],)
+        or not bool(torch.isfinite(logits).all())
+        or target.dtype
+        not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }
+        or bool(((target < 0) | (target >= len(core.CANONICAL_EVENTS))).any())
+    ):
+        raise FiveBodyContractError(
+            "terminal ordinal ranked probability score input is invalid"
+        )
+    cumulative_probability = torch.softmax(logits, dim=-1).cumsum(dim=-1)[:, :-1]
+    thresholds = torch.arange(
+        len(core.CANONICAL_EVENTS) - 1, device=logits.device
+    )[None]
+    observed_cumulative = (target[:, None] <= thresholds).to(logits)
+    return (cumulative_probability - observed_cumulative).square().mean(dim=-1)
+
+
 def _terminal_consequence_loss(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
@@ -3523,6 +3619,13 @@ def _terminal_consequence_loss(
         * batch["terminal_event_mask"].to(sample_weight)
     )
     terminal_event = core._weighted_mean(event_rows, event_weight)
+    ordinal_event_rows = _terminal_event_ordinal_rps_rows(
+        output["terminal_event_logits"],
+        batch["terminal_max_event_id"].long(),
+    )
+    terminal_event_ordinal_rps = core._weighted_mean(
+        ordinal_event_rows, event_weight
+    )
 
     goal_target = batch["terminal_goal_progress"].to(
         output["terminal_goal_progress_mean"]
@@ -3551,14 +3654,22 @@ def _terminal_consequence_loss(
 
     if ablation_variant == "success_only":
         terminal_event = terminal_event * 0.0
+        terminal_event_ordinal_rps = terminal_event_ordinal_rps * 0.0
     if ablation_variant in {"success_only", "no_object_effect"}:
         terminal_goal = terminal_goal * 0.0
     weighted_event = TERMINAL_EVENT_LOSS_WEIGHT * terminal_event
+    weighted_event_ordinal_rps = (
+        TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT * terminal_event_ordinal_rps
+    )
     weighted_goal = TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT * terminal_goal
-    return weighted_event + weighted_goal, {
+    return weighted_event + weighted_event_ordinal_rps + weighted_goal, {
         "terminal_event_uniform_proper": terminal_event,
+        "terminal_event_ordinal_rps_uniform_proper": terminal_event_ordinal_rps,
         "terminal_goal_progress_uniform_proper": terminal_goal,
         "terminal_event_weighted_uniform_proper": weighted_event,
+        "terminal_event_ordinal_rps_weighted_uniform_proper": (
+            weighted_event_ordinal_rps
+        ),
         "terminal_goal_progress_weighted_uniform_proper": weighted_goal,
     }
 
@@ -3750,6 +3861,41 @@ def _candidate_rank_loss(
         "all_failure_uninformative_groups_in_batch": score.new_tensor(
             all_failure_uninformative_groups
         ),
+    }
+
+
+def _supplement_candidate_rank_loss(
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    sample_weight: torch.Tensor,
+    *,
+    ablation_variant: str = "full",
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Low-weight source-only rank loss for expert-root actor branches.
+
+    ``candidate_rank_logit`` is built only from detached consequence features,
+    so this term updates the bounded monotone utility and cannot turn the
+    expert-root distribution into comparative supervision for world-model or
+    uncertainty heads.
+    """
+
+    raw, raw_pieces = _candidate_rank_loss(
+        output,
+        batch,
+        sample_weight,
+        ablation_variant=ablation_variant,
+    )
+    weighted = SUPPLEMENT_RANK_LOSS_WEIGHT * raw
+    return weighted, {
+        "supplement_candidate_rank_unweighted": raw,
+        "supplement_candidate_rank_weighted": weighted,
+        "supplement_candidate_rank_fixed_lambda": weighted.new_tensor(
+            SUPPLEMENT_RANK_LOSS_WEIGHT
+        ),
+        **{
+            f"supplement_rank_{name}": value
+            for name, value in raw_pieces.items()
+        },
     }
 
 
@@ -4501,7 +4647,7 @@ def materialize_supplement_rows(
         loaded = _npz_rows(group, body=body)
         if any(int(row["current_event_id"]) != root_event for row in loaded):
             raise FiveBodyContractError(
-                "supplement payload current event differs from its e3/e4 manifest"
+                "supplement payload current event differs from its e12/e3/e4 manifest"
             )
         if any(
             not math.isclose(
@@ -4552,7 +4698,7 @@ def supplement_group_bootstrap_weights(
             )
     bootstrap_seed = int.from_bytes(
         hashlib.sha256(
-            f"{seed}|proper-world-supplement-bootstrap-v1".encode()
+            f"{seed}|proper-world-utility-rank-supplement-bootstrap-v2".encode()
         ).digest()[:8],
         "big",
     )
@@ -4582,6 +4728,58 @@ def supplement_group_bootstrap_weights(
             }
         )
     return weights.astype(np.float32, copy=False), audit, bootstrap_seed
+
+
+def candidate_rank_supervision_inventory(
+    rows: Sequence[Mapping[str, Any]], *, ablation_variant: str = "full"
+) -> dict[str, int]:
+    """Count only real complete decisions that can identify listwise utility."""
+
+    if ablation_variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(
+            f"unknown ablation variant {ablation_variant!r}"
+        )
+    indices_by_group: dict[str, list[int]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        indices_by_group[str(row["logical_group"])].append(index)
+    mixed = 0
+    dense = 0
+    for group, indices in indices_by_group.items():
+        if sorted(int(rows[index]["candidate_index"]) for index in indices) != list(
+            range(CANDIDATE_COUNT)
+        ):
+            raise FiveBodyContractError(
+                f"rank inventory received incomplete decision {group}"
+            )
+        if not all(bool(rows[index]["success_mask"]) for index in indices):
+            raise FiveBodyContractError(
+                f"rank inventory lacks complete success supervision {group}"
+            )
+        outcomes = {float(rows[index]["success"]) for index in indices}
+        if outcomes == {0.0, 1.0}:
+            mixed += 1
+        elif (
+            outcomes == {0.0}
+            and all(
+                bool(rows[index].get("terminal_event_mask", 0.0))
+                and bool(rows[index].get("terminal_goal_progress_mask", 0.0))
+                for index in indices
+            )
+            and _dense_rank_labels_are_orderable(
+                [rows[index]["terminal_max_event_id"] for index in indices],
+                [rows[index]["terminal_goal_progress"] for index in indices],
+                ablation_variant=ablation_variant,
+            )
+        ):
+            dense += 1
+    if ablation_variant == "success_only":
+        mixed = 0
+        dense = 0
+    return {
+        "mixed_success_groups": mixed,
+        "informative_dense_groups": dense,
+        "rank_supervision_groups": mixed + dense,
+    }
 
 
 def effect_preserving_group_bootstrap_weights(
@@ -4938,6 +5136,10 @@ def _train_fold(
         supplement_rows = materialize_supplement_rows(
             supplement_groups, held_out_body=args.held_out_body
         )
+    supplement_rank_inventory = candidate_rank_supervision_inventory(
+        supplement_rows,
+        ablation_variant=args.ablation_variant,
+    )
     body_to_id = {body: 0 for body in preflight["source_bodies"]}
     train_dataset = core.TransitionDataset(train_rows, body_to_id)
     supplement_dataset = (
@@ -4994,21 +5196,38 @@ def _train_fold(
         for item in bootstrap_support
     ):
         raise FiveBodyContractError("rank supervision inventory changed by member")
-    rank_supervision_available = rank_supervision_groups > 0
+    formal_rank_supervision_available = rank_supervision_groups > 0
+    supplement_rank_supervision_available = (
+        supplement_rank_inventory["rank_supervision_groups"] > 0
+    )
+    rank_supervision_available = (
+        formal_rank_supervision_available or supplement_rank_supervision_available
+    )
     if args.ablation_variant != "success_only" and not rank_supervision_available:
         raise FiveBodyContractError(
             "candidate-rank utility has no real mixed-success or informative "
-            "dense comparison in this source fold"
+            "dense comparison in the formal or source-only supplement stream"
         )
     mixed_rank_groups = int(bootstrap_support[0]["mixed_success_groups_total"])
     informative_dense_groups = int(
         bootstrap_support[0]["informative_dense_groups_total"]
     )
+    total_mixed_rank_groups = (
+        mixed_rank_groups + supplement_rank_inventory["mixed_success_groups"]
+    )
+    total_informative_dense_groups = (
+        informative_dense_groups
+        + supplement_rank_inventory["informative_dense_groups"]
+    )
+    total_rank_supervision_groups = (
+        rank_supervision_groups
+        + supplement_rank_inventory["rank_supervision_groups"]
+    )
     if args.ablation_variant == "success_only":
         rank_supervision_mode = "proper_coherent_terminal_success_only"
-    elif mixed_rank_groups and informative_dense_groups:
+    elif total_mixed_rank_groups and total_informative_dense_groups:
         rank_supervision_mode = "mixed_success_plus_informative_dense"
-    elif mixed_rank_groups:
+    elif total_mixed_rank_groups:
         rank_supervision_mode = "mixed_success_only"
     else:
         rank_supervision_mode = "informative_dense_only"
@@ -5131,7 +5350,7 @@ def _train_fold(
                     positive_group_weight=rank_weight_for_member,
                     ablation_variant=args.ablation_variant,
                 )
-                if rank_supervision_available
+                if formal_rank_supervision_available
                 else CompleteDecisionBatchSampler(
                     train_rows, batch_size=args.batch_size, seed=seed
                 )
@@ -5198,10 +5417,16 @@ def _train_fold(
             )
             if supplement_raw is None:
                 supplement_loss = multitask_loss.new_zeros(())
+                supplement_rank_loss = multitask_loss.new_zeros(())
                 supplement_pieces = {
                     "supplement_proper_unweighted": supplement_loss,
                     "supplement_proper_weighted": supplement_loss,
                     "supplement_proper_fixed_lambda": supplement_loss,
+                }
+                supplement_rank_pieces = {
+                    "supplement_candidate_rank_unweighted": supplement_rank_loss,
+                    "supplement_candidate_rank_weighted": supplement_rank_loss,
+                    "supplement_candidate_rank_fixed_lambda": supplement_rank_loss,
                 }
             else:
                 supplement_batch = core._move_batch(supplement_raw, device)
@@ -5219,6 +5444,14 @@ def _train_fold(
                         supplement_batch,
                         supplement_weights,
                         loss_weights=base_loss_weights,
+                        ablation_variant=args.ablation_variant,
+                    )
+                )
+                supplement_rank_loss, supplement_rank_pieces = (
+                    _supplement_candidate_rank_loss(
+                        supplement_prediction,
+                        supplement_batch,
+                        supplement_weights,
                         ablation_variant=args.ablation_variant,
                     )
                 )
@@ -5266,6 +5499,7 @@ def _train_fold(
                 + object_effect_loss
                 + terminal_loss
                 + supplement_loss
+                + supplement_rank_loss
                 + decision_loss
                 + semantic_comparative_loss
             )
@@ -5322,6 +5556,10 @@ def _train_fold(
                 **{
                     name: float(value.detach())
                     for name, value in supplement_pieces.items()
+                },
+                **{
+                    name: float(value.detach())
+                    for name, value in supplement_rank_pieces.items()
                 },
                 **{name: float(value.detach()) for name, value in decision_pieces.items()},
                 **{
@@ -5575,11 +5813,23 @@ def _train_fold(
             **preflight["supplement"],
             "source_train_rows": len(supplement_rows),
             "loss": (
-                "fixed_lambda_times_multitask_plus_robust_object_plus_terminal_proper"
+                "fixed_lambda_proper_world_plus_detached_utility_candidate_rank"
                 if supplement_rows
                 else "disabled"
             ),
-            "rank_or_utility_rows_used": 0,
+            "rank_or_utility_loss_weight": (
+                SUPPLEMENT_RANK_LOSS_WEIGHT if supplement_rows else 0.0
+            ),
+            "rank_or_utility_rows_used": (
+                len(supplement_rows)
+                if supplement_rows and args.ablation_variant != "success_only"
+                else 0
+            ),
+            "rank_or_utility_groups_with_real_comparative_supervision": (
+                supplement_rank_inventory["rank_supervision_groups"]
+            ),
+            "rank_supervision_inventory": supplement_rank_inventory,
+            "semantic_comparative_rows_used": 0,
             "normalization_rows_used": 0,
             "source_validation_rows_used": 0,
             "checkpoint_selection_rows_used": 0,
@@ -5594,9 +5844,21 @@ def _train_fold(
             "synthetic_groups_or_labels": 0,
         },
         "rank_supervision_available": rank_supervision_available,
-        "rank_supervision_groups": rank_supervision_groups,
-        "mixed_success_rank_groups": mixed_rank_groups,
-        "informative_dense_rank_groups": informative_dense_groups,
+        "rank_supervision_groups": total_rank_supervision_groups,
+        "formal_rank_supervision_groups": rank_supervision_groups,
+        "supplement_rank_supervision_groups": supplement_rank_inventory[
+            "rank_supervision_groups"
+        ],
+        "mixed_success_rank_groups": total_mixed_rank_groups,
+        "formal_mixed_success_rank_groups": mixed_rank_groups,
+        "supplement_mixed_success_rank_groups": supplement_rank_inventory[
+            "mixed_success_groups"
+        ],
+        "informative_dense_rank_groups": total_informative_dense_groups,
+        "formal_informative_dense_rank_groups": informative_dense_groups,
+        "supplement_informative_dense_rank_groups": supplement_rank_inventory[
+            "informative_dense_groups"
+        ],
         "rank_supervision_mode": rank_supervision_mode,
         "candidate_rank_parameters_received_direct_supervision": (
             rank_supervision_available
@@ -5607,6 +5869,10 @@ def _train_fold(
         "ensemble_bootstrap_effect_support": bootstrap_support,
         "ensemble_proper_bootstrap_outcome_support": proper_bootstrap_support,
         "success_probability_training_loss": "unweighted_proper_binary_cross_entropy",
+        "terminal_stage_progress_training_loss": (
+            "categorical_cross_entropy_plus_weight_0.25_strictly_proper_"
+            "ordinal_ranked_probability_score"
+        ),
         "checkpoint_selection_primary": {
             "mixed_success_then_dense_progress": (
                 "five_member_epistemic_lcb_one_deviation_success_then_dense"
@@ -5724,7 +5990,8 @@ __all__ = [
     "SUPPLEMENT_BINDING_FORMAT", "SUPPLEMENT_MANIFEST_FORMAT",
     "SUPPLEMENT_COLLECTOR_FORMAT",
     "SUPPLEMENT_MATERIALIZER_FORMAT",
-    "SUPPLEMENT_PROPER_LOSS_WEIGHT", "SUPPLEMENT_USAGE_CONTRACT",
+    "SUPPLEMENT_PROPER_LOSS_WEIGHT", "SUPPLEMENT_RANK_LOSS_WEIGHT",
+    "SUPPLEMENT_USAGE_CONTRACT",
     "EXPERT_ROOT_PROVENANCE_CONTRACT",
     "CANONICAL_STATE_SCHEMA", "CANDIDATE_NOISE_CONTRACT",
     "CANDIDATE_RANK_FEATURE_DIM", "CANDIDATE_RANK_FEATURE_SCHEMA",
@@ -5743,12 +6010,14 @@ __all__ = [
     "RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT",
     "RiskAdjustedRankEnsemble", "SEMANTIC_COMPARATIVE_GRADIENT_BUDGET",
     "SEMANTIC_GRADIENT_SCALE_CAP",
+    "TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT",
     "TERMINAL_FILM_MODULATION_BOUND",
     "TERMINAL_SUPERVISION_CONTRACT",
     "ablation_contract", "ablation_selection_components",
     "aggregate_risk_adjusted_rank_scores",
     "build_preflight_receipt", "canonical_sha256",
     "candidate_checkpoint_selection_key", "checkpoint_candidate_rank_contract",
+    "candidate_rank_supervision_inventory",
     "effect_preserving_group_bootstrap_weights", "load_binding",
     "load_supplement_binding",
     "proper_outcome_preserving_group_bootstrap_weights",
