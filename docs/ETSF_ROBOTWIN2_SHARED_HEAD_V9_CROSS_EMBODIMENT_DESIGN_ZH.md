@@ -178,8 +178,11 @@ treatment：同一冻结 actor + 对应 LOBO 五成员 v9，执行风险调整�
 ```
 
 主指标为 `ΔSR = SR(actor+v9)-SR(actor)`；同时报告配对 bootstrap 95% CI、McNemar exact two-sided p、
-阶段进度 `0/0.25/0.5/0.75/1.0` 的配对差，以及 body、condition 和宏平均结果。N=4 保留主可比协议，
-N=8 使用同一 checkpoint 检验候选覆盖瓶颈。只有 1000 pairs/2000 rollouts 完整落盘后，才回答“跨本体
+阶段进度 `0/0.25/0.5/0.75/1.0` 的配对差，以及 body、condition 和宏平均结果。N=4 保留主可比协议。
+N=8 先由 frozen actor 生成 16 个原生候选，再以不读取 outcome、event label 或 critic score 的
+canonical-effect 最远点选择保留 8 个（candidate 0 始终保留），用同一 checkpoint 检验候选覆盖瓶颈；
+这增加的是无环境执行的 actor proposal 数，不增加每个配对的 rollout 数。只有 1000 pairs/2000 rollouts
+完整落盘后，才回答“跨本体
 是否提高成功率”。
 
 ## 8. 执行顺序与代码入口

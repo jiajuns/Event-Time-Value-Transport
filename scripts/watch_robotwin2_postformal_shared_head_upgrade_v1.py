@@ -47,6 +47,8 @@ SUPPLEMENT_RESERVE_SEED_STOP_EXCLUSIVE = 2026081800
 EXPECTED_SUPPLEMENT_DECISIONS_PER_BODY = 20
 EXPECTED_SUPPLEMENT_DECISIONS = 100
 EXPECTED_SUPPLEMENT_BRANCHES = 400
+N8_RETAINED_CANDIDATE_COUNT = 8
+N8_RAW_PROPOSAL_COUNT = 16
 EXPECTED_GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
 DEFAULT_ETSF_SITE = Path(
     "/home/user/anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages"
@@ -447,7 +449,9 @@ def paired_n8_command(args: argparse.Namespace, supplement_sha256: str) -> list[
         "--required-supplement-binding-sha256",
         supplement_sha256,
         "--candidate-count",
-        "8",
+        str(N8_RETAINED_CANDIDATE_COUNT),
+        "--proposal-count",
+        str(N8_RAW_PROPOSAL_COUNT),
         "--output",
         str(args.augmented_n8_root),
         "--action-exec-steps",
@@ -840,6 +844,8 @@ __all__ = [
     "evaluator_command",
     "fold_arguments",
     "lobo_command",
+    "N8_RAW_PROPOSAL_COUNT",
+    "N8_RETAINED_CANDIDATE_COUNT",
     "materializer_command",
     "paired_n4_command",
     "paired_n8_command",

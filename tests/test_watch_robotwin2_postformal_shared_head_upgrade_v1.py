@@ -92,6 +92,9 @@ def test_commands_bind_complete_supplement_and_both_full_candidate_studies(
         assert sum(value == "--lobo-fold" for value in command) == 5
     assert "--candidate-count" not in n4
     assert n8[n8.index("--candidate-count") + 1] == "8"
+    assert n8[n8.index("--proposal-count") + 1] == "16"
+    assert watcher.N8_RETAINED_CANDIDATE_COUNT == 8
+    assert watcher.N8_RAW_PROPOSAL_COUNT == 16
 
 
 def test_runtime_environment_includes_explicit_etsf_dependency_site(
