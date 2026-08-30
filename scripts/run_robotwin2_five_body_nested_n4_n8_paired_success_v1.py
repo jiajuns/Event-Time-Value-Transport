@@ -3,8 +3,9 @@
 
 For every policy query this runner draws one ordered set of sixteen proposals
 from the frozen actor using the frozen two-instruction-by-eight-flow roster.
-A deterministic, outcome/event/critic-blind greedy
-farthest-point order in canonical first-five-action effect space is frozen once.
+A deterministic, outcome/event/critic-score-blind greedy farthest-point order
+in the held-out fold's source-train-normalized first-five-action effect space is
+frozen once.
 The first four entries form N4 and the first eight form N8, so N4 is an exact
 ordered prefix of N8 and raw proposal zero is candidate zero in every arm.
 
@@ -47,7 +48,10 @@ CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v1"
 OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
 REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
 COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
-NESTED_POOL_AUDIT_FORMAT = "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v1"
+NESTED_POOL_AUDIT_FORMAT = "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v2"
+SOURCE_ACTION_NORMALIZER_FORMAT = (
+    "etsf_robotwin2_fold_source_action_normalizer_binding_v1"
+)
 INITIAL_COMMITMENT_FORMAT = "etsf_robotwin2_initial_raw16_nested_n4_n8_commitment_v1"
 METHOD_START_FORMAT = "etsf_robotwin2_nested_method_start_v1"
 METHOD_RESUME_FORMAT = "etsf_robotwin2_nested_method_noninformative_resume_v1"
@@ -221,6 +225,171 @@ class NestedCandidatePoolError(RuntimeError):
     """A frozen actor, nested pool, reset, fold, or output changed."""
 
 
+def _is_sha256(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_source_action_normalizer(
+    value: Mapping[str, Any], *, expected_heldout_body: str | None = None
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Validate one fold's source-only normalization binding."""
+
+    unsigned = {key: item for key, item in value.items() if key != "logical_sha256"}
+    mean = np.asarray(value.get("action_mean"), dtype=np.float32)
+    std = np.asarray(value.get("action_std"), dtype=np.float32)
+    clip = value.get("normalization_clip")
+    if (
+        value.get("format") != SOURCE_ACTION_NORMALIZER_FORMAT
+        or value.get("canonical_action_schema") != collector.ACTION_SCHEMA
+        or value.get("heldout_rows_used") != 0
+        or value.get("five_member_normalizers_bit_exact_equal") is not True
+        or value.get("selection_reads_heldout_labels_outcomes_or_critic_scores")
+        is not False
+        or value.get("normalization_fit_scope") != "four_source_bodies_train_only"
+        or not _is_sha256(
+            value.get("checkpoint_action_normalization_sha256")
+        )
+        or value.get("heldout_body") not in BODIES
+        or (
+            expected_heldout_body is not None
+            and value.get("heldout_body") != expected_heldout_body
+        )
+        or mean.shape != (collector.CANONICAL_ACTION_DIM,)
+        or std.shape != (collector.CANONICAL_ACTION_DIM,)
+        or not np.isfinite(mean).all()
+        or not np.isfinite(std).all()
+        or np.any(std < 1e-4)
+        or isinstance(clip, bool)
+        or not isinstance(clip, (int, float))
+        or float(clip) != float(shared_head.CROSS_BODY_STANDARDIZED_INPUT_CLIP)
+        or value.get("logical_sha256") != canonical_sha256(unsigned)
+    ):
+        raise NestedCandidatePoolError("source action normalizer binding changed")
+    return mean, std, float(clip)
+
+
+def inspect_fold_source_action_normalizer(
+    fold: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the identical source-train normalizer stored in all five members."""
+
+    heldout_body = str(fold.get("heldout_body"))
+    rows = []
+    for item in fold.get("members", []):
+        checkpoint = torch.load(
+            item["checkpoint"], map_location="cpu", weights_only=True
+        )
+        normalization = checkpoint.get("action_normalization")
+        if not isinstance(normalization, Mapping):
+            raise NestedCandidatePoolError("checkpoint lacks action normalization")
+        unsigned_normalization = {
+            key: value
+            for key, value in normalization.items()
+            if key != "sha256"
+        }
+        schema = normalization.get("schema")
+        if (
+            normalization.get("format")
+            != "etsf_five_body_canonical_train_only_normalization_v2"
+            or normalization.get("canonical_action_schema") != collector.ACTION_SCHEMA
+            or normalization.get("canonical_action_schema_id") != 0
+            or normalization.get("heldout_rows_used") != 0
+            or not _is_sha256(normalization.get("sha256"))
+            or normalization.get("sha256")
+            != canonical_sha256(unsigned_normalization)
+            or not isinstance(schema, Mapping)
+        ):
+            raise NestedCandidatePoolError("checkpoint action normalization changed")
+        mean = np.asarray(schema.get("mean"), dtype=np.float32)
+        std = np.asarray(schema.get("std"), dtype=np.float32)
+        model_state = checkpoint.get("model")
+        if not isinstance(model_state, Mapping):
+            raise NestedCandidatePoolError("checkpoint model state is missing")
+        state_mean = model_state.get("action.action_mean")
+        state_std = model_state.get("action.action_std")
+        if (
+            mean.shape != (collector.CANONICAL_ACTION_DIM,)
+            or std.shape != (collector.CANONICAL_ACTION_DIM,)
+            or not np.isfinite(mean).all()
+            or not np.isfinite(std).all()
+            or np.any(std < 1e-4)
+            or not isinstance(state_mean, torch.Tensor)
+            or not isinstance(state_std, torch.Tensor)
+            or not np.array_equal(
+                state_mean.detach().cpu().numpy(), mean[None, :]
+            )
+            or not np.array_equal(
+                state_std.detach().cpu().numpy(), std[None, :]
+            )
+        ):
+            raise NestedCandidatePoolError(
+                "checkpoint model/action normalization disagree"
+            )
+        rows.append(
+            {
+                "member": int(item["member"]),
+                "normalization_sha256": normalization["sha256"],
+                "action_mean": mean.astype(float).tolist(),
+                "action_std": std.astype(float).tolist(),
+            }
+        )
+        del checkpoint
+    if len(rows) != 5 or any(row != {**rows[0], "member": row["member"]} for row in rows):
+        raise NestedCandidatePoolError(
+            "five bootstrap members do not share one action normalizer"
+        )
+    base = {
+        "format": SOURCE_ACTION_NORMALIZER_FORMAT,
+        "heldout_body": heldout_body,
+        "canonical_action_schema": collector.ACTION_SCHEMA,
+        "normalization_fit_scope": "four_source_bodies_train_only",
+        "heldout_rows_used": 0,
+        "checkpoint_action_normalization_sha256": rows[0][
+            "normalization_sha256"
+        ],
+        "action_mean": rows[0]["action_mean"],
+        "action_std": rows[0]["action_std"],
+        "normalization_clip": float(
+            shared_head.CROSS_BODY_STANDARDIZED_INPUT_CLIP
+        ),
+        "five_member_normalizers_bit_exact_equal": True,
+        "selection_reads_heldout_labels_outcomes_or_critic_scores": False,
+    }
+    binding = {**base, "logical_sha256": canonical_sha256(base)}
+    validate_source_action_normalizer(
+        binding, expected_heldout_body=heldout_body
+    )
+    return binding
+
+
+def validate_runtime_ensemble_action_normalizer(
+    ensemble: Sequence[shared_head.EffectAlignedSharedEventHead],
+    binding: Mapping[str, Any],
+) -> None:
+    """Require the loaded inference models to replay the bound FPS geometry."""
+
+    mean, std, clip = validate_source_action_normalizer(binding)
+    if len(ensemble) != 5:
+        raise NestedCandidatePoolError("runtime action normalizer requires five members")
+    for model in ensemble:
+        observed_mean = model.action.action_mean.detach().cpu().numpy()
+        observed_std = model.action.action_std.detach().cpu().numpy()
+        if (
+            not np.array_equal(observed_mean, mean[None, :])
+            or not np.array_equal(observed_std, std[None, :])
+            or float(model.action.normalization_clip) != clip
+        ):
+            raise NestedCandidatePoolError(
+                "runtime ensemble action normalizer differs from binding"
+            )
+
+
 def existing_separate_n4_n8_comparability_audit() -> dict[str, Any]:
     """State why the two existing independent studies are not a pool-size RCT."""
 
@@ -249,12 +418,24 @@ def nested_pool_contract() -> dict[str, Any]:
         "retained_candidate_counts": [N4_CANDIDATE_COUNT, N8_CANDIDATE_COUNT],
         "single_actor_generation_per_policy_query": True,
         "ordering": (
-            "greedy_maximize_minimum_rms_in_flattened_first_five_"
-            "canonical_action_effect14_anchor_raw_zero_tie_lowest_raw_index"
+            "greedy_maximize_minimum_rms_in_source_train_zscore_clip5_first_"
+            "five_canonical_action_effect14_anchor_raw_zero_tie_lowest_raw_index"
         ),
+        "diversity_metric": {
+            "format": pool_runner.SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT,
+            "normalization": "heldout_fold_four_source_bodies_train_only",
+            "five_bootstrap_member_normalizers_must_be_bit_exact_equal": True,
+            "normalization_clip": float(
+                shared_head.CROSS_BODY_STANDARDIZED_INPUT_CLIP
+            ),
+            "same_geometry_as_shared_head_action_input": True,
+            "heldout_rows_used": 0,
+            "reads_heldout_labels_outcomes_events_or_critic_scores": False,
+        },
         "n4_is_exact_ordered_prefix_of_n8": True,
         "raw_proposal_zero_is_candidate_zero_for_actor_n4_n8": True,
         "selection_reads_outcomes_events_labels_or_critic_scores": False,
+        "selection_reads_source_train_action_normalizer": True,
         "raw16_flow_noise_contract": pool_runner.postformal_noise_contract(
             RAW_PROPOSAL_COUNT, RAW_PROPOSAL_COUNT
         ),
@@ -284,7 +465,10 @@ def _pairwise_rms(values: np.ndarray) -> np.ndarray:
 
 
 def nested_pool_selection_audit(
-    *, current_ee: np.ndarray, raw_proposals: np.ndarray
+    *,
+    current_ee: np.ndarray,
+    raw_proposals: np.ndarray,
+    source_action_normalizer: Mapping[str, Any],
 ) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
     """Freeze strict nested N4/N8 prefixes without labels or critic scores."""
 
@@ -293,7 +477,14 @@ def nested_pool_selection_audit(
         expected_count=RAW_PROPOSAL_COUNT,
         label="shared raw16 proposals",
     )
-    effects, embeddings = pool_runner.canonical_effect_embeddings(current_ee, raw)
+    effects, raw_embeddings = pool_runner.canonical_effect_embeddings(current_ee, raw)
+    mean, std, clip = validate_source_action_normalizer(source_action_normalizer)
+    embeddings = pool_runner.source_train_normalized_effect_embeddings(
+        effects,
+        action_mean=mean,
+        action_std=std,
+        normalization_clip=clip,
+    )
     n8_indices = pool_runner.greedy_farthest_point_indices(
         embeddings, retain_count=N8_CANDIDATE_COUNT
     )
@@ -310,6 +501,7 @@ def nested_pool_selection_audit(
         raise NestedCandidatePoolError("N4 is not the exact ordered prefix of N8")
     if not np.array_equal(raw[0], n4[0]) or not np.array_equal(raw[0], n8[0]):
         raise NestedCandidatePoolError("raw proposal zero identity changed")
+    raw_unscaled_distances = _pairwise_rms(raw_embeddings)
     raw_distances = _pairwise_rms(embeddings)
     n4_distances = _pairwise_rms(embeddings[n4_indices])
     n8_distances = _pairwise_rms(embeddings[n8_indices])
@@ -320,13 +512,28 @@ def nested_pool_selection_audit(
         "raw_proposal_zero_sha256": array_sha256(raw[:1]),
         "canonical_first_five_effects_sha256": array_sha256(effects),
         "canonical_effect_embedding_shape": list(embeddings.shape),
+        "canonical_effect_diversity_metric_format": (
+            pool_runner.SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT
+        ),
+        "source_action_normalizer": dict(source_action_normalizer),
+        "source_action_normalizer_logical_sha256": source_action_normalizer[
+            "logical_sha256"
+        ],
+        "normalized_clipped_effect_embeddings_sha256": array_sha256(
+            embeddings.astype(np.float32)
+        ),
         "ordered_fps_raw_indices_n8": n8_indices,
         "ordered_fps_raw_indices_n4": n4_indices,
         "n4_ordered_candidates_sha256": array_sha256(n4),
         "n8_ordered_candidates_sha256": array_sha256(n8),
         "n4_equals_n8_prefix_sha256": array_sha256(n8[:N4_CANDIDATE_COUNT]),
         "pairwise_effect_rms": {
-            "raw16": {
+            "raw16_unscaled_physical_units": {
+                "minimum": float(raw_unscaled_distances.min()),
+                "median": float(np.median(raw_unscaled_distances)),
+                "maximum": float(raw_unscaled_distances.max()),
+            },
+            "raw16_source_train_zscore_clip5": {
                 "minimum": float(raw_distances.min()),
                 "median": float(np.median(raw_distances)),
                 "maximum": float(raw_distances.max()),
@@ -353,6 +560,10 @@ def validate_nested_pool_audit(value: Mapping[str, Any]) -> None:
     unsigned = {key: item for key, item in value.items() if key != "audit_sha256"}
     n4_indices = value.get("ordered_fps_raw_indices_n4")
     n8_indices = value.get("ordered_fps_raw_indices_n8")
+    normalizer = value.get("source_action_normalizer")
+    if not isinstance(normalizer, Mapping):
+        raise NestedCandidatePoolError("nested pool audit lacks source normalizer")
+    validate_source_action_normalizer(normalizer)
     if (
         value.get("format") != NESTED_POOL_AUDIT_FORMAT
         or value.get("raw_proposal_count") != RAW_PROPOSAL_COUNT
@@ -361,6 +572,10 @@ def validate_nested_pool_audit(value: Mapping[str, Any]) -> None:
         or value.get("n4_is_exact_ordered_prefix_of_n8") is not True
         or value.get("raw_proposal_zero_is_candidate_zero_for_actor_n4_n8")
         is not True
+        or value.get("canonical_effect_diversity_metric_format")
+        != pool_runner.SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT
+        or value.get("source_action_normalizer_logical_sha256")
+        != normalizer.get("logical_sha256")
         or value.get("selection_reads_outcomes_events_labels_or_critic_scores")
         is not False
         or value.get("critic_scoring_occurs_only_after_both_pool_indices_are_frozen")
@@ -389,6 +604,7 @@ def generate_nested_pools(
     instruction: str,
     scene_seed: int,
     query_index: int,
+    source_action_normalizer: Mapping[str, Any],
     device: torch.device,
 ) -> tuple[np.ndarray, dict[int, np.ndarray], dict[str, Any]]:
     raw = pool_runner.generate_postformal_flow_candidates(
@@ -403,7 +619,9 @@ def generate_nested_pools(
         device=device,
     )
     pools, audit = nested_pool_selection_audit(
-        current_ee=collector.current_ee_action16(task), raw_proposals=raw
+        current_ee=collector.current_ee_action16(task),
+        raw_proposals=raw,
+        source_action_normalizer=source_action_normalizer,
     )
     return np.asarray(raw, dtype=np.float32), pools, audit
 
@@ -447,10 +665,17 @@ def prepare_initial_commitment(
     preprocessor: Any,
     postprocessor: Any,
     instruction: str,
+    source_action_normalizer: Mapping[str, Any],
     device: torch.device,
 ) -> dict[str, Any]:
     """Freeze query-zero raw16 and both nested pools before any arm executes."""
 
+    validate_source_action_normalizer(
+        source_action_normalizer, expected_heldout_body=body
+    )
+    source_action_normalizer_logical_sha256 = str(
+        source_action_normalizer["logical_sha256"]
+    )
     required_names = set(analytic_event.REQUIRED_OBJECTS)
     # RoboTwin seeds NumPy/Torch during setup but its Python-RNG reset is
     # disabled.  CuRobo fallback paths use Python random, so reset it here and
@@ -470,6 +695,7 @@ def prepare_initial_commitment(
             instruction=instruction,
             scene_seed=seed,
             query_index=0,
+            source_action_normalizer=source_action_normalizer,
             device=device,
         )
         after = formal.capture_reset_snapshot(task, names, objects)
@@ -497,6 +723,9 @@ def prepare_initial_commitment(
                 pools[N8_CANDIDATE_COUNT]
             ),
             "nested_pool_audit": audit,
+            "source_action_normalizer_logical_sha256": (
+                source_action_normalizer_logical_sha256
+            ),
             "reset_snapshot": reset_snapshot,
             "reset_identity_sha256": formal.reset_identity(reset_snapshot),
             "canonical_query_snapshot": canonical_snapshot,
@@ -523,8 +752,16 @@ def verify_initial_commitment(
     raw: np.ndarray,
     pools: Mapping[int, np.ndarray],
     audit: Mapping[str, Any],
+    expected_source_action_normalizer_logical_sha256: str,
 ) -> None:
     validate_nested_pool_audit(audit)
+    validate_source_action_normalizer(
+        audit["source_action_normalizer"], expected_heldout_body=body
+    )
+    if not _is_sha256(expected_source_action_normalizer_logical_sha256):
+        raise NestedCandidatePoolError(
+            "authoritative source action normalizer SHA is invalid"
+        )
     if (
         commitment.get("format") != INITIAL_COMMITMENT_FORMAT
         or commitment.get("heldout_body") != body
@@ -540,6 +777,10 @@ def verify_initial_commitment(
         or commitment.get("n8_ordered_candidates_sha256")
         != array_sha256(pools[N8_CANDIDATE_COUNT])
         or commitment.get("nested_pool_audit") != dict(audit)
+        or commitment.get("source_action_normalizer_logical_sha256")
+        != audit.get("source_action_normalizer_logical_sha256")
+        or audit.get("source_action_normalizer_logical_sha256")
+        != expected_source_action_normalizer_logical_sha256
         or commitment.get("reset_snapshot") != reset_snapshot
         or commitment.get("reset_identity_sha256")
         != formal.reset_identity(reset_snapshot)
@@ -634,12 +875,26 @@ def execute_rollout(
     ensemble: Sequence[shared_head.EffectAlignedSharedEventHead],
     calibration: Mapping[str, Any],
     initial_commitment: Mapping[str, Any],
+    source_action_normalizer: Mapping[str, Any],
     instruction: str,
     max_steps: int,
     device: torch.device,
 ) -> dict[str, Any]:
     if method not in METHODS:
         raise NestedCandidatePoolError(f"unknown nested method {method!r}")
+    validate_source_action_normalizer(
+        source_action_normalizer, expected_heldout_body=body
+    )
+    source_action_normalizer_logical_sha256 = str(
+        source_action_normalizer["logical_sha256"]
+    )
+    if (
+        initial_commitment.get("source_action_normalizer_logical_sha256")
+        != source_action_normalizer_logical_sha256
+    ):
+        raise NestedCandidatePoolError(
+            "rollout normalizer differs from its initial commitment"
+        )
     required_names = {str(calibration["moving"])}
     anchor = str(calibration.get("anchor", "")).strip()
     if anchor:
@@ -671,6 +926,7 @@ def execute_rollout(
                 instruction=instruction,
                 scene_seed=seed,
                 query_index=query_index,
+                source_action_normalizer=source_action_normalizer,
                 device=device,
             )
             after_pool_snapshot = formal.capture_reset_snapshot(task, names, objects)
@@ -691,6 +947,9 @@ def execute_rollout(
                     raw=raw,
                     pools=pools,
                     audit=audit,
+                    expected_source_action_normalizer_logical_sha256=(
+                        source_action_normalizer_logical_sha256
+                    ),
                 )
             current_event_age: float | None = None
             if method == METHOD_ACTOR:
@@ -735,6 +994,9 @@ def execute_rollout(
                     "raw_ordered_proposals_sha256": array_sha256(raw),
                     "raw_proposal_zero_sha256": array_sha256(raw[:1]),
                     "nested_pool_audit": audit,
+                    "source_action_normalizer_logical_sha256": (
+                        source_action_normalizer_logical_sha256
+                    ),
                     "selection_pool_candidate_count": len(candidates),
                     "selection_pool_raw_indices": raw_indices,
                     "selection_pool_sha256": array_sha256(candidates),
@@ -773,6 +1035,9 @@ def execute_rollout(
             "initial_candidate_commitment_sha256": initial_commitment[
                 "commitment_sha256"
             ],
+            "source_action_normalizer_logical_sha256": (
+                source_action_normalizer_logical_sha256
+            ),
             "tracked_object_names": list(names),
             "initial_object_poses": initial_poses.astype(float).tolist(),
             "initial_ee16": initial_ee.astype(float).tolist(),
@@ -799,8 +1064,16 @@ def _expected_pool_count(method: str) -> int:
 
 
 def validate_rollout(
-    rollout: Mapping[str, Any], *, method: str, expected: Mapping[str, Any]
+    rollout: Mapping[str, Any],
+    *,
+    method: str,
+    expected: Mapping[str, Any],
+    expected_source_action_normalizer_logical_sha256: str,
 ) -> None:
+    if not _is_sha256(expected_source_action_normalizer_logical_sha256):
+        raise NestedCandidatePoolError(
+            "authoritative source action normalizer SHA is invalid"
+        )
     if (
         rollout.get("method") != method
         or rollout.get("heldout_body") != expected["heldout_body"]
@@ -811,6 +1084,8 @@ def validate_rollout(
         or type(rollout.get("max_event_id")) is not int
         or not 0 <= rollout["max_event_id"] <= STAGE_DENOMINATOR
         or rollout.get("action_execution_error") is not None
+        or rollout.get("source_action_normalizer_logical_sha256")
+        != expected_source_action_normalizer_logical_sha256
     ):
         raise NestedCandidatePoolError(f"{method} rollout identity/outcome changed")
     expected_progress = (
@@ -833,6 +1108,10 @@ def validate_rollout(
         if not isinstance(audit, Mapping):
             raise NestedCandidatePoolError("decision lacks nested pool audit")
         validate_nested_pool_audit(audit)
+        validate_source_action_normalizer(
+            audit["source_action_normalizer"],
+            expected_heldout_body=str(expected["heldout_body"]),
+        )
         raw_indices = decision.get("selection_pool_raw_indices")
         expected_indices = (
             [0]
@@ -857,6 +1136,10 @@ def validate_rollout(
             or decision.get("raw_proposal_count") != RAW_PROPOSAL_COUNT
             or decision.get("raw_ordered_proposals_sha256")
             != audit.get("raw_ordered_proposals_sha256")
+            or decision.get("source_action_normalizer_logical_sha256")
+            != expected_source_action_normalizer_logical_sha256
+            or audit.get("source_action_normalizer_logical_sha256")
+            != expected_source_action_normalizer_logical_sha256
             or decision.get("selection_pool_candidate_count") != expected_count
             or raw_indices != expected_indices
             or decision.get("selection_pool_sha256") != expected_pool_sha
@@ -912,12 +1195,23 @@ def validate_rollout(
 
 
 def validate_stored_initial_commitment(
-    commitment: Mapping[str, Any], expected: Mapping[str, Any]
+    commitment: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    expected_source_action_normalizer_logical_sha256: str,
 ) -> None:
     audit = commitment.get("nested_pool_audit")
     if not isinstance(audit, Mapping):
         raise NestedCandidatePoolError("stored commitment lacks nested pool audit")
     validate_nested_pool_audit(audit)
+    validate_source_action_normalizer(
+        audit["source_action_normalizer"],
+        expected_heldout_body=str(expected["heldout_body"]),
+    )
+    if not _is_sha256(expected_source_action_normalizer_logical_sha256):
+        raise NestedCandidatePoolError(
+            "authoritative source action normalizer SHA is invalid"
+        )
     if (
         commitment.get("format") != INITIAL_COMMITMENT_FORMAT
         or commitment.get("heldout_body") != expected["heldout_body"]
@@ -926,6 +1220,10 @@ def validate_stored_initial_commitment(
         or commitment.get("resolved_seed") != expected["requested_seed"]
         or commitment.get("frozen_before_any_method_execution") is not True
         or commitment.get("candidate_generation_advanced_simulator") is not False
+        or commitment.get("source_action_normalizer_logical_sha256")
+        != audit.get("source_action_normalizer_logical_sha256")
+        or audit.get("source_action_normalizer_logical_sha256")
+        != expected_source_action_normalizer_logical_sha256
         or commitment.get("commitment_sha256")
         != canonical_sha256(_commitment_base(commitment))
         or commitment.get("reset_identity_sha256")
@@ -980,9 +1278,17 @@ def build_method_result(
     commitment_sha256: str,
     execution_contract_logical_sha256: str,
     execution_contract_file_sha256: str,
+    source_action_normalizer_logical_sha256: str,
     completed_prefix_result_sha256: Sequence[str],
 ) -> dict[str, Any]:
-    validate_rollout(rollout, method=method, expected=expected)
+    validate_rollout(
+        rollout,
+        method=method,
+        expected=expected,
+        expected_source_action_normalizer_logical_sha256=(
+            source_action_normalizer_logical_sha256
+        ),
+    )
     base = {
         "format": METHOD_RESULT_FORMAT,
         "status": "complete_create_once_no_retry",
@@ -994,6 +1300,9 @@ def build_method_result(
         "commitment_sha256": commitment_sha256,
         "execution_contract_logical_sha256": execution_contract_logical_sha256,
         "execution_contract_file_sha256": execution_contract_file_sha256,
+        "source_action_normalizer_logical_sha256": (
+            source_action_normalizer_logical_sha256
+        ),
         "completed_prefix_result_sha256": list(completed_prefix_result_sha256),
         "rollout": dict(rollout),
         "rollout_sha256": canonical_sha256(rollout),
@@ -1012,6 +1321,7 @@ def validate_method_result(
     commitment_sha256: str,
     execution_contract_logical_sha256: str,
     execution_contract_file_sha256: str,
+    source_action_normalizer_logical_sha256: str,
     completed_prefix_result_sha256: Sequence[str],
 ) -> Mapping[str, Any]:
     rollout = value.get("rollout")
@@ -1029,6 +1339,8 @@ def validate_method_result(
         != execution_contract_logical_sha256
         or value.get("execution_contract_file_sha256")
         != execution_contract_file_sha256
+        or value.get("source_action_normalizer_logical_sha256")
+        != source_action_normalizer_logical_sha256
         or value.get("completed_prefix_result_sha256")
         != list(completed_prefix_result_sha256)
         or not isinstance(rollout, Mapping)
@@ -1036,7 +1348,14 @@ def validate_method_result(
         or value.get("method_result_sha256") != canonical_sha256(unsigned)
     ):
         raise NestedCandidatePoolError("nested method result binding changed")
-    validate_rollout(rollout, method=method, expected=expected)
+    validate_rollout(
+        rollout,
+        method=method,
+        expected=expected,
+        expected_source_action_normalizer_logical_sha256=(
+            source_action_normalizer_logical_sha256
+        ),
+    )
     if rollout.get("initial_candidate_commitment_sha256") != commitment_sha256:
         raise NestedCandidatePoolError("nested method result commitment changed")
     return rollout
@@ -1049,12 +1368,34 @@ def materialize_triplet(
     commitment: Mapping[str, Any],
     attempt_sha256: str,
     execution_contract_logical_sha256: str,
+    source_action_normalizer_logical_sha256: str,
     method_result_bindings: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     if set(rollouts) != set(METHODS):
         raise NestedCandidatePoolError("triplet must contain actor, N4 and N8")
     if set(method_result_bindings) != set(METHODS):
         raise NestedCandidatePoolError("triplet lacks exact method-result bindings")
+    commitment_audit = commitment.get("nested_pool_audit")
+    if (
+        not _is_sha256(source_action_normalizer_logical_sha256)
+        or not isinstance(commitment_audit, Mapping)
+        or commitment.get("source_action_normalizer_logical_sha256")
+        != source_action_normalizer_logical_sha256
+        or commitment_audit.get("source_action_normalizer_logical_sha256")
+        != source_action_normalizer_logical_sha256
+    ):
+        raise NestedCandidatePoolError(
+            "triplet source action normalizer authority changed"
+        )
+    for method in METHODS:
+        validate_rollout(
+            rollouts[method],
+            method=method,
+            expected=expected,
+            expected_source_action_normalizer_logical_sha256=(
+                source_action_normalizer_logical_sha256
+            ),
+        )
     normalized_method_bindings = {}
     for method in METHODS:
         binding = method_result_bindings[method]
@@ -1117,6 +1458,9 @@ def materialize_triplet(
         **dict(expected),
         "attempt_sha256": attempt_sha256,
         "execution_contract_logical_sha256": execution_contract_logical_sha256,
+        "source_action_normalizer_logical_sha256": (
+            source_action_normalizer_logical_sha256
+        ),
         "initial_candidate_commitment_sha256": commitment.get(
             "commitment_sha256"
         ),
@@ -1134,10 +1478,12 @@ def validate_triplet(
     expected: Mapping[str, Any],
     *,
     execution_contract_logical_sha256: str,
+    expected_source_action_normalizer_logical_sha256: str,
     expected_method_result_bindings: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     if (
-        value.get("format") != PAIR_FORMAT
+        not _is_sha256(expected_source_action_normalizer_logical_sha256)
+        or value.get("format") != PAIR_FORMAT
         or value.get("benchmark") != BENCHMARK
         or value.get("task") != TASK
         or value.get("heldout_body") != expected["heldout_body"]
@@ -1149,6 +1495,8 @@ def validate_triplet(
         or value.get("n4_is_exact_ordered_prefix_of_n8") is not True
         or value.get("execution_contract_logical_sha256")
         != execution_contract_logical_sha256
+        or value.get("source_action_normalizer_logical_sha256")
+        != expected_source_action_normalizer_logical_sha256
         or not isinstance(value.get("method_result_bindings"), Mapping)
         or set(value["method_result_bindings"]) != set(METHODS)
         or (
@@ -1177,7 +1525,14 @@ def validate_triplet(
     if not isinstance(rollouts, Mapping) or set(rollouts) != set(METHODS):
         raise NestedCandidatePoolError("nested triplet rollout roster changed")
     for method in METHODS:
-        validate_rollout(rollouts[method], method=method, expected=expected)
+        validate_rollout(
+            rollouts[method],
+            method=method,
+            expected=expected,
+            expected_source_action_normalizer_logical_sha256=(
+                expected_source_action_normalizer_logical_sha256
+            ),
+        )
         if (
             rollouts[method].get("initial_candidate_commitment_sha256")
             != value.get("initial_candidate_commitment_sha256")
@@ -1198,6 +1553,7 @@ def recover_complete_existing_triplet(
     attempt: Mapping[str, Any],
     execution_contract_logical_sha256: str,
     execution_contract_file_sha256: str,
+    source_action_normalizer_logical_sha256: str,
 ) -> dict[str, Any] | None:
     """Recover a complete pair without executing or repairing a missing method."""
 
@@ -1225,7 +1581,13 @@ def recover_complete_existing_triplet(
         raise NestedCandidatePoolError(
             "existing nested triplet lacks its initial commitment"
         )
-    validate_stored_initial_commitment(commitment, expected)
+    validate_stored_initial_commitment(
+        commitment,
+        expected,
+        expected_source_action_normalizer_logical_sha256=(
+            source_action_normalizer_logical_sha256
+        ),
+    )
     promote_create_once_json(
         commitment_path, commitment, label="nested initial commitment"
     )
@@ -1289,6 +1651,9 @@ def recover_complete_existing_triplet(
                 execution_contract_logical_sha256
             ),
             execution_contract_file_sha256=execution_contract_file_sha256,
+            source_action_normalizer_logical_sha256=(
+                source_action_normalizer_logical_sha256
+            ),
             completed_prefix_result_sha256=prefix_result_shas,
         )
         result_file_sha = promote_create_once_json(
@@ -1308,6 +1673,9 @@ def recover_complete_existing_triplet(
         commitment=commitment,
         attempt_sha256=attempt_sha,
         execution_contract_logical_sha256=execution_contract_logical_sha256,
+        source_action_normalizer_logical_sha256=(
+            source_action_normalizer_logical_sha256
+        ),
         method_result_bindings=method_result_bindings,
     )
     if dict(existing_pair) != computed_pair:
@@ -1318,6 +1686,9 @@ def recover_complete_existing_triplet(
         existing_pair,
         expected,
         execution_contract_logical_sha256=execution_contract_logical_sha256,
+        expected_source_action_normalizer_logical_sha256=(
+            source_action_normalizer_logical_sha256
+        ),
         expected_method_result_bindings=method_result_bindings,
     )
     promote_create_once_json(pair_path, existing_pair, label="nested triplet")
@@ -1684,6 +2055,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     fold_paths = formal.parse_fold_specs(args.lobo_fold)
     folds = {body: formal.inspect_fold(body, fold_paths[body]) for body in BODIES}
+    fold_action_normalizers = {
+        body: inspect_fold_source_action_normalizer(folds[body]) for body in BODIES
+    }
     fold_training_regime = formal.inspect_fold_training_regime(
         folds,
         required_supplement_binding_sha256=args.required_supplement_binding_sha256,
@@ -1766,6 +2140,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vlm_metadata_file_count": vlm_file_count,
         "vlm_metadata_size_bytes": vlm_size,
         "folds": folds,
+        "source_train_action_normalizer_by_heldout_body": (
+            fold_action_normalizers
+        ),
         "fold_training_regime": fold_training_regime,
         "candidate_rank_ensemble_contracts": {
             "nested_n4": shared_head.risk_adjusted_rank_ensemble_contract(),
@@ -1877,6 +2254,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for expected in schedule:
         body = str(expected["heldout_body"])
+        source_action_normalizer_logical_sha256 = str(
+            fold_action_normalizers[body]["logical_sha256"]
+        )
         identity = pair_id(body, expected["condition"], expected["requested_seed"])
         pair_path = pairs_dir / f"{identity}.json"
         attempt_path = attempts_dir / f"{identity}.json"
@@ -1912,6 +2292,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             attempt=attempt,
             execution_contract_logical_sha256=contract["logical_sha256"],
             execution_contract_file_sha256=contract_file_sha,
+            source_action_normalizer_logical_sha256=(
+                source_action_normalizer_logical_sha256
+            ),
         )
         if pair is not None:
             record_completed_pair(
@@ -1923,6 +2306,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             gc.collect()
             torch.cuda.empty_cache()
             ensemble = formal.load_ensemble(folds[body], device)
+            validate_runtime_ensemble_action_normalizer(
+                ensemble, fold_action_normalizers[body]
+            )
             active_body = body
         promote_create_once_json(
             attempt_path, attempt, label="nested triplet attempt"
@@ -1946,9 +2332,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                     instruction=args.instruction,
+                    source_action_normalizer=fold_action_normalizers[body],
                     device=device,
                 )
-            validate_stored_initial_commitment(commitment, expected)
+            validate_stored_initial_commitment(
+                commitment,
+                expected,
+                expected_source_action_normalizer_logical_sha256=(
+                    source_action_normalizer_logical_sha256
+                ),
+            )
             promote_create_once_json(
                 commitment_path,
                 commitment,
@@ -2061,6 +2454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             ensemble=ensemble,
                             calibration=calibration,
                             initial_commitment=commitment,
+                            source_action_normalizer=fold_action_normalizers[body],
                             instruction=args.instruction,
                             max_steps=args.max_steps,
                             device=device,
@@ -2079,6 +2473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 "logical_sha256"
                             ],
                             execution_contract_file_sha256=contract_file_sha,
+                            source_action_normalizer_logical_sha256=(
+                                source_action_normalizer_logical_sha256
+                            ),
                             completed_prefix_result_sha256=prefix_result_shas,
                         )
                         promote_create_once_json(
@@ -2124,6 +2521,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     commitment_sha256=commitment_sha,
                     execution_contract_logical_sha256=contract["logical_sha256"],
                     execution_contract_file_sha256=contract_file_sha,
+                    source_action_normalizer_logical_sha256=(
+                        source_action_normalizer_logical_sha256
+                    ),
                     completed_prefix_result_sha256=prefix_result_shas,
                 )
                 result_file_sha = promote_create_once_json(
@@ -2142,6 +2542,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 commitment=commitment,
                 attempt_sha256=attempt_sha,
                 execution_contract_logical_sha256=contract["logical_sha256"],
+                source_action_normalizer_logical_sha256=(
+                    source_action_normalizer_logical_sha256
+                ),
                 method_result_bindings=method_result_bindings,
             )
             pair_existing, pair_staged = read_create_once_json(
@@ -2158,6 +2561,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pair,
                 expected,
                 execution_contract_logical_sha256=contract["logical_sha256"],
+                expected_source_action_normalizer_logical_sha256=(
+                    source_action_normalizer_logical_sha256
+                ),
                 expected_method_result_bindings=method_result_bindings,
             )
             promote_create_once_json(pair_path, pair, label="nested triplet")
@@ -2245,12 +2651,14 @@ __all__ = [
     "N8_CANDIDATE_COUNT",
     "NestedCandidatePoolError",
     "RAW_PROPOSAL_COUNT",
+    "SOURCE_ACTION_NORMALIZER_FORMAT",
     "build_outcome_document",
     "build_report",
     "build_method_result",
     "build_method_start",
     "evaluation_schedule",
     "existing_separate_n4_n8_comparability_audit",
+    "inspect_fold_source_action_normalizer",
     "materialize_triplet",
     "nested_pool_contract",
     "nested_evaluation_protocol",
@@ -2262,4 +2670,6 @@ __all__ = [
     "validate_complete_outcome_rows",
     "validate_nested_pool_audit",
     "validate_method_result",
+    "validate_runtime_ensemble_action_normalizer",
+    "validate_source_action_normalizer",
 ]

@@ -200,7 +200,9 @@ DENSE_ONLY_RANK_WEIGHT = 1.0
 SEMANTIC_COMPARATIVE_GRADIENT_BUDGET = 0.1
 SEMANTIC_GRADIENT_SCALE_CAP = 1.0
 TERMINAL_FILM_MODULATION_BOUND = 0.1
-DENSE_RANK_LABEL_EQUALITY_TOLERANCE = 1e-6
+EVENT_UTILITY_RESIDUAL_BOUND = 1.0
+EVENT_PRIORITY_SECONDARY_SCALE = 0.05
+DENSE_RANK_LABEL_EQUALITY_TOLERANCE = 1e-4
 MINIMUM_COMPARATIVE_VALIDATION_SEED_CLUSTERS = 10
 MINIMUM_COMPARATIVE_VALIDATION_REQUESTED_SEEDS = 2
 MINIMUM_COMPARATIVE_VALIDATION_BODY_CONDITION_UNITS = 4
@@ -512,10 +514,31 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "direct_transitioned_or_clock_hidden_rank_path": False,
         "rank_inputs_are_detached_consequence_predictions": variant != "success_only",
         "rank_utility": (
-            "bounded_invariant_monotone_benefit_softmax_minus_uncertainty_risk"
+            "bounded_invariant_monotone_global_plus_canonical_event_residual_utility"
             if variant != "success_only"
             else "coherent_bounded_terminal_success_probability"
         ),
+        "utility_conditioning": (
+            "canonical_current_event_global_logits_plus_bounded_event_residual"
+            if variant != "success_only"
+            else "coherent_success_probability_only"
+        ),
+        "event_utility_residual_bound": (
+            EVENT_UTILITY_RESIDUAL_BOUND if variant != "success_only" else 0.0
+        ),
+        "event_priority_primary": (
+            "terminal_expected_stage_progress"
+            if variant != "success_only"
+            else "terminal_eK_probability"
+        ),
+        "event_priority_secondary_scale": (
+            EVENT_PRIORITY_SECONDARY_SCALE if variant != "success_only" else 0.0
+        ),
+        "deterministic_one_event_step_dominates_all_secondary_features": (
+            variant != "success_only"
+        ),
+        "strict_lexicographic_for_arbitrary_expected_stage_difference": False,
+        "body_conditioned_utility_parameters": False,
         "raw_world_frame_object_axes_in_rank_input": False,
         "cross_feature_layer_normalization": False,
         "cross_body_input_normalization": (
@@ -526,6 +549,9 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "goal_progress_definition": (
             "norm(state_relative_goal_xyz)-norm(state_relative_goal_xyz-"
             "predicted_object_translation_mean)"
+        ),
+        "goal_progress_benefit_transform": (
+            "0.5_times_one_plus_softsign_progress_over_0.02m"
         ),
         "goal_progress_uncertainty_definition": (
             "delta_method_radial_std_from_student_t3_object_translation_scale_"
@@ -552,6 +578,22 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             if variant in {"success_only", "no_object_effect"}
             else DENSE_GOAL_PROGRESS_TEMPERATURE_METERS
         ),
+        "dense_goal_progress_target_transform": (
+            "disabled"
+            if variant in {"success_only", "no_object_effect"}
+            else (
+                "uniform_if_max_event_goal_spread_lte_1e-4_else_"
+                "softmax_of_0.5_times_one_plus_softsign_progress_over_0.02m"
+            )
+        ),
+        "dense_goal_progress_prediction_transform": (
+            "disabled"
+            if variant in {"success_only", "no_object_effect"}
+            else (
+                "0.5_times_one_plus_softsign_predicted_progress_over_0.02m"
+            )
+        ),
+        "dense_goal_progress_unbounded_logits": False,
         "proper_and_rank_batches_are_separate": True,
         "mixed_rank_bootstrap": "one_plus_poisson",
         "dense_rank_bootstrap": "poisson",
@@ -690,6 +732,15 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "dense_goal_progress_temperature_meters": checkpoint[
             "dense_goal_progress_temperature_meters"
         ],
+        "dense_goal_progress_target_transform": checkpoint[
+            "dense_goal_progress_target_transform"
+        ],
+        "dense_goal_progress_prediction_transform": checkpoint[
+            "dense_goal_progress_prediction_transform"
+        ],
+        "dense_goal_progress_unbounded_logits": checkpoint[
+            "dense_goal_progress_unbounded_logits"
+        ],
         "proper_and_rank_batches_are_separate": True,
         "mixed_rank_bootstrap": "one_plus_poisson",
         "dense_rank_bootstrap": "poisson",
@@ -697,6 +748,23 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "rank_ensemble_aggregation": risk_adjusted_rank_ensemble_contract(),
         "utility_rank_loss_updates_clock_or_duration_heads": checkpoint[
             "utility_rank_loss_updates_clock_or_duration_heads"
+        ],
+        "utility_conditioning": checkpoint["utility_conditioning"],
+        "event_utility_residual_bound": checkpoint[
+            "event_utility_residual_bound"
+        ],
+        "event_priority_primary": checkpoint["event_priority_primary"],
+        "event_priority_secondary_scale": checkpoint[
+            "event_priority_secondary_scale"
+        ],
+        "deterministic_one_event_step_dominates_all_secondary_features": checkpoint[
+            "deterministic_one_event_step_dominates_all_secondary_features"
+        ],
+        "strict_lexicographic_for_arbitrary_expected_stage_difference": checkpoint[
+            "strict_lexicographic_for_arbitrary_expected_stage_difference"
+        ],
+        "body_conditioned_utility_parameters": checkpoint[
+            "body_conditioned_utility_parameters"
         ],
         "utility_rank_loss_updates_semantic_action_transition": checkpoint[
             "utility_rank_loss_updates_semantic_action_transition"
@@ -755,6 +823,9 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ],
         "feature_schema": checkpoint["feature_schema"],
         "goal_progress_definition": checkpoint["goal_progress_definition"],
+        "goal_progress_benefit_transform": checkpoint[
+            "goal_progress_benefit_transform"
+        ],
         "goal_progress_uncertainty_definition": checkpoint[
             "goal_progress_uncertainty_definition"
         ],
@@ -2730,9 +2801,11 @@ class MacroBalancedRankDecisionBatchSampler:
 class InvariantMonotoneConsequenceUtility(torch.nn.Module):
     """Signed utility over bounded, cross-embodiment consequences.
 
-    Benefits have non-negative softmax weights and uncertainties have
-    non-positive bounded coefficients.  There is no cross-feature LayerNorm,
-    raw world-frame object axis, or unconstrained sign-flipping MLP.
+    Terminal event progress is the primary value.  Benefits have non-negative
+    softmax weights and uncertainties have non-positive bounded coefficients in
+    a small tie-break term.  Canonical-current-event residuals are shared across
+    bodies.  There is no cross-feature LayerNorm, raw world-frame object axis,
+    or unconstrained sign-flipping MLP.
     """
 
     def __init__(self) -> None:
@@ -2748,6 +2821,12 @@ class InvariantMonotoneConsequenceUtility(torch.nn.Module):
         self.risk_logits = torch.nn.Parameter(
             torch.full((len(MONOTONE_RISK_FEATURES),), -2.0)
         )
+        self.event_benefit_residual = torch.nn.Parameter(
+            torch.zeros(len(core.CANONICAL_EVENTS), len(MONOTONE_BENEFIT_FEATURES))
+        )
+        self.event_risk_residual = torch.nn.Parameter(
+            torch.zeros(len(core.CANONICAL_EVENTS), len(MONOTONE_RISK_FEATURES))
+        )
 
     @staticmethod
     def _indices(names: Sequence[str]) -> list[int]:
@@ -2761,9 +2840,32 @@ class InvariantMonotoneConsequenceUtility(torch.nn.Module):
             indices.append(start)
         return indices
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, features: torch.Tensor, current_event_id: torch.Tensor
+    ) -> torch.Tensor:
         if features.ndim != 2 or features.shape[-1] != CANDIDATE_RANK_FEATURE_DIM:
             raise FiveBodyContractError("monotone utility feature shape changed")
+        if (
+            not isinstance(current_event_id, torch.Tensor)
+            or current_event_id.shape != features.shape[:1]
+            or current_event_id.dtype
+            not in {
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            }
+            or bool(
+                (
+                    (current_event_id < 0)
+                    | (current_event_id >= len(core.CANONICAL_EVENTS))
+                ).any()
+            )
+        ):
+            raise FiveBodyContractError(
+                "monotone utility requires one canonical current event per row"
+            )
         if not bool(torch.isfinite(features).all()) or bool(
             ((features < 0.0) | (features > 1.0)).any()
         ):
@@ -2772,11 +2874,32 @@ class InvariantMonotoneConsequenceUtility(torch.nn.Module):
             )
         benefit = features[:, self._indices(MONOTONE_BENEFIT_FEATURES)]
         risk = features[:, self._indices(MONOTONE_RISK_FEATURES)]
-        benefit_weights = torch.softmax(self.benefit_logits, dim=0)
-        risk_weights = torch.sigmoid(self.risk_logits)
-        return (benefit * benefit_weights).sum(dim=-1) - (
+        event = current_event_id.long()
+        benefit_residual = EVENT_UTILITY_RESIDUAL_BOUND * torch.tanh(
+            self.event_benefit_residual[event]
+        )
+        risk_residual = EVENT_UTILITY_RESIDUAL_BOUND * torch.tanh(
+            self.event_risk_residual[event]
+        )
+        benefit_weights = torch.softmax(
+            self.benefit_logits[None] + benefit_residual, dim=-1
+        )
+        risk_weights = torch.sigmoid(self.risk_logits[None] + risk_residual)
+        secondary = (benefit * benefit_weights).sum(dim=-1) - (
             risk * risk_weights
         ).sum(dim=-1)
+        terminal_stage_index = CANDIDATE_RANK_FEATURE_SCHEMA[
+            "terminal_expected_stage_progress"
+        ][0]
+        # ``secondary`` is strictly bounded to (-2, 1): benefits are a convex
+        # combination of [0, 1] values and the two risks each have coefficients
+        # in (0, 1).  At scale 0.05 its entire possible reversal is < 0.15, so a
+        # deterministic canonical one-event step (0.25) remains absolute while
+        # the learned consequences can still break event ties.
+        return (
+            features[:, terminal_stage_index]
+            + EVENT_PRIORITY_SECONDARY_SCALE * secondary
+        )
 
 
 class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
@@ -3034,11 +3157,8 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             regression_probability.squeeze(-1)
             - joint_recovery_probability.squeeze(-1)
         ).clamp(0.0, 1.0)
-        short_goal_benefit = 0.5 * (
-            torch.tanh(
-                predicted_goal_progress / GOAL_PROGRESS_NORMALIZATION_METERS
-            )
-            + 1.0
+        short_goal_benefit = _goal_progress_benefit_value(
+            predicted_goal_progress
         )
         short_goal_risk = (
             predicted_goal_progress_uncertainty
@@ -3050,11 +3170,8 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         terminal_expected_stage = (
             terminal_event_probability * normalized_event_level
         ).sum(dim=-1)
-        terminal_goal_benefit = 0.5 * (
-            torch.tanh(
-                terminal_goal_progress_mean / GOAL_PROGRESS_NORMALIZATION_METERS
-            )
-            + 1.0
+        terminal_goal_benefit = _goal_progress_benefit_value(
+            terminal_goal_progress_mean
         )
         terminal_goal_risk = (
             terminal_goal_progress_std
@@ -3096,7 +3213,9 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         if self.ablation_variant == "success_only":
             candidate_rank_logit = success_probability
         else:
-            candidate_rank_logit = self.candidate_rank(rank_features)
+            candidate_rank_logit = self.candidate_rank(
+                rank_features, batch["current_event_id"]
+            )
             if candidate_rank_logit.shape == (len(rank_features), 1):
                 candidate_rank_logit = candidate_rank_logit[:, 0]
         if candidate_rank_logit.shape != output["success_logit"].shape:
@@ -3764,6 +3883,21 @@ def _dense_rank_components(
 DENSE_GOAL_PROGRESS_TEMPERATURE_METERS = 0.02
 
 
+def _goal_progress_benefit_value(progress: torch.Tensor) -> torch.Tensor:
+    """Map metric progress to the single deployed [0, 1] benefit geometry."""
+
+    if not isinstance(progress, torch.Tensor) or not bool(
+        torch.isfinite(progress).all()
+    ):
+        raise FiveBodyContractError("dense goal progress contains non-finite values")
+    return 0.5 * (
+        torch.nn.functional.softsign(
+            progress / DENSE_GOAL_PROGRESS_TEMPERATURE_METERS
+        )
+        + 1.0
+    )
+
+
 def _dense_soft_target_distribution(
     terminal_event_level: torch.Tensor,
     terminal_goal_progress: torch.Tensor,
@@ -3785,15 +3919,19 @@ def _dense_soft_target_distribution(
     if not bool(maximum_mask.any()):
         raise FiveBodyContractError("dense soft target selected no event level")
     target = torch.zeros_like(terminal_goal_progress)
-    if ablation_variant == "no_object_effect":
+    maximum_goal_progress = terminal_goal_progress[maximum_mask]
+    if (
+        ablation_variant == "no_object_effect"
+        or float(maximum_goal_progress.max() - maximum_goal_progress.min())
+        <= DENSE_RANK_LABEL_EQUALITY_TOLERANCE
+    ):
         preferred = torch.full_like(
-            terminal_goal_progress[maximum_mask],
+            maximum_goal_progress,
             1.0 / int(maximum_mask.sum()),
         )
     else:
         preferred = torch.softmax(
-            terminal_goal_progress[maximum_mask]
-            / DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
+            _goal_progress_benefit_value(maximum_goal_progress),
             dim=0,
         )
     target[maximum_mask] = preferred
@@ -3811,9 +3949,12 @@ def _dense_soft_listwise_loss(
 
     Event level remains lexicographically absolute: target probability is zero
     outside the maximum terminal-event level.  Within that level, the public
-    analytic near-goal scale (0.02 m) is the frozen softmax temperature.  This
-    avoids turning replay/numerical micrometre differences into a hard one-hot
-    label.  ``no_object_effect`` uses a uniform target over the maximum level.
+    analytic near-goal scale (0.02 m) defines the same bounded [0, 1] softsign
+    benefit coordinate used at deployment before softmax.  Spreads at or below
+    the frozen 1e-4 equality tolerance stay uniform.  This avoids allowing
+    numerical noise or an anomalous metric displacement to turn the target into
+    a hard one-hot label.  ``no_object_effect`` uses a uniform target over the
+    maximum level.
     """
 
     if ablation_variant not in ABLATION_VARIANTS:
@@ -3848,7 +3989,10 @@ def _lexicographic_compare_values(
     if len(left) != len(right) or not left:
         raise FiveBodyContractError("dense lexicographic values have incompatible shapes")
     for left_value, right_value in zip(left, right):
-        if abs(float(left_value) - float(right_value)) <= 1e-6:
+        if (
+            abs(float(left_value) - float(right_value))
+            <= DENSE_RANK_LABEL_EQUALITY_TOLERANCE
+        ):
             continue
         return 1 if float(left_value) > float(right_value) else -1
     return 0
@@ -4344,12 +4488,11 @@ def _semantic_comparative_loss(
             > DENSE_RANK_LABEL_EQUALITY_TOLERANCE
         ):
             target = torch.softmax(
-                goal_label[preferred] / DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
+                _goal_progress_benefit_value(goal_label[preferred]),
                 dim=0,
             )
-            predicted = (
+            predicted = _goal_progress_benefit_value(
                 output["terminal_goal_progress_mean"][selected][preferred]
-                / DENSE_GOAL_PROGRESS_TEMPERATURE_METERS
             )
             goal_group_loss = -(
                 target * torch.log_softmax(predicted, dim=0)
@@ -6851,7 +6994,9 @@ __all__ = [
     "CompleteDecisionBatchSampler", "MacroBalancedRankDecisionBatchSampler",
     "DENSE_FAILURE_RANK_WEIGHT", "DENSE_ONLY_RANK_WEIGHT",
     "DENSE_GOAL_PROGRESS_TEMPERATURE_METERS",
+    "DENSE_RANK_LABEL_EQUALITY_TOLERANCE",
     "EPISTEMIC_RANK_RISK_WEIGHT", "GOAL_PROGRESS_NORMALIZATION_METERS",
+    "EVENT_PRIORITY_SECONDARY_SCALE", "EVENT_UTILITY_RESIDUAL_BOUND",
     "CONDITIONS", "FORMAT",
     "EffectAlignedSharedEventHead", "FiveBodyContractError",
     "InvariantMonotoneConsequenceUtility", "MANIFEST_FORMAT",

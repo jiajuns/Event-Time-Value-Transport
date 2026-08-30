@@ -82,6 +82,9 @@ TRAINING_SEEN_INSTRUCTION = (
 TRAINING_SEEN_INSTRUCTION_SHA256 = hashlib.sha256(
     TRAINING_SEEN_INSTRUCTION.encode("utf-8")
 ).hexdigest()
+SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT = (
+    "etsf_source_train_normalized_canonical_effect_diversity_v1"
+)
 
 
 class PostformalCandidatePoolError(RuntimeError):
@@ -297,7 +300,7 @@ def generate_postformal_flow_candidates(
 def canonical_effect_embeddings(
     current_ee: np.ndarray, proposals: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return first-five canonical effects and their flattened FPS vectors."""
+    """Return first-five canonical effects and their raw flattened vectors."""
 
     current = np.asarray(current_ee, dtype=np.float32)
     if current.shape != (NATIVE_EE_DIM,) or not np.isfinite(current).all():
@@ -320,6 +323,48 @@ def canonical_effect_embeddings(
     if not np.isfinite(embeddings).all():
         raise PostformalCandidatePoolError("canonical effect embedding is non-finite")
     return effects, embeddings
+
+
+def source_train_normalized_effect_embeddings(
+    effects: np.ndarray,
+    *,
+    action_mean: np.ndarray,
+    action_std: np.ndarray,
+    normalization_clip: float,
+) -> np.ndarray:
+    """Replay the shared head's source-train-only action input geometry."""
+
+    value = np.asarray(effects, dtype=np.float32)
+    mean = np.asarray(action_mean, dtype=np.float32)
+    std = np.asarray(action_std, dtype=np.float32)
+    if (
+        value.ndim != 3
+        or value.shape[0] < 2
+        or value.shape[1] != ACTION_EXEC_STEPS
+        or value.shape[2] != collector.CANONICAL_ACTION_DIM
+        or not np.isfinite(value).all()
+        or mean.shape != (collector.CANONICAL_ACTION_DIM,)
+        or std.shape != (collector.CANONICAL_ACTION_DIM,)
+        or not np.isfinite(mean).all()
+        or not np.isfinite(std).all()
+        or np.any(std < 1e-4)
+        or not math.isfinite(float(normalization_clip))
+        or float(normalization_clip) <= 0.0
+    ):
+        raise PostformalCandidatePoolError(
+            "source-normalized diversity inputs are invalid"
+        )
+    normalized = np.clip(
+        (value - mean[None, None, :]) / std[None, None, :],
+        -float(normalization_clip),
+        float(normalization_clip),
+    )
+    embeddings = normalized.reshape(len(value), -1).astype(np.float64)
+    if not np.isfinite(embeddings).all():
+        raise PostformalCandidatePoolError(
+            "source-normalized canonical effect embedding is non-finite"
+        )
+    return embeddings
 
 
 def greedy_farthest_point_indices(
@@ -1893,6 +1938,7 @@ __all__ = [
     "FORMAT",
     "PAIR_FORMAT",
     "PostformalCandidatePoolError",
+    "SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT",
     "aggregate_risk_adjusted_rank_scores",
     "build_outcome_document",
     "build_report",
@@ -1908,4 +1954,5 @@ __all__ = [
     "runtime_rank_ensemble_contract",
     "score_candidates",
     "select_candidate",
+    "source_train_normalized_effect_embeddings",
 ]

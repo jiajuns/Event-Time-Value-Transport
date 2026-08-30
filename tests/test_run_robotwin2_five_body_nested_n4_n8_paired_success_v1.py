@@ -45,9 +45,36 @@ def _raw16() -> np.ndarray:
     return np.stack(rows).astype(np.float32)
 
 
-def _nested() -> tuple[dict[int, np.ndarray], dict[str, object]]:
+def _normalizer(
+    body: str | None = None, *, first_dimension_std: float = 1.0
+) -> dict[str, object]:
+    action_std = [1.0] * runner.collector.CANONICAL_ACTION_DIM
+    action_std[0] = first_dimension_std
+    base = {
+        "format": runner.SOURCE_ACTION_NORMALIZER_FORMAT,
+        "heldout_body": body or runner.BODIES[0],
+        "canonical_action_schema": runner.collector.ACTION_SCHEMA,
+        "normalization_fit_scope": "four_source_bodies_train_only",
+        "heldout_rows_used": 0,
+        "checkpoint_action_normalization_sha256": "a" * 64,
+        "action_mean": [0.0] * runner.collector.CANONICAL_ACTION_DIM,
+        "action_std": action_std,
+        "normalization_clip": float(
+            runner.shared_head.CROSS_BODY_STANDARDIZED_INPUT_CLIP
+        ),
+        "five_member_normalizers_bit_exact_equal": True,
+        "selection_reads_heldout_labels_outcomes_or_critic_scores": False,
+    }
+    return {**base, "logical_sha256": runner.canonical_sha256(base)}
+
+
+def _nested(
+    normalizer: dict[str, object] | None = None,
+) -> tuple[dict[int, np.ndarray], dict[str, object]]:
     return runner.nested_pool_selection_audit(
-        current_ee=_current(), raw_proposals=_raw16()
+        current_ee=_current(),
+        raw_proposals=_raw16(),
+        source_action_normalizer=normalizer or _normalizer(),
     )
 
 
@@ -73,6 +100,11 @@ def test_raw16_blind_fps_produces_exact_nested_prefix_and_candidate_zero() -> No
     assert audit[
         "selection_reads_outcomes_events_labels_or_critic_scores"
     ] is False
+    assert audit["format"].endswith("audit_v2")
+    assert audit["source_action_normalizer"] == _normalizer()
+    assert audit["source_action_normalizer_logical_sha256"] == _normalizer()[
+        "logical_sha256"
+    ]
     runner.validate_nested_pool_audit(audit)
 
     tampered = copy.deepcopy(audit)
@@ -84,6 +116,194 @@ def test_raw16_blind_fps_produces_exact_nested_prefix_and_candidate_zero() -> No
     )
     with pytest.raises(runner.NestedCandidatePoolError):
         runner.validate_nested_pool_audit(tampered)
+
+
+def test_source_normalized_fps_reverses_raw_unit_dominance_toward_translation() -> None:
+    effects = np.zeros((16, runner.ACTION_EXEC_STEPS, 14), dtype=np.float32)
+    # Raw physical units prefer one-radian rotation over two-centimetre motion.
+    effects[1, :, 3] = 1.0
+    effects[2, :, 0] = 0.02
+    for index in range(3, 16):
+        effects[index, :, 13] = 0.001 * index
+    raw_embeddings = effects.reshape(16, -1)
+    raw_indices = runner.pool_runner.greedy_farthest_point_indices(
+        raw_embeddings, retain_count=2
+    )
+    assert raw_indices == [0, 1]
+
+    std = np.ones(14, dtype=np.float32)
+    std[0] = 0.005
+    normalized = runner.pool_runner.source_train_normalized_effect_embeddings(
+        effects,
+        action_mean=np.zeros(14, dtype=np.float32),
+        action_std=std,
+        normalization_clip=float(
+            runner.shared_head.CROSS_BODY_STANDARDIZED_INPUT_CLIP
+        ),
+    )
+    normalized_indices = runner.pool_runner.greedy_farthest_point_indices(
+        normalized, retain_count=2
+    )
+    assert normalized_indices == [0, 2]
+    assert effects[normalized_indices[1], :, 0].mean() == pytest.approx(0.02)
+
+
+def test_fold_fails_closed_when_one_member_normalizer_differs(
+    tmp_path: Path,
+) -> None:
+    def write_checkpoint(path: Path, std0: float) -> None:
+        mean = np.zeros(14, dtype=np.float32)
+        std = np.ones(14, dtype=np.float32)
+        std[0] = std0
+        normalization_base = {
+            "format": "etsf_five_body_canonical_train_only_normalization_v2",
+            "canonical_action_schema": runner.collector.ACTION_SCHEMA,
+            "canonical_action_schema_id": 0,
+            "schema": {
+                "mean": mean.astype(float).tolist(),
+                "std": std.astype(float).tolist(),
+            },
+            "heldout_rows_used": 0,
+        }
+        normalization = {
+            **normalization_base,
+            "sha256": runner.canonical_sha256(normalization_base),
+        }
+        torch.save(
+            {
+                "action_normalization": normalization,
+                "model": {
+                    "action.action_mean": torch.from_numpy(mean[None]),
+                    "action.action_std": torch.from_numpy(std[None]),
+                },
+            },
+            path,
+        )
+
+    members = []
+    for member in range(5):
+        path = tmp_path / f"member-{member}.pt"
+        write_checkpoint(path, 1.0)
+        members.append({"member": member, "checkpoint": str(path)})
+    fold = {"heldout_body": runner.BODIES[0], "members": members}
+    binding = runner.inspect_fold_source_action_normalizer(fold)
+    assert binding["five_member_normalizers_bit_exact_equal"] is True
+    assert binding["heldout_rows_used"] == 0
+    runner.validate_source_action_normalizer(
+        binding, expected_heldout_body=runner.BODIES[0]
+    )
+
+    write_checkpoint(Path(members[-1]["checkpoint"]), 2.0)
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="five bootstrap members",
+    ):
+        runner.inspect_fold_source_action_normalizer(fold)
+
+
+def test_audit_and_commitment_normalizer_sha_tampering_fails_closed() -> None:
+    _pools, audit = _nested()
+    changed_audit = copy.deepcopy(audit)
+    changed_audit["source_action_normalizer"][
+        "checkpoint_action_normalization_sha256"
+    ] = "b" * 64
+    with pytest.raises(runner.NestedCandidatePoolError):
+        runner.validate_nested_pool_audit(changed_audit)
+
+    expected = runner.evaluation_schedule()[0]
+    reset = {"format": "etsf_robotwin2_observable_reset_snapshot_v2", "kind": "reset"}
+    canonical = {
+        "format": "etsf_robotwin2_observable_reset_snapshot_v2",
+        "kind": "canonical",
+    }
+    commitment_base = {
+        "format": runner.INITIAL_COMMITMENT_FORMAT,
+        "heldout_body": expected["heldout_body"],
+        "condition": expected["condition"],
+        "requested_seed": expected["requested_seed"],
+        "resolved_seed": expected["requested_seed"],
+        "nested_pool_audit": audit,
+        "source_action_normalizer_logical_sha256": audit[
+            "source_action_normalizer_logical_sha256"
+        ],
+        "reset_snapshot": reset,
+        "reset_identity_sha256": runner.formal.reset_identity(reset),
+        "canonical_query_snapshot": canonical,
+        "canonical_query_identity_sha256": runner.formal.reset_identity(canonical),
+        "candidate_generation_advanced_simulator": False,
+        "frozen_before_any_method_execution": True,
+    }
+    commitment = {
+        **commitment_base,
+        "commitment_sha256": runner.canonical_sha256(commitment_base),
+    }
+    authority_sha = str(audit["source_action_normalizer_logical_sha256"])
+    runner.validate_stored_initial_commitment(
+        commitment,
+        expected,
+        expected_source_action_normalizer_logical_sha256=authority_sha,
+    )
+    changed_commitment = copy.deepcopy(commitment)
+    changed_commitment["source_action_normalizer_logical_sha256"] = "c" * 64
+    changed_commitment["commitment_sha256"] = runner.canonical_sha256(
+        {
+            key: value
+            for key, value in changed_commitment.items()
+            if key != "commitment_sha256"
+        }
+    )
+    with pytest.raises(runner.NestedCandidatePoolError):
+        runner.validate_stored_initial_commitment(
+            changed_commitment,
+            expected,
+            expected_source_action_normalizer_logical_sha256=authority_sha,
+        )
+
+
+def test_self_consistent_replacement_commitment_normalizer_is_rejected() -> None:
+    expected = runner.evaluation_schedule()[0]
+    _pools, authoritative_audit = _nested()
+    _changed_pools, changed_audit = _nested(
+        _normalizer(first_dimension_std=2.0)
+    )
+    reset = {"format": "etsf_robotwin2_observable_reset_snapshot_v2", "kind": "reset"}
+    canonical = {
+        "format": "etsf_robotwin2_observable_reset_snapshot_v2",
+        "kind": "canonical",
+    }
+    replacement_base = {
+        "format": runner.INITIAL_COMMITMENT_FORMAT,
+        "heldout_body": expected["heldout_body"],
+        "condition": expected["condition"],
+        "requested_seed": expected["requested_seed"],
+        "resolved_seed": expected["requested_seed"],
+        "nested_pool_audit": changed_audit,
+        "source_action_normalizer_logical_sha256": changed_audit[
+            "source_action_normalizer_logical_sha256"
+        ],
+        "reset_snapshot": reset,
+        "reset_identity_sha256": runner.formal.reset_identity(reset),
+        "canonical_query_snapshot": canonical,
+        "canonical_query_identity_sha256": runner.formal.reset_identity(canonical),
+        "candidate_generation_advanced_simulator": False,
+        "frozen_before_any_method_execution": True,
+    }
+    replacement = {
+        **replacement_base,
+        "commitment_sha256": runner.canonical_sha256(replacement_base),
+    }
+    runner.validate_nested_pool_audit(changed_audit)
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="stored initial commitment changed",
+    ):
+        runner.validate_stored_initial_commitment(
+            replacement,
+            expected,
+            expected_source_action_normalizer_logical_sha256=str(
+                authoritative_audit["source_action_normalizer_logical_sha256"]
+            ),
+        )
 
 
 def test_schedule_uses_same_complete_seed_roster_and_rotates_three_arms() -> None:
@@ -162,8 +382,13 @@ def test_overall_interval_clusters_all_ten_cells_by_requested_seed() -> None:
     assert summary["mcnemar_contract"]["role"] == "descriptive_only"
 
 
-def _decision(method: str) -> dict[str, object]:
-    pools, audit = _nested()
+def _decision(
+    method: str,
+    *,
+    query_index: int = 0,
+    normalizer: dict[str, object] | None = None,
+) -> dict[str, object]:
+    pools, audit = _nested(normalizer)
     if method == runner.METHOD_ACTOR:
         candidates = _raw16()[:1]
         indices = [0]
@@ -201,11 +426,14 @@ def _decision(method: str) -> dict[str, object]:
             "selected_candidate_index": selected,
         }
     return {
-        "query_index": 0,
+        "query_index": query_index,
         "raw_proposal_count": runner.RAW_PROPOSAL_COUNT,
         "raw_ordered_proposals_sha256": audit["raw_ordered_proposals_sha256"],
         "raw_proposal_zero_sha256": audit["raw_proposal_zero_sha256"],
         "nested_pool_audit": audit,
+        "source_action_normalizer_logical_sha256": audit[
+            "source_action_normalizer_logical_sha256"
+        ],
         "selection_pool_candidate_count": len(candidates),
         "selection_pool_raw_indices": indices,
         "selection_pool_sha256": runner.array_sha256(candidates),
@@ -217,6 +445,7 @@ def _decision(method: str) -> dict[str, object]:
 
 
 def _rollout(method: str, commitment_sha: str) -> dict[str, object]:
+    source_action_normalizer_logical_sha256 = str(_normalizer()["logical_sha256"])
     return {
         "method": method,
         "heldout_body": runner.BODIES[0],
@@ -225,6 +454,9 @@ def _rollout(method: str, commitment_sha: str) -> dict[str, object]:
         "initial_reset_snapshot": {"format": "reset", "seed": runner.SEED_BASE},
         "initial_canonical_query_snapshot": {"format": "canonical", "step": 1},
         "initial_candidate_commitment_sha256": commitment_sha,
+        "source_action_normalizer_logical_sha256": (
+            source_action_normalizer_logical_sha256
+        ),
         "binary_success": 1 if method == runner.METHOD_N8 else 0,
         "stage_progress": 1.0 if method == runner.METHOD_N8 else 0.5,
         "max_event_id": 4 if method == runner.METHOD_N8 else 2,
@@ -242,6 +474,9 @@ def test_triplet_materialization_requires_one_reset_and_initial_raw16() -> None:
         "canonical_query_snapshot": {"format": "canonical", "step": 1},
         "raw_ordered_proposals_sha256": audit["raw_ordered_proposals_sha256"],
         "nested_pool_audit": audit,
+        "source_action_normalizer_logical_sha256": audit[
+            "source_action_normalizer_logical_sha256"
+        ],
     }
     expected = runner.evaluation_schedule()[0]
     rollouts = {
@@ -254,6 +489,9 @@ def test_triplet_materialization_requires_one_reset_and_initial_raw16() -> None:
         commitment=commitment,
         attempt_sha256="a" * 64,
         execution_contract_logical_sha256="b" * 64,
+        source_action_normalizer_logical_sha256=str(
+            audit["source_action_normalizer_logical_sha256"]
+        ),
         method_result_bindings={
             method: {
                 "logical_sha256": f"{index + 1:x}" * 64,
@@ -277,6 +515,9 @@ def test_triplet_materialization_requires_one_reset_and_initial_raw16() -> None:
             commitment=commitment,
             attempt_sha256="a" * 64,
             execution_contract_logical_sha256="b" * 64,
+            source_action_normalizer_logical_sha256=str(
+                audit["source_action_normalizer_logical_sha256"]
+            ),
             method_result_bindings={
                 method: {
                     "logical_sha256": f"{index + 1:x}" * 64,
@@ -291,10 +532,41 @@ def test_rollout_validator_replays_n4_and_n8_selection_without_new_gate() -> Non
     expected = runner.evaluation_schedule()[0]
     for method in runner.METHODS:
         rollout = _rollout(method, "c" * 64)
-        runner.validate_rollout(rollout, method=method, expected=expected)
+        runner.validate_rollout(
+            rollout,
+            method=method,
+            expected=expected,
+            expected_source_action_normalizer_logical_sha256=str(
+                _normalizer()["logical_sha256"]
+            ),
+        )
     assert runner.nested_pool_contract()[
         "additional_authorization_or_confidence_gate"
     ] is False
+
+
+def test_query_after_zero_cannot_switch_to_another_self_consistent_normalizer() -> None:
+    expected = runner.evaluation_schedule()[0]
+    authority_sha = str(_normalizer()["logical_sha256"])
+    rollout = _rollout(runner.METHOD_N4, "c" * 64)
+    rollout["decisions"].append(
+        _decision(
+            runner.METHOD_N4,
+            query_index=1,
+            normalizer=_normalizer(first_dimension_std=2.0),
+        )
+    )
+    rollout["policy_query_count"] = 2
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="nested decision changed",
+    ):
+        runner.validate_rollout(
+            rollout,
+            method=runner.METHOD_N4,
+            expected=expected,
+            expected_source_action_normalizer_logical_sha256=authority_sha,
+        )
 
 
 def test_method_result_is_create_once_and_replay_validated(tmp_path: Path) -> None:
@@ -319,6 +591,9 @@ def test_method_result_is_create_once_and_replay_validated(tmp_path: Path) -> No
         commitment_sha256="c" * 64,
         execution_contract_logical_sha256="b" * 64,
         execution_contract_file_sha256="d" * 64,
+        source_action_normalizer_logical_sha256=str(
+            _normalizer()["logical_sha256"]
+        ),
         completed_prefix_result_sha256=[],
     )
     path = tmp_path / "result.json"
@@ -340,6 +615,9 @@ def test_method_result_is_create_once_and_replay_validated(tmp_path: Path) -> No
         commitment_sha256="c" * 64,
         execution_contract_logical_sha256="b" * 64,
         execution_contract_file_sha256="d" * 64,
+        source_action_normalizer_logical_sha256=str(
+            _normalizer()["logical_sha256"]
+        ),
         completed_prefix_result_sha256=[],
     )
     assert rollout["method"] == method
@@ -389,6 +667,9 @@ def _persist_complete_triplet(
         "requested_seed": expected["requested_seed"],
         "resolved_seed": expected["requested_seed"],
         "nested_pool_audit": audit,
+        "source_action_normalizer_logical_sha256": audit[
+            "source_action_normalizer_logical_sha256"
+        ],
         "raw_ordered_proposals_sha256": audit["raw_ordered_proposals_sha256"],
         "reset_snapshot": reset_snapshot,
         "reset_identity_sha256": runner.formal.reset_identity(reset_snapshot),
@@ -447,6 +728,9 @@ def _persist_complete_triplet(
             commitment_sha256=commitment["commitment_sha256"],
             execution_contract_logical_sha256=logical_contract_sha,
             execution_contract_file_sha256=file_contract_sha,
+            source_action_normalizer_logical_sha256=str(
+                audit["source_action_normalizer_logical_sha256"]
+            ),
             completed_prefix_result_sha256=prefix_result_shas,
         )
         result_path = paths["method_results_dir"] / f"{stem}.json"
@@ -466,6 +750,9 @@ def _persist_complete_triplet(
         commitment=commitment,
         attempt_sha256=attempt["attempt_sha256"],
         execution_contract_logical_sha256=logical_contract_sha,
+        source_action_normalizer_logical_sha256=str(
+            audit["source_action_normalizer_logical_sha256"]
+        ),
         method_result_bindings=bindings,
     )
     if tamper_embedded_actor_outcome:
@@ -481,6 +768,9 @@ def _persist_complete_triplet(
         "attempt": attempt,
         "execution_contract_logical_sha256": logical_contract_sha,
         "execution_contract_file_sha256": file_contract_sha,
+        "source_action_normalizer_logical_sha256": str(
+            audit["source_action_normalizer_logical_sha256"]
+        ),
     }
     return context, pair, paths
 
