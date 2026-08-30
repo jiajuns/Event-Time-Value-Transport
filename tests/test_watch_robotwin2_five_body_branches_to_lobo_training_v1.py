@@ -121,6 +121,110 @@ def _pairwise(actions: np.ndarray) -> np.ndarray:
     return np.sqrt(np.mean(np.square(first - second), axis=(2, 3))).astype(np.float32)
 
 
+def _rewrite_npz(
+    path: Path,
+    *,
+    remove: str | None = None,
+    extra: tuple[str, np.ndarray] | None = None,
+    **overrides: np.ndarray,
+) -> None:
+    with np.load(path, allow_pickle=False) as payload:
+        arrays = {
+            name: np.asarray(payload[name])
+            for name in payload.files
+            if name != remove
+        }
+    arrays.update(overrides)
+    if extra is not None:
+        arrays[extra[0]] = extra[1]
+    np.savez(path, **arrays)
+
+
+def test_decision_npz_requires_exact_float64_height_authority(
+    tmp_path: Path,
+) -> None:
+    core_path = tmp_path / "group.npz"
+    _core(core_path)
+
+    result = watcher.validate_decision_npz(
+        core_path, watcher.sha256_file(core_path)
+    )
+
+    assert result["candidate_count"] == 4
+    assert "success_height_reference_z" in watcher.REQUIRED_ARRAYS
+    assert watcher.FLOAT64_ARRAYS == {"success_height_reference_z"}
+    assert "success_height_reference_z" not in watcher.FLOAT_ARRAYS
+
+    _rewrite_npz(core_path, remove="success_height_reference_z")
+    with pytest.raises(watcher.LoboWatcherError, match="NPZ member set mismatch"):
+        watcher.validate_decision_npz(core_path, watcher.sha256_file(core_path))
+
+    _core(core_path)
+    _rewrite_npz(
+        core_path,
+        extra=("unexpected_float64", np.zeros(4, dtype=np.float64)),
+    )
+    with pytest.raises(watcher.LoboWatcherError, match="NPZ member set mismatch"):
+        watcher.validate_decision_npz(core_path, watcher.sha256_file(core_path))
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement"),
+    [
+        ("success_height_reference_z", np.full(4, 0.75, dtype=np.float32)),
+        ("state", np.zeros((4, 27), dtype=np.float64)),
+    ],
+)
+def test_decision_npz_rejects_wrong_or_unapproved_float64_dtype(
+    tmp_path: Path,
+    name: str,
+    replacement: np.ndarray,
+) -> None:
+    core_path = tmp_path / "group.npz"
+    _core(core_path)
+    _rewrite_npz(core_path, **{name: replacement})
+
+    with pytest.raises(watcher.LoboWatcherError, match=rf"{name} dtype mismatch"):
+        watcher.validate_decision_npz(core_path, watcher.sha256_file(core_path))
+
+
+def test_decision_npz_rejects_height_authority_wrong_shape(tmp_path: Path) -> None:
+    core_path = tmp_path / "group.npz"
+    _core(core_path)
+    _rewrite_npz(
+        core_path,
+        success_height_reference_z=np.full(5, 0.75, dtype=np.float64),
+    )
+
+    with pytest.raises(
+        watcher.LoboWatcherError,
+        match=r"success_height_reference_z shape mismatch",
+    ):
+        watcher.validate_decision_npz(core_path, watcher.sha256_file(core_path))
+
+
+@pytest.mark.parametrize(
+    "height_reference",
+    [
+        np.asarray([0.75, 0.75, 0.76, 0.75], dtype=np.float64),
+        np.asarray([0.75, 0.75, np.nan, 0.75], dtype=np.float64),
+    ],
+)
+def test_decision_npz_rejects_nonconstant_or_nonfinite_height_authority(
+    tmp_path: Path,
+    height_reference: np.ndarray,
+) -> None:
+    core_path = tmp_path / "group.npz"
+    _core(core_path)
+    _rewrite_npz(core_path, success_height_reference_z=height_reference)
+
+    with pytest.raises(
+        watcher.LoboWatcherError,
+        match=r"do not share one finite task\.orig_z authority",
+    ):
+        watcher.validate_decision_npz(core_path, watcher.sha256_file(core_path))
+
+
 def test_progress_rejects_legacy_manifest_before_waiting_for_completion(
     tmp_path: Path,
 ) -> None:

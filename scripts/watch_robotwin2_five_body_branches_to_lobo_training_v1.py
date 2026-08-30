@@ -244,6 +244,7 @@ REQUIRED_ARRAYS = {
     "candidate_index",
     "event_age_seconds",
     "remaining_action_budget",
+    "success_height_reference_z",
     "dt",
 }
 FLOAT_ARRAYS = {
@@ -269,6 +270,7 @@ FLOAT_ARRAYS = {
     "remaining_action_budget",
     "dt",
 }
+FLOAT64_ARRAYS = {"success_height_reference_z"}
 INTEGER_ARRAYS = {
     "current_event_id", "post_event_id", "next_event_id",
     "terminal_max_event_id", "terminal_stop_reason_id", "candidate_index"
@@ -1008,10 +1010,16 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                     allowed = {"|b1"}
                 elif name in FLOAT_ARRAYS:
                     allowed = {"<f4", "=f4"}
+                elif name in FLOAT64_ARRAYS:
+                    allowed = {"<f8", "=f8"}
                 else:
                     allowed = {"<i8", "=i8"}
                 if (
-                    name not in FLOAT_ARRAYS | INTEGER_ARRAYS | {"action_mask"}
+                    name
+                    not in FLOAT_ARRAYS
+                    | FLOAT64_ARRAYS
+                    | INTEGER_ARRAYS
+                    | {"action_mask"}
                     or header["descr"] not in allowed
                 ):
                     raise LoboWatcherError(f"decision {name} dtype mismatch: {path}")
@@ -1072,6 +1080,31 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
             ]:
                 raise LoboWatcherError(
                     f"decision remaining budget is outside the formal query grid: {path}"
+                )
+            with archive.open("success_height_reference_z.npy") as stream:
+                header = read_npy_header(
+                    stream, f"{path}:success_height_reference_z"
+                )
+                byte_order = "<" if header["descr"] == "<f8" else "="
+                height_reference = struct.unpack(
+                    byte_order + "4d",
+                    _read_exact(
+                        stream,
+                        CANDIDATE_COUNT * 8,
+                        "success_height_reference_z",
+                    ),
+                )
+                if stream.read(1):
+                    raise LoboWatcherError(
+                        "decision success height reference contains trailing bytes: "
+                        f"{path}"
+                    )
+            if any(not math.isfinite(value) for value in height_reference) or any(
+                value != height_reference[0] for value in height_reference[1:]
+            ):
+                raise LoboWatcherError(
+                    "decision candidates do not share one finite task.orig_z "
+                    f"authority: {path}"
                 )
             with archive.open("actions.npy") as stream:
                 header = read_npy_header(stream, f"{path}:actions")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import signal
@@ -103,6 +104,28 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         poll_seconds=30.0,
         expected_gpu_uuid=watcher.EXPECTED_GPU_UUID,
     )
+
+
+def _signed(value: dict[str, object]) -> dict[str, object]:
+    unsigned = dict(value)
+    unsigned.pop("logical_sha256", None)
+    return {
+        **unsigned,
+        "logical_sha256": watcher.canonical_sha256(unsigned),
+    }
+
+
+def _module_constant(path: Path, name: str) -> object:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in statement.targets
+        ):
+            return ast.literal_eval(statement.value)
+    raise AssertionError(f"missing constant {name} in {path}")
 
 
 def test_commands_bind_complete_supplement_and_nested_candidate_study(
@@ -270,6 +293,8 @@ def test_supplement_completion_is_exact_design_not_just_group_count(
         )
     value = {
         "format": watcher.SUPPLEMENT_MANIFEST_FORMAT,
+        "collector_format": watcher.SUPPLEMENT_COLLECTOR_FORMAT,
+        "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
         "body": "franka",
         "conditions": list(watcher.CONDITIONS),
         "collection_status": "complete",
@@ -281,17 +306,124 @@ def test_supplement_completion_is_exact_design_not_just_group_count(
         "groups": groups,
         "attempts": attempts,
     }
-    value["logical_sha256"] = watcher.canonical_sha256(value)
+    value = _signed(value)
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(value), encoding="utf-8")
     assert watcher.supplement_manifest_complete(path, "franka") is True
 
+    for incompatible in (
+        {
+            **value,
+            "format": (
+                "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
+            ),
+        },
+        {
+            **value,
+            "collector_format": (
+                "etsf_robotwin2_scripted_expert_root_actor_branches_v2"
+            ),
+        },
+        {
+            key: item
+            for key, item in value.items()
+            if key != "state_action_frame_contract"
+        },
+    ):
+        path.write_text(json.dumps(_signed(incompatible)), encoding="utf-8")
+        assert watcher.supplement_manifest_complete(path, "franka") is False
+
     value["groups"][-1]["scripted_root_event"] = "e3"
-    unsigned = dict(value)
-    unsigned.pop("logical_sha256")
-    value["logical_sha256"] = watcher.canonical_sha256(unsigned)
+    value = _signed(value)
     path.write_text(json.dumps(value), encoding="utf-8")
     assert watcher.supplement_manifest_complete(path, "franka") is False
+
+
+def test_supplement_binding_requires_v3_endpose_frame_chain() -> None:
+    value = _signed(
+        {
+            "format": watcher.SUPPLEMENT_BINDING_FORMAT,
+            "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
+            "materializer_provenance": {
+                "format": watcher.SUPPLEMENT_MATERIALIZER_FORMAT,
+                "complete_decisions": watcher.EXPECTED_SUPPLEMENT_DECISIONS,
+                "complete_branches": watcher.EXPECTED_SUPPLEMENT_BRANCHES,
+            },
+        }
+    )
+    watcher.validate_supplement_binding(value)
+
+    old_binding = _signed(
+        {
+            **value,
+            "format": (
+                "etsf_robotwin2_five_body_proper_world_utility_rank_"
+                "supplement_binding_v2"
+            ),
+        }
+    )
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="v3 end-pose-frame"):
+        watcher.validate_supplement_binding(old_binding)
+
+    old_materializer = _signed(
+        {
+            **value,
+            "materializer_provenance": {
+                **value["materializer_provenance"],
+                "format": (
+                    "etsf_robotwin2_scripted_expert_root_supplement_binding_"
+                    "materializer_v2"
+                ),
+            },
+        }
+    )
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="v3 end-pose-frame"):
+        watcher.validate_supplement_binding(old_materializer)
+
+    missing_frame = _signed(
+        {
+            key: item
+            for key, item in value.items()
+            if key != "state_action_frame_contract"
+        }
+    )
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="v3 end-pose-frame"):
+        watcher.validate_supplement_binding(missing_frame)
+
+
+def test_supplement_formats_match_current_trainer_materializer_contract() -> None:
+    trainer_path = SCRIPTS / "train_robotwin2_five_body_lobo_shared_event_head_v1.py"
+    collector_path = (
+        SCRIPTS / "collect_robotwin2_scripted_expert_root_actor_branches_v1.py"
+    )
+    materializer_path = (
+        SCRIPTS
+        / "materialize_robotwin2_scripted_expert_root_supplement_binding_v1.py"
+    )
+    assert watcher.SUPPLEMENT_MANIFEST_FORMAT == _module_constant(
+        trainer_path, "SUPPLEMENT_MANIFEST_FORMAT"
+    )
+    assert watcher.SUPPLEMENT_BINDING_FORMAT == _module_constant(
+        trainer_path, "SUPPLEMENT_BINDING_FORMAT"
+    )
+    assert watcher.SUPPLEMENT_COLLECTOR_FORMAT == _module_constant(
+        trainer_path, "SUPPLEMENT_COLLECTOR_FORMAT"
+    )
+    assert watcher.SUPPLEMENT_MATERIALIZER_FORMAT == _module_constant(
+        trainer_path, "SUPPLEMENT_MATERIALIZER_FORMAT"
+    )
+    assert watcher.STATE_ACTION_FRAME_CONTRACT == _module_constant(
+        trainer_path, "STATE_ACTION_FRAME_CONTRACT"
+    )
+    assert watcher.SUPPLEMENT_MANIFEST_FORMAT == _module_constant(
+        collector_path, "MANIFEST_FORMAT"
+    )
+    assert watcher.SUPPLEMENT_COLLECTOR_FORMAT == _module_constant(
+        collector_path, "FORMAT"
+    )
+    assert watcher.SUPPLEMENT_MATERIALIZER_FORMAT == _module_constant(
+        materializer_path, "FORMAT"
+    )
 
 
 def test_reserve_rosters_are_body_local_and_disjoint() -> None:

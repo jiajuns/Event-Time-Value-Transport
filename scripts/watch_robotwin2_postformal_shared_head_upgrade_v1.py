@@ -41,11 +41,30 @@ RECOVERABLE_INTERRUPTION_SIGNALS = frozenset(
 )
 UPSTREAM_FORMAT = "etsf_robotwin2_five_body_postformal_ablation_watcher_v1"
 SUPPLEMENT_MANIFEST_FORMAT = (
-    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v3_endpose_frame"
 )
 SUPPLEMENT_BINDING_FORMAT = (
-    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v2"
+    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v3_endpose_frame"
 )
+SUPPLEMENT_COLLECTOR_FORMAT = (
+    "etsf_robotwin2_scripted_expert_root_actor_branches_v3_endpose_frame"
+)
+SUPPLEMENT_MATERIALIZER_FORMAT = (
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v3_endpose_frame"
+)
+STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
+    "training_state_source": "public_hdf5_endpose_left_right_endpose",
+    "runtime_state_api": "task.get_arm_pose(left/right)",
+    "runtime_state_pose_semantics": "robot.get_*_ee_pose(is_endpose=False)",
+    "native_action_pose_semantics": (
+        "same_absolute_world_ee_frame_as_training_endpose"
+    ),
+    "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "pose_convention": "xyz_plus_quaternion_wxyz",
+    "tcp_tool_axis_offset_m_excluded": 0.12,
+    "state_and_action_same_frame": True,
+}
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 TARGET_EVENTS = ("e12", "e3", "e4")
@@ -564,6 +583,9 @@ def supplement_manifest_complete(path: Path, body: str) -> bool:
     roster = supplement_reserve_roster(body)
     if (
         value.get("format") != SUPPLEMENT_MANIFEST_FORMAT
+        or value.get("collector_format") != SUPPLEMENT_COLLECTOR_FORMAT
+        or value.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or value.get("body") != body
         or value.get("conditions") != list(CONDITIONS)
         or value.get("collection_status") != "complete"
@@ -641,6 +663,27 @@ def supplement_manifest_complete(path: Path, body: str) -> bool:
             for event in TARGET_EVENTS
         )
     return design == expected and consumed_attempts == set(attempt_by_id)
+
+
+def validate_supplement_binding(value: Mapping[str, Any]) -> None:
+    """Require the exact trainer-compatible v3 end-pose supplement binding."""
+
+    verify_logical_sha(value, "supplement binding")
+    materializer = value.get("materializer_provenance")
+    if (
+        value.get("format") != SUPPLEMENT_BINDING_FORMAT
+        or value.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
+        or not isinstance(materializer, Mapping)
+        or materializer.get("format") != SUPPLEMENT_MATERIALIZER_FORMAT
+        or materializer.get("complete_decisions")
+        != EXPECTED_SUPPLEMENT_DECISIONS
+        or materializer.get("complete_branches")
+        != EXPECTED_SUPPLEMENT_BRANCHES
+    ):
+        raise SharedHeadUpgradeError(
+            "supplement binding is not the complete v3 end-pose-frame 150/600 design"
+        )
 
 
 def gpu_compute_pids(expected_uuid: str) -> list[int]:
@@ -1189,15 +1232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         environment=environment,
     )
     binding = read_json(args.supplement_binding, "supplement binding")
-    verify_logical_sha(binding, "supplement binding")
-    if (
-        binding.get("format") != SUPPLEMENT_BINDING_FORMAT
-        or binding.get("materializer_provenance", {}).get("complete_decisions")
-        != EXPECTED_SUPPLEMENT_DECISIONS
-        or binding.get("materializer_provenance", {}).get("complete_branches")
-        != EXPECTED_SUPPLEMENT_BRANCHES
-    ):
-        raise SharedHeadUpgradeError("supplement binding is not the complete 150/600 design")
+    validate_supplement_binding(binding)
     supplement_sha256 = sha256_file(args.supplement_binding)
 
     run_stage(
@@ -1352,6 +1387,7 @@ __all__ = [
     "supplement_collector_command",
     "supplement_manifest_complete",
     "supplement_reserve_roster",
+    "validate_supplement_binding",
     "validate_nested_completion",
     "validate_upstream_state",
 ]
