@@ -104,6 +104,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     sha256_file,
     sha256_tree,
     source_group_split,
+    standardized_input_clip_diagnostics,
     supplement_group_bootstrap_weights,
     supplement_reserve_attempt_id,
     supplement_reserve_group_id,
@@ -120,6 +121,38 @@ def _signed(value: dict[str, object]) -> dict[str, object]:
     result = dict(value)
     result["logical_sha256"] = canonical_sha256(result)
     return result
+
+
+def test_standardized_input_clip_diagnostics_reports_tail_collisions() -> None:
+    rows = []
+    for candidate, value in enumerate((10.0, 11.0, -10.0, 0.0)):
+        state = np.zeros(core.STATE_DIM, dtype=np.float32)
+        state[0] = 10.0
+        rows.append(
+            {
+                "body": BODIES[0],
+                "logical_group": f"{BODIES[0]}|clean|clip-audit",
+                "candidate_index": np.int64(candidate),
+                "state": state,
+                "actions": np.full(
+                    (2, core.ACTION_DIM), value, dtype=np.float32
+                ),
+                "action_mask": np.ones(2, dtype=bool),
+            }
+        )
+    result = standardized_input_clip_diagnostics(
+        rows,
+        state_mean=np.zeros(core.STATE_DIM),
+        state_std=np.ones(core.STATE_DIM),
+        action_mean=np.zeros((1, core.ACTION_DIM)),
+        action_std=np.ones((1, core.ACTION_DIM)),
+    )
+    overall = result["overall"]
+    assert overall["state_continuous_clip_fraction"] == pytest.approx(1.0 / 18.0)
+    assert overall["action_valid_clip_fraction"] == pytest.approx(0.75)
+    assert overall["candidate_standardized_distinct_pair_count"] == 6
+    assert overall["candidate_pair_collision_count_after_clip"] == 1
+    assert set(result["by_body"]) == {BODIES[0]}
 
 
 def _write_json(path: Path, value: dict[str, object]) -> str:
@@ -1549,11 +1582,18 @@ def _fixed_terminal_metrics(
                 (nonterminal, probability.unsqueeze(-1)), dim=-1
             )
             zero = probability.new_zeros(count)
+            event_logits = probability.new_full((count, 5), -4.0)
+            event_logits[:, 0] = 0.0
             return {
+                "post_event_logits": event_logits,
+                "next_event_logits": event_logits,
+                "duration_selected_log_mean": zero,
+                "duration_selected_log_scale": zero,
                 "terminal_event_logits": terminal_probability.log(),
                 "terminal_goal_progress_mean": zero,
                 "terminal_goal_progress_log_scale": zero,
                 "success_logit": torch.logit(probability),
+                "recovery_logit": zero,
                 "regression_probability": zero,
                 "joint_recovery_probability": zero,
             }
@@ -1570,8 +1610,15 @@ def _fixed_terminal_metrics(
         ),
         "post_event_id": torch.zeros(count, dtype=torch.long),
         "post_event_mask": torch.ones(count),
+        "next_event_id": torch.zeros(count, dtype=torch.long),
+        "next_event_mask": torch.ones(count),
+        "duration": torch.ones(count),
+        "duration_observed": torch.ones(count),
+        "duration_mask": torch.ones(count),
         "current_event_id": torch.zeros(count, dtype=torch.long),
         "recovery": torch.zeros(count),
+        "recovery_mask": torch.zeros(count),
+        "action_available": torch.ones(count),
         "requested_seed": torch.tensor(
             [seed for _group, seed, _probability in group_specs]
         ).repeat_interleave(4),
@@ -1658,6 +1705,9 @@ def test_no_object_effect_strict_evaluation_does_not_require_goal_labels() -> No
     strict = metrics["strict_proper"]
     assert np.isfinite(strict["macro_score"])
     assert set(strict["components"]) == {
+        "post_event_nll",
+        "next_event_nll",
+        "duration_censored_lognormal_nll",
         "success_nll",
         "terminal_event_nll",
         "terminal_event_ordinal_rps",
@@ -1803,10 +1853,11 @@ def test_rank_features_are_only_explicit_predicted_consequences() -> None:
     )
     assert torch.allclose(
         block("short_goal_progress_uncertainty_risk")[:, 0],
-        torch.tanh(
+        output["predicted_goal_progress_uncertainty"]
+        / (
             output["predicted_goal_progress_uncertainty"]
-            / GOAL_PROGRESS_NORMALIZATION_METERS
-        ).clamp(0.0, 1.0),
+            + GOAL_PROGRESS_NORMALIZATION_METERS
+        ),
     )
     assert torch.allclose(
         block("terminal_expected_stage_progress")[:, 0],
@@ -1825,10 +1876,11 @@ def test_rank_features_are_only_explicit_predicted_consequences() -> None:
     )
     assert torch.allclose(
         block("terminal_goal_progress_uncertainty_risk")[:, 0],
-        torch.tanh(
+        output["terminal_goal_progress_std"]
+        / (
             output["terminal_goal_progress_std"]
-            / GOAL_PROGRESS_NORMALIZATION_METERS
-        ).clamp(0.0, 1.0),
+            + GOAL_PROGRESS_NORMALIZATION_METERS
+        ),
     )
     assert bool(((features >= 0.0) & (features <= 1.0)).all())
 
@@ -2501,7 +2553,7 @@ class _FixedRankModel(torch.nn.Module):
 
 def _ranking_rows() -> list[dict[str, object]]:
     rows = []
-    for group, success, terminal, goal_progress in (
+    for requested_seed, (group, success, terminal, goal_progress) in enumerate((
         (
             "piper|clean|mixed",
             [0, 1, 0, 0],
@@ -2520,11 +2572,12 @@ def _ranking_rows() -> list[dict[str, object]]:
             [2, 2, 2, 2],
             [0.1, 0.1, 0.1, 0.1],
         ),
-    ):
+    ), start=101):
         for candidate in range(4):
             rows.append(
                 {
                     "logical_group": group,
+                    "requested_seed": np.int64(requested_seed),
                     "body": "piper",
                     "candidate_index": np.int64(candidate),
                     "success": np.float32(success[candidate]),
@@ -2567,6 +2620,45 @@ def test_ranking_evaluation_separates_success_change_from_dense_progress() -> No
     assert success_only["dense_progress_pairwise_accuracy"] is None
 
 
+def test_ranking_selection_metrics_are_requested_seed_balanced() -> None:
+    template = _ranking_rows()[:4]
+    rows = []
+    for replicate in range(5):
+        for candidate, source in enumerate(template):
+            rows.append(
+                {
+                    **source,
+                    "logical_group": f"piper|clean|seed101-good-{replicate}",
+                    "requested_seed": np.int64(101),
+                    "success": np.float32(candidate == 1),
+                }
+            )
+    for candidate, source in enumerate(template):
+        rows.append(
+            {
+                **source,
+                "logical_group": "piper|clean|seed102-bad",
+                "requested_seed": np.int64(102),
+                "success": np.float32(candidate == 0),
+            }
+        )
+    loader = torch.utils.data.DataLoader(
+        core.TransitionDataset(rows, {"piper": 0}),
+        batch_size=8,
+        shuffle=False,
+        collate_fn=core.collate_rows,
+    )
+    result = evaluate_candidate_ranking(
+        _FixedRankModel("full"), loader, torch.device("cpu")
+    )
+    assert result["mixed_success_decisions"] == 6
+    assert result["comparative_validation_seed_clusters"] == 2
+    assert result["comparative_validation_requested_seeds"] == 2
+    assert result["macro_one_deviation_branch_success_gain"] == pytest.approx(0.0)
+    assert result["macro_mixed_success_selection_accuracy"] == pytest.approx(0.5)
+    assert result["macro_mixed_success_pairwise_accuracy"] == pytest.approx(0.5)
+
+
 def test_checkpoint_selection_prefers_mixed_success_before_dense_diagnostics() -> None:
     base = {
         "macro_one_deviation_branch_success_gain": 0.1,
@@ -2594,13 +2686,13 @@ def test_checkpoint_selection_uses_dense_evidence_when_mixed_is_absent() -> None
         "macro_one_deviation_branch_success_gain": 0.0,
         "macro_mixed_success_selection_accuracy": None,
         "macro_mixed_success_pairwise_accuracy": None,
-        "macro_dense_progress_selection_accuracy": 0.5,
-        "macro_dense_progress_pairwise_accuracy": 0.5,
+        "macro_dense_soft_target_probability_selected": 0.2,
+        "macro_dense_soft_target_weighted_pairwise_accuracy": 0.5,
     }
     strong_dense = {
         **weak_dense,
-        "macro_dense_progress_selection_accuracy": 0.8,
-        "macro_dense_progress_pairwise_accuracy": 0.7,
+        "macro_dense_soft_target_probability_selected": 0.4,
+        "macro_dense_soft_target_weighted_pairwise_accuracy": 0.7,
     }
     assert candidate_checkpoint_selection_key(
         strong_dense, 100.0, 3000
@@ -2615,8 +2707,12 @@ def test_calibration_guard_selects_rank_only_inside_proper_one_se_set() -> None:
             "conservative_strict_proper_standard_error": 0.1,
             "selection_key": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100),
             "ensemble_candidate_ranking": {
-                "mixed_success_decisions": 1,
+                "mixed_success_decisions": 10,
                 "dense_progress_decisions": 0,
+                "comparative_validation_seed_clusters": 10,
+                "comparative_validation_requested_seeds": 2,
+                "comparative_validation_body_condition_units": 4,
+                "comparative_validation_bodies": 2,
             },
         },
         {
@@ -2625,8 +2721,12 @@ def test_calibration_guard_selects_rank_only_inside_proper_one_se_set() -> None:
             "conservative_strict_proper_standard_error": 0.9,
             "selection_key": (-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 200),
             "ensemble_candidate_ranking": {
-                "mixed_success_decisions": 1,
+                "mixed_success_decisions": 10,
                 "dense_progress_decisions": 0,
+                "comparative_validation_seed_clusters": 10,
+                "comparative_validation_requested_seeds": 2,
+                "comparative_validation_body_condition_units": 4,
+                "comparative_validation_bodies": 2,
             },
         },
         {
@@ -2635,8 +2735,12 @@ def test_calibration_guard_selects_rank_only_inside_proper_one_se_set() -> None:
             "conservative_strict_proper_standard_error": 0.9,
             "selection_key": (-10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 300),
             "ensemble_candidate_ranking": {
-                "mixed_success_decisions": 1,
+                "mixed_success_decisions": 10,
                 "dense_progress_decisions": 0,
+                "comparative_validation_seed_clusters": 10,
+                "comparative_validation_requested_seeds": 2,
+                "comparative_validation_body_condition_units": 4,
+                "comparative_validation_bodies": 2,
             },
         },
     ]
@@ -2659,6 +2763,10 @@ def test_calibration_guard_without_comparative_evidence_uses_strict_proper_step(
             "ensemble_candidate_ranking": {
                 "mixed_success_decisions": 0,
                 "dense_progress_decisions": 0,
+                "comparative_validation_seed_clusters": 0,
+                "comparative_validation_requested_seeds": 0,
+                "comparative_validation_body_condition_units": 0,
+                "comparative_validation_bodies": 0,
             },
         }
         for step, score, rank_key in (
@@ -2674,11 +2782,29 @@ def test_calibration_guard_without_comparative_evidence_uses_strict_proper_step(
     assert audit["selected_score"] == pytest.approx(1.0)
 
 
+def test_reported_selection_mode_matches_comparative_authorization() -> None:
+    sparse = {"mixed_success_decisions": 1, "dense_progress_decisions": 0}
+    assert trainer_entry.checkpoint_selection_evidence_mode(
+        sparse, comparative_authorized=False
+    ) == "strict_proper_no_comparative_evidence"
+    assert trainer_entry.checkpoint_selection_evidence_mode(
+        sparse, comparative_authorized=True
+    ) == "mixed_success_then_dense_progress"
+    dense = {"mixed_success_decisions": 0, "dense_progress_decisions": 20}
+    assert trainer_entry.checkpoint_selection_evidence_mode(
+        dense, comparative_authorized=True
+    ) == "dense_progress_without_mixed_success"
+
+
 def _checkpoint_selection_record(
     step: int,
     *,
-    mixed_support: int = 1,
-    dense_support: int = 2,
+    mixed_support: int = 10,
+    dense_support: int = 10,
+    seed_cluster_support: int = 10,
+    requested_seed_support: int = 2,
+    body_condition_support: int = 6,
+    body_support: int = 4,
 ) -> dict[str, object]:
     return {
         "step": step,
@@ -2688,6 +2814,10 @@ def _checkpoint_selection_record(
         "ensemble_candidate_ranking": {
             "mixed_success_decisions": mixed_support,
             "dense_progress_decisions": dense_support,
+            "comparative_validation_seed_clusters": seed_cluster_support,
+            "comparative_validation_requested_seeds": requested_seed_support,
+            "comparative_validation_body_condition_units": body_condition_support,
+            "comparative_validation_bodies": body_support,
         },
     }
 
@@ -2726,7 +2856,15 @@ def test_calibration_guard_rejects_duplicate_steps() -> None:
 
 
 @pytest.mark.parametrize(
-    "support_name", ("mixed_success_decisions", "dense_progress_decisions")
+    "support_name",
+    (
+        "mixed_success_decisions",
+        "dense_progress_decisions",
+        "comparative_validation_seed_clusters",
+        "comparative_validation_requested_seeds",
+        "comparative_validation_body_condition_units",
+        "comparative_validation_bodies",
+    ),
 )
 def test_calibration_guard_rejects_comparative_support_drift(
     support_name: str,
@@ -2890,10 +3028,16 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert full_contract["world_and_utility_gradient_clipping_are_separate"] is True
     assert full_contract["checkpoint_selection_calibration_guard"] == (
         "source_body_condition_macro_seed_clustered_strict_proper_score_"
-        "one_standard_error"
+        "one_standard_error_then_minimum_10_comparative_seed_clusters_"
+        "across_minimum_2_requested_seeds_4_body_condition_units_2_bodies"
     )
     assert full_contract["strict_proper_components"] == [
+        "post_event_categorical_nll_weight_1.0",
+        "next_event_categorical_nll_weight_0.5",
+        "duration_censored_lognormal_nll_weight_0.5",
         "success_binary_nll",
+        "recovery_binary_nll_weight_0.5_when_supervised",
+        "object_student_t3_nll_weight_0.5",
         "terminal_event_categorical_nll_weight_0.5",
         "terminal_event_ordinal_ranked_probability_score_weight_0.25",
         "terminal_goal_student_t3_nll_weight_0.5",

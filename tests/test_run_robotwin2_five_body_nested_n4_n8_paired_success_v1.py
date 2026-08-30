@@ -104,6 +104,64 @@ def test_schedule_uses_same_complete_seed_roster_and_rotates_three_arms() -> Non
             assert max(first_counts.values()) - min(first_counts.values()) <= 1
 
 
+def _complete_outcome_rows() -> list[dict[str, object]]:
+    rows = []
+    for expected in runner.evaluation_schedule():
+        row = {
+            **expected,
+            "pair_sha256": runner.canonical_sha256(expected),
+        }
+        for method in runner.METHODS:
+            row[f"{method}_binary_success"] = 0
+            row[f"{method}_stage_progress"] = 0.25
+        rows.append(row)
+    return rows
+
+
+def test_complete_outcome_roster_rejects_an_entire_missing_cell() -> None:
+    rows = _complete_outcome_rows()
+    runner.validate_complete_outcome_rows(rows)
+    incomplete = [
+        row
+        for row in rows
+        if not (
+            row["heldout_body"] == runner.BODIES[-1]
+            and row["condition"] == runner.CONDITIONS[-1]
+        )
+    ]
+    with pytest.raises(
+        runner.NestedCandidatePoolError, match="complete 1000-triplet schedule"
+    ):
+        runner.validate_complete_outcome_rows(incomplete)
+
+
+def test_nested_protocol_declares_all_bootstrap_seed_offsets() -> None:
+    protocol = runner.nested_evaluation_protocol()
+    assert protocol["formal_seed_block_reused"] is False
+    assert protocol["bootstrap_seed_base"] == runner.BOOTSTRAP_SEED
+    assert set(protocol["bootstrap_seed_derivation"]) == {
+        "overall_comparisons",
+        "body_comparisons",
+        "body_condition_comparisons",
+    }
+
+
+def test_overall_interval_clusters_all_ten_cells_by_requested_seed() -> None:
+    rows = _complete_outcome_rows()
+    summary = runner._comparison_summary(
+        rows,
+        runner.METHOD_N4,
+        runner.METHOD_N8,
+        seed=runner.BOOTSTRAP_SEED,
+    )
+    contract = summary["paired_success_delta_interval_contract"]
+    assert contract["cluster_count"] == runner.SEED_COUNT
+    assert contract["rows_per_cluster"] == len(runner.BODIES) * len(
+        runner.CONDITIONS
+    )
+    assert summary["mcnemar_contract"]["role"] == "descriptive_only"
+
+
 def _decision(method: str) -> dict[str, object]:
     pools, audit = _nested()
     if method == runner.METHOD_ACTOR:
@@ -196,6 +254,13 @@ def test_triplet_materialization_requires_one_reset_and_initial_raw16() -> None:
         commitment=commitment,
         attempt_sha256="a" * 64,
         execution_contract_logical_sha256="b" * 64,
+        method_result_bindings={
+            method: {
+                "logical_sha256": f"{index + 1:x}" * 64,
+                "file_sha256": f"{index + 4:x}" * 64,
+            }
+            for index, method in enumerate(runner.METHODS)
+        },
     )
     assert pair["same_resolved_reset_actor_n4_n8"] is True
     assert pair["same_initial_raw16_and_nested_pool_audit"] is True
@@ -212,6 +277,13 @@ def test_triplet_materialization_requires_one_reset_and_initial_raw16() -> None:
             commitment=commitment,
             attempt_sha256="a" * 64,
             execution_contract_logical_sha256="b" * 64,
+            method_result_bindings={
+                method: {
+                    "logical_sha256": f"{index + 1:x}" * 64,
+                    "file_sha256": f"{index + 4:x}" * 64,
+                }
+                for index, method in enumerate(runner.METHODS)
+            },
         )
 
 
@@ -223,3 +295,229 @@ def test_rollout_validator_replays_n4_and_n8_selection_without_new_gate() -> Non
     assert runner.nested_pool_contract()[
         "additional_authorization_or_confidence_gate"
     ] is False
+
+
+def test_method_result_is_create_once_and_replay_validated(tmp_path: Path) -> None:
+    expected = runner.evaluation_schedule()[0]
+    method = runner.METHOD_ACTOR
+    start = runner.build_method_start(
+        expected,
+        method=method,
+        method_ordinal=0,
+        attempt_sha256="a" * 64,
+        commitment_sha256="c" * 64,
+        execution_contract_logical_sha256="b" * 64,
+        completed_prefix_result_sha256=[],
+    )
+    result = runner.build_method_result(
+        expected,
+        method=method,
+        method_ordinal=0,
+        rollout=_rollout(method, "c" * 64),
+        method_start_sha256=start["method_start_sha256"],
+        attempt_sha256="a" * 64,
+        commitment_sha256="c" * 64,
+        execution_contract_logical_sha256="b" * 64,
+        execution_contract_file_sha256="d" * 64,
+        completed_prefix_result_sha256=[],
+    )
+    path = tmp_path / "result.json"
+    first_file_sha = runner.promote_create_once_json(
+        path, result, label="test method result"
+    )
+    assert first_file_sha == runner.sha256_file(path)
+    loaded, staged_only = runner.read_create_once_json(
+        path, label="test method result"
+    )
+    assert staged_only is False
+    rollout = runner.validate_method_result(
+        loaded,
+        expected,
+        method=method,
+        method_ordinal=0,
+        method_start_sha256=start["method_start_sha256"],
+        attempt_sha256="a" * 64,
+        commitment_sha256="c" * 64,
+        execution_contract_logical_sha256="b" * 64,
+        execution_contract_file_sha256="d" * 64,
+        completed_prefix_result_sha256=[],
+    )
+    assert rollout["method"] == method
+    changed = copy.deepcopy(result)
+    changed["rollout"]["binary_success"] = 1
+    with pytest.raises(runner.NestedCandidatePoolError, match="create-once value"):
+        runner.promote_create_once_json(
+            path, changed, label="test method result"
+        )
+
+
+def _persist_complete_triplet(
+    tmp_path: Path, *, tamper_embedded_actor_outcome: bool = False
+) -> tuple[dict[str, object], dict[str, object], dict[str, Path]]:
+    expected = runner.evaluation_schedule()[0]
+    identity = runner.pair_id(
+        expected["heldout_body"], expected["condition"], expected["requested_seed"]
+    )
+    logical_contract_sha = "b" * 64
+    file_contract_sha = "d" * 64
+    attempt_base = {
+        "format": "etsf_robotwin2_nested_n4_n8_attempt_v2",
+        "status": "started_once_fixed_method_order_with_bounded_resume",
+        "pair_id": identity,
+        **expected,
+        "execution_contract_logical_sha256": logical_contract_sha,
+        "execution_contract_file_sha256": file_contract_sha,
+        "attempt_number": 1,
+    }
+    attempt = {
+        **attempt_base,
+        "attempt_sha256": runner.canonical_sha256(attempt_base),
+    }
+    reset_snapshot = {
+        "format": "etsf_robotwin2_observable_reset_snapshot_v2",
+        "kind": "reset",
+    }
+    canonical_snapshot = {
+        "format": "etsf_robotwin2_observable_reset_snapshot_v2",
+        "kind": "canonical_query",
+    }
+    _pools, audit = _nested()
+    commitment_base = {
+        "format": runner.INITIAL_COMMITMENT_FORMAT,
+        "heldout_body": expected["heldout_body"],
+        "condition": expected["condition"],
+        "requested_seed": expected["requested_seed"],
+        "resolved_seed": expected["requested_seed"],
+        "nested_pool_audit": audit,
+        "raw_ordered_proposals_sha256": audit["raw_ordered_proposals_sha256"],
+        "reset_snapshot": reset_snapshot,
+        "reset_identity_sha256": runner.formal.reset_identity(reset_snapshot),
+        "canonical_query_snapshot": canonical_snapshot,
+        "canonical_query_identity_sha256": runner.formal.reset_identity(
+            canonical_snapshot
+        ),
+        "candidate_generation_advanced_simulator": False,
+        "frozen_before_any_method_execution": True,
+    }
+    commitment = {
+        **commitment_base,
+        "commitment_sha256": runner.canonical_sha256(commitment_base),
+    }
+    paths = {
+        "pair_path": tmp_path / "pairs" / f"{identity}.json",
+        "attempt_path": tmp_path / "attempts" / f"{identity}.json",
+        "commitment_path": tmp_path / "initial_commitments" / f"{identity}.json",
+        "method_starts_dir": tmp_path / "method_starts",
+        "method_results_dir": tmp_path / "method_results",
+        "method_failures_dir": tmp_path / "method_failures",
+    }
+    runner.promote_create_once_json(
+        paths["attempt_path"], attempt, label="test attempt"
+    )
+    runner.promote_create_once_json(
+        paths["commitment_path"], commitment, label="test commitment"
+    )
+
+    rollouts = {}
+    bindings = {}
+    prefix_result_shas = []
+    for method_ordinal, method in enumerate(expected["method_order"]):
+        stem = f"{identity}.{method_ordinal:02d}.{method}"
+        start = runner.build_method_start(
+            expected,
+            method=method,
+            method_ordinal=method_ordinal,
+            attempt_sha256=attempt["attempt_sha256"],
+            commitment_sha256=commitment["commitment_sha256"],
+            execution_contract_logical_sha256=logical_contract_sha,
+            completed_prefix_result_sha256=prefix_result_shas,
+        )
+        start_path = paths["method_starts_dir"] / f"{stem}.json"
+        runner.promote_create_once_json(start_path, start, label="test method start")
+        rollout = _rollout(method, commitment["commitment_sha256"])
+        rollout["initial_reset_snapshot"] = reset_snapshot
+        rollout["initial_canonical_query_snapshot"] = canonical_snapshot
+        result = runner.build_method_result(
+            expected,
+            method=method,
+            method_ordinal=method_ordinal,
+            rollout=rollout,
+            method_start_sha256=start["method_start_sha256"],
+            attempt_sha256=attempt["attempt_sha256"],
+            commitment_sha256=commitment["commitment_sha256"],
+            execution_contract_logical_sha256=logical_contract_sha,
+            execution_contract_file_sha256=file_contract_sha,
+            completed_prefix_result_sha256=prefix_result_shas,
+        )
+        result_path = paths["method_results_dir"] / f"{stem}.json"
+        result_file_sha = runner.promote_create_once_json(
+            result_path, result, label="test method result"
+        )
+        rollouts[method] = rollout
+        bindings[method] = {
+            "logical_sha256": result["method_result_sha256"],
+            "file_sha256": result_file_sha,
+        }
+        prefix_result_shas.append(result["method_result_sha256"])
+
+    pair = runner.materialize_triplet(
+        expected,
+        rollouts,
+        commitment=commitment,
+        attempt_sha256=attempt["attempt_sha256"],
+        execution_contract_logical_sha256=logical_contract_sha,
+        method_result_bindings=bindings,
+    )
+    if tamper_embedded_actor_outcome:
+        pair["rollouts"][runner.METHOD_ACTOR]["binary_success"] = 1
+        pair["rollouts"][runner.METHOD_ACTOR]["stage_progress"] = 1.0
+        pair["pair_sha256"] = runner.canonical_sha256(
+            {key: value for key, value in pair.items() if key != "pair_sha256"}
+        )
+    runner.promote_create_once_json(paths["pair_path"], pair, label="test pair")
+    context = {
+        "identity": identity,
+        "expected": expected,
+        "attempt": attempt,
+        "execution_contract_logical_sha256": logical_contract_sha,
+        "execution_contract_file_sha256": file_contract_sha,
+    }
+    return context, pair, paths
+
+
+def test_existing_pair_embedded_outcome_must_match_method_result(
+    tmp_path: Path,
+) -> None:
+    context, _pair, paths = _persist_complete_triplet(
+        tmp_path, tamper_embedded_actor_outcome=True
+    )
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="differs from its method results",
+    ):
+        runner.recover_complete_existing_triplet(**paths, **context)
+
+
+def test_existing_pair_with_missing_method_result_fails_without_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, _pair, paths = _persist_complete_triplet(tmp_path)
+    expected = context["expected"]
+    first_method = expected["method_order"][0]
+    identity = context["identity"]
+    missing = paths["method_results_dir"] / f"{identity}.00.{first_method}.json"
+    missing.unlink()
+    rollout_called = False
+
+    def forbidden_rollout(**_kwargs: object) -> dict[str, object]:
+        nonlocal rollout_called
+        rollout_called = True
+        raise AssertionError("existing pair recovery must not execute a rollout")
+
+    monkeypatch.setattr(runner, "execute_rollout", forbidden_rollout)
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="lacks a method result",
+    ):
+        runner.recover_complete_existing_triplet(**paths, **context)
+    assert rollout_called is False

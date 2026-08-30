@@ -708,6 +708,12 @@ class PerSchemaActionEncoder(nn.Module):
             subset = (
                 subset - self.action_mean[schema][None, None]
             ) / self.action_std[schema][None, None]
+            normalization_clip = getattr(self, "normalization_clip", None)
+            if normalization_clip is not None:
+                clip = float(normalization_clip)
+                if not math.isfinite(clip) or clip <= 0.0:
+                    raise ValueError("action normalization clip must be finite/positive")
+                subset = subset.clamp(min=-clip, max=clip)
             hidden = subset.new_zeros(subset.shape[0], effect.shape[-1])
             for step in range(subset.shape[1]):
                 proposal = self.cells[schema](self.projections[schema](subset[:, step]), hidden)

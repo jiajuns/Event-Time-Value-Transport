@@ -41,20 +41,27 @@ import run_robotwin2_five_body_postformal_candidate_pool_v1 as pool_runner
 collector = formal.collector
 shared_head = formal.shared_head
 analytic_event = formal.analytic_event
-FORMAT = "etsf_robotwin2_five_body_nested_n4_n8_execution_v1"
-PAIR_FORMAT = "etsf_robotwin2_actor_nested_n4_n8_paired_execution_v1"
+FORMAT = "etsf_robotwin2_five_body_nested_n4_n8_execution_v2"
+PAIR_FORMAT = "etsf_robotwin2_actor_nested_n4_n8_paired_execution_v2"
 CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v1"
-OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v1"
-REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v1"
-COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v1"
+OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
+REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
+COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
 NESTED_POOL_AUDIT_FORMAT = "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v1"
 INITIAL_COMMITMENT_FORMAT = "etsf_robotwin2_initial_raw16_nested_n4_n8_commitment_v1"
+METHOD_START_FORMAT = "etsf_robotwin2_nested_method_start_v1"
+METHOD_RESUME_FORMAT = "etsf_robotwin2_nested_method_noninformative_resume_v1"
+METHOD_RESULT_FORMAT = "etsf_robotwin2_nested_method_result_v1"
+METHOD_FAILURE_FORMAT = "etsf_robotwin2_nested_method_failure_v1"
 BENCHMARK = formal.BENCHMARK
 TASK = formal.TASK
 BODIES = formal.BODIES
 CONDITIONS = formal.CONDITIONS
-SEED_BASE = formal.SEED_BASE
-SEED_COUNT = formal.SEED_COUNT
+# This prospective postformal study uses a fresh, previously untouched reset
+# block.  Reusing the formal N4 seeds after their outcomes were inspected would
+# make the stronger shared-raw16 N4/N8 comparison exploratory by construction.
+SEED_BASE = 2026091000
+SEED_COUNT = 100
 RAW_PROPOSAL_COUNT = 16
 N4_CANDIDATE_COUNT = 4
 N8_CANDIDATE_COUNT = 8
@@ -73,10 +80,140 @@ BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20260909
 
 
+def nested_evaluation_protocol() -> dict[str, Any]:
+    """Return the frozen, outcome-blind protocol for the nested comparison."""
+
+    formal_seeds = set(range(formal.SEED_BASE, formal.SEED_BASE + formal.SEED_COUNT))
+    nested_seeds = set(range(SEED_BASE, SEED_BASE + SEED_COUNT))
+    if formal_seeds & nested_seeds:
+        raise RuntimeError("nested evaluation seeds overlap the inspected formal study")
+    base = {
+        "format": "etsf_robotwin2_nested_n4_n8_prospective_protocol_v1",
+        "evaluation_seed_base": SEED_BASE,
+        "evaluation_seed_count": SEED_COUNT,
+        "formal_seed_block_reused": False,
+        "formal_seed_block": [formal.SEED_BASE, formal.SEED_BASE + formal.SEED_COUNT],
+        "seed_block_selected_before_any_nested_rollout_outcome": True,
+        "balanced_body_condition_cells": len(BODIES) * len(CONDITIONS),
+        "bootstrap_unit": (
+            "requested_seed_cluster_with_all_selected_body_condition_rows_kept_together"
+        ),
+        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+        "bootstrap_seed_base": BOOTSTRAP_SEED,
+        "bootstrap_seed_derivation": {
+            "overall_comparisons": "base_plus_comparison_offset_0_1_2",
+            "body_comparisons": (
+                "base_plus_10_plus_body_index_times_10_plus_"
+                "comparison_offset_0_1_2"
+            ),
+            "body_condition_comparisons": (
+                "base_plus_100_plus_cell_index_times_10_plus_"
+                "comparison_offset_0_1_2"
+            ),
+        },
+        "pooled_mcnemar_role": "descriptive_only_due_repeated_requested_seeds",
+        "single_body_condition_mcnemar_role": "inferential",
+        "fixed_benchmark_body_inference_scope": (
+            "new_initial_conditions_on_the_five_fixed_heldout_bodies"
+        ),
+        "postformal_but_prospective_for_this_nested_estimand": True,
+    }
+    return {**base, "logical_sha256": canonical_sha256(base)}
+
+
 canonical_sha256 = formal.canonical_sha256
 sha256_file = formal.sha256_file
 array_sha256 = formal.array_sha256
 atomic_json = formal.atomic_json
+
+
+def _staged_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.staged")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def read_create_once_json(
+    path: Path, *, label: str
+) -> tuple[dict[str, Any] | None, bool]:
+    """Read a final/staged create-once artifact without silently replacing it."""
+
+    stage = _staged_path(path)
+    final_exists = path.exists()
+    stage_exists = stage.exists()
+    if (final_exists and (not path.is_file() or path.is_symlink())) or (
+        stage_exists and (not stage.is_file() or stage.is_symlink())
+    ):
+        raise NestedCandidatePoolError(f"{label} is missing, symbolic or non-file")
+    if not final_exists and not stage_exists:
+        return None, False
+
+    def load(candidate: Path) -> dict[str, Any]:
+        try:
+            value = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise NestedCandidatePoolError(
+                f"{label} staged/final JSON is incomplete"
+            ) from error
+        if not isinstance(value, dict):
+            raise NestedCandidatePoolError(f"{label} must be a JSON object")
+        return value
+
+    final_value = load(path) if final_exists else None
+    stage_value = load(stage) if stage_exists else None
+    if final_value is not None and stage_value is not None and final_value != stage_value:
+        raise NestedCandidatePoolError(f"{label} final/staged artifacts differ")
+    return (
+        final_value if final_value is not None else stage_value,
+        final_value is None and stage_value is not None,
+    )
+
+
+def promote_create_once_json(
+    path: Path, value: Mapping[str, Any], *, label: str
+) -> str:
+    """Persist JSON by fsync + hard-link create; an existing value must match."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stage = _staged_path(path)
+    existing, staged_only = read_create_once_json(path, label=label)
+    if existing is None:
+        payload = (
+            json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        )
+        try:
+            with stage.open("x", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            stage.chmod(0o444)
+            _fsync_directory(path.parent)
+        except FileExistsError:
+            pass
+        existing, staged_only = read_create_once_json(path, label=label)
+    if existing != dict(value):
+        raise NestedCandidatePoolError(f"{label} create-once value changed")
+    if staged_only:
+        try:
+            os.link(stage, path)
+        except FileExistsError:
+            current, _staged = read_create_once_json(path, label=label)
+            if current != dict(value):
+                raise NestedCandidatePoolError(f"{label} link race changed value")
+        _fsync_directory(path.parent)
+    current, _staged_only = read_create_once_json(path, label=label)
+    if current != dict(value) or not path.is_file() or path.is_symlink():
+        raise NestedCandidatePoolError(f"{label} final promotion failed")
+    if stage.exists():
+        stage.unlink()
+        _fsync_directory(path.parent)
+    return sha256_file(path)
 pair_id = formal.pair_id
 
 
@@ -132,6 +269,7 @@ def nested_pool_contract() -> dict[str, Any]:
             "the_same_initial_reset"
         ),
         "post_divergence_queries_share_construction_not_state": True,
+        "evaluation_protocol": nested_evaluation_protocol(),
     }
 
 
@@ -773,6 +911,137 @@ def validate_rollout(
             raise NestedCandidatePoolError("nested critic selection changed")
 
 
+def validate_stored_initial_commitment(
+    commitment: Mapping[str, Any], expected: Mapping[str, Any]
+) -> None:
+    audit = commitment.get("nested_pool_audit")
+    if not isinstance(audit, Mapping):
+        raise NestedCandidatePoolError("stored commitment lacks nested pool audit")
+    validate_nested_pool_audit(audit)
+    if (
+        commitment.get("format") != INITIAL_COMMITMENT_FORMAT
+        or commitment.get("heldout_body") != expected["heldout_body"]
+        or commitment.get("condition") != expected["condition"]
+        or commitment.get("requested_seed") != expected["requested_seed"]
+        or commitment.get("resolved_seed") != expected["requested_seed"]
+        or commitment.get("frozen_before_any_method_execution") is not True
+        or commitment.get("candidate_generation_advanced_simulator") is not False
+        or commitment.get("commitment_sha256")
+        != canonical_sha256(_commitment_base(commitment))
+        or commitment.get("reset_identity_sha256")
+        != formal.reset_identity(commitment.get("reset_snapshot", {}))
+        or commitment.get("canonical_query_identity_sha256")
+        != formal.reset_identity(commitment.get("canonical_query_snapshot", {}))
+    ):
+        raise NestedCandidatePoolError("stored initial commitment changed")
+
+
+def build_method_start(
+    expected: Mapping[str, Any],
+    *,
+    method: str,
+    method_ordinal: int,
+    attempt_sha256: str,
+    commitment_sha256: str,
+    execution_contract_logical_sha256: str,
+    completed_prefix_result_sha256: Sequence[str],
+) -> dict[str, Any]:
+    base = {
+        "format": METHOD_START_FORMAT,
+        "status": "started_once_fixed_order_no_outcome_selection",
+        **dict(expected),
+        "method": method,
+        "method_ordinal": method_ordinal,
+        "attempt_sha256": attempt_sha256,
+        "commitment_sha256": commitment_sha256,
+        "execution_contract_logical_sha256": execution_contract_logical_sha256,
+        "completed_prefix_result_sha256": list(completed_prefix_result_sha256),
+        "automatic_noninformative_resume_limit": 1,
+        "result_or_failure_never_overwritten_or_retried": True,
+    }
+    return {**base, "method_start_sha256": canonical_sha256(base)}
+
+
+def validate_method_start(
+    value: Mapping[str, Any], expected_value: Mapping[str, Any]
+) -> None:
+    if dict(value) != dict(expected_value):
+        raise NestedCandidatePoolError("nested method start contract changed")
+
+
+def build_method_result(
+    expected: Mapping[str, Any],
+    *,
+    method: str,
+    method_ordinal: int,
+    rollout: Mapping[str, Any],
+    method_start_sha256: str,
+    attempt_sha256: str,
+    commitment_sha256: str,
+    execution_contract_logical_sha256: str,
+    execution_contract_file_sha256: str,
+    completed_prefix_result_sha256: Sequence[str],
+) -> dict[str, Any]:
+    validate_rollout(rollout, method=method, expected=expected)
+    base = {
+        "format": METHOD_RESULT_FORMAT,
+        "status": "complete_create_once_no_retry",
+        **dict(expected),
+        "method": method,
+        "method_ordinal": method_ordinal,
+        "method_start_sha256": method_start_sha256,
+        "attempt_sha256": attempt_sha256,
+        "commitment_sha256": commitment_sha256,
+        "execution_contract_logical_sha256": execution_contract_logical_sha256,
+        "execution_contract_file_sha256": execution_contract_file_sha256,
+        "completed_prefix_result_sha256": list(completed_prefix_result_sha256),
+        "rollout": dict(rollout),
+        "rollout_sha256": canonical_sha256(rollout),
+    }
+    return {**base, "method_result_sha256": canonical_sha256(base)}
+
+
+def validate_method_result(
+    value: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    method: str,
+    method_ordinal: int,
+    method_start_sha256: str,
+    attempt_sha256: str,
+    commitment_sha256: str,
+    execution_contract_logical_sha256: str,
+    execution_contract_file_sha256: str,
+    completed_prefix_result_sha256: Sequence[str],
+) -> Mapping[str, Any]:
+    rollout = value.get("rollout")
+    unsigned = {key: item for key, item in value.items() if key != "method_result_sha256"}
+    if (
+        value.get("format") != METHOD_RESULT_FORMAT
+        or value.get("status") != "complete_create_once_no_retry"
+        or any(value.get(key) != expected[key] for key in expected)
+        or value.get("method") != method
+        or value.get("method_ordinal") != method_ordinal
+        or value.get("method_start_sha256") != method_start_sha256
+        or value.get("attempt_sha256") != attempt_sha256
+        or value.get("commitment_sha256") != commitment_sha256
+        or value.get("execution_contract_logical_sha256")
+        != execution_contract_logical_sha256
+        or value.get("execution_contract_file_sha256")
+        != execution_contract_file_sha256
+        or value.get("completed_prefix_result_sha256")
+        != list(completed_prefix_result_sha256)
+        or not isinstance(rollout, Mapping)
+        or value.get("rollout_sha256") != canonical_sha256(rollout)
+        or value.get("method_result_sha256") != canonical_sha256(unsigned)
+    ):
+        raise NestedCandidatePoolError("nested method result binding changed")
+    validate_rollout(rollout, method=method, expected=expected)
+    if rollout.get("initial_candidate_commitment_sha256") != commitment_sha256:
+        raise NestedCandidatePoolError("nested method result commitment changed")
+    return rollout
+
+
 def materialize_triplet(
     expected: Mapping[str, Any],
     rollouts: Mapping[str, Mapping[str, Any]],
@@ -780,9 +1049,26 @@ def materialize_triplet(
     commitment: Mapping[str, Any],
     attempt_sha256: str,
     execution_contract_logical_sha256: str,
+    method_result_bindings: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     if set(rollouts) != set(METHODS):
         raise NestedCandidatePoolError("triplet must contain actor, N4 and N8")
+    if set(method_result_bindings) != set(METHODS):
+        raise NestedCandidatePoolError("triplet lacks exact method-result bindings")
+    normalized_method_bindings = {}
+    for method in METHODS:
+        binding = method_result_bindings[method]
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != {"logical_sha256", "file_sha256"}
+            or any(
+                not isinstance(binding.get(name), str)
+                or len(str(binding.get(name))) != 64
+                for name in ("logical_sha256", "file_sha256")
+            )
+        ):
+            raise NestedCandidatePoolError("triplet method-result SHA binding changed")
+        normalized_method_bindings[method] = dict(binding)
     first = {method: rollouts[method]["decisions"][0] for method in METHODS}
     same_reset = bool(
         len(
@@ -834,6 +1120,7 @@ def materialize_triplet(
         "initial_candidate_commitment_sha256": commitment.get(
             "commitment_sha256"
         ),
+        "method_result_bindings": normalized_method_bindings,
         "same_resolved_reset_actor_n4_n8": same_reset,
         "same_initial_raw16_and_nested_pool_audit": same_initial_raw16,
         "n4_is_exact_ordered_prefix_of_n8": True,
@@ -847,6 +1134,7 @@ def validate_triplet(
     expected: Mapping[str, Any],
     *,
     execution_contract_logical_sha256: str,
+    expected_method_result_bindings: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     if (
         value.get("format") != PAIR_FORMAT
@@ -861,12 +1149,30 @@ def validate_triplet(
         or value.get("n4_is_exact_ordered_prefix_of_n8") is not True
         or value.get("execution_contract_logical_sha256")
         != execution_contract_logical_sha256
+        or not isinstance(value.get("method_result_bindings"), Mapping)
+        or set(value["method_result_bindings"]) != set(METHODS)
+        or (
+            expected_method_result_bindings is not None
+            and value.get("method_result_bindings")
+            != {key: dict(item) for key, item in expected_method_result_bindings.items()}
+        )
         or value.get("pair_sha256")
         != canonical_sha256(
             {key: item for key, item in value.items() if key != "pair_sha256"}
         )
     ):
         raise NestedCandidatePoolError("nested triplet record changed")
+    for binding in value["method_result_bindings"].values():
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != {"logical_sha256", "file_sha256"}
+            or any(
+                not isinstance(binding.get(name), str)
+                or len(str(binding.get(name))) != 64
+                for name in ("logical_sha256", "file_sha256")
+            )
+        ):
+            raise NestedCandidatePoolError("triplet method-result SHA binding changed")
     rollouts = value.get("rollouts")
     if not isinstance(rollouts, Mapping) or set(rollouts) != set(METHODS):
         raise NestedCandidatePoolError("nested triplet rollout roster changed")
@@ -877,6 +1183,145 @@ def validate_triplet(
             != value.get("initial_candidate_commitment_sha256")
         ):
             raise NestedCandidatePoolError("triplet commitment binding changed")
+
+
+def recover_complete_existing_triplet(
+    *,
+    pair_path: Path,
+    attempt_path: Path,
+    commitment_path: Path,
+    method_starts_dir: Path,
+    method_results_dir: Path,
+    method_failures_dir: Path,
+    identity: str,
+    expected: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+    execution_contract_logical_sha256: str,
+    execution_contract_file_sha256: str,
+) -> dict[str, Any] | None:
+    """Recover a complete pair without executing or repairing a missing method."""
+
+    existing_pair, _pair_staged = read_create_once_json(
+        pair_path, label="nested triplet"
+    )
+    if existing_pair is None:
+        return None
+
+    existing_attempt, _attempt_staged = read_create_once_json(
+        attempt_path, label="nested triplet attempt"
+    )
+    if existing_attempt is None or dict(existing_attempt) != dict(attempt):
+        raise NestedCandidatePoolError(
+            "existing nested triplet lacks its exact attempt"
+        )
+    promote_create_once_json(
+        attempt_path, existing_attempt, label="nested triplet attempt"
+    )
+
+    commitment, _commitment_staged = read_create_once_json(
+        commitment_path, label="nested initial commitment"
+    )
+    if commitment is None:
+        raise NestedCandidatePoolError(
+            "existing nested triplet lacks its initial commitment"
+        )
+    validate_stored_initial_commitment(commitment, expected)
+    promote_create_once_json(
+        commitment_path, commitment, label="nested initial commitment"
+    )
+    commitment_sha = str(commitment["commitment_sha256"])
+    attempt_sha = str(attempt["attempt_sha256"])
+
+    rollouts: dict[str, Mapping[str, Any]] = {}
+    method_result_bindings: dict[str, dict[str, str]] = {}
+    prefix_result_shas: list[str] = []
+    for method_ordinal, method in enumerate(expected["method_order"]):
+        stem = f"{identity}.{method_ordinal:02d}.{method}"
+        start_path = method_starts_dir / f"{stem}.json"
+        result_path = method_results_dir / f"{stem}.json"
+        method_failure_path = method_failures_dir / f"{stem}.json"
+        start_value = build_method_start(
+            expected,
+            method=method,
+            method_ordinal=method_ordinal,
+            attempt_sha256=attempt_sha,
+            commitment_sha256=commitment_sha,
+            execution_contract_logical_sha256=(
+                execution_contract_logical_sha256
+            ),
+            completed_prefix_result_sha256=prefix_result_shas,
+        )
+        existing_start, _start_staged = read_create_once_json(
+            start_path, label="nested method start"
+        )
+        if existing_start is None:
+            raise NestedCandidatePoolError(
+                "existing nested triplet lacks a method start"
+            )
+        validate_method_start(existing_start, start_value)
+        promote_create_once_json(
+            start_path, existing_start, label="nested method start"
+        )
+
+        existing_method_failure, _method_failure_staged = read_create_once_json(
+            method_failure_path, label="nested method failure"
+        )
+        if existing_method_failure is not None:
+            raise NestedCandidatePoolError(
+                f"existing nested triplet method {method} has a failure"
+            )
+        result_value, _result_staged = read_create_once_json(
+            result_path, label="nested method result"
+        )
+        if result_value is None:
+            raise NestedCandidatePoolError(
+                "existing nested triplet lacks a method result"
+            )
+        rollout = validate_method_result(
+            result_value,
+            expected,
+            method=method,
+            method_ordinal=method_ordinal,
+            method_start_sha256=start_value["method_start_sha256"],
+            attempt_sha256=attempt_sha,
+            commitment_sha256=commitment_sha,
+            execution_contract_logical_sha256=(
+                execution_contract_logical_sha256
+            ),
+            execution_contract_file_sha256=execution_contract_file_sha256,
+            completed_prefix_result_sha256=prefix_result_shas,
+        )
+        result_file_sha = promote_create_once_json(
+            result_path, result_value, label="nested method result"
+        )
+        result_logical_sha = str(result_value["method_result_sha256"])
+        rollouts[method] = rollout
+        method_result_bindings[method] = {
+            "logical_sha256": result_logical_sha,
+            "file_sha256": result_file_sha,
+        }
+        prefix_result_shas.append(result_logical_sha)
+
+    computed_pair = materialize_triplet(
+        expected,
+        rollouts,
+        commitment=commitment,
+        attempt_sha256=attempt_sha,
+        execution_contract_logical_sha256=execution_contract_logical_sha256,
+        method_result_bindings=method_result_bindings,
+    )
+    if dict(existing_pair) != computed_pair:
+        raise NestedCandidatePoolError(
+            "existing nested triplet differs from its method results"
+        )
+    validate_triplet(
+        existing_pair,
+        expected,
+        execution_contract_logical_sha256=execution_contract_logical_sha256,
+        expected_method_result_bindings=method_result_bindings,
+    )
+    promote_create_once_json(pair_path, existing_pair, label="nested triplet")
+    return dict(existing_pair)
 
 
 def outcome_row(pair: Mapping[str, Any]) -> dict[str, Any]:
@@ -910,6 +1355,8 @@ def _exact_mcnemar_two_sided(left_only: int, right_only: int) -> float:
 def _comparison_summary(
     rows: Sequence[Mapping[str, Any]], left: str, right: str, *, seed: int
 ) -> dict[str, Any]:
+    if not rows:
+        raise NestedCandidatePoolError("comparison summary cannot be empty")
     left_success = np.asarray(
         [row[f"{left}_binary_success"] for row in rows], dtype=np.float64
     )
@@ -924,15 +1371,62 @@ def _comparison_summary(
     )
     success_delta = right_success - left_success
     stage_delta = right_stage - left_stage
+    selected_cells = sorted(
+        {
+            (str(row["heldout_body"]), str(row["condition"]))
+            for row in rows
+        }
+    )
+    expected_seeds = list(range(SEED_BASE, SEED_BASE + SEED_COUNT))
+    indices_by_seed: dict[int, list[int]] = {value: [] for value in expected_seeds}
+    for index, row in enumerate(rows):
+        requested_seed = row.get("requested_seed")
+        if isinstance(requested_seed, bool) or requested_seed not in indices_by_seed:
+            raise NestedCandidatePoolError(
+                "comparison rows do not use the frozen nested seed roster"
+            )
+        indices_by_seed[int(requested_seed)].append(index)
+    expected_rows_per_cluster = len(selected_cells)
+    if expected_rows_per_cluster <= 0 or any(
+        len(indices) != expected_rows_per_cluster
+        for indices in indices_by_seed.values()
+    ):
+        raise NestedCandidatePoolError(
+            "requested-seed clusters lack complete body-condition coverage"
+        )
+    for requested_seed, indices in indices_by_seed.items():
+        observed_cells = {
+            (
+                str(rows[index]["heldout_body"]),
+                str(rows[index]["condition"]),
+            )
+            for index in indices
+        }
+        if observed_cells != set(selected_cells):
+            raise NestedCandidatePoolError(
+                f"requested-seed cluster {requested_seed} duplicates or loses a cell"
+            )
+    success_cluster_delta = np.asarray(
+        [success_delta[indices].mean() for indices in indices_by_seed.values()],
+        dtype=np.float64,
+    )
+    stage_cluster_delta = np.asarray(
+        [stage_delta[indices].mean() for indices in indices_by_seed.values()],
+        dtype=np.float64,
+    )
     generator = np.random.default_rng(seed)
     success_bootstrap = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
     stage_bootstrap = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
     for replicate in range(BOOTSTRAP_REPLICATES):
-        indices = generator.integers(0, len(rows), size=len(rows))
-        success_bootstrap[replicate] = success_delta[indices].mean()
-        stage_bootstrap[replicate] = stage_delta[indices].mean()
+        cluster_indices = generator.integers(0, SEED_COUNT, size=SEED_COUNT)
+        success_bootstrap[replicate] = success_cluster_delta[
+            cluster_indices
+        ].mean()
+        stage_bootstrap[replicate] = stage_cluster_delta[cluster_indices].mean()
     left_only = int(np.sum((left_success == 1) & (right_success == 0)))
     right_only = int(np.sum((left_success == 0) & (right_success == 1)))
+    mcnemar_p = _exact_mcnemar_two_sided(left_only, right_only)
+    cell_count = len(selected_cells)
     return {
         "left_method": left,
         "right_method": right,
@@ -944,17 +1438,54 @@ def _comparison_summary(
             float(value)
             for value in np.quantile(success_bootstrap, [0.025, 0.975])
         ],
+        "paired_success_delta_interval_contract": {
+            "method": "paired_requested_seed_cluster_percentile_bootstrap",
+            "cluster_unit": (
+                "requested_seed_with_all_selected_body_condition_rows_kept_together"
+            ),
+            "cluster_count": SEED_COUNT,
+            "rows_per_cluster": expected_rows_per_cluster,
+            "replicates": BOOTSTRAP_REPLICATES,
+            "seed": seed,
+            "replacement": True,
+            "inference_scope": (
+                "new_initial_conditions_on_the_selected_fixed_heldout_bodies"
+            ),
+        },
         "left_stage_progress_mean": float(left_stage.mean()),
         "right_stage_progress_mean": float(right_stage.mean()),
         "paired_stage_progress_delta_right_minus_left": float(stage_delta.mean()),
         "paired_stage_delta_percentile_95_interval": [
             float(value) for value in np.quantile(stage_bootstrap, [0.025, 0.975])
         ],
+        "paired_stage_delta_interval_contract": {
+            "method": "paired_requested_seed_cluster_percentile_bootstrap",
+            "cluster_unit": (
+                "requested_seed_with_all_selected_body_condition_rows_kept_together"
+            ),
+            "cluster_count": SEED_COUNT,
+            "rows_per_cluster": expected_rows_per_cluster,
+            "replicates": BOOTSTRAP_REPLICATES,
+            "seed": seed,
+            "replacement": True,
+            "inference_scope": (
+                "new_initial_conditions_on_the_selected_fixed_heldout_bodies"
+            ),
+        },
         "left_only_successes": left_only,
         "right_only_successes": right_only,
-        "mcnemar_exact_two_sided_p": _exact_mcnemar_two_sided(
-            left_only, right_only
-        ),
+        "mcnemar_exact_two_sided_p": mcnemar_p,
+        "mcnemar_contract": {
+            "selected_body_condition_cell_count": cell_count,
+            "requested_seed_repeated_across_cells": cell_count > 1,
+            "repeated_seed_dependence_accounted_for": False,
+            "inferentially_valid_for_this_reporting_unit": cell_count == 1,
+            "role": "inferential" if cell_count == 1 else "descriptive_only",
+            "scope_note": (
+                "inferential only for one body-condition cell with distinct seeds; "
+                "multi-cell summaries repeat requested seeds"
+            ),
+        },
     }
 
 
@@ -974,12 +1505,57 @@ def _report_scope(
     }
 
 
+def validate_complete_outcome_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Require the exact prospective 5-body/2-condition/100-seed roster."""
+
+    expected_schedule = evaluation_schedule()
+    if len(rows) != len(expected_schedule):
+        raise NestedCandidatePoolError(
+            "nested outcomes are not the complete 1000-triplet schedule"
+        )
+    for index, (row, expected) in enumerate(zip(rows, expected_schedule)):
+        if not isinstance(row, Mapping):
+            raise NestedCandidatePoolError(
+                f"nested outcome row {index} is not an object"
+            )
+        if any(row.get(key) != expected[key] for key in expected):
+            raise NestedCandidatePoolError(
+                f"nested outcome row {index} changed the frozen schedule"
+            )
+        pair_sha = row.get("pair_sha256")
+        if (
+            not isinstance(pair_sha, str)
+            or len(pair_sha) != 64
+            or any(character not in "0123456789abcdef" for character in pair_sha)
+        ):
+            raise NestedCandidatePoolError(
+                f"nested outcome row {index} lacks a valid pair SHA-256"
+            )
+        for method in METHODS:
+            success = row.get(f"{method}_binary_success")
+            stage = row.get(f"{method}_stage_progress")
+            if (
+                type(success) is not int
+                or success not in (0, 1)
+                or isinstance(stage, bool)
+                or not isinstance(stage, (int, float, np.integer, np.floating))
+                or not math.isfinite(float(stage))
+                or not 0.0 <= float(stage) <= 1.0
+            ):
+                raise NestedCandidatePoolError(
+                    f"nested outcome row {index} has an invalid {method} outcome"
+                )
+
+
 def build_outcome_document(
     rows: Sequence[Mapping[str, Any]],
     *,
     execution_contract_logical_sha256: str,
     execution_contract_file_sha256: str,
 ) -> dict[str, Any]:
+    validate_complete_outcome_rows(rows)
     normalized = [dict(row) for row in rows]
     base = {
         "format": OUTCOME_FORMAT,
@@ -992,6 +1568,7 @@ def build_outcome_document(
         "execution_contract_logical_sha256": execution_contract_logical_sha256,
         "execution_contract_file_sha256": execution_contract_file_sha256,
         "reference_preregistration_sha256": REFERENCE_PREREGISTRATION_SHA256,
+        "nested_evaluation_protocol": nested_evaluation_protocol(),
         "postformal_not_part_of_reference_preregistration": True,
     }
     return {**base, "document_sha256": canonical_sha256(base)}
@@ -1000,12 +1577,14 @@ def build_outcome_document(
 def build_report(
     rows: Sequence[Mapping[str, Any]], *, outcome_document_sha256: str
 ) -> dict[str, Any]:
+    validate_complete_outcome_rows(rows)
     normalized = [dict(row) for row in rows]
     base = {
         "format": REPORT_FORMAT,
         "status": "complete_shared_raw16_nested_n4_n8_paired_report",
         "outcome_document_sha256": outcome_document_sha256,
         "nested_pool_contract": nested_pool_contract(),
+        "nested_evaluation_protocol": nested_evaluation_protocol(),
         "primary_estimand": (
             "paired_policy_success_and_stage_progress_delta_nested_n8_minus_"
             "nested_n4_on_identical_initial_conditions"
@@ -1129,7 +1708,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     attempts_dir = output / "attempts"
     commitments_dir = output / "initial_commitments"
     failures_dir = output / "failures"
-    for directory in (pairs_dir, attempts_dir, commitments_dir, failures_dir):
+    method_starts_dir = output / "method_starts"
+    method_resumes_dir = output / "method_resumes"
+    method_results_dir = output / "method_results"
+    method_failures_dir = output / "method_failures"
+    for directory in (
+        pairs_dir,
+        attempts_dir,
+        commitments_dir,
+        failures_dir,
+        method_starts_dir,
+        method_resumes_dir,
+        method_results_dir,
+        method_failures_dir,
+    ):
         directory.mkdir(exist_ok=True)
     outcome_path = output / "nested_paired_outcomes.json"
     report_path = output / "nested_n4_n8_report.json"
@@ -1151,6 +1743,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "nested_pool_contract": nested_pool_contract(),
         "same_requested_seed_and_complete_reset_tripled": True,
         "method_order_rotated_before_outcomes": True,
+        "method_result_persistence": {
+            "state_machine": (
+                "fixed_order_create_once_start_result_prefix_then_triplet"
+            ),
+            "result_write": "deterministic_stage_fsync_hard_link_fsync_directory",
+            "existing_result_overwrite_or_retry_allowed": False,
+            "automatic_noninformative_resume_limit_per_method": 1,
+            "resume_assumption": (
+                "process_or_host_interruption_before_create_once_result_is_"
+                "noninformative_about_unpersisted_outcome"
+            ),
+            "exception_or_action_failure_retry_allowed": False,
+            "later_method_before_complete_prefix_allowed": False,
+        },
         "actor_checkpoint": str(actor_checkpoint),
         "actor_checkpoint_tree_sha256": actor_tree_sha,
         "actor_checkpoint_file_count": actor_file_count,
@@ -1174,6 +1780,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.reference_preregistration.expanduser().resolve()
         ),
         "reference_preregistration_sha256": reference["preregistration_sha256"],
+        "nested_evaluation_protocol": nested_evaluation_protocol(),
         "postformal_not_part_of_reference_preregistration": True,
         "action_exec_steps": ACTION_EXEC_STEPS,
         "max_steps": args.max_steps,
@@ -1185,12 +1792,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "official_expert_or_protected_internal_payloads_opened": False,
     }
     contract = {**contract_base, "logical_sha256": canonical_sha256(contract_base)}
-    if contract_path.exists():
-        if json.loads(contract_path.read_text(encoding="utf-8")) != contract:
-            raise NestedCandidatePoolError("existing nested contract differs")
-    else:
-        atomic_json(contract_path, contract, frozen=True)
-    contract_file_sha = sha256_file(contract_path)
+    contract_file_sha = promote_create_once_json(
+        contract_path, contract, label="nested execution contract"
+    )
 
     from envs import CONFIGS_PATH  # noqa: F401
     from lerobot.configs.policies import PreTrainedConfig
@@ -1231,114 +1835,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     active_body = None
     ensemble: list[shared_head.EffectAlignedSharedEventHead] = []
     started = time.time()
-    for expected in schedule:
-        body = str(expected["heldout_body"])
-        identity = pair_id(body, expected["condition"], expected["requested_seed"])
-        if body != active_body:
-            del ensemble
-            gc.collect()
-            torch.cuda.empty_cache()
-            ensemble = formal.load_ensemble(folds[body], device)
-            active_body = body
-        pair_path = pairs_dir / f"{identity}.json"
-        if pair_path.exists():
-            pair = json.loads(pair_path.read_text(encoding="utf-8"))
-            validate_triplet(
-                pair,
-                expected,
-                execution_contract_logical_sha256=contract["logical_sha256"],
-            )
-        else:
-            attempt_path = attempts_dir / f"{identity}.json"
-            commitment_path = commitments_dir / f"{identity}.json"
-            failure_path = failures_dir / f"{identity}.json"
-            if attempt_path.exists() or commitment_path.exists() or failure_path.exists():
-                raise NestedCandidatePoolError(
-                    "incomplete/failed nested attempt exists; no silent retry"
-                )
-            attempt_base = {
-                "format": "etsf_robotwin2_nested_n4_n8_attempt_v1",
-                "status": "started_once_no_automatic_retry",
-                "pair_id": identity,
-                **dict(expected),
-                "execution_contract_logical_sha256": contract["logical_sha256"],
-                "attempt_number": 1,
-            }
-            attempt_sha = canonical_sha256(attempt_base)
-            atomic_json(
-                attempt_path,
-                {**attempt_base, "attempt_sha256": attempt_sha},
-                frozen=True,
-            )
-            task_args = collector._load_task_args(
-                robotwin_root, body, str(expected["condition"])
-            )
-            task_args["step_lim"] = args.max_steps
-            try:
-                commitment = prepare_initial_commitment(
-                    body=body,
-                    condition=str(expected["condition"]),
-                    seed=int(expected["requested_seed"]),
-                    task_class=task_class,
-                    task_args=task_args,
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    instruction=args.instruction,
-                    device=device,
-                )
-                atomic_json(commitment_path, commitment, frozen=True)
-                rollouts = {}
-                for method in expected["method_order"]:
-                    rollouts[method] = execute_rollout(
-                        method=method,
-                        body=body,
-                        condition=str(expected["condition"]),
-                        seed=int(expected["requested_seed"]),
-                        task_class=task_class,
-                        task_args=task_args,
-                        policy=policy,
-                        preprocessor=preprocessor,
-                        postprocessor=postprocessor,
-                        ensemble=ensemble,
-                        calibration=calibration,
-                        initial_commitment=commitment,
-                        instruction=args.instruction,
-                        max_steps=args.max_steps,
-                        device=device,
-                    )
-                pair = materialize_triplet(
-                    expected,
-                    rollouts,
-                    commitment=commitment,
-                    attempt_sha256=attempt_sha,
-                    execution_contract_logical_sha256=contract["logical_sha256"],
-                )
-                validate_triplet(
-                    pair,
-                    expected,
-                    execution_contract_logical_sha256=contract["logical_sha256"],
-                )
-                atomic_json(pair_path, pair, frozen=True)
-            except Exception as error:
-                failure_base = {
-                    "format": "etsf_robotwin2_nested_n4_n8_attempt_failure_v1",
-                    "status": "failed_no_automatic_retry",
-                    "pair_id": identity,
-                    "attempt_sha256": attempt_sha,
-                    "error_type": type(error).__name__,
-                    "error_message": str(error),
-                }
-                if not failure_path.exists():
-                    atomic_json(
-                        failure_path,
-                        {
-                            **failure_base,
-                            "failure_sha256": canonical_sha256(failure_base),
-                        },
-                        frozen=True,
-                    )
-                raise
+
+    def record_completed_pair(
+        pair: Mapping[str, Any],
+        *,
+        body: str,
+        expected: Mapping[str, Any],
+        identity: str,
+    ) -> None:
+        nonlocal completed
         rows.append(outcome_row(pair))
         completed += 1
         atomic_json(
@@ -1370,22 +1875,323 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
 
+    for expected in schedule:
+        body = str(expected["heldout_body"])
+        identity = pair_id(body, expected["condition"], expected["requested_seed"])
+        pair_path = pairs_dir / f"{identity}.json"
+        attempt_path = attempts_dir / f"{identity}.json"
+        commitment_path = commitments_dir / f"{identity}.json"
+        failure_path = failures_dir / f"{identity}.json"
+        existing_failure, _failure_staged = read_create_once_json(
+            failure_path, label="nested triplet failure"
+        )
+        if existing_failure is not None:
+            raise NestedCandidatePoolError(
+                "nested triplet has an immutable prior failure"
+            )
+        attempt_base = {
+            "format": "etsf_robotwin2_nested_n4_n8_attempt_v2",
+            "status": "started_once_fixed_method_order_with_bounded_resume",
+            "pair_id": identity,
+            **dict(expected),
+            "execution_contract_logical_sha256": contract["logical_sha256"],
+            "execution_contract_file_sha256": contract_file_sha,
+            "attempt_number": 1,
+        }
+        attempt_sha = canonical_sha256(attempt_base)
+        attempt = {**attempt_base, "attempt_sha256": attempt_sha}
+        pair = recover_complete_existing_triplet(
+            pair_path=pair_path,
+            attempt_path=attempt_path,
+            commitment_path=commitment_path,
+            method_starts_dir=method_starts_dir,
+            method_results_dir=method_results_dir,
+            method_failures_dir=method_failures_dir,
+            identity=identity,
+            expected=expected,
+            attempt=attempt,
+            execution_contract_logical_sha256=contract["logical_sha256"],
+            execution_contract_file_sha256=contract_file_sha,
+        )
+        if pair is not None:
+            record_completed_pair(
+                pair, body=body, expected=expected, identity=identity
+            )
+            continue
+        if body != active_body:
+            del ensemble
+            gc.collect()
+            torch.cuda.empty_cache()
+            ensemble = formal.load_ensemble(folds[body], device)
+            active_body = body
+        promote_create_once_json(
+            attempt_path, attempt, label="nested triplet attempt"
+        )
+        task_args = collector._load_task_args(
+            robotwin_root, body, str(expected["condition"])
+        )
+        task_args["step_lim"] = args.max_steps
+        try:
+            commitment, commitment_staged = read_create_once_json(
+                commitment_path, label="nested initial commitment"
+            )
+            if commitment is None:
+                commitment = prepare_initial_commitment(
+                    body=body,
+                    condition=str(expected["condition"]),
+                    seed=int(expected["requested_seed"]),
+                    task_class=task_class,
+                    task_args=task_args,
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    instruction=args.instruction,
+                    device=device,
+                )
+            validate_stored_initial_commitment(commitment, expected)
+            promote_create_once_json(
+                commitment_path,
+                commitment,
+                label="nested initial commitment",
+            )
+            commitment_sha = str(commitment["commitment_sha256"])
+            rollouts: dict[str, Mapping[str, Any]] = {}
+            method_result_bindings: dict[str, dict[str, str]] = {}
+            prefix_result_shas: list[str] = []
+            ordered_methods = list(expected["method_order"])
+            for method_ordinal, method in enumerate(ordered_methods):
+                stem = f"{identity}.{method_ordinal:02d}.{method}"
+                start_path = method_starts_dir / f"{stem}.json"
+                resume_path = method_resumes_dir / f"{stem}.json"
+                result_path = method_results_dir / f"{stem}.json"
+                method_failure_path = method_failures_dir / f"{stem}.json"
+                start_value = build_method_start(
+                    expected,
+                    method=method,
+                    method_ordinal=method_ordinal,
+                    attempt_sha256=attempt_sha,
+                    commitment_sha256=commitment_sha,
+                    execution_contract_logical_sha256=contract["logical_sha256"],
+                    completed_prefix_result_sha256=prefix_result_shas,
+                )
+                existing_start, start_staged = read_create_once_json(
+                    start_path, label="nested method start"
+                )
+                start_created_now = existing_start is None
+                if existing_start is not None:
+                    validate_method_start(existing_start, start_value)
+                promote_create_once_json(
+                    start_path, start_value, label="nested method start"
+                )
+                existing_method_failure, _method_failure_staged = (
+                    read_create_once_json(
+                        method_failure_path, label="nested method failure"
+                    )
+                )
+                if existing_method_failure is not None:
+                    raise NestedCandidatePoolError(
+                        f"nested method {method} has an immutable prior failure"
+                    )
+                result_value, result_staged = read_create_once_json(
+                    result_path, label="nested method result"
+                )
+                if result_value is None:
+                    for later_ordinal, later_method in enumerate(
+                        ordered_methods[method_ordinal + 1 :],
+                        start=method_ordinal + 1,
+                    ):
+                        later_stem = f"{identity}.{later_ordinal:02d}.{later_method}"
+                        later_paths = (
+                            method_starts_dir / f"{later_stem}.json",
+                            method_results_dir / f"{later_stem}.json",
+                            method_failures_dir / f"{later_stem}.json",
+                        )
+                        if any(
+                            path.exists() or _staged_path(path).exists()
+                            for path in later_paths
+                        ):
+                            raise NestedCandidatePoolError(
+                                "nested method artifacts are not a complete prefix"
+                            )
+                    if not start_created_now:
+                        resume_base = {
+                            "format": METHOD_RESUME_FORMAT,
+                            "status": "single_automatic_noninformative_resume",
+                            "pair_id": identity,
+                            **dict(expected),
+                            "method": method,
+                            "method_ordinal": method_ordinal,
+                            "method_start_sha256": start_value[
+                                "method_start_sha256"
+                            ],
+                            "attempt_sha256": attempt_sha,
+                            "commitment_sha256": commitment_sha,
+                            "resume_number": 1,
+                            "resume_trigger": (
+                                "missing_result_and_failure_after_process_or_host_"
+                                "interruption"
+                            ),
+                            "noninformative_interruption_assumption": True,
+                        }
+                        resume_value = {
+                            **resume_base,
+                            "method_resume_sha256": canonical_sha256(resume_base),
+                        }
+                        existing_resume, _resume_staged = read_create_once_json(
+                            resume_path, label="nested method resume"
+                        )
+                        if existing_resume is not None:
+                            raise NestedCandidatePoolError(
+                                "nested method exceeded its one-resume limit"
+                            )
+                        promote_create_once_json(
+                            resume_path, resume_value, label="nested method resume"
+                        )
+                    try:
+                        rollout = execute_rollout(
+                            method=method,
+                            body=body,
+                            condition=str(expected["condition"]),
+                            seed=int(expected["requested_seed"]),
+                            task_class=task_class,
+                            task_args=task_args,
+                            policy=policy,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            ensemble=ensemble,
+                            calibration=calibration,
+                            initial_commitment=commitment,
+                            instruction=args.instruction,
+                            max_steps=args.max_steps,
+                            device=device,
+                        )
+                        result_value = build_method_result(
+                            expected,
+                            method=method,
+                            method_ordinal=method_ordinal,
+                            rollout=rollout,
+                            method_start_sha256=start_value[
+                                "method_start_sha256"
+                            ],
+                            attempt_sha256=attempt_sha,
+                            commitment_sha256=commitment_sha,
+                            execution_contract_logical_sha256=contract[
+                                "logical_sha256"
+                            ],
+                            execution_contract_file_sha256=contract_file_sha,
+                            completed_prefix_result_sha256=prefix_result_shas,
+                        )
+                        promote_create_once_json(
+                            result_path,
+                            result_value,
+                            label="nested method result",
+                        )
+                    except Exception as method_error:
+                        method_failure_base = {
+                            "format": METHOD_FAILURE_FORMAT,
+                            "status": "failed_once_no_retry",
+                            "pair_id": identity,
+                            **dict(expected),
+                            "method": method,
+                            "method_ordinal": method_ordinal,
+                            "method_start_sha256": start_value[
+                                "method_start_sha256"
+                            ],
+                            "attempt_sha256": attempt_sha,
+                            "commitment_sha256": commitment_sha,
+                            "error_type": type(method_error).__name__,
+                            "error_message": str(method_error),
+                        }
+                        method_failure_value = {
+                            **method_failure_base,
+                            "method_failure_sha256": canonical_sha256(
+                                method_failure_base
+                            ),
+                        }
+                        promote_create_once_json(
+                            method_failure_path,
+                            method_failure_value,
+                            label="nested method failure",
+                        )
+                        raise
+                rollout = validate_method_result(
+                    result_value,
+                    expected,
+                    method=method,
+                    method_ordinal=method_ordinal,
+                    method_start_sha256=start_value["method_start_sha256"],
+                    attempt_sha256=attempt_sha,
+                    commitment_sha256=commitment_sha,
+                    execution_contract_logical_sha256=contract["logical_sha256"],
+                    execution_contract_file_sha256=contract_file_sha,
+                    completed_prefix_result_sha256=prefix_result_shas,
+                )
+                result_file_sha = promote_create_once_json(
+                    result_path, result_value, label="nested method result"
+                )
+                result_logical_sha = str(result_value["method_result_sha256"])
+                rollouts[method] = rollout
+                method_result_bindings[method] = {
+                    "logical_sha256": result_logical_sha,
+                    "file_sha256": result_file_sha,
+                }
+                prefix_result_shas.append(result_logical_sha)
+            computed_pair = materialize_triplet(
+                expected,
+                rollouts,
+                commitment=commitment,
+                attempt_sha256=attempt_sha,
+                execution_contract_logical_sha256=contract["logical_sha256"],
+                method_result_bindings=method_result_bindings,
+            )
+            pair_existing, pair_staged = read_create_once_json(
+                pair_path, label="nested triplet"
+            )
+            if pair_existing is not None and dict(pair_existing) != computed_pair:
+                raise NestedCandidatePoolError(
+                    "existing nested triplet differs from its method results"
+                )
+            pair = computed_pair
+            if pair.get("attempt_sha256") != attempt_sha:
+                raise NestedCandidatePoolError("nested triplet attempt binding changed")
+            validate_triplet(
+                pair,
+                expected,
+                execution_contract_logical_sha256=contract["logical_sha256"],
+                expected_method_result_bindings=method_result_bindings,
+            )
+            promote_create_once_json(pair_path, pair, label="nested triplet")
+        except Exception as error:
+            failure_base = {
+                "format": "etsf_robotwin2_nested_n4_n8_attempt_failure_v2",
+                "status": "failed_no_automatic_retry",
+                "pair_id": identity,
+                "attempt_sha256": attempt_sha,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            }
+            failure_value = {
+                **failure_base,
+                "failure_sha256": canonical_sha256(failure_base),
+            }
+            promote_create_once_json(
+                failure_path, failure_value, label="nested triplet failure"
+            )
+            raise
+        record_completed_pair(
+            pair, body=body, expected=expected, identity=identity
+        )
+
     document = build_outcome_document(
         rows,
         execution_contract_logical_sha256=contract["logical_sha256"],
         execution_contract_file_sha256=contract_file_sha,
     )
-    if outcome_path.exists():
-        if json.loads(outcome_path.read_text(encoding="utf-8")) != document:
-            raise NestedCandidatePoolError("existing nested outcomes differ")
-    else:
-        atomic_json(outcome_path, document, frozen=True)
+    promote_create_once_json(
+        outcome_path, document, label="nested outcome document"
+    )
     report = build_report(rows, outcome_document_sha256=document["document_sha256"])
-    if report_path.exists():
-        if json.loads(report_path.read_text(encoding="utf-8")) != report:
-            raise NestedCandidatePoolError("existing nested report differs")
-    else:
-        atomic_json(report_path, report, frozen=True)
+    promote_create_once_json(report_path, report, label="nested paired report")
     completion_base = {
         "format": COMPLETION_FORMAT,
         "status": "complete_1000_triplets_3000_rollouts_frozen",
@@ -1397,17 +2203,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "report_file_sha256": sha256_file(report_path),
         "initial_condition_triplet_count": len(rows),
         "rollout_count": len(rows) * len(METHODS),
+        "nested_evaluation_protocol_logical_sha256": (
+            nested_evaluation_protocol()["logical_sha256"]
+        ),
         "postformal_not_part_of_reference_preregistration": True,
     }
     completion = {
         **completion_base,
         "logical_sha256": canonical_sha256(completion_base),
     }
-    if completion_path.exists():
-        if json.loads(completion_path.read_text(encoding="utf-8")) != completion:
-            raise NestedCandidatePoolError("existing completion receipt differs")
-    else:
-        atomic_json(completion_path, completion, frozen=True)
+    promote_create_once_json(
+        completion_path, completion, label="nested completion receipt"
+    )
     print(
         "NESTED_N4_N8_COMPLETE="
         + json.dumps(
@@ -1440,11 +2247,19 @@ __all__ = [
     "RAW_PROPOSAL_COUNT",
     "build_outcome_document",
     "build_report",
+    "build_method_result",
+    "build_method_start",
     "evaluation_schedule",
     "existing_separate_n4_n8_comparability_audit",
     "materialize_triplet",
     "nested_pool_contract",
+    "nested_evaluation_protocol",
     "nested_pool_selection_audit",
     "outcome_row",
+    "promote_create_once_json",
+    "read_create_once_json",
+    "recover_complete_existing_triplet",
+    "validate_complete_outcome_rows",
     "validate_nested_pool_audit",
+    "validate_method_result",
 ]

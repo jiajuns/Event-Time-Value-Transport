@@ -449,6 +449,8 @@ def _write_fold_summary(tmp_path: Path, seeds: list[int]) -> Path:
         "format": runner.shared_head.FORMAT,
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": "franka",
+        "source_bodies": [body for body in runner.BODIES if body != "franka"],
+        "body_adapter": "single_shared_row_zero_heldout_parameters",
         "heldout_labels_used_for_normalization_training_or_selection": False,
         "heldout_specific_trainable_parameters": 0,
         "actor_frozen": True,
@@ -490,6 +492,8 @@ def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
 ) -> None:
     fold = {
         "heldout_body": "franka",
+        "source_bodies": [body for body in runner.BODIES if body != "franka"],
+        "body_adapter": "single_shared_row_zero_heldout_parameters",
         "event_derivation_implementation_sha256": "a" * 64,
         "trainer_file_sha256": "b" * 64,
         "ensemble_common_selection_step": 100,
@@ -498,6 +502,11 @@ def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
     checkpoint = {
         "format": runner.shared_head.FORMAT,
         "held_out_body": "franka",
+        "source_bodies": [body for body in runner.BODIES if body != "franka"],
+        "body_adapter": "single_shared_row_zero_heldout_parameters",
+        "body_to_id": {
+            body: 0 for body in runner.BODIES if body != "franka"
+        },
         "canonical_state_schema": runner.shared_head.CANONICAL_STATE_SCHEMA,
         "canonical_action_schema": runner.shared_head.CANONICAL_ACTION_SCHEMA,
         "event_age_contract": runner.shared_head.event_age_contract(),

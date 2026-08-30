@@ -2,8 +2,8 @@
 """Supervise one explicitly specified postformal watcher process.
 
 The guarded watcher's ``run.exit`` file is authoritative: ``0`` is durable
-success and ``1`` is durable failure.  A child exit without that file is
-treated as an interrupted watcher and may be restarted.  The guardian never
+success and ``1`` is durable failure.  Without that file, restart is authorized
+only by an unambiguous watcher/stage interruption signal.  The guardian never
 changes watcher arguments, experiment ordering, or GPU allocation.
 """
 
@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,13 @@ from typing import Any, Mapping, Sequence
 
 
 FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_guardian_v1"
+WATCHER_FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2"
+RECOVERABLE_INTERRUPTION_STATUS = "recoverable_child_signal_interruption"
+RECOVERABLE_WATCHER_EXIT_CODE = 75
+RECOVERABLE_INTERRUPTION_SIGNALS = frozenset(
+    int(member)
+    for member in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGKILL)
+)
 SAME_ERROR_LIMIT = 3
 MAX_UNEXPECTED_RESTARTS = 3
 TERMINAL_CHILD_GRACE_SECONDS = 5.0
@@ -131,6 +139,75 @@ def changed_failed_error(
     }
 
 
+def changed_recoverable_interruption(
+    path: Path, before_fingerprint: str | None
+) -> dict[str, Any] | None:
+    """Validate a newly written, signal-specific watcher restart credential."""
+
+    if not path.exists():
+        return None
+    if not path.is_file() or path.is_symlink():
+        raise PostformalGuardianError("watcher state must be a real regular file")
+    payload = path.read_bytes()
+    payload_sha256 = sha256_bytes(payload)
+    fingerprint = f"{path.stat().st_mtime_ns}:{payload_sha256}"
+    if fingerprint == before_fingerprint:
+        return None
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PostformalGuardianError("watcher state is not valid JSON") from error
+    if not isinstance(value, Mapping):
+        raise PostformalGuardianError("watcher state must be a JSON object")
+    stage = value.get("child_stage")
+    child_returncode = value.get("child_returncode")
+    signal_number = value.get("child_signal_number")
+    signal_name = value.get("child_signal_name")
+    if (
+        value.get("format") != WATCHER_FORMAT
+        or value.get("status") != RECOVERABLE_INTERRUPTION_STATUS
+        or value.get("error_type") != "RecoverableChildSignalInterruption"
+        or not isinstance(stage, str)
+        or not stage
+        or isinstance(child_returncode, bool)
+        or not isinstance(child_returncode, int)
+        or child_returncode >= 0
+        or isinstance(signal_number, bool)
+        or not isinstance(signal_number, int)
+        or signal_number != -child_returncode
+        or signal_number not in RECOVERABLE_INTERRUPTION_SIGNALS
+        or signal_name != signal.Signals(signal_number).name
+        or value.get("run_exit_written") is not False
+    ):
+        return None
+    return {
+        "interrupted_process": "watcher_stage_child",
+        "interrupted_stage": stage,
+        "interrupted_child_returncode": child_returncode,
+        "interrupted_signal_number": signal_number,
+        "interrupted_signal_name": signal_name,
+        "watcher_state_file_sha256": payload_sha256,
+    }
+
+
+def recoverable_watcher_signal(returncode: int | None) -> dict[str, Any] | None:
+    """Classify an unambiguously signal-stopped watcher process."""
+
+    if (
+        isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or returncode >= 0
+        or -returncode not in RECOVERABLE_INTERRUPTION_SIGNALS
+    ):
+        return None
+    signal_number = -returncode
+    return {
+        "interrupted_process": "watcher",
+        "interrupted_signal_number": signal_number,
+        "interrupted_signal_name": signal.Signals(signal_number).name,
+    }
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-exit", type=Path, required=True)
@@ -175,7 +252,6 @@ def supervise(arguments: argparse.Namespace) -> int:
     }
     attempts: list[dict[str, Any]] = []
     unexpected_restarts = 0
-    prior_error_signature_sha256: str | None = None
     same_error_count = 0
 
     def write_state(status: str, **extra: Any) -> None:
@@ -302,46 +378,42 @@ def supervise(arguments: argparse.Namespace) -> int:
             )
             return 1
 
-        observed_error = changed_failed_error(
-            arguments.watcher_state, before_fingerprint
-        )
-        if observed_error is None:
-            prior_error_signature_sha256 = None
-            same_error_count = 0
-        else:
-            attempt.update(observed_error)
-            if (
-                observed_error["error_signature_sha256"]
-                == prior_error_signature_sha256
-            ):
-                same_error_count += 1
-            else:
-                prior_error_signature_sha256 = observed_error[
-                    "error_signature_sha256"
-                ]
-                same_error_count = 1
-            if same_error_count >= SAME_ERROR_LIMIT:
-                write_state(
-                    "failed",
-                    terminal_reason="same_unrecoverable_error_repeated",
-                    terminal_attempt_number=attempt_number,
-                    repeated_error={
+        recoverable = recoverable_watcher_signal(process.returncode)
+        if recoverable is None and process.returncode == RECOVERABLE_WATCHER_EXIT_CODE:
+            recoverable = changed_recoverable_interruption(
+                arguments.watcher_state, before_fingerprint
+            )
+        if recoverable is None:
+            observed_error = changed_failed_error(
+                arguments.watcher_state, before_fingerprint
+            )
+            if observed_error is not None:
+                attempt.update(observed_error)
+            write_state(
+                "failed",
+                terminal_reason="unrecoverable_child_exit_without_run_exit",
+                terminal_attempt_number=attempt_number,
+                child_returncode=process.returncode,
+                watcher_failure_error=(
+                    {
                         "error_type": observed_error["error_type"],
                         "error_message": observed_error["error_message"],
-                    },
-                    repeated_error_signature_sha256=observed_error[
-                        "error_signature_sha256"
-                    ],
-                    child_returncode=process.returncode,
-                )
-                return 1
+                    }
+                    if observed_error is not None
+                    else None
+                ),
+            )
+            return 1
+
+        attempt.update(recoverable)
 
         if unexpected_restarts >= MAX_UNEXPECTED_RESTARTS:
             write_state(
                 "failed",
-                terminal_reason="unexpected_restart_limit_exhausted",
+                terminal_reason="recoverable_signal_restart_limit_exhausted",
                 terminal_attempt_number=attempt_number,
                 child_returncode=process.returncode,
+                recoverable_interruption=recoverable,
             )
             return 1
 
@@ -350,6 +422,7 @@ def supervise(arguments: argparse.Namespace) -> int:
             "restarting",
             last_child_pid=process.pid,
             last_child_returncode=process.returncode,
+            recoverable_interruption=recoverable,
             next_attempt_number=attempt_number + 1,
         )
         if arguments.restart_delay_seconds:
@@ -401,13 +474,18 @@ __all__ = [
     "FORMAT",
     "MAX_UNEXPECTED_RESTARTS",
     "PostformalGuardianError",
+    "RECOVERABLE_INTERRUPTION_SIGNALS",
+    "RECOVERABLE_INTERRUPTION_STATUS",
+    "RECOVERABLE_WATCHER_EXIT_CODE",
     "SAME_ERROR_LIMIT",
     "TERMINAL_CHILD_GRACE_SECONDS",
     "atomic_json",
     "changed_failed_error",
+    "changed_recoverable_interruption",
     "file_fingerprint",
     "main",
     "parse_args",
     "read_run_exit",
+    "recoverable_watcher_signal",
     "supervise",
 ]

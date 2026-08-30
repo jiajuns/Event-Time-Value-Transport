@@ -60,20 +60,38 @@ def test_preexisting_success_is_reused_without_starting_child(tmp_path: Path) ->
     assert state["attempts_started"] == 0
 
 
-def test_unexpected_exits_restart_then_observe_durable_success(tmp_path: Path) -> None:
+def test_credentialed_stage_signal_restarts_then_observes_success(
+    tmp_path: Path,
+) -> None:
     counter = tmp_path / "attempt-count"
+    watcher_state = tmp_path / "watcher-state.json"
     run_exit = tmp_path / "run.exit"
     code = """
 from pathlib import Path
-import sys
-counter = Path(sys.argv[1])
+import json, signal, sys
+counter, state, run_exit = map(Path, sys.argv[1:4])
 count = int(counter.read_text()) + 1 if counter.exists() else 1
 counter.write_text(str(count))
 if count >= 3:
-    Path(sys.argv[2]).write_text("0\\n")
-raise SystemExit(0 if count >= 3 else 17)
+    run_exit.write_text("0\\n")
+    raise SystemExit(0)
+state.write_text(json.dumps({
+    "format": "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2",
+    "status": "recoverable_child_signal_interruption",
+    "error_type": "RecoverableChildSignalInterruption",
+    "error_message": "nested interrupted by SIGTERM (15)",
+    "child_stage": "nested",
+    "child_returncode": -int(signal.SIGTERM),
+    "child_signal_number": int(signal.SIGTERM),
+    "child_signal_name": "SIGTERM",
+    "run_exit_written": False,
+    "attempt": count,
+}))
+raise SystemExit(75)
 """
-    result = guardian.main(_guardian_argv(tmp_path, code, counter, run_exit))
+    result = guardian.main(
+        _guardian_argv(tmp_path, code, counter, watcher_state, run_exit)
+    )
     assert result == 0
     assert counter.read_text(encoding="utf-8") == "3"
     state = _state(tmp_path)
@@ -116,7 +134,9 @@ raise SystemExit(1)
     }
 
 
-def test_same_new_unrecoverable_error_three_times_fails_closed(tmp_path: Path) -> None:
+def test_unrecoverable_error_without_run_exit_fails_on_first_attempt(
+    tmp_path: Path,
+) -> None:
     counter = tmp_path / "attempt-count"
     watcher_state = tmp_path / "watcher-state.json"
     code = """
@@ -135,15 +155,17 @@ raise SystemExit(23)
 """
     result = guardian.main(_guardian_argv(tmp_path, code, counter, watcher_state))
     assert result == 1
-    assert counter.read_text(encoding="utf-8") == "3"
+    assert counter.read_text(encoding="utf-8") == "1"
     state = _state(tmp_path)
     assert state["status"] == "failed"
-    assert state["terminal_reason"] == "same_unrecoverable_error_repeated"
-    assert state["same_error_consecutive_count"] == 3
-    assert state["unexpected_restart_count"] == 2
+    assert state["terminal_reason"] == "unrecoverable_child_exit_without_run_exit"
+    assert state["unexpected_restart_count"] == 0
+    assert state["watcher_failure_error"]["error_message"] == (
+        "immutable authority mismatch"
+    )
 
 
-def test_stateless_crash_never_exceeds_restart_budget(tmp_path: Path) -> None:
+def test_stateless_crash_is_not_mislabeled_as_interruption(tmp_path: Path) -> None:
     counter = tmp_path / "attempt-count"
     code = """
 from pathlib import Path
@@ -154,11 +176,60 @@ raise SystemExit(31)
 """
     result = guardian.main(_guardian_argv(tmp_path, code, counter))
     assert result == 1
-    assert counter.read_text(encoding="utf-8") == str(
-        guardian.MAX_UNEXPECTED_RESTARTS + 1
-    )
+    assert counter.read_text(encoding="utf-8") == "1"
     state = _state(tmp_path)
     assert state["status"] == "failed"
-    assert state["terminal_reason"] == "unexpected_restart_limit_exhausted"
-    assert state["unexpected_restart_count"] == guardian.MAX_UNEXPECTED_RESTARTS
+    assert state["terminal_reason"] == "unrecoverable_child_exit_without_run_exit"
+    assert state["unexpected_restart_count"] == 0
     assert not list(tmp_path.glob("guardian-state.json.partial-*"))
+
+
+def test_signal_stopped_watcher_process_is_restarted(tmp_path: Path) -> None:
+    counter = tmp_path / "attempt-count"
+    run_exit = tmp_path / "run.exit"
+    code = """
+from pathlib import Path
+import os, signal, sys
+counter, run_exit = map(Path, sys.argv[1:3])
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+if count == 1:
+    os.kill(os.getpid(), signal.SIGTERM)
+run_exit.write_text("0\\n")
+"""
+    result = guardian.main(_guardian_argv(tmp_path, code, counter, run_exit))
+    assert result == 0
+    assert counter.read_text(encoding="utf-8") == "2"
+    state = _state(tmp_path)
+    assert state["unexpected_restart_count"] == 1
+    assert state["attempt_history"][0]["interrupted_process"] == "watcher"
+    assert state["attempt_history"][0]["interrupted_signal_name"] == "SIGTERM"
+
+
+def test_shell_style_signal_exit_and_crash_signals_are_not_recoverable(
+    tmp_path: Path,
+) -> None:
+    watcher_state = tmp_path / "watcher-state.json"
+    code = """
+from pathlib import Path
+import json, sys
+state = Path(sys.argv[1])
+state.write_text(json.dumps({
+    "format": "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2",
+    "status": "recoverable_child_signal_interruption",
+    "error_type": "RecoverableChildSignalInterruption",
+    "child_stage": "nested",
+    "child_returncode": 143,
+    "child_signal_number": 15,
+    "child_signal_name": "SIGTERM",
+    "run_exit_written": False,
+}))
+raise SystemExit(75)
+"""
+    result = guardian.main(_guardian_argv(tmp_path, code, watcher_state))
+    assert result == 1
+    assert _state(tmp_path)["terminal_reason"] == (
+        "unrecoverable_child_exit_without_run_exit"
+    )
+    assert guardian.recoverable_watcher_signal(-11) is None
+    assert guardian.recoverable_watcher_signal(143) is None

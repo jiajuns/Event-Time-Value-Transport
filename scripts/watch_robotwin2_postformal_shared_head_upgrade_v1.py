@@ -22,6 +22,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -31,6 +32,12 @@ from typing import Any, Mapping, Sequence
 
 
 FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2"
+RECOVERABLE_INTERRUPTION_STATUS = "recoverable_child_signal_interruption"
+RECOVERABLE_WATCHER_EXIT_CODE = 75
+RECOVERABLE_INTERRUPTION_SIGNALS = frozenset(
+    int(member)
+    for member in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGKILL)
+)
 UPSTREAM_FORMAT = "etsf_robotwin2_five_body_postformal_ablation_watcher_v1"
 SUPPLEMENT_MANIFEST_FORMAT = (
     "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
@@ -50,6 +57,23 @@ EXPECTED_SUPPLEMENT_DECISIONS = 150
 EXPECTED_SUPPLEMENT_BRANCHES = 600
 N8_RETAINED_CANDIDATE_COUNT = 8
 N8_RAW_PROPOSAL_COUNT = 16
+NESTED_RUNNER_FORMAT = "etsf_robotwin2_five_body_nested_n4_n8_execution_v2"
+NESTED_CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v1"
+NESTED_OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
+NESTED_REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
+NESTED_COMPLETION_FORMAT = (
+    "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
+)
+NESTED_PROTOCOL_FORMAT = "etsf_robotwin2_nested_n4_n8_prospective_protocol_v1"
+NESTED_METHODS = (
+    "actor_baseline",
+    "etsf_nested_best_of_4_from_raw16",
+    "etsf_nested_best_of_8_from_raw16",
+)
+NESTED_SEED_BASE = 2026091000
+NESTED_SEED_COUNT = 100
+EXPECTED_NESTED_TRIPLETS = 1000
+EXPECTED_NESTED_ROLLOUTS = 3000
 EXPECTED_GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
 DEFAULT_ETSF_SITE = Path(
     "/home/user/anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages"
@@ -58,6 +82,39 @@ DEFAULT_ETSF_SITE = Path(
 
 class SharedHeadUpgradeError(RuntimeError):
     """The upstream, supplement, training, or paired upgrade failed closed."""
+
+
+class RecoverableChildSignalInterruption(SharedHeadUpgradeError):
+    """A stage child was unambiguously stopped by an interruption signal."""
+
+    def __init__(self, stage: str, returncode: int) -> None:
+        if (
+            isinstance(returncode, bool)
+            or returncode >= 0
+            or -returncode not in RECOVERABLE_INTERRUPTION_SIGNALS
+        ):
+            raise ValueError("recoverable interruption requires an allowed signal")
+        self.stage = stage
+        self.child_returncode = returncode
+        self.signal_number = -returncode
+        self.signal_name = signal.Signals(self.signal_number).name
+        super().__init__(
+            f"{stage} interrupted by {self.signal_name} ({self.signal_number})"
+        )
+
+
+def raise_for_stage_returncode(stage: str, returncode: int) -> None:
+    """Classify only direct POSIX interruption signals as recoverable."""
+
+    if returncode == 0:
+        return
+    if (
+        not isinstance(returncode, bool)
+        and returncode < 0
+        and -returncode in RECOVERABLE_INTERRUPTION_SIGNALS
+    ):
+        raise RecoverableChildSignalInterruption(stage, returncode)
+    raise SharedHeadUpgradeError(f"{stage} exited {returncode}")
 
 
 def utc_now() -> str:
@@ -118,6 +175,193 @@ def verify_logical_sha(value: Mapping[str, Any], label: str) -> None:
     declared = unsigned.pop("logical_sha256", None)
     if declared != canonical_sha256(unsigned):
         raise SharedHeadUpgradeError(f"{label} logical SHA-256 mismatch")
+
+
+def verify_named_sha(
+    value: Mapping[str, Any], field: str, label: str
+) -> None:
+    unsigned = dict(value)
+    declared = unsigned.pop(field, None)
+    if declared != canonical_sha256(unsigned):
+        raise SharedHeadUpgradeError(f"{label} {field} mismatch")
+
+
+def validate_nested_protocol(value: Mapping[str, Any]) -> str:
+    verify_logical_sha(value, "nested evaluation protocol")
+    if (
+        value.get("format") != NESTED_PROTOCOL_FORMAT
+        or value.get("evaluation_seed_base") != NESTED_SEED_BASE
+        or value.get("evaluation_seed_count") != NESTED_SEED_COUNT
+        or value.get("formal_seed_block_reused") is not False
+        or value.get("seed_block_selected_before_any_nested_rollout_outcome")
+        is not True
+        or value.get("balanced_body_condition_cells")
+        != len(BODIES) * len(CONDITIONS)
+        or value.get("bootstrap_unit")
+        != "requested_seed_cluster_with_all_selected_body_condition_rows_kept_together"
+        or value.get("pooled_mcnemar_role")
+        != "descriptive_only_due_repeated_requested_seeds"
+        or value.get("single_body_condition_mcnemar_role") != "inferential"
+        or not isinstance(value.get("bootstrap_seed_derivation"), Mapping)
+    ):
+        raise SharedHeadUpgradeError("nested evaluation protocol changed")
+    return str(value["logical_sha256"])
+
+
+def validate_nested_completion(root: Path) -> dict[str, Any]:
+    """Validate the complete contract→outcomes→report→receipt SHA chain."""
+
+    root = root.expanduser().resolve()
+    contract_path = root / "execution_contract.json"
+    outcome_path = root / "nested_paired_outcomes.json"
+    report_path = root / "nested_n4_n8_report.json"
+    completion_path = root / "completion_receipt.json"
+    contract = read_json(contract_path, "nested execution contract")
+    outcome = read_json(outcome_path, "nested outcomes")
+    report = read_json(report_path, "nested report")
+    completion = read_json(completion_path, "nested completion receipt")
+
+    verify_logical_sha(contract, "nested execution contract")
+    protocol = contract.get("nested_evaluation_protocol")
+    if not isinstance(protocol, Mapping):
+        raise SharedHeadUpgradeError("nested contract lacks its evaluation protocol")
+    protocol_sha = validate_nested_protocol(protocol)
+    persistence = contract.get("method_result_persistence")
+    if (
+        contract.get("format") != NESTED_CONTRACT_FORMAT
+        or contract.get("runner_format") != NESTED_RUNNER_FORMAT
+        or contract.get("bodies") != list(BODIES)
+        or contract.get("conditions") != list(CONDITIONS)
+        or contract.get("evaluation_seed_base") != NESTED_SEED_BASE
+        or contract.get("evaluation_seed_count") != NESTED_SEED_COUNT
+        or contract.get("initial_condition_triplet_count")
+        != EXPECTED_NESTED_TRIPLETS
+        or contract.get("rollout_count") != EXPECTED_NESTED_ROLLOUTS
+        or contract.get("methods") != list(NESTED_METHODS)
+        or contract.get("same_requested_seed_and_complete_reset_tripled") is not True
+        or contract.get("method_order_rotated_before_outcomes") is not True
+        or contract.get("no_training") is not True
+        or not isinstance(persistence, Mapping)
+        or persistence.get("existing_result_overwrite_or_retry_allowed") is not False
+        or persistence.get("automatic_noninformative_resume_limit_per_method")
+        != 1
+        or persistence.get("exception_or_action_failure_retry_allowed") is not False
+        or persistence.get("later_method_before_complete_prefix_allowed") is not False
+    ):
+        raise SharedHeadUpgradeError("nested execution contract is incomplete")
+    contract_file_sha = sha256_file(contract_path)
+
+    verify_named_sha(outcome, "document_sha256", "nested outcomes")
+    rows = outcome.get("rows")
+    if not isinstance(rows, list) or len(rows) != EXPECTED_NESTED_TRIPLETS:
+        raise SharedHeadUpgradeError("nested outcomes lack exactly 1000 rows")
+    expected_identities = {
+        (body, condition, NESTED_SEED_BASE + ordinal)
+        for body in BODIES
+        for condition in CONDITIONS
+        for ordinal in range(NESTED_SEED_COUNT)
+    }
+    observed_identities: set[tuple[str, str, int]] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise SharedHeadUpgradeError(f"nested outcome row {index} is invalid")
+        identity = (
+            row.get("heldout_body"),
+            row.get("condition"),
+            row.get("requested_seed"),
+        )
+        if identity not in expected_identities or identity in observed_identities:
+            raise SharedHeadUpgradeError("nested outcome identity roster changed")
+        observed_identities.add(identity)
+        order = row.get("method_order")
+        if (
+            not isinstance(order, list)
+            or len(order) != len(NESTED_METHODS)
+            or set(order) != set(NESTED_METHODS)
+        ):
+            raise SharedHeadUpgradeError("nested outcome method order changed")
+        for method in NESTED_METHODS:
+            success = row.get(f"{method}_binary_success")
+            stage = row.get(f"{method}_stage_progress")
+            if (
+                type(success) is not int
+                or success not in (0, 1)
+                or isinstance(stage, bool)
+                or not isinstance(stage, (int, float))
+                or not 0.0 <= float(stage) <= 1.0
+            ):
+                raise SharedHeadUpgradeError("nested outcome value changed")
+    outcome_protocol = outcome.get("nested_evaluation_protocol")
+    if (
+        observed_identities != expected_identities
+        or outcome.get("format") != NESTED_OUTCOME_FORMAT
+        or outcome.get("status")
+        != "complete_1000_initial_condition_triplets_3000_rollouts"
+        or outcome.get("pair_count") != EXPECTED_NESTED_TRIPLETS
+        or outcome.get("rollout_count") != EXPECTED_NESTED_ROLLOUTS
+        or outcome.get("methods") != list(NESTED_METHODS)
+        or outcome.get("rows_sha256") != canonical_sha256(rows)
+        or outcome.get("execution_contract_logical_sha256")
+        != contract.get("logical_sha256")
+        or outcome.get("execution_contract_file_sha256") != contract_file_sha
+        or not isinstance(outcome_protocol, Mapping)
+        or dict(outcome_protocol) != dict(protocol)
+    ):
+        raise SharedHeadUpgradeError("nested outcome document binding changed")
+    outcome_file_sha = sha256_file(outcome_path)
+
+    verify_named_sha(report, "report_sha256", "nested report")
+    report_protocol = report.get("nested_evaluation_protocol")
+    expected_cells = {
+        f"{body}|{condition}" for body in BODIES for condition in CONDITIONS
+    }
+    if (
+        report.get("format") != NESTED_REPORT_FORMAT
+        or report.get("status")
+        != "complete_shared_raw16_nested_n4_n8_paired_report"
+        or report.get("outcome_document_sha256")
+        != outcome.get("document_sha256")
+        or not isinstance(report_protocol, Mapping)
+        or dict(report_protocol) != dict(protocol)
+        or set(report.get("by_heldout_body", {})) != set(BODIES)
+        or set(report.get("by_heldout_body_and_condition", {})) != expected_cells
+    ):
+        raise SharedHeadUpgradeError("nested report binding changed")
+    report_file_sha = sha256_file(report_path)
+
+    verify_logical_sha(completion, "nested completion receipt")
+    if (
+        completion.get("format") != NESTED_COMPLETION_FORMAT
+        or completion.get("status")
+        != "complete_1000_triplets_3000_rollouts_frozen"
+        or completion.get("execution_contract_logical_sha256")
+        != contract.get("logical_sha256")
+        or completion.get("execution_contract_file_sha256") != contract_file_sha
+        or completion.get("outcome_document_sha256")
+        != outcome.get("document_sha256")
+        or completion.get("outcome_file_sha256") != outcome_file_sha
+        or completion.get("report_sha256") != report.get("report_sha256")
+        or completion.get("report_file_sha256") != report_file_sha
+        or completion.get("initial_condition_triplet_count")
+        != EXPECTED_NESTED_TRIPLETS
+        or completion.get("rollout_count") != EXPECTED_NESTED_ROLLOUTS
+        or completion.get("nested_evaluation_protocol_logical_sha256")
+        != protocol_sha
+    ):
+        raise SharedHeadUpgradeError("nested completion SHA chain changed")
+    return {
+        "contract_file_sha256": contract_file_sha,
+        "outcome_file_sha256": outcome_file_sha,
+        "report_file_sha256": report_file_sha,
+        "completion_file_sha256": sha256_file(completion_path),
+        "nested_evaluation_protocol_logical_sha256": protocol_sha,
+        "completed_initial_condition_triplets": EXPECTED_NESTED_TRIPLETS,
+        "completed_rollouts": EXPECTED_NESTED_ROLLOUTS,
+        "completed_rollouts_by_method": {
+            method: EXPECTED_NESTED_TRIPLETS for method in NESTED_METHODS
+        },
+        "report": str(report_path),
+    }
 
 
 def validate_upstream_state(value: Mapping[str, Any]) -> None:
@@ -678,8 +922,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stderr=subprocess.STDOUT,
                 check=False,
             )
-        if result.returncode != 0:
-            raise SharedHeadUpgradeError(f"{stage} exited {result.returncode}")
+        raise_for_stage_returncode(stage, result.returncode)
 
     while True:
         try:
@@ -795,16 +1038,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         cwd=args.robotwin_root,
         environment=environment,
     )
-    nested_receipt = args.augmented_n8_root / "completion_receipt.json"
-    nested_report = args.augmented_n8_root / "nested_n4_n8_report.json"
-    if not nested_receipt.is_file() or nested_receipt.is_symlink():
-        raise SharedHeadUpgradeError(
-            "nested actor/N4/N8 runner did not complete 1000 triplets"
-        )
-    if not nested_report.is_file() or nested_report.is_symlink():
-        raise SharedHeadUpgradeError(
-            "nested actor/N4/N8 runner did not produce its paired report"
-        )
+    nested_completion = validate_nested_completion(args.augmented_n8_root)
+    nested_report = Path(str(nested_completion["report"]))
 
     atomic_text(args.run_exit, "0\n")
     write_state(
@@ -814,9 +1049,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.augmented_lobo_root / "five_fold_training_summary.json"
         ),
         nested_actor_n4_n8_report=str(nested_report),
-        nested_actor_n4_n8_report_file_sha256=sha256_file(nested_report),
-        completed_initial_condition_triplets=1000,
-        completed_rollouts_by_method={"actor": 1000, "n4": 1000, "n8": 1000},
+        nested_actor_n4_n8_report_file_sha256=nested_completion[
+            "report_file_sha256"
+        ],
+        nested_completion_audit=nested_completion,
+        completed_initial_condition_triplets=nested_completion[
+            "completed_initial_condition_triplets"
+        ],
+        completed_rollouts_by_method=nested_completion[
+            "completed_rollouts_by_method"
+        ],
         n4_is_exact_ordered_prefix_of_n8=True,
         gpu_reserved_by_watcher=False,
     )
@@ -842,6 +1084,29 @@ def record_failure(
         )
 
 
+def record_recoverable_interruption(
+    state: Path | None, error: RecoverableChildSignalInterruption
+) -> None:
+    """Persist a narrow guardian restart authorization without terminal failure."""
+
+    if state is not None:
+        atomic_json(
+            state,
+            {
+                "format": FORMAT,
+                "status": RECOVERABLE_INTERRUPTION_STATUS,
+                "updated_at_utc": utc_now(),
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "child_stage": error.stage,
+                "child_returncode": error.child_returncode,
+                "child_signal_number": error.signal_number,
+                "child_signal_name": error.signal_name,
+                "run_exit_written": False,
+            },
+        )
+
+
 if __name__ == "__main__":
     state_path: Path | None = None
     run_exit_path: Path | None = None
@@ -850,6 +1115,9 @@ if __name__ == "__main__":
         state_path = parsed.state
         run_exit_path = parsed.run_exit
         raise SystemExit(main(sys.argv[1:]))
+    except RecoverableChildSignalInterruption as error:
+        record_recoverable_interruption(state_path, error)
+        raise SystemExit(RECOVERABLE_WATCHER_EXIT_CODE)
     except BaseException as error:
         if not isinstance(error, SystemExit) or error.code not in (None, 0):
             record_failure(state_path, run_exit_path, error)
@@ -857,6 +1125,10 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "RecoverableChildSignalInterruption",
+    "RECOVERABLE_INTERRUPTION_SIGNALS",
+    "RECOVERABLE_INTERRUPTION_STATUS",
+    "RECOVERABLE_WATCHER_EXIT_CODE",
     "SharedHeadUpgradeError",
     "evaluator_command",
     "fold_arguments",
@@ -867,8 +1139,11 @@ __all__ = [
     "nested_n4_n8_command",
     "paired_n4_command",
     "paired_n8_command",
+    "raise_for_stage_returncode",
+    "record_recoverable_interruption",
     "supplement_collector_command",
     "supplement_manifest_complete",
     "supplement_reserve_roster",
+    "validate_nested_completion",
     "validate_upstream_state",
 ]

@@ -17,13 +17,14 @@ import run_robotwin2_five_body_paired_success_v1 as paired  # noqa: E402
 import run_robotwin2_five_body_postformal_candidate_pool_v1 as postformal  # noqa: E402
 
 
-def _write_real_v9_fold(root: Path) -> Path:
+def _write_real_v10_fold(root: Path) -> Path:
     trainer = paired.shared_head
     fold_root = root / "outer_lobo_franka"
     fold_root.mkdir()
     trainer_sha = paired.sha256_file(Path(trainer.__file__).resolve())
     event_sha = paired.sha256_file(Path(paired.analytic_event.__file__).resolve())
     selected_step = 100
+    source_bodies = [body for body in paired.BODIES if body != "franka"]
     members = []
     for member in range(5):
         seed = 20260901 + member
@@ -34,6 +35,9 @@ def _write_real_v9_fold(root: Path) -> Path:
             {
                 "format": trainer.FORMAT,
                 "held_out_body": "franka",
+                "source_bodies": source_bodies,
+                "body_adapter": "single_shared_row_zero_heldout_parameters",
+                "body_to_id_source_only": {body: 0 for body in source_bodies},
                 "canonical_state_schema": trainer.CANONICAL_STATE_SCHEMA,
                 "canonical_action_schema": trainer.CANONICAL_ACTION_SCHEMA,
                 "event_age_contract": trainer.event_age_contract(),
@@ -73,6 +77,8 @@ def _write_real_v9_fold(root: Path) -> Path:
         "format": trainer.FORMAT,
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": "franka",
+        "source_bodies": source_bodies,
+        "body_adapter": "single_shared_row_zero_heldout_parameters",
         "heldout_labels_used_for_normalization_training_or_selection": False,
         "heldout_specific_trainable_parameters": 0,
         "actor_frozen": True,
@@ -126,10 +132,10 @@ def _state27() -> np.ndarray:
     return state
 
 
-def test_real_v9_checkpoint_loads_and_scores_n4_and_n8_runner_batches(
+def test_real_v10_checkpoint_loads_and_scores_n4_and_n8_runner_batches(
     tmp_path: Path,
 ) -> None:
-    fold_root = _write_real_v9_fold(tmp_path)
+    fold_root = _write_real_v10_fold(tmp_path)
     inspected = paired.inspect_fold("franka", fold_root)
     models = paired.load_ensemble(inspected, torch.device("cpu"))
     assert len(models) == 5

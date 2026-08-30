@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,42 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 watcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(watcher)
+
+
+def test_stage_returncode_only_authorizes_direct_interruption_signals(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(watcher.RecoverableChildSignalInterruption) as raised:
+        watcher.raise_for_stage_returncode("nested", -int(signal.SIGTERM))
+    error = raised.value
+    assert error.stage == "nested"
+    assert error.child_returncode == -int(signal.SIGTERM)
+    assert error.signal_name == "SIGTERM"
+
+    for returncode in (1, 143, -int(signal.SIGSEGV)):
+        with pytest.raises(watcher.SharedHeadUpgradeError) as ordinary:
+            watcher.raise_for_stage_returncode("nested", returncode)
+        assert type(ordinary.value) is watcher.SharedHeadUpgradeError
+
+    state = tmp_path / "watcher-state.json"
+    watcher.record_recoverable_interruption(state, error)
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["status"] == watcher.RECOVERABLE_INTERRUPTION_STATUS
+    assert document["child_returncode"] == -int(signal.SIGTERM)
+    assert document["run_exit_written"] is False
+    run_exit = tmp_path / "run.exit"
+    assert not run_exit.exists()
+
+    failure_state = tmp_path / "failure-state.json"
+    watcher.record_failure(
+        failure_state,
+        run_exit,
+        watcher.SharedHeadUpgradeError("nested exited 1"),
+    )
+    assert run_exit.read_text(encoding="utf-8") == "1\n"
+    assert json.loads(failure_state.read_text(encoding="utf-8"))["status"] == (
+        "failed"
+    )
 
 
 def _args(tmp_path: Path) -> SimpleNamespace:
@@ -210,3 +247,143 @@ def test_upstream_gate_requires_complete_bound_ablation(tmp_path: Path) -> None:
         watcher.validate_upstream_state(
             {**value, "summary_file_sha256": "0" * 64}
         )
+
+
+def _write_nested_completion_chain(root: Path) -> None:
+    root.mkdir()
+    protocol_base = {
+        "format": watcher.NESTED_PROTOCOL_FORMAT,
+        "evaluation_seed_base": watcher.NESTED_SEED_BASE,
+        "evaluation_seed_count": watcher.NESTED_SEED_COUNT,
+        "formal_seed_block_reused": False,
+        "seed_block_selected_before_any_nested_rollout_outcome": True,
+        "balanced_body_condition_cells": len(watcher.BODIES)
+        * len(watcher.CONDITIONS),
+        "bootstrap_unit": (
+            "requested_seed_cluster_with_all_selected_body_condition_rows_kept_together"
+        ),
+        "bootstrap_seed_derivation": {"overall": "frozen"},
+        "pooled_mcnemar_role": "descriptive_only_due_repeated_requested_seeds",
+        "single_body_condition_mcnemar_role": "inferential",
+    }
+    protocol = {
+        **protocol_base,
+        "logical_sha256": watcher.canonical_sha256(protocol_base),
+    }
+    contract_base = {
+        "format": watcher.NESTED_CONTRACT_FORMAT,
+        "runner_format": watcher.NESTED_RUNNER_FORMAT,
+        "bodies": list(watcher.BODIES),
+        "conditions": list(watcher.CONDITIONS),
+        "evaluation_seed_base": watcher.NESTED_SEED_BASE,
+        "evaluation_seed_count": watcher.NESTED_SEED_COUNT,
+        "initial_condition_triplet_count": watcher.EXPECTED_NESTED_TRIPLETS,
+        "rollout_count": watcher.EXPECTED_NESTED_ROLLOUTS,
+        "methods": list(watcher.NESTED_METHODS),
+        "same_requested_seed_and_complete_reset_tripled": True,
+        "method_order_rotated_before_outcomes": True,
+        "no_training": True,
+        "method_result_persistence": {
+            "existing_result_overwrite_or_retry_allowed": False,
+            "automatic_noninformative_resume_limit_per_method": 1,
+            "exception_or_action_failure_retry_allowed": False,
+            "later_method_before_complete_prefix_allowed": False,
+        },
+        "nested_evaluation_protocol": protocol,
+    }
+    contract = {
+        **contract_base,
+        "logical_sha256": watcher.canonical_sha256(contract_base),
+    }
+    contract_path = root / "execution_contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    rows = []
+    for body in watcher.BODIES:
+        for condition in watcher.CONDITIONS:
+            for ordinal in range(watcher.NESTED_SEED_COUNT):
+                row = {
+                    "heldout_body": body,
+                    "condition": condition,
+                    "requested_seed": watcher.NESTED_SEED_BASE + ordinal,
+                    "method_order": list(watcher.NESTED_METHODS),
+                }
+                for method in watcher.NESTED_METHODS:
+                    row[f"{method}_binary_success"] = 0
+                    row[f"{method}_stage_progress"] = 0.25
+                rows.append(row)
+    outcome_base = {
+        "format": watcher.NESTED_OUTCOME_FORMAT,
+        "status": "complete_1000_initial_condition_triplets_3000_rollouts",
+        "pair_count": watcher.EXPECTED_NESTED_TRIPLETS,
+        "rollout_count": watcher.EXPECTED_NESTED_ROLLOUTS,
+        "methods": list(watcher.NESTED_METHODS),
+        "rows": rows,
+        "rows_sha256": watcher.canonical_sha256(rows),
+        "execution_contract_logical_sha256": contract["logical_sha256"],
+        "execution_contract_file_sha256": watcher.sha256_file(contract_path),
+        "nested_evaluation_protocol": protocol,
+    }
+    outcome = {
+        **outcome_base,
+        "document_sha256": watcher.canonical_sha256(outcome_base),
+    }
+    outcome_path = root / "nested_paired_outcomes.json"
+    outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+    report_base = {
+        "format": watcher.NESTED_REPORT_FORMAT,
+        "status": "complete_shared_raw16_nested_n4_n8_paired_report",
+        "outcome_document_sha256": outcome["document_sha256"],
+        "nested_evaluation_protocol": protocol,
+        "by_heldout_body": {body: {} for body in watcher.BODIES},
+        "by_heldout_body_and_condition": {
+            f"{body}|{condition}": {}
+            for body in watcher.BODIES
+            for condition in watcher.CONDITIONS
+        },
+    }
+    report = {
+        **report_base,
+        "report_sha256": watcher.canonical_sha256(report_base),
+    }
+    report_path = root / "nested_n4_n8_report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    completion_base = {
+        "format": watcher.NESTED_COMPLETION_FORMAT,
+        "status": "complete_1000_triplets_3000_rollouts_frozen",
+        "execution_contract_logical_sha256": contract["logical_sha256"],
+        "execution_contract_file_sha256": watcher.sha256_file(contract_path),
+        "outcome_document_sha256": outcome["document_sha256"],
+        "outcome_file_sha256": watcher.sha256_file(outcome_path),
+        "report_sha256": report["report_sha256"],
+        "report_file_sha256": watcher.sha256_file(report_path),
+        "initial_condition_triplet_count": watcher.EXPECTED_NESTED_TRIPLETS,
+        "rollout_count": watcher.EXPECTED_NESTED_ROLLOUTS,
+        "nested_evaluation_protocol_logical_sha256": protocol["logical_sha256"],
+    }
+    completion = {
+        **completion_base,
+        "logical_sha256": watcher.canonical_sha256(completion_base),
+    }
+    (root / "completion_receipt.json").write_text(
+        json.dumps(completion), encoding="utf-8"
+    )
+
+
+def test_nested_completion_gate_validates_exact_roster_and_sha_chain(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "nested"
+    _write_nested_completion_chain(root)
+    audit = watcher.validate_nested_completion(root)
+    assert audit["completed_initial_condition_triplets"] == 1000
+    assert audit["completed_rollouts"] == 3000
+    assert audit["completed_rollouts_by_method"] == {
+        method: 1000 for method in watcher.NESTED_METHODS
+    }
+
+    outcome_path = root / "nested_paired_outcomes.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    outcome["rows"][0]["actor_baseline_binary_success"] = 1
+    outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+    with pytest.raises(watcher.SharedHeadUpgradeError):
+        watcher.validate_nested_completion(root)

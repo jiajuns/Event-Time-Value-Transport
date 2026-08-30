@@ -96,6 +96,7 @@ MONOTONE_RISK_FEATURES = (
 GOAL_PROGRESS_NORMALIZATION_METERS = 0.02
 OBJECT_STUDENT_T_DOF = 3.0
 TERMINAL_PROGRESS_STUDENT_T_DOF = 3.0
+CONSEQUENCE_LOG_SCALE_MIN = -7.0
 TERMINAL_EVENT_LOSS_WEIGHT = 0.5
 TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT = 0.25
 TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT = 0.5
@@ -200,6 +201,11 @@ SEMANTIC_COMPARATIVE_GRADIENT_BUDGET = 0.1
 SEMANTIC_GRADIENT_SCALE_CAP = 1.0
 TERMINAL_FILM_MODULATION_BOUND = 0.1
 DENSE_RANK_LABEL_EQUALITY_TOLERANCE = 1e-6
+MINIMUM_COMPARATIVE_VALIDATION_SEED_CLUSTERS = 10
+MINIMUM_COMPARATIVE_VALIDATION_REQUESTED_SEEDS = 2
+MINIMUM_COMPARATIVE_VALIDATION_BODY_CONDITION_UNITS = 4
+MINIMUM_COMPARATIVE_VALIDATION_BODIES = 2
+CROSS_BODY_STANDARDIZED_INPUT_CLIP = 5.0
 ONE_DEVIATION_ESTIMAND = (
     "one_candidate_deviation_then_frozen_actor_continuation_not_"
     "recursive_closed_loop_delta_success_rate"
@@ -512,12 +518,18 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ),
         "raw_world_frame_object_axes_in_rank_input": False,
         "cross_feature_layer_normalization": False,
+        "cross_body_input_normalization": (
+            "source_train_only_zscore_then_fixed_symmetric_clip"
+        ),
+        "cross_body_standardized_input_clip": CROSS_BODY_STANDARDIZED_INPUT_CLIP,
+        "heldout_statistics_used_for_input_normalization_or_clip": False,
         "goal_progress_definition": (
             "norm(state_relative_goal_xyz)-norm(state_relative_goal_xyz-"
             "predicted_object_translation_mean)"
         ),
         "goal_progress_uncertainty_definition": (
-            "delta_method_radial_std_from_student_t3_object_translation_scale"
+            "delta_method_radial_std_from_student_t3_object_translation_scale_"
+            "mapped_as_std_over_std_plus_0.02m"
         ),
         "pairwise_rank_loss_enabled": False,
         "group_listwise_success_mass_loss_enabled": variant != "success_only",
@@ -561,6 +573,9 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             if variant == "success_only"
             else "single_active_union_semantic_action_transition_terminal_trunk_and_location_heads"
         ),
+        "semantic_comparative_gradient_budget_proper_reference": (
+            "primary_plus_fixed_weight_source_train_supplement_proper_losses"
+        ),
         "semantic_comparative_scale_heads_excluded": True,
         "semantic_comparative_gradient_cap_applications": (
             0 if variant == "success_only" else 1
@@ -569,13 +584,27 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "world_and_utility_gradient_clipping_are_separate": True,
         "checkpoint_selection_calibration_guard": (
             "source_body_condition_macro_seed_clustered_strict_proper_score_"
-            "one_standard_error"
+            "one_standard_error_then_minimum_10_comparative_seed_clusters_"
+            "across_minimum_2_requested_seeds_4_body_condition_units_2_bodies"
         ),
         "strict_proper_components": (
             ["success_binary_nll"]
             if variant == "success_only"
             else [
+                "post_event_categorical_nll_weight_1.0",
+                "next_event_categorical_nll_weight_0.5",
+                *(
+                    []
+                    if variant == "no_time_duration"
+                    else ["duration_censored_lognormal_nll_weight_0.5"]
+                ),
                 "success_binary_nll",
+                "recovery_binary_nll_weight_0.5_when_supervised",
+                *(
+                    []
+                    if variant == "no_object_effect"
+                    else ["object_student_t3_nll_weight_0.5"]
+                ),
                 "terminal_event_categorical_nll_weight_0.5",
                 "terminal_event_ordinal_ranked_probability_score_weight_0.25",
                 *(
@@ -684,6 +713,9 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "semantic_comparative_gradient_budget_scope": checkpoint[
             "semantic_comparative_gradient_budget_scope"
         ],
+        "semantic_comparative_gradient_budget_proper_reference": checkpoint[
+            "semantic_comparative_gradient_budget_proper_reference"
+        ],
         "semantic_comparative_scale_heads_excluded": checkpoint[
             "semantic_comparative_scale_heads_excluded"
         ],
@@ -725,6 +757,15 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "goal_progress_definition": checkpoint["goal_progress_definition"],
         "goal_progress_uncertainty_definition": checkpoint[
             "goal_progress_uncertainty_definition"
+        ],
+        "cross_body_input_normalization": checkpoint[
+            "cross_body_input_normalization"
+        ],
+        "cross_body_standardized_input_clip": checkpoint[
+            "cross_body_standardized_input_clip"
+        ],
+        "heldout_statistics_used_for_input_normalization_or_clip": checkpoint[
+            "heldout_statistics_used_for_input_normalization_or_clip"
         ],
     }
 CANONICAL_STATE_SCHEMA = canonical_adapter.STATE_SCHEMA
@@ -2746,6 +2787,7 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
         super().__init__(core.ModelConfig(body_count=1, action_schema_count=1))
         self.ablation_variant = ablation_variant
+        self.action.normalization_clip = CROSS_BODY_STANDARDIZED_INPUT_CLIP
         # The base class exposes horizon-free terminal outcome heads.  Branch
         # success and recovery are finite-horizon labels here, so those heads
         # are frozen and replaced below by horizon-coherent predictions.
@@ -2801,7 +2843,21 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         normalized_batch["state"] = (
             batch["state"] - self.state_mean
         ) / self.state_std
+        normalized_batch["state"] = normalized_batch["state"].clamp(
+            min=-CROSS_BODY_STANDARDIZED_INPUT_CLIP,
+            max=CROSS_BODY_STANDARDIZED_INPUT_CLIP,
+        )
         output = super().forward(normalized_batch)
+        # The generic core uses -5 for historical Gaussian heads.  The v10
+        # Student-t consequence head needs a lower floor: at -5 its deployed
+        # 2 cm-normalized risk can never fall below 0.525, erasing the low-risk
+        # end of the candidate ordering.  Recompute from the same transitioned
+        # representation so both training likelihood and deployment use -7.
+        output["object_delta_log_scale"] = torch.clamp(
+            self.object_scale(output["transitioned"]),
+            CONSEQUENCE_LOG_SCALE_MIN,
+            2.0,
+        )
 
         event_age = batch.get("event_age_seconds")
         if (
@@ -2873,7 +2929,7 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         ).squeeze(-1)
         terminal_goal_progress_log_scale = torch.clamp(
             self.terminal_goal_progress_scale(terminal_hidden).squeeze(-1),
-            -7.0,
+            CONSEQUENCE_LOG_SCALE_MIN,
             2.0,
         )
         output["terminal_event_logits"] = terminal_event_logits
@@ -2984,9 +3040,12 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             )
             + 1.0
         )
-        short_goal_risk = torch.tanh(
+        short_goal_risk = (
             predicted_goal_progress_uncertainty
-            / GOAL_PROGRESS_NORMALIZATION_METERS
+            / (
+                predicted_goal_progress_uncertainty
+                + GOAL_PROGRESS_NORMALIZATION_METERS
+            )
         ).clamp(0.0, 1.0)
         terminal_expected_stage = (
             terminal_event_probability * normalized_event_level
@@ -2997,8 +3056,9 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             )
             + 1.0
         )
-        terminal_goal_risk = torch.tanh(
-            terminal_goal_progress_std / GOAL_PROGRESS_NORMALIZATION_METERS
+        terminal_goal_risk = (
+            terminal_goal_progress_std
+            / (terminal_goal_progress_std + GOAL_PROGRESS_NORMALIZATION_METERS)
         ).clamp(0.0, 1.0)
         if self.ablation_variant == "no_time_duration":
             next_event_advance_rate = torch.zeros_like(next_event_advance_rate)
@@ -3166,6 +3226,70 @@ def evaluate_terminal_consequences(
             ],
             "requested_seed": batch["requested_seed"],
         }
+        if variant != "success_only":
+            tensors.update(
+                {
+                    "post_nll": torch.nn.functional.cross_entropy(
+                        output["post_event_logits"],
+                        batch["post_event_id"].long(),
+                        reduction="none",
+                    ),
+                    "post_proper_mask": batch["post_event_mask"],
+                    "next_nll": torch.nn.functional.cross_entropy(
+                        output["next_event_logits"],
+                        batch["next_event_id"].long(),
+                        reduction="none",
+                    ),
+                    "next_proper_mask": batch["next_event_mask"],
+                    "recovery_nll": (
+                        torch.nn.functional.binary_cross_entropy_with_logits(
+                            output["recovery_logit"],
+                            batch["recovery"].to(output["recovery_logit"]),
+                            reduction="none",
+                        )
+                    ),
+                    "recovery_proper_mask": (
+                        batch["recovery_mask"] * batch["action_available"]
+                    ),
+                }
+            )
+            if variant != "no_time_duration":
+                tensors.update(
+                    {
+                        "duration_nll": core.censored_lognormal_loss(
+                            output["duration_selected_log_mean"],
+                            output["duration_selected_log_scale"],
+                            batch["duration"],
+                            batch["duration_observed"],
+                        ),
+                        "duration_proper_mask": batch["duration_mask"],
+                    }
+                )
+            if variant != "no_object_effect":
+                object_scale = torch.exp(
+                    output["object_delta_log_scale"]
+                ).clamp_min(1e-4)
+                object_standardized = (
+                    batch["object_delta"].to(output["object_delta_mean"])
+                    - output["object_delta_mean"]
+                ) / object_scale
+                tensors.update(
+                    {
+                        "object_student_t3_nll": (
+                            output["object_delta_log_scale"]
+                            + 2.0
+                            * torch.log1p(object_standardized.square() / 3.0)
+                        ).mean(dim=-1),
+                        "object_proper_mask": (
+                            batch["object_delta_mask"]
+                            * batch["action_available"]
+                        ),
+                        "object_abs_student_t3_standardized": (
+                            object_standardized.abs()
+                        ),
+                        "object_log_scale": output["object_delta_log_scale"],
+                    }
+                )
         for name, tensor in tensors.items():
             collected[name].append(tensor.detach().cpu().numpy())
     values = {name: np.concatenate(parts) for name, parts in collected.items()}
@@ -3267,11 +3391,76 @@ def evaluate_terminal_consequences(
                 )
             return value
 
+        def optional_supervised_mean(
+            rows: np.ndarray, mask: np.ndarray, name: str
+        ) -> float | None:
+            active = mask[selected]
+            if not active.any():
+                return None
+            value = float(np.mean(rows[selected][active]))
+            if not math.isfinite(value):
+                raise FiveBodyContractError(
+                    f"strict proper validation {name} is non-finite"
+                )
+            return value
+
         success_component = supervised_mean(
             success_nll_rows, success_mask, "success"
         )
         strict = success_component
         if variant != "success_only":
+            auxiliary_components = (
+                (
+                    "post_event_nll",
+                    values["post_nll"],
+                    values["post_proper_mask"] > 0.5,
+                    float(core.DEFAULT_LOSS_WEIGHTS["post_event"]),
+                ),
+                (
+                    "next_event_nll",
+                    values["next_nll"],
+                    values["next_proper_mask"] > 0.5,
+                    float(core.DEFAULT_LOSS_WEIGHTS["next_event"]),
+                ),
+                *(
+                    ()
+                    if variant == "no_time_duration"
+                    else (
+                        (
+                            "duration_censored_lognormal_nll",
+                            values["duration_nll"],
+                            values["duration_proper_mask"] > 0.5,
+                            float(core.DEFAULT_LOSS_WEIGHTS["duration"]),
+                        ),
+                    )
+                ),
+                (
+                    "recovery_binary_nll",
+                    values["recovery_nll"],
+                    values["recovery_proper_mask"] > 0.5,
+                    float(core.DEFAULT_LOSS_WEIGHTS["recovery"]),
+                ),
+                *(
+                    ()
+                    if variant == "no_object_effect"
+                    else (
+                        (
+                            "object_student_t3_nll",
+                            values["object_student_t3_nll"],
+                            values["object_proper_mask"] > 0.5,
+                            0.5,
+                        ),
+                    )
+                ),
+            )
+            for name, rows, mask, weight in auxiliary_components:
+                component = optional_supervised_mean(rows, mask, name)
+                if component is None:
+                    continue
+                strict += weight * component
+                component_group_rows[name].append(
+                    (unit, seed_cluster, component)
+                )
             event_component = supervised_mean(
                 row_event_nll, values["event_mask"] > 0.5, "terminal event"
             )
@@ -3342,8 +3531,33 @@ def evaluate_terminal_consequences(
     strict_macro, strict_standard_error, independent_seed_clusters = macro_and_standard_error(
         strict_group_rows
     )
+
+    def component_macro(rows: Sequence[tuple[str, str, float]]) -> float:
+        values_by_unit_seed: dict[str, dict[str, list[float]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for unit, seed_cluster, value in rows:
+            values_by_unit_seed[unit][seed_cluster].append(float(value))
+        if not values_by_unit_seed:
+            raise FiveBodyContractError("strict proper component has no support")
+        return float(
+            np.mean(
+                [
+                    float(
+                        np.mean(
+                            [
+                                float(np.mean(seed_values))
+                                for seed_values in clusters.values()
+                            ]
+                        )
+                    )
+                    for clusters in values_by_unit_seed.values()
+                ]
+            )
+        )
+
     strict_components = {
-        name: macro_and_standard_error(rows)[0]
+        name: component_macro(rows)
         for name, rows in component_group_rows.items()
     }
 
@@ -3413,6 +3627,92 @@ def evaluate_terminal_consequences(
             "student_t3_nll": None,
             "central_90_coverage": None,
         }
+    if variant not in {"success_only", "no_object_effect"}:
+        object_mask = values["object_proper_mask"] > 0.5
+        object_nll_rows = values["object_student_t3_nll"][object_mask]
+        object_abs_standardized = values[
+            "object_abs_student_t3_standardized"
+        ][object_mask]
+        object_log_scale = values["object_log_scale"][object_mask]
+        object_scale = np.exp(object_log_scale)
+        object_active_indices = np.flatnonzero(object_mask)
+
+        def object_seed_cluster_macro(row_values: np.ndarray) -> float | None:
+            if not len(row_values):
+                return None
+            by_unit_seed: dict[str, dict[int, list[float]]] = defaultdict(
+                lambda: defaultdict(list)
+            )
+            for active_position, row_index in enumerate(object_active_indices):
+                identity = logical_groups[int(row_index)].split("|", 2)
+                if len(identity) != 3:
+                    raise FiveBodyContractError(
+                        "object uncertainty logical group identity changed"
+                    )
+                unit = "|".join(identity[:2])
+                seed = int(values["requested_seed"][int(row_index)])
+                by_unit_seed[unit][seed].append(float(row_values[active_position]))
+            return float(
+                np.mean(
+                    [
+                        np.mean(
+                            [np.mean(seed_rows) for seed_rows in seeds.values()]
+                        )
+                        for seeds in by_unit_seed.values()
+                    ]
+                )
+            )
+
+        object_transition_metrics = {
+            "support_rows": int(object_mask.sum()),
+            "support_components": int(object_abs_standardized.size),
+            "student_t3_nll_without_additive_normalizer": (
+                object_seed_cluster_macro(object_nll_rows)
+            ),
+            "central_90_component_coverage": (
+                object_seed_cluster_macro(
+                    np.mean(
+                        object_abs_standardized <= central_90_t3,
+                        axis=-1,
+                    )
+                )
+            ),
+            "log_scale_floor_fraction": (
+                object_seed_cluster_macro(
+                    np.mean(
+                        object_log_scale <= CONSEQUENCE_LOG_SCALE_MIN + 1e-6,
+                        axis=-1,
+                    )
+                )
+            ),
+            "scale_quantiles_05_50_95": (
+                [
+                    float(value)
+                    for value in np.quantile(object_scale, [0.05, 0.5, 0.95])
+                ]
+                if object_scale.size
+                else None
+            ),
+            "likelihood": "independent_student_t_dof_3",
+            "proper_metric_aggregation": (
+                "requested_seed_cluster_then_body_condition_macro"
+            ),
+            "scale_quantile_aggregation": "raw_component_descriptive_only",
+        }
+    else:
+        object_transition_metrics = {
+            "support_rows": 0,
+            "support_components": 0,
+            "student_t3_nll_without_additive_normalizer": None,
+            "central_90_component_coverage": None,
+            "log_scale_floor_fraction": None,
+            "scale_quantiles_05_50_95": None,
+            "likelihood": "disabled_by_ablation",
+            "proper_metric_aggregation": (
+                "requested_seed_cluster_then_body_condition_macro"
+            ),
+            "scale_quantile_aggregation": "raw_component_descriptive_only",
+        }
     return {
         "strict_proper": {
             "macro_score": strict_macro,
@@ -3433,6 +3733,7 @@ def evaluate_terminal_consequences(
         ),
         "terminal_event": event_metrics,
         "terminal_goal_progress": goal_metrics,
+        "object_transition": object_transition_metrics,
         "regression": binary_metrics(
             regression_label,
             values["regression_probability"][regression_mask],
@@ -3463,6 +3764,42 @@ def _dense_rank_components(
 DENSE_GOAL_PROGRESS_TEMPERATURE_METERS = 0.02
 
 
+def _dense_soft_target_distribution(
+    terminal_event_level: torch.Tensor,
+    terminal_goal_progress: torch.Tensor,
+    *,
+    ablation_variant: str,
+) -> torch.Tensor:
+    """Return the exact full-support target used by dense rank training."""
+
+    if ablation_variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
+    if (
+        terminal_event_level.ndim != 1
+        or terminal_goal_progress.shape != terminal_event_level.shape
+        or not bool(torch.isfinite(terminal_event_level).all())
+        or not bool(torch.isfinite(terminal_goal_progress).all())
+    ):
+        raise FiveBodyContractError("dense soft target has invalid shape/value")
+    maximum_mask = terminal_event_level == terminal_event_level.max()
+    if not bool(maximum_mask.any()):
+        raise FiveBodyContractError("dense soft target selected no event level")
+    target = torch.zeros_like(terminal_goal_progress)
+    if ablation_variant == "no_object_effect":
+        preferred = torch.full_like(
+            terminal_goal_progress[maximum_mask],
+            1.0 / int(maximum_mask.sum()),
+        )
+    else:
+        preferred = torch.softmax(
+            terminal_goal_progress[maximum_mask]
+            / DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
+            dim=0,
+        )
+    target[maximum_mask] = preferred
+    return target
+
+
 def _dense_soft_listwise_loss(
     scores: torch.Tensor,
     terminal_event_level: torch.Tensor,
@@ -3489,19 +3826,12 @@ def _dense_soft_listwise_loss(
         or not bool(torch.isfinite(terminal_goal_progress).all())
     ):
         raise FiveBodyContractError("dense soft listwise target has invalid shape/value")
-    maximum_level = terminal_event_level.max()
-    maximum_mask = terminal_event_level == maximum_level
-    if not bool(maximum_mask.any()):
-        raise FiveBodyContractError("dense soft listwise target selected no event level")
-    if ablation_variant == "no_object_effect":
-        target = torch.full_like(scores[maximum_mask], 1.0 / int(maximum_mask.sum()))
-    else:
-        target = torch.softmax(
-            terminal_goal_progress[maximum_mask]
-            / DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
-            dim=0,
-        )
-    return -(target * torch.log_softmax(scores, dim=0)[maximum_mask]).sum()
+    target = _dense_soft_target_distribution(
+        terminal_event_level,
+        terminal_goal_progress,
+        ablation_variant=ablation_variant,
+    )
+    return -(target * torch.log_softmax(scores, dim=0)).sum()
 
 
 def _negative_log_probability_mass(
@@ -4216,6 +4546,7 @@ def evaluate_candidate_ranking(
         str,
         list[tuple[int, float, float, tuple[float, ...], float, float, float]],
     ] = defaultdict(list)
+    group_requested_seeds: dict[str, int] = {}
     for raw in loader:
         batch = core._move_batch(raw, device)
         output = model(batch)
@@ -4223,7 +4554,18 @@ def evaluate_candidate_ranking(
             batch, output["candidate_rank_logit"], ablation_variant=variant
         )
         for index, group in enumerate(raw["logical_group"]):
-            groups[str(group)].append(
+            group = str(group)
+            if "requested_seed" not in raw:
+                raise FiveBodyContractError(
+                    "validation ranking rows lack requested_seed clustering"
+                )
+            requested_seed = int(raw["requested_seed"][index])
+            previous_seed = group_requested_seeds.setdefault(group, requested_seed)
+            if previous_seed != requested_seed:
+                raise FiveBodyContractError(
+                    f"validation decision spans requested seeds: {group}"
+                )
+            groups[group].append(
                 (
                     int(batch["candidate_index"][index]),
                     float(output["candidate_rank_logit"][index]),
@@ -4237,6 +4579,7 @@ def evaluate_candidate_ranking(
     decisions: list[dict[str, Any]] = []
     mixed_pairs: list[dict[str, Any]] = []
     dense_pairs: list[dict[str, Any]] = []
+    dense_soft_pairs: list[dict[str, Any]] = []
     for group, rows in groups.items():
         rows = sorted(rows)
         if len(rows) != CANDIDATE_COUNT or [row[0] for row in rows] != list(range(4)):
@@ -4244,7 +4587,8 @@ def evaluate_candidate_ranking(
         identity = group.split("|", 2)
         if len(identity) != 3 or identity[0] not in BODIES or identity[1] not in CONDITIONS:
             raise FiveBodyContractError(f"validation decision identity changed: {group}")
-        selected = max(rows, key=lambda row: row[1])
+        selected_position = max(range(len(rows)), key=lambda index: rows[index][1])
+        selected = rows[selected_position]
         oracle_success = max(row[2] for row in rows)
         minimum_success = min(row[2] for row in rows)
         mixed_success = oracle_success > 0.5 and minimum_success <= 0.5
@@ -4261,9 +4605,25 @@ def evaluate_candidate_ranking(
         for row in rows[1:]:
             if _lexicographic_compare_values(row[3], best_dense) > 0:
                 best_dense = row[3]
+        dense_target: np.ndarray | None = None
+        if dense_applicable:
+            dense_target = (
+                _dense_soft_target_distribution(
+                    torch.as_tensor(
+                        [float(row[3][0]) for row in rows], dtype=torch.float64
+                    ),
+                    torch.as_tensor(
+                        [float(row[6]) for row in rows], dtype=torch.float64
+                    ),
+                    ablation_variant=variant,
+                )
+                .cpu()
+                .numpy()
+            )
         decision = {
             "body": identity[0],
             "condition": identity[1],
+            "requested_seed": group_requested_seeds[group],
             "baseline_success": rows[0][2],
             "selected_success": selected[2],
             "oracle_success": oracle_success,
@@ -4283,6 +4643,14 @@ def evaluate_candidate_ranking(
                 dense_applicable
                 and _lexicographic_compare_values(selected[3], best_dense) == 0
             ),
+            "selected_dense_soft_target_probability": (
+                float(dense_target[selected_position])
+                if dense_target is not None
+                else None
+            ),
+            "dense_soft_target_peak_probability": (
+                float(dense_target.max()) if dense_target is not None else None
+            ),
         }
         decisions.append(decision)
         for left in range(4):
@@ -4294,6 +4662,7 @@ def evaluate_candidate_ranking(
                         {
                             "body": identity[0],
                             "condition": identity[1],
+                            "requested_seed": group_requested_seeds[group],
                             "correct": bool(score_difference * success_difference > 0),
                         }
                     )
@@ -4307,13 +4676,48 @@ def evaluate_candidate_ranking(
                         {
                             "body": identity[0],
                             "condition": identity[1],
+                            "requested_seed": group_requested_seeds[group],
                             "correct": bool(score_difference * dense_sign > 0),
                         }
                     )
+                if dense_target is not None:
+                    target_difference = float(dense_target[left] - dense_target[right])
+                    if abs(target_difference) > 1e-12:
+                        dense_soft_pairs.append(
+                            {
+                                "body": identity[0],
+                                "condition": identity[1],
+                                "requested_seed": group_requested_seeds[group],
+                                "correct": bool(
+                                    score_difference * target_difference > 0.0
+                                ),
+                                "preference_weight": abs(target_difference),
+                            }
+                        )
 
     def summarize(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        baseline = float(np.mean([float(row["baseline_success"]) for row in rows]))
-        selected = float(np.mean([float(row["selected_success"]) for row in rows]))
+        def seed_cluster_mean(
+            selected_rows: Sequence[Mapping[str, Any]], field: str
+        ) -> float:
+            clusters: dict[tuple[str, str, int], list[float]] = defaultdict(list)
+            for row in selected_rows:
+                clusters[
+                    (
+                        str(row["body"]),
+                        str(row["condition"]),
+                        int(row["requested_seed"]),
+                    )
+                ].append(float(row[field]))
+            if not clusters:
+                raise FiveBodyContractError(
+                    f"cannot aggregate empty requested-seed clusters for {field}"
+                )
+            return float(
+                np.mean([np.mean(values) for values in clusters.values()])
+            )
+
+        baseline = seed_cluster_mean(rows, "baseline_success")
+        selected = seed_cluster_mean(rows, "selected_success")
         mixed = [row for row in rows if bool(row["mixed_success"])]
         dense = [row for row in rows if bool(row["dense_applicable"])]
         dense_uninformative = [
@@ -4325,51 +4729,95 @@ def evaluate_candidate_ranking(
             "selected_success_rate": selected,
             "one_deviation_branch_success_gain": selected - baseline,
             "oracle_success_rate": float(
-                np.mean([float(row["oracle_success"]) for row in rows])
+                seed_cluster_mean(rows, "oracle_success")
             ),
             "baseline_terminal_stage_progress": float(
-                np.mean([float(row["baseline_terminal_stage_progress"]) for row in rows])
+                seed_cluster_mean(rows, "baseline_terminal_stage_progress")
             ),
             "selected_terminal_stage_progress": float(
-                np.mean([float(row["selected_terminal_stage_progress"]) for row in rows])
+                seed_cluster_mean(rows, "selected_terminal_stage_progress")
             ),
             "delta_terminal_stage_progress": float(
-                np.mean(
+                seed_cluster_mean(
                     [
-                        float(row["selected_terminal_stage_progress"])
-                        - float(row["baseline_terminal_stage_progress"])
+                        {
+                            **row,
+                            "stage_delta": (
+                                float(row["selected_terminal_stage_progress"])
+                                - float(row["baseline_terminal_stage_progress"])
+                            ),
+                        }
                         for row in rows
-                    ]
+                    ],
+                    "stage_delta",
                 )
             ),
             "oracle_terminal_stage_progress": float(
-                np.mean([float(row["oracle_terminal_stage_progress"]) for row in rows])
+                seed_cluster_mean(rows, "oracle_terminal_stage_progress")
             ),
             "baseline_terminal_goal_distance": float(
-                np.mean([float(row["baseline_terminal_goal_distance"]) for row in rows])
+                seed_cluster_mean(rows, "baseline_terminal_goal_distance")
             ),
             "selected_terminal_goal_distance": float(
-                np.mean([float(row["selected_terminal_goal_distance"]) for row in rows])
+                seed_cluster_mean(rows, "selected_terminal_goal_distance")
             ),
             "delta_terminal_goal_progress": float(
-                np.mean(
+                seed_cluster_mean(
                     [
-                        float(row["selected_terminal_goal_progress"])
-                        - float(row["baseline_terminal_goal_progress"])
+                        {
+                            **row,
+                            "goal_delta": (
+                                float(row["selected_terminal_goal_progress"])
+                                - float(row["baseline_terminal_goal_progress"])
+                            ),
+                        }
                         for row in rows
-                    ]
+                    ],
+                    "goal_delta",
                 )
             ),
             "mixed_success_decisions": len(mixed),
             "mixed_success_selection_accuracy": (
-                float(np.mean([float(row["selected_success"]) for row in mixed]))
+                seed_cluster_mean(mixed, "selected_success")
                 if mixed
                 else None
             ),
             "dense_progress_decisions": len(dense),
             "dense_uninformative_decisions": len(dense_uninformative),
             "dense_progress_selection_accuracy": (
-                float(np.mean([float(row["selected_dense_best"]) for row in dense]))
+                seed_cluster_mean(dense, "selected_dense_best")
+                if dense
+                else None
+            ),
+            "dense_soft_target_probability_selected": (
+                float(
+                    seed_cluster_mean(
+                        dense, "selected_dense_soft_target_probability"
+                    )
+                )
+                if dense
+                else None
+            ),
+            "dense_soft_target_probability_regret": (
+                float(
+                    seed_cluster_mean(
+                        [
+                            {
+                                **row,
+                                "soft_regret": (
+                                    float(row["dense_soft_target_peak_probability"])
+                                    - float(
+                                        row[
+                                            "selected_dense_soft_target_probability"
+                                        ]
+                                    )
+                                ),
+                            }
+                            for row in dense
+                        ],
+                        "soft_regret",
+                    )
+                )
                 if dense
                 else None
             ),
@@ -4384,11 +4832,64 @@ def evaluate_candidate_ranking(
             if (body is None or row["body"] == body)
             and (condition is None or row["condition"] == condition)
         ]
+        clusters: dict[tuple[str, str, int], list[float]] = defaultdict(list)
+        for row in selected:
+            clusters[
+                (
+                    str(row["body"]),
+                    str(row["condition"]),
+                    int(row["requested_seed"]),
+                )
+            ].append(float(row["correct"]))
         return (
-            float(np.mean([float(row["correct"]) for row in selected]))
-            if selected
+            float(np.mean([np.mean(values) for values in clusters.values()]))
+            if clusters
             else None,
             len(selected),
+        )
+
+    def weighted_pair_summary(
+        rows: Sequence[Mapping[str, Any]], *, body: str | None = None,
+        condition: str | None = None,
+    ) -> tuple[float | None, int, float]:
+        selected = [
+            row for row in rows
+            if (body is None or row["body"] == body)
+            and (condition is None or row["condition"] == condition)
+        ]
+        total_weight = float(sum(float(row["preference_weight"]) for row in selected))
+        clusters: dict[
+            tuple[str, str, int], list[Mapping[str, Any]]
+        ] = defaultdict(list)
+        for row in selected:
+            clusters[
+                (
+                    str(row["body"]),
+                    str(row["condition"]),
+                    int(row["requested_seed"]),
+                )
+            ].append(row)
+        cluster_accuracies = []
+        for cluster_rows in clusters.values():
+            cluster_weight = sum(
+                float(row["preference_weight"]) for row in cluster_rows
+            )
+            if cluster_weight > 0.0:
+                cluster_accuracies.append(
+                    sum(
+                        float(row["preference_weight"]) * float(row["correct"])
+                        for row in cluster_rows
+                    )
+                    / cluster_weight
+                )
+        return (
+            (
+                float(np.mean(cluster_accuracies))
+                if cluster_accuracies
+                else None
+            ),
+            len(selected),
+            total_weight,
         )
 
     global_metrics = summarize(decisions)
@@ -4408,12 +4909,28 @@ def evaluate_candidate_ranking(
                 dense_pair_accuracy, dense_pair_count = pair_summary(
                     dense_pairs, body=body, condition=condition
                 )
+                (
+                    dense_soft_pair_accuracy,
+                    dense_soft_pair_count,
+                    dense_soft_pair_weight,
+                ) = weighted_pair_summary(
+                    dense_soft_pairs, body=body, condition=condition
+                )
                 unit.update(
                     {
                         "mixed_success_pairwise_accuracy": mixed_pair_accuracy,
                         "mixed_success_pairwise_comparisons": mixed_pair_count,
                         "dense_progress_pairwise_accuracy": dense_pair_accuracy,
                         "dense_progress_pairwise_comparisons": dense_pair_count,
+                        "dense_soft_target_weighted_pairwise_accuracy": (
+                            dense_soft_pair_accuracy
+                        ),
+                        "dense_soft_target_pairwise_comparisons": (
+                            dense_soft_pair_count
+                        ),
+                        "dense_soft_target_pairwise_preference_weight": (
+                            dense_soft_pair_weight
+                        ),
                     }
                 )
                 units[f"{body}|{condition}"] = unit
@@ -4438,6 +4955,28 @@ def evaluate_candidate_ranking(
     )
     mixed_pair_accuracy, mixed_pair_count = pair_summary(mixed_pairs)
     dense_pair_accuracy, dense_pair_count = pair_summary(dense_pairs)
+    (
+        dense_soft_pair_accuracy,
+        dense_soft_pair_count,
+        dense_soft_pair_weight,
+    ) = weighted_pair_summary(dense_soft_pairs)
+    comparative_decisions = [
+        row
+        for row in decisions
+        if bool(row["mixed_success"]) or bool(row["dense_applicable"])
+    ]
+    comparative_seed_clusters = {
+        (str(row["body"]), str(row["condition"]), int(row["requested_seed"]))
+        for row in comparative_decisions
+    }
+    comparative_requested_seeds = {
+        int(row["requested_seed"]) for row in comparative_decisions
+    }
+    comparative_body_condition_units = {
+        (str(row["body"]), str(row["condition"]))
+        for row in comparative_decisions
+    }
+    comparative_bodies = {str(row["body"]) for row in comparative_decisions}
     return {
         **global_metrics,
         "body_condition_units": units,
@@ -4467,6 +5006,28 @@ def evaluate_candidate_ranking(
         "macro_dense_progress_pairwise_accuracy": macro(
             "dense_progress_pairwise_accuracy"
         ),
+        "macro_dense_soft_target_probability_selected": macro(
+            "dense_soft_target_probability_selected"
+        ),
+        "macro_dense_soft_target_probability_regret": macro(
+            "dense_soft_target_probability_regret"
+        ),
+        "dense_soft_target_weighted_pairwise_accuracy": (
+            dense_soft_pair_accuracy
+        ),
+        "dense_soft_target_pairwise_comparisons": dense_soft_pair_count,
+        "dense_soft_target_pairwise_preference_weight": dense_soft_pair_weight,
+        "macro_dense_soft_target_weighted_pairwise_accuracy": macro(
+            "dense_soft_target_weighted_pairwise_accuracy"
+        ),
+        "comparative_validation_seed_clusters": len(comparative_seed_clusters),
+        "comparative_validation_requested_seeds": len(
+            comparative_requested_seeds
+        ),
+        "comparative_validation_body_condition_units": len(
+            comparative_body_condition_units
+        ),
+        "comparative_validation_bodies": len(comparative_bodies),
         # Backward-compatible diagnostic aliases now mean success-changing
         # comparisons only; dense failure ordering is reported separately.
         "pairwise_accuracy": mixed_pair_accuracy,
@@ -4488,10 +5049,28 @@ def candidate_checkpoint_selection_key(
         maximize(ranking["macro_one_deviation_branch_success_gain"]),
         maximize(ranking.get("macro_mixed_success_selection_accuracy")),
         maximize(ranking.get("macro_mixed_success_pairwise_accuracy")),
-        maximize(ranking.get("macro_dense_progress_selection_accuracy")),
-        maximize(ranking.get("macro_dense_progress_pairwise_accuracy")),
+        maximize(ranking.get("macro_dense_soft_target_probability_selected")),
+        maximize(
+            ranking.get("macro_dense_soft_target_weighted_pairwise_accuracy")
+        ),
         float(diagnostic_score),
         int(step),
+    )
+
+
+def checkpoint_selection_evidence_mode(
+    ranking: Mapping[str, Any], *, comparative_authorized: bool
+) -> str:
+    """Describe the evidence that actually selected the deployed checkpoint."""
+
+    if not comparative_authorized:
+        return "strict_proper_no_comparative_evidence"
+    if int(ranking.get("mixed_success_decisions", 0)) > 0:
+        return "mixed_success_then_dense_progress"
+    if int(ranking.get("dense_progress_decisions", 0)) > 0:
+        return "dense_progress_without_mixed_success"
+    raise FiveBodyContractError(
+        "comparative checkpoint selection was authorized without comparative rows"
     )
 
 
@@ -4504,7 +5083,7 @@ def select_calibration_guarded_checkpoint(
         raise FiveBodyContractError("checkpoint selection has no evaluated steps")
     normalized = []
     observed_steps: set[int] = set()
-    comparative_support: tuple[int, int] | None = None
+    comparative_support: tuple[int, int, int, int, int, int] | None = None
     for record in records:
         raw_score = record.get("mean_member_strict_proper_score")
         raw_standard_error = record.get(
@@ -4544,6 +5123,26 @@ def select_calibration_guarded_checkpoint(
             if isinstance(ranking, Mapping)
             else None
         )
+        seed_cluster_support = (
+            ranking.get("comparative_validation_seed_clusters")
+            if isinstance(ranking, Mapping)
+            else None
+        )
+        requested_seed_support = (
+            ranking.get("comparative_validation_requested_seeds")
+            if isinstance(ranking, Mapping)
+            else None
+        )
+        body_condition_support = (
+            ranking.get("comparative_validation_body_condition_units")
+            if isinstance(ranking, Mapping)
+            else None
+        )
+        body_support = (
+            ranking.get("comparative_validation_bodies")
+            if isinstance(ranking, Mapping)
+            else None
+        )
         if (
             not math.isfinite(score)
             or not math.isfinite(standard_error)
@@ -4565,6 +5164,25 @@ def select_calibration_guarded_checkpoint(
             or isinstance(dense_support, bool)
             or not isinstance(dense_support, int)
             or dense_support < 0
+            or isinstance(seed_cluster_support, bool)
+            or not isinstance(seed_cluster_support, int)
+            or seed_cluster_support < 0
+            or isinstance(requested_seed_support, bool)
+            or not isinstance(requested_seed_support, int)
+            or requested_seed_support < 0
+            or seed_cluster_support > mixed_support + dense_support
+            or (seed_cluster_support == 0) != (requested_seed_support == 0)
+            or isinstance(body_condition_support, bool)
+            or not isinstance(body_condition_support, int)
+            or body_condition_support < 0
+            or body_condition_support > len(BODIES) * len(CONDITIONS)
+            or isinstance(body_support, bool)
+            or not isinstance(body_support, int)
+            or body_support < 0
+            or body_support > len(BODIES)
+            or body_condition_support > body_support * len(CONDITIONS)
+            or (seed_cluster_support == 0) != (body_condition_support == 0)
+            or (seed_cluster_support == 0) != (body_support == 0)
         ):
             raise FiveBodyContractError(
                 "checkpoint selection record violates the proper/rank contract"
@@ -4572,7 +5190,14 @@ def select_calibration_guarded_checkpoint(
         if step in observed_steps:
             raise FiveBodyContractError("checkpoint selection steps are not unique")
         observed_steps.add(step)
-        support = (mixed_support, dense_support)
+        support = (
+            mixed_support,
+            dense_support,
+            seed_cluster_support,
+            requested_seed_support,
+            body_condition_support,
+            body_support,
+        )
         if comparative_support is None:
             comparative_support = support
         elif support != comparative_support:
@@ -4587,9 +5212,31 @@ def select_calibration_guarded_checkpoint(
         key=lambda item: (item[1], item[3]),
     )
     threshold = best_score + best_standard_error
-    comparative = bool(
-        comparative_support
-        and (comparative_support[0] > 0 or comparative_support[1] > 0)
+    comparative_decisions = (
+        int(comparative_support[0] + comparative_support[1])
+        if comparative_support is not None
+        else 0
+    )
+    comparative_seed_clusters = (
+        int(comparative_support[2]) if comparative_support is not None else 0
+    )
+    comparative_requested_seeds = (
+        int(comparative_support[3]) if comparative_support is not None else 0
+    )
+    comparative_body_condition_units = (
+        int(comparative_support[4]) if comparative_support is not None else 0
+    )
+    comparative_bodies = (
+        int(comparative_support[5]) if comparative_support is not None else 0
+    )
+    comparative = (
+        comparative_seed_clusters
+        >= MINIMUM_COMPARATIVE_VALIDATION_SEED_CLUSTERS
+        and comparative_requested_seeds
+        >= MINIMUM_COMPARATIVE_VALIDATION_REQUESTED_SEEDS
+        and comparative_body_condition_units
+        >= MINIMUM_COMPARATIVE_VALIDATION_BODY_CONDITION_UNITS
+        and comparative_bodies >= MINIMUM_COMPARATIVE_VALIDATION_BODIES
     )
     if comparative:
         eligible = [item for item in normalized if item[1] <= threshold + 1e-12]
@@ -4603,6 +5250,25 @@ def select_calibration_guarded_checkpoint(
             "maximize_rank_within_one_standard_error"
         ),
         "comparative_validation_evidence": comparative,
+        "comparative_validation_decisions": comparative_decisions,
+        "comparative_validation_seed_clusters": comparative_seed_clusters,
+        "comparative_validation_requested_seeds": comparative_requested_seeds,
+        "comparative_validation_body_condition_units": (
+            comparative_body_condition_units
+        ),
+        "comparative_validation_bodies": comparative_bodies,
+        "minimum_comparative_validation_seed_clusters": (
+            MINIMUM_COMPARATIVE_VALIDATION_SEED_CLUSTERS
+        ),
+        "minimum_comparative_validation_requested_seeds": (
+            MINIMUM_COMPARATIVE_VALIDATION_REQUESTED_SEEDS
+        ),
+        "minimum_comparative_validation_body_condition_units": (
+            MINIMUM_COMPARATIVE_VALIDATION_BODY_CONDITION_UNITS
+        ),
+        "minimum_comparative_validation_bodies": (
+            MINIMUM_COMPARATIVE_VALIDATION_BODIES
+        ),
         "best_score": best_score,
         "conservative_one_standard_error": best_standard_error,
         "eligible_threshold": threshold,
@@ -4671,6 +5337,152 @@ def materialize_supplement_rows(
     if any(row["body"] == held_out_body for row in rows):
         raise FiveBodyContractError("held-out supplement row reached source fitting")
     return rows
+
+
+def standardized_input_clip_diagnostics(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    state_mean: np.ndarray,
+    state_std: np.ndarray,
+    action_mean: np.ndarray,
+    action_std: np.ndarray,
+    clip: float = CROSS_BODY_STANDARDIZED_INPUT_CLIP,
+) -> dict[str, Any]:
+    """Audit cross-body clipping without using held-out rows for fitting."""
+
+    if not rows:
+        raise FiveBodyContractError("input clip diagnostics require source rows")
+    state_mean = np.asarray(state_mean, dtype=np.float64)
+    state_std = np.asarray(state_std, dtype=np.float64)
+    action_mean = np.asarray(action_mean, dtype=np.float64).reshape(-1)
+    action_std = np.asarray(action_std, dtype=np.float64).reshape(-1)
+    if (
+        state_mean.shape != (core.STATE_DIM,)
+        or state_std.shape != (core.STATE_DIM,)
+        or action_mean.shape != (core.ACTION_DIM,)
+        or action_std.shape != (core.ACTION_DIM,)
+        or not math.isfinite(float(clip))
+        or clip <= 0.0
+        or np.any(state_std <= 0.0)
+        or np.any(action_std <= 0.0)
+    ):
+        raise FiveBodyContractError("input clip diagnostic normalization changed")
+
+    def summarize(selected: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        states = np.stack(
+            [np.asarray(row["state"], dtype=np.float64) for row in selected]
+        )
+        state_z = (states[:, :18] - state_mean[None, :18]) / state_std[None, :18]
+        state_clipped = np.abs(state_z) > clip
+        action_total = np.zeros(core.ACTION_DIM, dtype=np.int64)
+        action_clipped = np.zeros(core.ACTION_DIM, dtype=np.int64)
+        normalized_actions: dict[str, list[tuple[int, np.ndarray, np.ndarray]]] = (
+            defaultdict(list)
+        )
+        unavailable_action_rows = 0
+        unavailable_action_groups: set[str] = set()
+        for row in selected:
+            actions = np.asarray(row["actions"], dtype=np.float64)
+            mask = np.asarray(row["action_mask"], dtype=bool)
+            group = str(row["logical_group"])
+            if not bool(row.get("action_available", 1.0)):
+                unavailable_action_rows += 1
+                unavailable_action_groups.add(group)
+                continue
+            if (
+                actions.ndim != 2
+                or actions.shape[-1] != core.ACTION_DIM
+                or mask.shape != actions.shape[:1]
+                or not mask.any()
+            ):
+                raise FiveBodyContractError(
+                    "input clip diagnostics received an invalid action prefix"
+                )
+            z = (actions - action_mean[None]) / action_std[None]
+            action_total += int(mask.sum())
+            action_clipped += (np.abs(z[mask]) > clip).sum(axis=0)
+            normalized_actions[group].append(
+                (int(row["candidate_index"]), z, mask)
+            )
+        retention = []
+        collisions = 0
+        distinct_pairs = 0
+        for group, candidates in normalized_actions.items():
+            if group in unavailable_action_groups:
+                continue
+            candidates = sorted(candidates, key=lambda value: value[0])
+            if [value[0] for value in candidates] != list(range(CANDIDATE_COUNT)):
+                raise FiveBodyContractError(
+                    f"input clip diagnostics split decision {group}"
+                )
+            for left in range(CANDIDATE_COUNT):
+                for right in range(left + 1, CANDIDATE_COUNT):
+                    common = candidates[left][2] & candidates[right][2]
+                    raw_difference = (
+                        candidates[left][1][common] - candidates[right][1][common]
+                    )
+                    clipped_difference = (
+                        np.clip(candidates[left][1][common], -clip, clip)
+                        - np.clip(candidates[right][1][common], -clip, clip)
+                    )
+                    raw_distance = float(np.linalg.norm(raw_difference))
+                    if raw_distance <= 1e-12:
+                        continue
+                    clipped_distance = float(np.linalg.norm(clipped_difference))
+                    distinct_pairs += 1
+                    collisions += int(clipped_distance <= 1e-12)
+                    retention.append(clipped_distance / raw_distance)
+        return {
+            "rows": len(selected),
+            "state_continuous_component_count": int(state_z.size),
+            "state_continuous_clip_fraction": float(state_clipped.mean()),
+            "state_continuous_clip_fraction_by_channel": [
+                float(value) for value in state_clipped.mean(axis=0)
+            ],
+            "action_valid_component_count": int(action_total.sum()),
+            "action_unavailable_rows_excluded": unavailable_action_rows,
+            "candidate_groups_excluded_for_unavailable_action": len(
+                unavailable_action_groups
+            ),
+            "action_valid_clip_fraction": float(
+                action_clipped.sum() / max(int(action_total.sum()), 1)
+            ),
+            "action_valid_clip_fraction_by_channel": [
+                (
+                    float(action_clipped[index] / action_total[index])
+                    if action_total[index] > 0
+                    else None
+                )
+                for index in range(core.ACTION_DIM)
+            ],
+            "candidate_standardized_distinct_pair_count": distinct_pairs,
+            "candidate_pair_collision_count_after_clip": collisions,
+            "candidate_pair_collision_fraction_after_clip": (
+                float(collisions / distinct_pairs) if distinct_pairs else 0.0
+            ),
+            "candidate_pair_distance_retention_quantiles_05_50_95": (
+                [
+                    float(value)
+                    for value in np.quantile(retention, [0.05, 0.5, 0.95])
+                ]
+                if retention
+                else None
+            ),
+        }
+
+    by_body = {
+        body: summarize([row for row in rows if row["body"] == body])
+        for body in BODIES
+        if any(row["body"] == body for row in rows)
+    }
+    return {
+        "format": "etsf_cross_body_standardized_input_clip_diagnostics_v1",
+        "clip_absolute_z": float(clip),
+        "normalization_fit_scope": "source_train_only",
+        "heldout_rows_used_for_normalization_or_diagnostics": False,
+        "overall": summarize(rows),
+        "by_body": by_body,
+    }
 
 
 def supplement_group_bootstrap_weights(
@@ -5136,6 +5948,33 @@ def _train_fold(
         supplement_rows = materialize_supplement_rows(
             supplement_groups, held_out_body=args.held_out_body
         )
+    input_clip_diagnostics = {
+        "source_train": standardized_input_clip_diagnostics(
+            train_rows,
+            state_mean=state_mean,
+            state_std=state_std,
+            action_mean=action_mean,
+            action_std=action_std,
+        ),
+        "source_validation": standardized_input_clip_diagnostics(
+            validation_rows,
+            state_mean=state_mean,
+            state_std=state_std,
+            action_mean=action_mean,
+            action_std=action_std,
+        ),
+        "proper_world_supplement_source_train": (
+            standardized_input_clip_diagnostics(
+                supplement_rows,
+                state_mean=state_mean,
+                state_std=state_std,
+                action_mean=action_mean,
+                action_std=action_std,
+            )
+            if supplement_rows
+            else None
+        ),
+    }
     supplement_rank_inventory = candidate_rank_supervision_inventory(
         supplement_rows,
         ablation_variant=args.ablation_variant,
@@ -5475,7 +6314,10 @@ def _train_fold(
                 semantic_comparative_loss = multitask_loss.new_zeros(())
             else:
                 proper_world_reference = (
-                    multitask_loss + object_effect_loss + terminal_loss
+                    multitask_loss
+                    + object_effect_loss
+                    + terminal_loss
+                    + supplement_loss
                 )
                 (
                     semantic_comparative_loss,
@@ -5513,12 +6355,21 @@ def _train_fold(
             if step % args.eval_every and step != args.steps:
                 continue
             metrics = core.evaluate_validation_model(model, validation_loader, device)
-            metrics["terminal_consequences"] = evaluate_terminal_consequences(
+            terminal_consequences = evaluate_terminal_consequences(
                 model,
                 validation_loader,
                 device,
                 ablation_variant=args.ablation_variant,
             )
+            metrics["terminal_consequences"] = terminal_consequences
+            if args.ablation_variant not in {"success_only", "no_object_effect"}:
+                metrics["legacy_gaussian_object_nll_not_model_distribution"] = (
+                    metrics["object_nll"]
+                )
+                metrics["object_nll"] = terminal_consequences[
+                    "object_transition"
+                ]["student_t3_nll_without_additive_normalizer"]
+                metrics["object_nll_distribution"] = "independent_student_t_dof_3"
             metrics["candidate_ranking"] = evaluate_candidate_ranking(
                 model, validation_loader, device
             )
@@ -5693,12 +6544,10 @@ def _train_fold(
         selected_record["mean_member_diagnostic_multitask_score"]
     )
     best_ensemble_key = tuple(selected_record["selection_key"])
-    if int(best_ensemble_ranking.get("mixed_success_decisions", 0)) > 0:
-        selection_evidence_mode = "mixed_success_then_dense_progress"
-    elif int(best_ensemble_ranking.get("dense_progress_decisions", 0)) > 0:
-        selection_evidence_mode = "dense_progress_without_mixed_success"
-    else:
-        selection_evidence_mode = "strict_proper_no_comparative_evidence"
+    selection_evidence_mode = checkpoint_selection_evidence_mode(
+        best_ensemble_ranking,
+        comparative_authorized=validation_has_comparative_rank_evidence,
+    )
 
     members = []
     for member, seed in enumerate(args.ensemble_seeds):
@@ -5752,6 +6601,7 @@ def _train_fold(
                 "actor_frozen": True,
                 "action_normalization": normalization,
                 "state_normalization": state_normalization,
+                "input_clip_diagnostics": input_clip_diagnostics,
                 "preflight_logical_sha256": preflight["logical_sha256"],
                 "validation": member_validation,
                 "one_deviation_ensemble_source_validation": (
@@ -5782,6 +6632,7 @@ def _train_fold(
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": args.held_out_body,
         "source_bodies": preflight["source_bodies"],
+        "body_adapter": "single_shared_row_zero_heldout_parameters",
         "canonical_state_schema": CANONICAL_STATE_SCHEMA,
         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
         "event_age_contract": event_age_contract(),
@@ -5902,6 +6753,7 @@ def _train_fold(
         "heldout_group_payload_bytes_read": 0,
         "heldout_group_payload_deserialized": 0,
         "heldout_labels_used_for_normalization_training_or_selection": False,
+        "input_clip_diagnostics": input_clip_diagnostics,
         "heldout_specific_trainable_parameters": 0,
         "actor_frozen": True,
         "same_ordered_candidate_set_required_for_live_evaluation": True,

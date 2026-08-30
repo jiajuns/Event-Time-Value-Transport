@@ -390,10 +390,14 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
     )
     current_trainer_sha = sha256_file(Path(shared_head.__file__).resolve())
     ensemble_selection = summary.get("ensemble_checkpoint_selection")
+    expected_source_bodies = [candidate for candidate in BODIES if candidate != body]
     if (
         summary.get("format") != shared_head.FORMAT
         or summary.get("status") != "source_only_checkpoint_selection_complete"
         or summary.get("held_out_body") != body
+        or summary.get("source_bodies") != expected_source_bodies
+        or summary.get("body_adapter")
+        != "single_shared_row_zero_heldout_parameters"
         or summary.get("heldout_labels_used_for_normalization_training_or_selection") is not False
         or summary.get("heldout_specific_trainable_parameters") != 0
         or summary.get("actor_frozen") is not True
@@ -476,6 +480,8 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         raise PairedExecutionError("fold member seeds must be exactly five unique integers")
     return {
         "heldout_body": body,
+        "source_bodies": expected_source_bodies,
+        "body_adapter": "single_shared_row_zero_heldout_parameters",
         "fold_root": str(fold_root),
         "training_summary": str(summary_path),
         "training_summary_sha256": sha256_file(summary_path),
@@ -607,6 +613,15 @@ def load_ensemble(
     fold: Mapping[str, Any], device: torch.device
 ) -> list[shared_head.EffectAlignedSharedEventHead]:
     models = []
+    expected_source_bodies = [
+        body for body in BODIES if body != fold["heldout_body"]
+    ]
+    if (
+        fold.get("source_bodies") != expected_source_bodies
+        or fold.get("body_adapter")
+        != "single_shared_row_zero_heldout_parameters"
+    ):
+        raise PairedExecutionError("LOBO fold source-body roster changed")
     for item in fold["members"]:
         checkpoint = torch.load(
             item["checkpoint"], map_location=device, weights_only=True
@@ -614,6 +629,11 @@ def load_ensemble(
         if (
             checkpoint.get("format") != shared_head.FORMAT
             or checkpoint.get("held_out_body") != fold["heldout_body"]
+            or checkpoint.get("source_bodies") != expected_source_bodies
+            or checkpoint.get("body_adapter")
+            != "single_shared_row_zero_heldout_parameters"
+            or checkpoint.get("body_to_id_source_only")
+            != {body: 0 for body in expected_source_bodies}
             or checkpoint.get("canonical_state_schema")
             != shared_head.CANONICAL_STATE_SCHEMA
             or checkpoint.get("canonical_action_schema")
