@@ -110,10 +110,24 @@ def _fake_snapshot(task: _ObserverTask) -> dict:
     }
 
 
-def test_observer_freezes_first_e12_e3_e4_and_resets_actor_horizon() -> None:
+def test_observer_freezes_first_e12_e3_e4_and_resets_actor_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     task = _ObserverTask()
     can = _PoseObject(0.30)
     pot = _PoseObject(0.0)
+    authoritative = analytic_event.derive_predicates_and_events
+    authoritative_prefix_lengths: list[int] = []
+
+    def tracked_authoritative(*args: object, **kwargs: object):
+        authoritative_prefix_lengths.append(len(np.asarray(args[0])))
+        return authoritative(*args, **kwargs)
+
+    monkeypatch.setattr(
+        collector.analytic_event,
+        "derive_predicates_and_events",
+        tracked_authoritative,
+    )
     observer = collector.ScriptedRootObserver(
         task=task,
         names=["can", "pot"],
@@ -137,6 +151,9 @@ def test_observer_freezes_first_e12_e3_e4_and_resets_actor_horizon() -> None:
         observer.record_physics_step()
     assert set(observer.roots) == {"e12", "e3", "e4"}
     assert observer.roots["e4"]["detector_sim_step"] == 5
+    # The full-history authority runs only for the three accepted targets, not
+    # for every physics step in a potentially long scripted expert rollout.
+    assert authoritative_prefix_lengths == [2, 3, 5]
     for root in observer.roots.values():
         fields = root["branch_root_snapshot"]["task_fields"]
         assert fields == {

@@ -346,6 +346,71 @@ class ScriptedRootObserver:
         self.expert_move_index = -1
         self.expert_dense_segment_index = -1
 
+    def _current_target(self) -> str | None:
+        """Match the frozen e12/e3/e4 event at the newest sample in O(T).
+
+        The authoritative event implementation is still called before a root
+        is accepted.  This exact incremental prefilter avoids recomputing its
+        full O(T^2) stationary history at every expert physics step.
+        """
+
+        poses = np.asarray(self.trajectory, dtype=np.float32)
+        times = np.asarray(self.sim_times, dtype=np.float64)
+        step = len(poses) - 1
+        moving_index = self.names.index(str(self.calibration["moving"]))
+        position = poses[:, moving_index, :3].astype(np.float64)
+        thresholds = self.calibration["thresholds"]
+        moved = bool(
+            np.linalg.norm(position[step] - position[0])
+            >= float(thresholds["moved_displacement_m"])
+        )
+        lifted = bool(
+            position[step, 2]
+            >= position[0, 2] + float(thresholds["lifted_delta_z_m"])
+        )
+        _moving, relative = analytic_event.goal_vector(
+            poses, self.names, step, self.calibration
+        )
+        near = bool(
+            np.linalg.norm(relative)
+            <= float(thresholds["near_goal_euclidean_m"])
+        )
+        if not near:
+            return "e12" if moved or lifted else None
+
+        speed = np.r_[
+            0.0,
+            np.linalg.norm(np.diff(position, axis=0), axis=1) / np.diff(times),
+        ]
+        speed_threshold = float(thresholds["stationary_speed_m_per_s"])
+        window = float(thresholds["stationary_window_seconds"])
+        stationary = False
+        for start in range(step, -1, -1):
+            _moving_at_start, relative_at_start = analytic_event.goal_vector(
+                poses, self.names, start, self.calibration
+            )
+            if (
+                np.linalg.norm(relative_at_start)
+                > float(thresholds["near_goal_euclidean_m"])
+                or speed[start] > speed_threshold
+            ):
+                break
+            elapsed = float(times[step] - times[start])
+            tolerance = (
+                64.0
+                * np.finfo(np.float64).eps
+                * max(
+                    abs(float(times[step])),
+                    abs(float(times[start])),
+                    window,
+                    1.0,
+                )
+            )
+            if elapsed + tolerance >= window:
+                stationary = True
+                break
+        return "e4" if stationary else "e3"
+
     def record_physics_step(self) -> None:
         now = base._sim_time(self.task)
         if now <= self.sim_times[-1]:
@@ -354,6 +419,9 @@ class ScriptedRootObserver:
             )
         self.trajectory.append(base.read_poses(self.objects))
         self.sim_times.append(now)
+        target = self._current_target()
+        if target is None or target in self.roots:
+            return
         simulator_success = bool(self.task.check_success())
         poses = np.stack(self.trajectory)
         times = np.asarray(self.sim_times, dtype=np.float64)
@@ -369,11 +437,13 @@ class ScriptedRootObserver:
             raise ScriptedRootCollectionError(str(error)) from error
         observed_event = str(analytic_event.EVENT_NAMES[int(events[-1])])
         if observed_event == "eK":
-            self.terminal_target_rejections["e4"] += 1
+            self.terminal_target_rejections[target] += 1
             return
-        if observed_event not in TARGET_EVENTS or observed_event in self.roots:
-            return
-        target = observed_event
+        if observed_event != target:
+            raise ScriptedRootCollectionError(
+                f"incremental expert event {target} disagrees with analytic "
+                f"{observed_event}"
+            )
         if simulator_success:
             self.terminal_target_rejections[target] += 1
             return
