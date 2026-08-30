@@ -14,6 +14,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import train_multibody_canonical_event_world_model as core  # noqa: E402
+import collect_robotwin2_scripted_expert_root_actor_branches_v1 as expert_collector  # noqa: E402
 import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E402
 import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
@@ -24,6 +25,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     _relative_gradient_budget_scale,
     _robust_object_effect_loss,
     _semantic_comparative_loss,
+    _supplement_proper_world_model_loss,
     _terminal_consequence_loss,
     ABLATION_VARIANTS,
     ACTOR_FORMAT,
@@ -62,6 +64,11 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     SEMANTIC_GRADIENT_SCALE_CAP,
     TERMINAL_SUPERVISION_CONTRACT,
     SOURCE_EVENT_SAMPLING_HZ,
+    SUPPLEMENT_BINDING_FORMAT,
+    SUPPLEMENT_MANIFEST_FORMAT,
+    SUPPLEMENT_PROPER_LOSS_WEIGHT,
+    SUPPLEMENT_USAGE_CONTRACT,
+    EXPERT_ROOT_PROVENANCE_CONTRACT,
     TASK,
     FiveBodyContractError,
     ablation_contract,
@@ -76,12 +83,17 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     evaluate_candidate_ranking,
     evaluate_terminal_consequences,
     load_binding,
+    load_supplement_binding,
     materialize_source_rows,
+    materialize_supplement_rows,
     select_calibration_guarded_checkpoint,
     sha256_file,
     sha256_tree,
     source_group_split,
+    supplement_group_bootstrap_weights,
+    supplement_source_train_split,
     summary_candidate_rank_contract,
+    validate_supplement_body_manifest,
 )
 
 
@@ -96,11 +108,17 @@ def _write_json(path: Path, value: dict[str, object]) -> str:
     return sha256_file(path)
 
 
-def _group(path: Path, offset: float) -> None:
+def _group(
+    path: Path,
+    offset: float,
+    *,
+    current_event: int = 0,
+    remaining_action_budget: int = 175,
+) -> None:
     count, horizon = 4, 5
     state = np.full((count, core.STATE_DIM), offset, dtype=np.float32)
     state[:, 18:27] = 0.0
-    state[:, 18] = 1.0
+    state[:, 18 + current_event] = 1.0
     terminal_goal_progress = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
     terminal_goal_distance = (
         np.linalg.norm(state[:, 0:3], axis=-1) - terminal_goal_progress
@@ -110,10 +128,14 @@ def _group(path: Path, offset: float) -> None:
         state=state,
         actions=np.full((count, horizon, core.ACTION_DIM), offset, dtype=np.float32),
         action_mask=np.ones((count, horizon), dtype=np.float32),
-        current_event_id=np.zeros(count, dtype=np.int64),
-        post_event_id=np.asarray([1, 2, 3, 4], dtype=np.int64),
+        current_event_id=np.full(count, current_event, dtype=np.int64),
+        post_event_id=np.maximum(
+            np.asarray([1, 2, 3, 4], dtype=np.int64), current_event
+        ),
         post_event_mask=np.ones(count, dtype=np.float32),
-        next_event_id=np.asarray([1, 2, 3, 4], dtype=np.int64),
+        next_event_id=np.maximum(
+            np.asarray([1, 2, 3, 4], dtype=np.int64), current_event
+        ),
         next_event_mask=np.ones(count, dtype=np.float32),
         duration=np.asarray([0, 2, 3, 4], dtype=np.float32),
         duration_observed=np.asarray([0, 1, 1, 1], dtype=np.float32),
@@ -124,16 +146,27 @@ def _group(path: Path, offset: float) -> None:
         recovery_mask=np.ones(count, dtype=np.float32),
         object_delta=np.full((count, core.OBJECT_DELTA_DIM), 0.1, dtype=np.float32),
         object_delta_mask=np.ones(count, dtype=np.float32),
-        terminal_max_event_id=np.asarray([1, 4, 3, 4], dtype=np.int64),
+        terminal_max_event_id=np.maximum(
+            np.asarray([1, 4, 3, 4], dtype=np.int64), current_event
+        ),
         terminal_event_mask=np.ones(count, dtype=np.float32),
-        terminal_stage_progress=np.asarray([0.25, 1.0, 0.75, 1.0], dtype=np.float32),
+        terminal_stage_progress=np.where(
+            np.asarray([0, 1, 0, 1], dtype=bool),
+            1.0,
+            np.maximum(
+                np.asarray([1, 4, 3, 4], dtype=np.float32), current_event
+            )
+            / 4.0,
+        ).astype(np.float32),
         terminal_goal_distance=terminal_goal_distance,
         terminal_goal_progress=terminal_goal_progress,
         terminal_goal_progress_mask=np.ones(count, dtype=np.float32),
         terminal_stop_reason_id=np.asarray([1, 0, 1, 0], dtype=np.int64),
         candidate_index=np.arange(count, dtype=np.int64),
         event_age_seconds=np.full(count, 0.4, dtype=np.float32),
-        remaining_action_budget=np.full(count, 175.0, dtype=np.float32),
+        remaining_action_budget=np.full(
+            count, float(remaining_action_budget), dtype=np.float32
+        ),
         dt=np.full(count, 5.0 / SOURCE_EVENT_SAMPLING_HZ, dtype=np.float32),
     )
 
@@ -376,6 +409,179 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
     return binding_path, _write_json(binding_path, binding)
 
 
+def _supplement_fixture(
+    tmp_path: Path,
+    primary_binding_path: Path,
+    primary_binding_sha256: str,
+) -> tuple[Path, str]:
+    primary_binding = json.loads(primary_binding_path.read_text(encoding="utf-8"))
+    actor_authority_sha256 = primary_binding["actor_authority"]["sha256"]
+    actor_authority = json.loads(
+        (tmp_path / primary_binding["actor_authority"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    body_bindings = {}
+    for body_index, body in enumerate(BODIES):
+        primary_manifest_path = tmp_path / primary_binding["body_manifests"][body]["path"]
+        primary_manifest = json.loads(
+            primary_manifest_path.read_text(encoding="utf-8")
+        )
+        seeds = list(expert_collector.PREDEFINED_SEEDS)
+        horizon_by_seed = dict(
+            zip(seeds, expert_collector.HORIZON_SCHEDULE, strict=True)
+        )
+        groups = []
+        for condition_index, condition in enumerate(("clean", "randomized")):
+            for seed in seeds:
+                horizon = horizon_by_seed[seed]
+                for root_event, event_name in ((2, "e3"), (3, "e4")):
+                    name = (
+                        f"supplement-{body}-{condition}-{event_name}-seed{seed}.npz"
+                    )
+                    path = tmp_path / name
+                    _group(
+                        path,
+                        float(body_index + condition_index + root_event + 1),
+                        current_event=root_event,
+                        remaining_action_budget=horizon,
+                    )
+                    groups.append(
+                        {
+                            "group_id": (
+                                f"{condition}|seed={seed}|scripted_root={event_name}"
+                            ),
+                            "collector_file_sha256": "8" * 64,
+                            "base_collector_file_sha256": "9" * 64,
+                            "condition": condition,
+                            "requested_seed": seed,
+                            "scripted_root_event": event_name,
+                            "scripted_root_event_id": root_event,
+                            "root_event_id": root_event,
+                            "pre_registered_horizon": horizon,
+                            "candidate_noise_query_index": {2: 2, 3: 3}[root_event],
+                            "raw_expert_snapshot_sha256": "0" * 64,
+                            "branch_root_snapshot_sha256": "1" * 64,
+                            "branch_root_restorable_snapshot_sha256": "2" * 64,
+                            "canonical_root_snapshot_sha256": "3" * 64,
+                            "path": name,
+                            "sha256": sha256_file(path),
+                            "diagnostic_format": BRANCH_DIAGNOSTIC_CONTRACT["format"],
+                            "diagnostics_path": name.replace(
+                                ".npz", ".diagnostics.npz"
+                            ),
+                            "diagnostics_sha256": "4" * 64,
+                        }
+                    )
+        manifest = {
+            "format": SUPPLEMENT_MANIFEST_FORMAT,
+            "collector_format": expert_collector.FORMAT,
+            "dataset_repo": DATASET_REPO,
+            "dataset_revision": DATASET_REVISION,
+            "task": TASK,
+            "body": body,
+            "conditions": ["clean", "randomized"],
+            "pre_registered_seeds": seeds,
+            "pre_registered_horizon_by_seed": {
+                str(seed): horizon for seed, horizon in horizon_by_seed.items()
+            },
+            "target_events": ["e3", "e4"],
+            "collector_file_sha256": "8" * 64,
+            "base_collector_file_sha256": "9" * 64,
+            "actor_checkpoint_tree_or_file_sha256": actor_authority["actors"][body][
+                "checkpoint_sha256"
+            ],
+            "actor_authority_sha256": actor_authority_sha256,
+            "instruction": DEFAULT_INSTRUCTION,
+            "candidate_count": 4,
+            "action_exec_steps": 5,
+            "supplement_role": (
+                "expert_event_root_proper_world_model_source_train_only"
+            ),
+            "root_policy": "robotwin_scripted_expert",
+            "candidate_and_continuation_policy": (
+                "same_frozen_native_actor_as_primary_binding"
+            ),
+            "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+            "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
+            "expert_root_provenance_contract": dict(
+                EXPERT_ROOT_PROVENANCE_CONTRACT
+            ),
+            "root_selection_contract": dict(expert_collector.ROOT_SELECTION_CONTRACT),
+            "horizon_contract": dict(expert_collector.HORIZON_CONTRACT),
+            "actor_branch_contract": dict(expert_collector.ACTOR_BRANCH_CONTRACT),
+            "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "event_age_contract": EVENT_AGE_CONTRACT,
+            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
+            "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+            "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
+            "event_spec_sha256": EVENT_SPEC_SHA256,
+            "event_derivation_implementation_sha256": primary_manifest[
+                "event_derivation_implementation_sha256"
+            ],
+            "schema_adapter": dict(primary_manifest["schema_adapter"]),
+            "analytic_event_contract": dict(
+                primary_manifest["analytic_event_contract"]
+            ),
+            "state27_relative_goal_contract": primary_manifest[
+                "state27_relative_goal_contract"
+            ],
+            "physical_time_contract": dict(
+                primary_manifest["physical_time_contract"]
+            ),
+            "candidate_action_contract": dict(
+                primary_manifest["candidate_action_contract"]
+            ),
+            "groups": groups,
+        }
+        manifest = _signed(manifest)
+        manifest_path = tmp_path / f"supplement-{body}-manifest.json"
+        body_bindings[body] = {
+            "path": manifest_path.name,
+            "sha256": _write_json(manifest_path, manifest),
+            "group_count": len(groups),
+        }
+    binding = _signed(
+        {
+            "format": SUPPLEMENT_BINDING_FORMAT,
+            "dataset_repo": DATASET_REPO,
+            "dataset_revision": DATASET_REVISION,
+            "task": TASK,
+            "instruction": DEFAULT_INSTRUCTION,
+            "event_spec_sha256": EVENT_SPEC_SHA256,
+            "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+            "event_age_contract": EVENT_AGE_CONTRACT,
+            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
+            "object_effect_schema": OBJECT_EFFECT_SCHEMA,
+            "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
+            "primary_binding_file_sha256": primary_binding_sha256,
+            "actor_authority_sha256": actor_authority_sha256,
+            "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+            "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
+            "expert_root_provenance_contract": dict(
+                EXPERT_ROOT_PROVENANCE_CONTRACT
+            ),
+            "body_manifests": body_bindings,
+            "materializer_provenance": {
+                "format": (
+                    "etsf_robotwin2_scripted_expert_root_"
+                    "supplement_binding_materializer_v1"
+                ),
+                "payload_npz_files_opened": 0,
+                "complete_decisions": 100,
+                "complete_branches": 400,
+                "seed_overlap_with_primary": 0,
+            },
+        }
+    )
+    path = tmp_path / "supplement-binding.json"
+    return path, _write_json(path, binding)
+
+
 def test_preflight_is_five_fold_source_only_and_payload_blind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -518,6 +724,228 @@ def test_heldout_payload_is_not_stat_hashed_or_deserialized_in_preflight(
     franka = [group for group in train if group["body"] == "franka"]
     with pytest.raises(FiveBodyContractError, match="missing/tampered"):
         materialize_source_rows(franka, held_out_body="piper")
+
+
+def test_supplement_heldout_manifest_and_payload_are_zero_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    primary = load_binding(binding, digest)
+    supplement_binding, supplement_digest = _supplement_fixture(
+        tmp_path, binding, digest
+    )
+    declared = json.loads(supplement_binding.read_text(encoding="utf-8"))
+    heldout_manifest_path = (
+        tmp_path / declared["body_manifests"]["franka"]["path"]
+    )
+    heldout_manifest = json.loads(heldout_manifest_path.read_text(encoding="utf-8"))
+    for group in heldout_manifest["groups"]:
+        (tmp_path / group["path"]).unlink()
+    heldout_manifest_path.unlink()
+
+    supplement = load_supplement_binding(
+        supplement_binding,
+        supplement_digest,
+        primary_audit=primary,
+        held_out_body="franka",
+    )
+    assert set(supplement["manifests"]) == set(BODIES) - {"franka"}
+    assert supplement["heldout_manifest_binding"]["manifest_file_opened"] == 0
+    assert supplement["heldout_manifest_binding"]["payload_files_opened"] == 0
+    monkeypatch.setattr(
+        np,
+        "load",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preflight opened a supplement transition NPZ")
+        ),
+    )
+    receipt = build_preflight_receipt(
+        primary,
+        held_out_body="franka",
+        split_seed=23,
+        supplement_audit=supplement,
+    )
+    assert receipt["supplement"]["source_train_groups"] == 80
+    assert receipt["supplement"]["heldout_groups_deferred"] == 20
+    assert receipt["supplement"]["heldout_manifest_file_opened"] == 0
+    assert receipt["supplement"]["heldout_group_npz_opened"] == 0
+
+
+def test_supplement_is_source_train_only_and_never_enters_validation(
+    tmp_path: Path,
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    primary = load_binding(binding, digest)
+    supplement_binding, supplement_digest = _supplement_fixture(
+        tmp_path, binding, digest
+    )
+    supplement = load_supplement_binding(
+        supplement_binding,
+        supplement_digest,
+        primary_audit=primary,
+        held_out_body="franka",
+    )
+    _primary_train, primary_validation, _primary_heldout = source_group_split(
+        primary, held_out_body="franka", split_seed=19
+    )
+    supplement_train, supplement_heldout = supplement_source_train_split(
+        supplement, held_out_body="franka"
+    )
+    assert supplement_heldout["declared_group_count"] == 20
+    assert all(group["body"] != "franka" for group in supplement_train)
+    assert all(
+        group.get("source_role") == "proper_world_supplement"
+        for group in supplement_train
+    )
+    validation_identities = {
+        (row["body"], row["condition"], row["group_id"])
+        for row in primary_validation
+    }
+    supplement_identities = {
+        (row["body"], row["condition"], row["group_id"])
+        for row in supplement_train
+    }
+    assert validation_identities.isdisjoint(supplement_identities)
+    rows = materialize_supplement_rows(
+        supplement_train, held_out_body="franka"
+    )
+    assert len(rows) == 320
+    assert {int(row["current_event_id"]) for row in rows} == {2, 3}
+    assert all(
+        "|proper-world-supplement|" in row["logical_group"] for row in rows
+    )
+    receipt = build_preflight_receipt(
+        primary,
+        held_out_body="franka",
+        split_seed=19,
+        supplement_audit=supplement,
+    )
+    assert receipt["supplement"]["source_validation_groups"] == 0
+    assert receipt["supplement"]["normalization_rows_used"] == 0
+    assert receipt["supplement"]["rank_or_utility_rows_used"] == 0
+
+
+def test_supplement_seed_and_expert_root_contracts_fail_closed(
+    tmp_path: Path,
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    primary = load_binding(binding, digest)
+    supplement_binding, _supplement_digest = _supplement_fixture(
+        tmp_path, binding, digest
+    )
+    declared = json.loads(supplement_binding.read_text(encoding="utf-8"))
+    manifest_path = tmp_path / declared["body_manifests"]["aloha-agilex"]["path"]
+    original = json.loads(manifest_path.read_text(encoding="utf-8"))
+    checkpoint_sha = primary["actor"]["checkpoint_sha256_by_body"]["aloha-agilex"]
+
+    changed_seed = dict(original)
+    changed_seed["pre_registered_seeds"] = [
+        *expert_collector.PREDEFINED_SEEDS[:-1],
+        expert_collector.PREDEFINED_SEEDS[-1] + 1,
+    ]
+    changed_seed.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="seed/horizon"):
+        validate_supplement_body_manifest(
+            _signed(changed_seed),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+    changed_root = json.loads(json.dumps(original))
+    changed_root["root_selection_contract"][
+        "e4_must_be_nonterminal_simulator_success"
+    ] = False
+    changed_root.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="contract changed"):
+        validate_supplement_body_manifest(
+            _signed(changed_root),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+
+def test_supplement_fixed_lambda_updates_only_proper_world_objectives(
+    tmp_path: Path,
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    primary = load_binding(binding, digest)
+    supplement_binding, supplement_digest = _supplement_fixture(
+        tmp_path, binding, digest
+    )
+    supplement = load_supplement_binding(
+        supplement_binding,
+        supplement_digest,
+        primary_audit=primary,
+        held_out_body="franka",
+    )
+    groups, _heldout = supplement_source_train_split(
+        supplement, held_out_body="franka"
+    )
+    rows = materialize_supplement_rows(groups[:1], held_out_body="franka")
+    mapping = {body: 0 for body in BODIES if body != "franka"}
+    dataset = core.TransitionDataset(rows, mapping)
+    batch = core.collate_rows([dataset[index] for index in range(4)])
+    model = EffectAlignedSharedEventHead().train()
+    output = model(batch)
+    loss_weights = dict(core.DEFAULT_LOSS_WEIGHTS)
+    loss_weights["object"] = 0.0
+    loss, pieces = _supplement_proper_world_model_loss(
+        output,
+        batch,
+        torch.ones(4),
+        loss_weights=loss_weights,
+    )
+    assert torch.allclose(
+        loss,
+        SUPPLEMENT_PROPER_LOSS_WEIGHT * pieces["supplement_proper_unweighted"],
+    )
+    loss.backward()
+    assert any(parameter.grad is not None for parameter in model.semantic.parameters())
+    assert all(
+        parameter.grad is None for parameter in model.candidate_rank.parameters()
+    )
+
+
+def test_supplement_bootstrap_is_member_specific_and_complete_group_constant(
+    tmp_path: Path,
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    primary = load_binding(binding, digest)
+    supplement_binding, supplement_digest = _supplement_fixture(
+        tmp_path, binding, digest
+    )
+    supplement = load_supplement_binding(
+        supplement_binding,
+        supplement_digest,
+        primary_audit=primary,
+        held_out_body="franka",
+    )
+    groups, _heldout = supplement_source_train_split(
+        supplement, held_out_body="franka"
+    )
+    rows = materialize_supplement_rows(groups[:8], held_out_body="franka")
+    weights, audit, bootstrap_seed = supplement_group_bootstrap_weights(
+        rows, members=5, seed=20260901
+    )
+    assert weights.shape == (5, len(rows))
+    assert len(audit) == 5
+    assert all(item["bootstrap_seed"] == bootstrap_seed for item in audit)
+    assert all(item["class_balancing_used"] is False for item in audit)
+    assert all(item["synthetic_groups_or_labels"] == 0 for item in audit)
+    indices_by_group: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        indices_by_group.setdefault(str(row["logical_group"]), []).append(index)
+    for member in range(5):
+        for indices in indices_by_group.values():
+            assert len(indices) == 4
+            assert np.all(weights[member, indices] == weights[member, indices[0]])
+    member_group_weights = {
+        tuple(float(weights[member, indices[0]]) for indices in indices_by_group.values())
+        for member in range(5)
+    }
+    assert len(member_group_weights) > 1
 
 
 def test_source_materialization_never_accepts_heldout_and_model_has_one_body_row(

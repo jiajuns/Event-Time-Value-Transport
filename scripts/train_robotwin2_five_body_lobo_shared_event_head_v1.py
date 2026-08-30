@@ -40,6 +40,18 @@ FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
 MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v8"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
+SUPPLEMENT_BINDING_FORMAT = (
+    "etsf_robotwin2_five_body_proper_world_supplement_binding_v1"
+)
+SUPPLEMENT_MANIFEST_FORMAT = (
+    "etsf_robotwin2_proper_world_supplement_manifest_v1"
+)
+SUPPLEMENT_COLLECTOR_FORMAT = (
+    "etsf_robotwin2_scripted_expert_root_actor_branches_v1"
+)
+SUPPLEMENT_MATERIALIZER_FORMAT = (
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v1"
+)
 ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
 MATERIALIZATION_FORMAT = public_materialization.FORMAT
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
@@ -86,6 +98,53 @@ OBJECT_STUDENT_T_DOF = 3.0
 TERMINAL_PROGRESS_STUDENT_T_DOF = 3.0
 TERMINAL_EVENT_LOSS_WEIGHT = 0.5
 TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT = 0.5
+SUPPLEMENT_PROPER_LOSS_WEIGHT = 0.25
+SUPPLEMENT_USAGE_CONTRACT = {
+    "outer_lobo_source_train_only": True,
+    "multitask_proper_loss": True,
+    "robust_object_effect_proper_loss": True,
+    "terminal_event_proper_loss": True,
+    "terminal_goal_progress_proper_loss": True,
+    "normalization_or_baseline_fit": False,
+    "candidate_rank_or_utility_loss": False,
+    "source_validation_or_checkpoint_selection": False,
+    "calibration": False,
+    "heldout_payload_access": False,
+}
+EXPERT_ROOT_PROVENANCE_CONTRACT = {
+    "root_prefix_policy": "robotwin_scripted_expert",
+    "root_definition": "fresh_frozen_actor_branch_initialized_from_expert_state",
+    "expert_prefix_claimed_actor_on_policy": False,
+    "candidate_policy": "same_frozen_native_actor_as_primary_binding",
+    "continuation_policy": "same_frozen_native_actor_as_primary_binding",
+    "expert_terminal_outcome_used_as_branch_label": False,
+    "fresh_branch_horizon_starts_at_root": True,
+    "formal_actor_prefix_distribution_claimed": False,
+}
+SUPPLEMENT_PRE_REGISTERED_SEEDS = tuple(range(2026081000, 2026081005))
+SUPPLEMENT_HORIZON_SCHEDULE = (10, 25, 50, 100, 200)
+SUPPLEMENT_ROOT_SELECTION_CONTRACT = {
+    "controller": "public_RoboTwin_move_can_pot.play_once",
+    "observation_granularity": "every_successful_sapien_scene_step",
+    "targets": ["e3", "e4"],
+    "selection": "first_physical_sample_whose_frozen_analytic_event_equals_target",
+    "one_root_per_target_per_scene_seed": True,
+    "adjacent_same_event_frames_used_as_additional_roots": False,
+    "e4_must_be_nonterminal_simulator_success": True,
+    "root_selection_reads_actor_branch_outcomes": False,
+    "missing_target_policy": "record_missing_and_do_not_replace_or_outcome_search",
+    "planner_after_root": "scripted_expert_ends_and_is_never_used_for_continuation",
+}
+SUPPLEMENT_HORIZON_CONTRACT = {
+    "values": list(SUPPLEMENT_HORIZON_SCHEDULE),
+    "binding": "ordered_pre_registered_seed_zip_horizon_before_any_rollout",
+    "same_horizon_for_e3_and_e4_of_one_seed": True,
+    "new_actor_branch_take_action_count_at_root": 0,
+    "remaining_action_budget_at_root_equals_bound_horizon": True,
+    "expert_physics_steps_or_planner_frames_used_to_compute_horizon": False,
+    "candidate_or_terminal_outcomes_used_to_choose_horizon": False,
+    "actor_query_stride_actions": 5,
+}
 DENSE_FAILURE_RANK_WEIGHT = 0.1
 DENSE_ONLY_RANK_WEIGHT = 1.0
 SEMANTIC_COMPARATIVE_GRADIENT_BUDGET = 0.1
@@ -181,6 +240,20 @@ BRANCH_DIAGNOSTIC_CONTRACT = {
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
     ),
+}
+SUPPLEMENT_ACTOR_BRANCH_CONTRACT = {
+    "candidate_count": CANDIDATE_COUNT,
+    "candidate_generator": (
+        "collect_robotwin2_five_body_ee_candidate_branches_v1.generate_candidates"
+    ),
+    "fresh_scene_candidate_evaluator": (
+        "collect_robotwin2_five_body_ee_candidate_branches_v1._evaluate_candidate"
+    ),
+    "snapshot_restore_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
+    "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+    "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+    "expert_actions_after_root": 0,
+    "continuation_controller": "same_frozen_actor_as_four_root_candidates",
 }
 ABLATION_VARIANTS = (
     "success_only",
@@ -810,6 +883,7 @@ def validate_actor_authority(
     actors = value.get("actors")
     if not isinstance(actors, Mapping) or set(actors) != set(BODIES):
         raise FiveBodyContractError("actor authority must bind exactly five bodies")
+    checkpoint_sha256_by_body: dict[str, str] = {}
     for body in BODIES:
         actor = actors[body]
         if (
@@ -833,20 +907,26 @@ def validate_actor_authority(
             observed_sha = sha256_tree(checkpoint)[0] if checkpoint.is_dir() else None
         if observed_sha != actor["checkpoint_sha256"]:
             raise FiveBodyContractError(f"frozen actor checkpoint missing/tampered for {body}")
+        checkpoint_sha256_by_body[body] = str(actor["checkpoint_sha256"])
     return {
         "actor_frozen": True,
         "bodies": list(BODIES),
         "candidate_count": CANDIDATE_COUNT,
         "same_ordered_candidate_set": True,
+        "checkpoint_sha256_by_body": checkpoint_sha256_by_body,
     }
 
 
 def validate_body_manifest(
-    value: Mapping[str, Any], *, expected_body: str, manifest_dir: Path
+    value: Mapping[str, Any],
+    *,
+    expected_body: str,
+    manifest_dir: Path,
+    expected_format: str = MANIFEST_FORMAT,
 ) -> dict[str, Any]:
     _verify_signed(value, f"{expected_body} canonical manifest")
     if (
-        value.get("format") != MANIFEST_FORMAT
+        value.get("format") != expected_format
         or value.get("dataset_repo") != DATASET_REPO
         or value.get("dataset_revision") != DATASET_REVISION
         or value.get("task") != TASK
@@ -995,6 +1075,223 @@ def validate_body_manifest(
     }
 
 
+def validate_supplement_body_manifest(
+    value: Mapping[str, Any],
+    *,
+    expected_body: str,
+    manifest_dir: Path,
+    expected_actor_checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Validate the collector's raw manifest without opening branch payloads."""
+
+    # The raw supplement carries the same canonical state/action/event/time and
+    # finite-horizon target contracts as formal actor-prefix groups.  Reuse the
+    # common manifest validator first, then enforce the distinct expert-root
+    # provenance and the complete scripted-root design below.
+    validate_body_manifest(
+        value,
+        expected_body=expected_body,
+        manifest_dir=manifest_dir,
+        expected_format=SUPPLEMENT_MANIFEST_FORMAT,
+    )
+    _verify_signed(value, f"{expected_body} supplement manifest")
+    root_selection = value.get("root_selection_contract")
+    horizon = value.get("horizon_contract")
+    actor_branch = value.get("actor_branch_contract")
+    seeds = value.get("pre_registered_seeds")
+    horizon_by_seed = value.get("pre_registered_horizon_by_seed")
+    adapter = value.get("schema_adapter")
+    if (
+        not isinstance(seeds, list)
+        or seeds != list(SUPPLEMENT_PRE_REGISTERED_SEEDS)
+        or not isinstance(horizon_by_seed, Mapping)
+    ):
+        raise FiveBodyContractError(
+            f"{expected_body} supplement seed/horizon registration changed"
+        )
+    expected_horizon_by_seed = dict(
+        zip(
+            SUPPLEMENT_PRE_REGISTERED_SEEDS,
+            SUPPLEMENT_HORIZON_SCHEDULE,
+            strict=True,
+        )
+    )
+    try:
+        observed_horizon_by_seed = {
+            int(seed): int(branch_horizon)
+            for seed, branch_horizon in horizon_by_seed.items()
+        }
+    except (TypeError, ValueError) as error:
+        raise FiveBodyContractError(
+            f"{expected_body} supplement horizon binding is invalid"
+        ) from error
+    if (
+        value.get("format") != SUPPLEMENT_MANIFEST_FORMAT
+        or value.get("collector_format") != SUPPLEMENT_COLLECTOR_FORMAT
+        or value.get("dataset_repo") != DATASET_REPO
+        or value.get("dataset_revision") != DATASET_REVISION
+        or value.get("task") != TASK
+        or value.get("body") != expected_body
+        or value.get("conditions") != list(CONDITIONS)
+        or value.get("target_events") != ["e3", "e4"]
+        or observed_horizon_by_seed != expected_horizon_by_seed
+        or value.get("instruction") != DEFAULT_INSTRUCTION
+        or value.get("candidate_count") != CANDIDATE_COUNT
+        or value.get("action_exec_steps") != 5
+        or value.get("supplement_role")
+        != "expert_event_root_proper_world_model_source_train_only"
+        or value.get("root_policy") != "robotwin_scripted_expert"
+        or value.get("candidate_and_continuation_policy")
+        != "same_frozen_native_actor_as_primary_binding"
+        or value.get("proper_loss_weight") != SUPPLEMENT_PROPER_LOSS_WEIGHT
+        or value.get("usage_contract") != SUPPLEMENT_USAGE_CONTRACT
+        or value.get("expert_root_provenance_contract")
+        != EXPERT_ROOT_PROVENANCE_CONTRACT
+        or not _is_sha(value.get("collector_file_sha256"))
+        or not _is_sha(value.get("base_collector_file_sha256"))
+        or value.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or not _is_sha(value.get("event_derivation_implementation_sha256"))
+        or value.get("actor_checkpoint_tree_or_file_sha256")
+        != expected_actor_checkpoint_sha256
+        or not _is_sha(value.get("actor_authority_sha256"))
+        or value.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+        or value.get("terminal_supervision_contract")
+        != TERMINAL_SUPERVISION_CONTRACT
+        or value.get("event_age_contract") != EVENT_AGE_CONTRACT
+        or value.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or value.get("branch_root_snapshot_contract")
+        != BRANCH_ROOT_SNAPSHOT_CONTRACT
+        or value.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+        or value.get("branch_diagnostic_contract")
+        != BRANCH_DIAGNOSTIC_CONTRACT
+        or not isinstance(adapter, Mapping)
+        or adapter.get("kind") != "analytic_label_free_canonical_v1"
+        or adapter.get("trainable") is not False
+        or adapter.get("labels_or_outcomes_used_to_fit") is not False
+        or adapter.get("heldout_supervision_allowed") is not False
+        or adapter.get("state_dim") != core.STATE_DIM
+        or adapter.get("action_dim") != core.ACTION_DIM
+        or adapter.get("state_schema") != CANONICAL_STATE_SCHEMA
+        or adapter.get("action_schema") != CANONICAL_ACTION_SCHEMA
+        or adapter.get("elapsed_time_unit") != "seconds"
+        or adapter.get("duration_unit") != "seconds"
+        or adapter.get("event_names") != list(core.CANONICAL_EVENTS)
+        or not _is_sha(adapter.get("implementation_sha256"))
+        or root_selection != SUPPLEMENT_ROOT_SELECTION_CONTRACT
+        or horizon != SUPPLEMENT_HORIZON_CONTRACT
+        or actor_branch != SUPPLEMENT_ACTOR_BRANCH_CONTRACT
+    ):
+        raise FiveBodyContractError(
+            f"{expected_body} raw scripted-root supplement contract changed"
+        )
+    groups = value.get("groups")
+    if not isinstance(groups, list) or len(groups) != 20:
+        raise FiveBodyContractError(
+            f"{expected_body} supplement needs the complete 20-root design"
+        )
+    identities: set[str] = set()
+    conditions: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for declared in groups:
+        if not isinstance(declared, Mapping):
+            raise FiveBodyContractError("supplement group entry must be an object")
+        group_id = declared.get("group_id")
+        condition = declared.get("condition")
+        root_event = declared.get("scripted_root_event_id")
+        branch_horizon = declared.get("pre_registered_horizon")
+        seed = declared.get("requested_seed")
+        event_name = {2: "e3", 3: "e4"}.get(root_event)
+        if (
+            not isinstance(group_id, str)
+            or not group_id
+            or group_id in identities
+            or condition not in CONDITIONS
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or seed not in expected_horizon_by_seed
+            or isinstance(root_event, bool)
+            or not isinstance(root_event, int)
+            or root_event not in {2, 3}
+            or declared.get("scripted_root_event") != event_name
+            or declared.get("root_event_id") != root_event
+            or isinstance(branch_horizon, bool)
+            or not isinstance(branch_horizon, int)
+            or branch_horizon != expected_horizon_by_seed.get(seed)
+            or declared.get("candidate_noise_query_index")
+            != {2: 2, 3: 3}.get(root_event)
+            or group_id
+            != f"{condition}|seed={seed}|scripted_root={event_name}"
+            or not _is_sha(declared.get("sha256"))
+            or not _is_sha(declared.get("raw_expert_snapshot_sha256"))
+            or not _is_sha(declared.get("branch_root_snapshot_sha256"))
+            or not _is_sha(
+                declared.get("branch_root_restorable_snapshot_sha256")
+            )
+            or not _is_sha(declared.get("canonical_root_snapshot_sha256"))
+            or declared.get("diagnostic_format")
+            != BRANCH_DIAGNOSTIC_CONTRACT["format"]
+            or not _is_sha(declared.get("diagnostics_sha256"))
+        ):
+            raise FiveBodyContractError(
+                f"{expected_body} supplement group is invalid"
+            )
+        path = _lexical_contained_payload_path(
+            manifest_dir, str(declared.get("path", "")), "supplement group"
+        )
+        diagnostics_path = _lexical_contained_payload_path(
+            manifest_dir,
+            str(declared.get("diagnostics_path", "")),
+            "supplement group diagnostics",
+        )
+        identities.add(group_id)
+        conditions.add(str(condition))
+        normalized.append(
+            {
+                **dict(declared),
+                "root_event_id": int(root_event),
+                "source_role": "proper_world_supplement",
+                "resolved_path": str(path),
+                "resolved_diagnostics_path": str(diagnostics_path),
+            }
+        )
+    if conditions != set(CONDITIONS):
+        raise FiveBodyContractError(
+            f"{expected_body} supplement lacks clean/randomized roots"
+        )
+    design = {
+        (
+            str(group["condition"]),
+            int(group["requested_seed"]),
+            int(group["root_event_id"]),
+        )
+        for group in normalized
+    }
+    expected_design = {
+        (condition, seed, root_event)
+        for condition in CONDITIONS
+        for seed in seeds
+        for root_event in (2, 3)
+    }
+    if design != expected_design:
+        raise FiveBodyContractError(
+            f"{expected_body} supplement design cells are incomplete"
+        )
+    return {
+        "body": expected_body,
+        "groups": normalized,
+        "group_identity_sha256": canonical_sha256(sorted(identities)),
+        "event_derivation_implementation_sha256": value[
+            "event_derivation_implementation_sha256"
+        ],
+        "raw_manifest_format": SUPPLEMENT_MANIFEST_FORMAT,
+        "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
+        "expert_root_provenance_contract": dict(
+            EXPERT_ROOT_PROVENANCE_CONTRACT
+        ),
+        "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+    }
+
+
 def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
     binding = _read_bound_json(path, expected_sha256, "training binding")
     _verify_signed(binding, "training binding")
@@ -1076,6 +1373,168 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         "manifests": manifests,
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": event_implementations.pop(),
+    }
+
+
+def load_supplement_binding(
+    path: Path,
+    expected_sha256: str,
+    *,
+    primary_audit: Mapping[str, Any],
+    held_out_body: str,
+) -> dict[str, Any]:
+    """Load an independently bound supplement without opening group payloads."""
+
+    if held_out_body not in BODIES:
+        raise FiveBodyContractError(f"unknown held-out body {held_out_body!r}")
+    binding = _read_bound_json(path, expected_sha256, "supplement binding")
+    _verify_signed(binding, "supplement binding")
+    primary_binding = primary_audit.get("binding")
+    if not isinstance(primary_binding, Mapping):
+        raise FiveBodyContractError("primary audit is missing its binding")
+    actor_binding = primary_binding.get("actor_authority")
+    actor_authority_sha256 = (
+        actor_binding.get("sha256") if isinstance(actor_binding, Mapping) else None
+    )
+    materializer = binding.get("materializer_provenance")
+    if (
+        binding.get("format") != SUPPLEMENT_BINDING_FORMAT
+        or binding.get("dataset_repo") != DATASET_REPO
+        or binding.get("dataset_revision") != DATASET_REVISION
+        or binding.get("task") != TASK
+        or binding.get("instruction") != DEFAULT_INSTRUCTION
+        or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+        or binding.get("terminal_supervision_contract")
+        != TERMINAL_SUPERVISION_CONTRACT
+        or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
+        or binding.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or binding.get("branch_root_snapshot_contract")
+        != BRANCH_ROOT_SNAPSHOT_CONTRACT
+        or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
+        or binding.get("branch_diagnostic_contract")
+        != BRANCH_DIAGNOSTIC_CONTRACT
+        or binding.get("primary_binding_file_sha256")
+        != primary_audit.get("binding_file_sha256")
+        or not _is_sha(actor_authority_sha256)
+        or binding.get("actor_authority_sha256") != actor_authority_sha256
+        or binding.get("proper_loss_weight") != SUPPLEMENT_PROPER_LOSS_WEIGHT
+        or binding.get("usage_contract") != SUPPLEMENT_USAGE_CONTRACT
+        or binding.get("expert_root_provenance_contract")
+        != EXPERT_ROOT_PROVENANCE_CONTRACT
+        or not isinstance(materializer, Mapping)
+        or materializer.get("format") != SUPPLEMENT_MATERIALIZER_FORMAT
+        or materializer.get("payload_npz_files_opened") != 0
+        or materializer.get("complete_decisions") != 100
+        or materializer.get("complete_branches") != 400
+        or materializer.get("seed_overlap_with_primary") != 0
+    ):
+        raise FiveBodyContractError(
+            "supplement binding violates the source-train proper-only contract"
+        )
+    body_bindings = binding.get("body_manifests")
+    if not isinstance(body_bindings, Mapping) or set(body_bindings) != set(BODIES):
+        raise FiveBodyContractError(
+            "supplement binding must contain exactly five body manifests"
+        )
+    root = path.expanduser().resolve().parent
+    manifests: dict[str, dict[str, Any]] = {}
+    heldout_manifest_binding: dict[str, Any] | None = None
+    for body in BODIES:
+        item = body_bindings[body]
+        if (
+            not isinstance(item, Mapping)
+            or not _is_sha(item.get("sha256"))
+            or isinstance(item.get("group_count"), bool)
+            or not isinstance(item.get("group_count"), int)
+            or int(item["group_count"]) != 20
+        ):
+            raise FiveBodyContractError(
+                f"supplement body manifest binding missing for {body}"
+            )
+        if body == held_out_body:
+            opaque_path = _lexical_contained_payload_path(
+                root,
+                str(item.get("path", "")),
+                "held-out supplement manifest",
+            )
+            heldout_manifest_binding = {
+                "body": body,
+                "opaque_path": str(opaque_path),
+                "sha256": str(item["sha256"]),
+                "declared_group_count": int(item["group_count"]),
+                "manifest_file_opened": 0,
+                "manifest_bytes_read": 0,
+                "payload_files_opened": 0,
+                "payload_bytes_read": 0,
+            }
+            continue
+        manifest_path = _resolve_contained(
+            root, str(item.get("path", "")), "supplement body manifest"
+        )
+        manifest = _read_bound_json(
+            manifest_path,
+            str(item.get("sha256", "")),
+            f"{body} supplement body manifest",
+        )
+        if manifest.get("actor_authority_sha256") != actor_authority_sha256:
+            raise FiveBodyContractError(
+                f"{body} supplement did not use the bound actor authority"
+            )
+        manifests[body] = validate_supplement_body_manifest(
+            manifest,
+            expected_body=body,
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=str(
+                primary_audit["actor"]["checkpoint_sha256_by_body"][body]
+            ),
+        )
+        if len(manifests[body]["groups"]) != int(item["group_count"]):
+            raise FiveBodyContractError(
+                f"{body} supplement manifest group count differs from binding"
+            )
+        primary_manifest = primary_audit.get("manifests", {}).get(body)
+        if not isinstance(primary_manifest, Mapping):
+            raise FiveBodyContractError(
+                f"primary audit is missing {body} reset identities"
+            )
+        primary_resets = {
+            (str(group["condition"]), int(group["requested_seed"]))
+            for group in primary_manifest["groups"]
+        }
+        supplement_resets = {
+            (str(group["condition"]), int(group["requested_seed"]))
+            for group in manifests[body]["groups"]
+        }
+        if primary_resets & supplement_resets:
+            raise FiveBodyContractError(
+                f"{body} supplement overlaps formal condition/seed resets"
+            )
+    if heldout_manifest_binding is None:
+        raise FiveBodyContractError("supplement held-out binding was not deferred")
+    implementations = {
+        value["event_derivation_implementation_sha256"]
+        for value in manifests.values()
+    }
+    if implementations != {
+        primary_audit.get("event_derivation_implementation_sha256")
+    }:
+        raise FiveBodyContractError(
+            "supplement and primary event implementations differ"
+        )
+    return {
+        "binding": binding,
+        "binding_file_sha256": expected_sha256.lower(),
+        "manifests": manifests,
+        "held_out_body": held_out_body,
+        "heldout_manifest_binding": heldout_manifest_binding,
+        "event_spec_sha256": EVENT_SPEC_SHA256,
+        "event_derivation_implementation_sha256": implementations.pop(),
+        "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
+        "expert_root_provenance_contract": dict(
+            EXPERT_ROOT_PROVENANCE_CONTRACT
+        ),
     }
 
 
@@ -1228,8 +1687,46 @@ def source_group_split(
     return training, validation, heldout
 
 
+def supplement_source_train_split(
+    supplement_audit: Mapping[str, Any], *, held_out_body: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Route supplements only to outer-fold source train; there is no val lane."""
+
+    if held_out_body not in BODIES:
+        raise FiveBodyContractError(f"unknown held-out body {held_out_body!r}")
+    training: list[dict[str, Any]] = []
+    manifests = supplement_audit.get("manifests")
+    expected_sources = set(BODIES) - {held_out_body}
+    if (
+        supplement_audit.get("held_out_body") != held_out_body
+        or not isinstance(manifests, Mapping)
+        or set(manifests) != expected_sources
+    ):
+        raise FiveBodyContractError(
+            "supplement audit does not expose exactly four source manifests"
+        )
+    for body in BODIES:
+        if body == held_out_body:
+            continue
+        groups = list(manifests[body]["groups"])
+        training.extend({**group, "body": body} for group in groups)
+    heldout = supplement_audit.get("heldout_manifest_binding")
+    if (
+        not training
+        or not isinstance(heldout, Mapping)
+        or heldout.get("body") != held_out_body
+        or int(heldout.get("declared_group_count", 0)) <= 0
+    ):
+        raise FiveBodyContractError("supplement LOBO split contains an empty lane")
+    return training, dict(heldout)
+
+
 def build_preflight_receipt(
-    audit: Mapping[str, Any], *, held_out_body: str, split_seed: int
+    audit: Mapping[str, Any],
+    *,
+    held_out_body: str,
+    split_seed: int,
+    supplement_audit: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     training, validation, heldout = source_group_split(
         audit, held_out_body=held_out_body, split_seed=split_seed
@@ -1268,6 +1765,16 @@ def build_preflight_receipt(
         raise FiveBodyContractError(
             "source train/validation split does not cover every formal query"
         )
+    if supplement_audit is None:
+        supplement_training: list[dict[str, Any]] = []
+        supplement_heldout: dict[str, Any] = {
+            "declared_group_count": 0,
+            "sha256": None,
+        }
+    else:
+        supplement_training, supplement_heldout = supplement_source_train_split(
+            supplement_audit, held_out_body=held_out_body
+        )
     receipt = {
         "format": FORMAT,
         "status": "preflight_passed_payloads_still_unopened",
@@ -1304,6 +1811,40 @@ def build_preflight_receipt(
         "heldout_group_payload_bytes_read": 0,
         "heldout_group_payload_deserialized": 0,
         "heldout_labels_used_for_normalization_training_or_selection": False,
+        "supplement": {
+            "enabled": supplement_audit is not None,
+            "binding_file_sha256": (
+                supplement_audit.get("binding_file_sha256")
+                if supplement_audit is not None
+                else None
+            ),
+            "proper_loss_weight": (
+                SUPPLEMENT_PROPER_LOSS_WEIGHT
+                if supplement_audit is not None
+                else 0.0
+            ),
+            "source_train_groups": len(supplement_training),
+            "source_validation_groups": 0,
+            "heldout_groups_deferred": int(
+                supplement_heldout["declared_group_count"]
+            ),
+            "source_train_identity_sha256": canonical_sha256(
+                identity(supplement_training)
+            ),
+            "heldout_manifest_sha256": supplement_heldout.get("sha256"),
+            "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
+            "normalization_rows_used": 0,
+            "baseline_fit_rows_used": 0,
+            "rank_or_utility_rows_used": 0,
+            "source_validation_rows_used": 0,
+            "checkpoint_selection_rows_used": 0,
+            "calibration_rows_used": 0,
+            "heldout_group_npz_opened": 0,
+            "heldout_group_payload_bytes_read": 0,
+            "heldout_group_payload_deserialized": 0,
+            "heldout_manifest_file_opened": 0,
+            "heldout_manifest_bytes_read": 0,
+        },
         "model_body_rows": 1,
         "heldout_specific_trainable_parameters": 0,
         "actor_frozen": True,
@@ -2547,7 +3088,7 @@ def _terminal_consequence_loss(
     *,
     ablation_variant: str = "full",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Proper finite-horizon consequence losses on the uniform stream only."""
+    """Proper finite-horizon consequence losses for one caller-owned stream."""
 
     if ablation_variant not in ABLATION_VARIANTS:
         raise FiveBodyContractError(f"unknown ablation variant {ablation_variant!r}")
@@ -2600,6 +3141,59 @@ def _terminal_consequence_loss(
         "terminal_event_weighted_uniform_proper": weighted_event,
         "terminal_goal_progress_weighted_uniform_proper": weighted_goal,
     }
+
+
+def _supplement_proper_world_model_loss(
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    sample_weight: torch.Tensor,
+    *,
+    loss_weights: Mapping[str, float],
+    ablation_variant: str = "full",
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply the fixed train-only supplement weight to proper heads only."""
+
+    multitask, multitask_pieces = core.compute_multitask_loss(
+        output,
+        batch,
+        sample_weight=sample_weight,
+        loss_weights=loss_weights,
+    )
+    object_effect, object_pieces = _robust_object_effect_loss(
+        output,
+        batch,
+        sample_weight,
+        ablation_variant=ablation_variant,
+    )
+    terminal, terminal_pieces = _terminal_consequence_loss(
+        output,
+        batch,
+        sample_weight,
+        ablation_variant=ablation_variant,
+    )
+    unweighted = multitask + object_effect + terminal
+    weighted = SUPPLEMENT_PROPER_LOSS_WEIGHT * unweighted
+    pieces = {
+        "supplement_proper_unweighted": unweighted,
+        "supplement_proper_weighted": weighted,
+        "supplement_proper_fixed_lambda": weighted.new_tensor(
+            SUPPLEMENT_PROPER_LOSS_WEIGHT
+        ),
+    }
+    pieces.update(
+        {
+            f"supplement_multitask_{name}": value
+            for name, value in multitask_pieces.items()
+            if name != "total"
+        }
+    )
+    pieces.update(
+        {f"supplement_{name}": value for name, value in object_pieces.items()}
+    )
+    pieces.update(
+        {f"supplement_{name}": value for name, value in terminal_pieces.items()}
+    )
+    return weighted, pieces
 
 
 def _candidate_rank_loss(
@@ -3403,6 +3997,110 @@ def materialize_source_rows(
     return rows
 
 
+def materialize_supplement_rows(
+    groups: Sequence[Mapping[str, Any]], *, held_out_body: str
+) -> list[dict[str, Any]]:
+    """Open only source-body supplements and bind each row to its declared root."""
+
+    if any(group.get("body") == held_out_body for group in groups):
+        raise FiveBodyContractError(
+            "held-out supplement group reached source payload loader"
+        )
+    rows: list[dict[str, Any]] = []
+    for group in groups:
+        body = str(group.get("body", ""))
+        if body not in BODIES or body == held_out_body:
+            raise FiveBodyContractError("supplement source body is invalid")
+        if group.get("source_role") != "proper_world_supplement":
+            raise FiveBodyContractError("supplement source role changed")
+        root_event = int(group["root_event_id"])
+        declared_horizon = int(group["pre_registered_horizon"])
+        loaded = _npz_rows(group, body=body)
+        if any(int(row["current_event_id"]) != root_event for row in loaded):
+            raise FiveBodyContractError(
+                "supplement payload current event differs from its e3/e4 manifest"
+            )
+        if any(
+            not math.isclose(
+                float(row["remaining_action_budget"]),
+                float(declared_horizon),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            for row in loaded
+        ):
+            raise FiveBodyContractError(
+                "supplement payload remaining budget differs from its bound horizon"
+            )
+        namespace = (
+            f"{body}|{group['condition']}|proper-world-supplement|"
+            f"{group['group_id']}"
+        )
+        for row in loaded:
+            row["logical_group"] = namespace
+        rows.extend(loaded)
+    if any(row["body"] == held_out_body for row in rows):
+        raise FiveBodyContractError("held-out supplement row reached source fitting")
+    return rows
+
+
+def supplement_group_bootstrap_weights(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    members: int,
+    seed: int,
+) -> tuple[np.ndarray, list[dict[str, Any]], int]:
+    """Ordinary member-specific Poisson bootstrap over real supplement groups."""
+
+    if members != 5:
+        raise FiveBodyContractError(
+            "formal supplement epistemic bootstrap requires five members"
+        )
+    indices_by_group: dict[str, list[int]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        indices_by_group[str(row["logical_group"])].append(index)
+    if not indices_by_group:
+        raise FiveBodyContractError("cannot bootstrap an empty supplement stream")
+    for group, indices in indices_by_group.items():
+        candidates = sorted(int(rows[index]["candidate_index"]) for index in indices)
+        if candidates != list(range(CANDIDATE_COUNT)):
+            raise FiveBodyContractError(
+                f"supplement bootstrap received incomplete decision {group}"
+            )
+    bootstrap_seed = int.from_bytes(
+        hashlib.sha256(
+            f"{seed}|proper-world-supplement-bootstrap-v1".encode()
+        ).digest()[:8],
+        "big",
+    )
+    group_order = [str(row["logical_group"]) for row in rows]
+    weights = core.logical_group_bootstrap_weights(
+        group_order, members=members, seed=bootstrap_seed
+    )
+    audit: list[dict[str, Any]] = []
+    for member in range(members):
+        for group, indices in indices_by_group.items():
+            group_values = weights[member, indices]
+            if not np.all(group_values == group_values[0]):
+                raise FiveBodyContractError(
+                    f"supplement bootstrap changed within logical group {group}"
+                )
+        audit.append(
+            {
+                "member": member,
+                "real_groups_with_nonzero_weight": sum(
+                    float(weights[member, indices[0]]) > 0.0
+                    for indices in indices_by_group.values()
+                ),
+                "real_groups_total": len(indices_by_group),
+                "class_balancing_used": False,
+                "synthetic_groups_or_labels": 0,
+                "bootstrap_seed": bootstrap_seed,
+            }
+        )
+    return weights.astype(np.float32, copy=False), audit, bootstrap_seed
+
+
 def effect_preserving_group_bootstrap_weights(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -3666,7 +4364,11 @@ def proper_outcome_preserving_group_bootstrap_weights(
     return weights.astype(np.float32, copy=False), audit
 
 
-def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str, Any]:
+def _train_fold(
+    args: argparse.Namespace,
+    audit: Mapping[str, Any],
+    supplement_audit: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     output = args.output.expanduser().resolve()
     if output.exists():
         raise FileExistsError("training output must be a new path")
@@ -3678,7 +4380,10 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         audit, held_out_body=args.held_out_body, split_seed=args.split_seed
     )
     preflight = build_preflight_receipt(
-        audit, held_out_body=args.held_out_body, split_seed=args.split_seed
+        audit,
+        held_out_body=args.held_out_body,
+        split_seed=args.split_seed,
+        supplement_audit=supplement_audit,
     )
     output.mkdir(parents=True)
     core.atomic_json(output / "preflight_receipt.json", preflight)
@@ -3738,8 +4443,25 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
     state_normalization["sha256"] = core.canonical_json_sha256(state_normalization)
     baseline = core.fit_train_baselines(train_rows)
     validation_baseline = core.evaluate_train_only_baselines(baseline, validation_rows)
+    if supplement_audit is None:
+        supplement_groups: list[dict[str, Any]] = []
+        supplement_rows: list[dict[str, Any]] = []
+    else:
+        supplement_groups, _supplement_heldout_groups = (
+            supplement_source_train_split(
+                supplement_audit, held_out_body=args.held_out_body
+            )
+        )
+        supplement_rows = materialize_supplement_rows(
+            supplement_groups, held_out_body=args.held_out_body
+        )
     body_to_id = {body: 0 for body in preflight["source_bodies"]}
     train_dataset = core.TransitionDataset(train_rows, body_to_id)
+    supplement_dataset = (
+        core.TransitionDataset(supplement_rows, body_to_id)
+        if supplement_rows
+        else None
+    )
     validation_loader = DataLoader(
         core.TransitionDataset(validation_rows, body_to_id),
         batch_size=args.batch_size,
@@ -3748,6 +4470,28 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
     )
     device = torch.device(args.device)
     group_order = [str(row["logical_group"]) for row in train_rows]
+    supplement_group_order = [
+        str(row["logical_group"]) for row in supplement_rows
+    ]
+    if supplement_group_order:
+        (
+            supplement_bootstrap,
+            supplement_bootstrap_support,
+            supplement_bootstrap_seed,
+        ) = supplement_group_bootstrap_weights(
+            supplement_rows, members=5, seed=args.split_seed
+        )
+        supplement_indices_by_group: dict[str, list[int]] = defaultdict(list)
+        for index, group in enumerate(supplement_group_order):
+            supplement_indices_by_group[group].append(index)
+        supplement_group_weight = {
+            group: supplement_bootstrap[:, indices[0]].tolist()
+            for group, indices in supplement_indices_by_group.items()
+        }
+    else:
+        supplement_bootstrap_seed = None
+        supplement_group_weight = {}
+        supplement_bootstrap_support = []
     proper_bootstrap, proper_bootstrap_support = (
         proper_outcome_preserving_group_bootstrap_weights(
             train_rows, members=5, seed=args.split_seed
@@ -3878,6 +4622,19 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             ),
             collate_fn=core.collate_rows,
         )
+        supplement_loader = (
+            DataLoader(
+                supplement_dataset,
+                batch_sampler=CompleteDecisionBatchSampler(
+                    supplement_rows,
+                    batch_size=args.batch_size,
+                    seed=seed,
+                ),
+                collate_fn=core.collate_rows,
+            )
+            if supplement_dataset is not None
+            else None
+        )
         rank_weight_for_member = {
             group: float(weights[member]) for group, weights in rank_group_weight.items()
         }
@@ -3899,6 +4656,9 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             collate_fn=core.collate_rows,
         )
         proper_iterator = iter(proper_loader)
+        supplement_iterator = (
+            iter(supplement_loader) if supplement_loader is not None else None
+        )
         rank_iterator = iter(rank_loader)
         eval_records: dict[int, dict[str, Any]] = {}
         snapshot_paths: dict[int, Path] = {}
@@ -3908,6 +4668,14 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             except StopIteration:
                 proper_iterator = iter(proper_loader)
                 proper_raw = next(proper_iterator)
+            supplement_raw = None
+            if supplement_loader is not None:
+                assert supplement_iterator is not None
+                try:
+                    supplement_raw = next(supplement_iterator)
+                except StopIteration:
+                    supplement_iterator = iter(supplement_loader)
+                    supplement_raw = next(supplement_iterator)
             try:
                 rank_raw = next(rank_iterator)
             except StopIteration:
@@ -3945,6 +4713,32 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 proper_weights,
                 ablation_variant=args.ablation_variant,
             )
+            if supplement_raw is None:
+                supplement_loss = multitask_loss.new_zeros(())
+                supplement_pieces = {
+                    "supplement_proper_unweighted": supplement_loss,
+                    "supplement_proper_weighted": supplement_loss,
+                    "supplement_proper_fixed_lambda": supplement_loss,
+                }
+            else:
+                supplement_batch = core._move_batch(supplement_raw, device)
+                supplement_weights = torch.tensor(
+                    [
+                        supplement_group_weight[group][member]
+                        for group in supplement_raw["logical_group"]
+                    ],
+                    device=device,
+                )
+                supplement_prediction = model(supplement_batch)
+                supplement_loss, supplement_pieces = (
+                    _supplement_proper_world_model_loss(
+                        supplement_prediction,
+                        supplement_batch,
+                        supplement_weights,
+                        loss_weights=base_loss_weights,
+                        ablation_variant=args.ablation_variant,
+                    )
+                )
             rank_prediction = model(rank_batch)
             decision_loss, decision_pieces = _candidate_rank_loss(
                 rank_prediction,
@@ -4035,6 +4829,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 multitask_loss
                 + object_effect_loss
                 + terminal_loss
+                + supplement_loss
                 + decision_loss
                 + semantic_comparative_loss
             )
@@ -4088,6 +4883,10 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 **{name: float(value.detach()) for name, value in pieces.items() if name != "total"},
                 **{name: float(value.detach()) for name, value in object_pieces.items()},
                 **{name: float(value.detach()) for name, value in terminal_pieces.items()},
+                **{
+                    name: float(value.detach())
+                    for name, value in supplement_pieces.items()
+                },
                 **{name: float(value.detach()) for name, value in decision_pieces.items()},
                 **{
                     name: float(value.detach())
@@ -4265,6 +5064,7 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 "action_stem_count": 1,
                 "body_to_id_source_only": body_to_id,
                 "heldout_rows_used_for_training_normalization_or_selection": 0,
+                "proper_world_supplement": preflight["supplement"],
                 "rank_supervision_available": rank_supervision_available,
                 "rank_supervision_mode": rank_supervision_mode,
                 "candidate_rank_parameters_received_direct_supervision": (
@@ -4335,6 +5135,28 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         ),
         "source_success_rows": positive_count,
         "source_failure_rows": int((successes <= 0.5).sum()),
+        "proper_world_supplement": {
+            **preflight["supplement"],
+            "source_train_rows": len(supplement_rows),
+            "loss": (
+                "fixed_lambda_times_multitask_plus_robust_object_plus_terminal_proper"
+                if supplement_rows
+                else "disabled"
+            ),
+            "rank_or_utility_rows_used": 0,
+            "normalization_rows_used": 0,
+            "source_validation_rows_used": 0,
+            "checkpoint_selection_rows_used": 0,
+            "calibration_rows_used": 0,
+            "ensemble_logical_group_poisson_bootstrap": (
+                supplement_bootstrap_support
+            ),
+            "ensemble_logical_group_poisson_bootstrap_seed": (
+                supplement_bootstrap_seed
+            ),
+            "class_balancing_used": False,
+            "synthetic_groups_or_labels": 0,
+        },
         "rank_supervision_available": rank_supervision_available,
         "rank_supervision_groups": rank_supervision_groups,
         "mixed_success_rank_groups": mixed_rank_groups,
@@ -4394,6 +5216,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("preflight", "train-fold"), required=True)
     parser.add_argument("--binding", type=Path, required=True)
     parser.add_argument("--binding-sha256", required=True)
+    parser.add_argument("--supplement-binding", type=Path)
+    parser.add_argument("--supplement-binding-sha256")
     parser.add_argument("--held-out-body", choices=BODIES, required=True)
     parser.add_argument("--split-seed", type=int, default=20260901)
     parser.add_argument("--output", type=Path)
@@ -4415,9 +5239,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     audit = load_binding(args.binding, args.binding_sha256)
+    if (args.supplement_binding is None) != (
+        args.supplement_binding_sha256 is None
+    ):
+        raise FiveBodyContractError(
+            "supplement binding path and SHA-256 must be supplied together"
+        )
+    supplement_audit = (
+        load_supplement_binding(
+            args.supplement_binding,
+            args.supplement_binding_sha256,
+            primary_audit=audit,
+            held_out_body=args.held_out_body,
+        )
+        if args.supplement_binding is not None
+        else None
+    )
     if args.mode == "preflight":
         receipt = build_preflight_receipt(
-            audit, held_out_body=args.held_out_body, split_seed=args.split_seed
+            audit,
+            held_out_body=args.held_out_body,
+            split_seed=args.split_seed,
+            supplement_audit=supplement_audit,
         )
         print("PREFLIGHT=" + json.dumps(receipt, sort_keys=True))
         return
@@ -4425,7 +5268,13 @@ def main() -> None:
         raise FiveBodyContractError("train-fold requires --output")
     if args.steps <= 0 or args.eval_every <= 0:
         raise FiveBodyContractError("steps/eval-every must be positive")
-    print("TRAINING=" + json.dumps(_train_fold(args, audit), sort_keys=True))
+    print(
+        "TRAINING="
+        + json.dumps(
+            _train_fold(args, audit, supplement_audit=supplement_audit),
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
@@ -4435,6 +5284,11 @@ if __name__ == "__main__":
 __all__ = [
     "ABLATION_VARIANTS",
     "ACTOR_FORMAT", "BINDING_FORMAT", "BODIES", "CANONICAL_ACTION_SCHEMA",
+    "SUPPLEMENT_BINDING_FORMAT", "SUPPLEMENT_MANIFEST_FORMAT",
+    "SUPPLEMENT_COLLECTOR_FORMAT",
+    "SUPPLEMENT_MATERIALIZER_FORMAT",
+    "SUPPLEMENT_PROPER_LOSS_WEIGHT", "SUPPLEMENT_USAGE_CONTRACT",
+    "EXPERT_ROOT_PROVENANCE_CONTRACT",
     "CANONICAL_STATE_SCHEMA", "CANDIDATE_NOISE_CONTRACT",
     "CANDIDATE_RANK_FEATURE_DIM", "CANDIDATE_RANK_FEATURE_SCHEMA",
     "BRANCH_DIAGNOSTIC_CONTRACT",
@@ -4458,11 +5312,16 @@ __all__ = [
     "build_preflight_receipt", "canonical_sha256",
     "candidate_checkpoint_selection_key", "checkpoint_candidate_rank_contract",
     "effect_preserving_group_bootstrap_weights", "load_binding",
+    "load_supplement_binding",
     "proper_outcome_preserving_group_bootstrap_weights",
-    "evaluate_candidate_ranking", "materialize_source_rows", "sha256_file",
-    "sha256_tree", "source_group_split", "summary_candidate_rank_contract",
+    "evaluate_candidate_ranking", "materialize_source_rows",
+    "materialize_supplement_rows", "sha256_file",
+    "sha256_tree", "source_group_split", "supplement_source_train_split",
+    "supplement_group_bootstrap_weights",
+    "summary_candidate_rank_contract",
     "risk_adjusted_rank_ensemble_contract",
     "select_calibration_guarded_checkpoint",
     "validate_actor_authority", "validate_body_manifest",
+    "validate_supplement_body_manifest",
     "validate_materialization_receipt",
 ]

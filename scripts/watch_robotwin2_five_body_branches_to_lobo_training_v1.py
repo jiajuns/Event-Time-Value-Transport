@@ -1042,12 +1042,44 @@ def nested_values(members: Sequence[Mapping[str, Any]], *keys: str) -> list[Any]
 
 
 def summarize_fold(
-    path: Path, held_out_body: str, expected_binding_sha256: str
+    path: Path,
+    held_out_body: str,
+    expected_binding_sha256: str,
+    expected_supplement_binding_sha256: str | None = None,
 ) -> dict[str, Any]:
     summary_path = path / "training_summary.json"
     summary = read_json(summary_path, f"{held_out_body} training summary")
     members = summary.get("members")
     ensemble_selection = summary.get("ensemble_checkpoint_selection")
+    supplement = summary.get("proper_world_supplement")
+    if expected_supplement_binding_sha256 is None:
+        supplement_matches = (
+            supplement is None
+            or (
+                isinstance(supplement, Mapping)
+                and supplement.get("enabled") is False
+                and supplement.get("binding_file_sha256") is None
+                and supplement.get("source_train_groups", 0) == 0
+                and supplement.get("source_train_rows", 0) == 0
+            )
+        )
+    else:
+        supplement_matches = bool(
+            isinstance(supplement, Mapping)
+            and supplement.get("enabled") is True
+            and supplement.get("binding_file_sha256")
+            == expected_supplement_binding_sha256
+            and supplement.get("proper_loss_weight") == 0.25
+            and supplement.get("source_train_groups") == 80
+            and supplement.get("source_train_rows") == 320
+            and supplement.get("heldout_groups_deferred") == 20
+            and supplement.get("source_validation_groups") == 0
+            and supplement.get("rank_or_utility_rows_used") == 0
+            and supplement.get("normalization_rows_used") == 0
+            and supplement.get("source_validation_rows_used") == 0
+            and supplement.get("checkpoint_selection_rows_used") == 0
+            and supplement.get("calibration_rows_used") == 0
+        )
     if (
         summary.get("status") != "source_only_checkpoint_selection_complete"
         or summary.get("held_out_body") != held_out_body
@@ -1065,6 +1097,7 @@ def summarize_fold(
         or not isinstance(summary.get("preflight"), Mapping)
         or summary["preflight"].get("binding_file_sha256")
         != expected_binding_sha256
+        or not supplement_matches
         or not isinstance(summary.get("trainer_file_sha256"), str)
         or len(summary["trainer_file_sha256"]) != 64
         or summary.get("rank_supervision_available") is not True
@@ -1210,6 +1243,7 @@ def summarize_fold(
         ),
         "ensemble_common_selection_step": ensemble_selection["selected_step"],
         "trainer_file_sha256": summary["trainer_file_sha256"],
+        "proper_world_supplement": supplement,
         "member_best_steps": [member.get("best_step") for member in members],
         "member_checkpoints": [
             {
@@ -1382,6 +1416,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--materialization-receipt", type=Path, required=True)
     parser.add_argument("--actor-authority", type=Path, required=True)
     parser.add_argument("--binding", type=Path, required=True)
+    parser.add_argument("--supplement-binding", type=Path)
+    parser.add_argument("--supplement-binding-sha256")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--run-exit", type=Path, required=True)
@@ -1404,6 +1440,14 @@ def normalized_args(args: argparse.Namespace) -> argparse.Namespace:
         "trainer", "training_python",
     ):
         setattr(args, name, getattr(args, name).expanduser().resolve())
+    if (args.supplement_binding is None) != (
+        args.supplement_binding_sha256 is None
+    ):
+        raise LoboWatcherError(
+            "supplement binding path and SHA-256 must be supplied together"
+        )
+    if args.supplement_binding is not None:
+        args.supplement_binding = args.supplement_binding.expanduser().resolve()
     if args.poll_seconds <= 0:
         raise LoboWatcherError("poll interval must be positive")
     return args
@@ -1426,6 +1470,12 @@ def main() -> int:
                 "branches_root": str(args.branches_root),
                 "actor_checkpoint": str(args.actor_checkpoint),
                 "binding": str(args.binding),
+                "supplement_binding": (
+                    str(args.supplement_binding)
+                    if args.supplement_binding is not None
+                    else None
+                ),
+                "supplement_binding_sha256": args.supplement_binding_sha256,
                 "output_root": str(args.output_root),
                 "expected_decisions": TOTAL_DECISIONS,
                 "expected_branches": TOTAL_BRANCHES,
@@ -1433,9 +1483,22 @@ def main() -> int:
             },
         )
 
-    for required in (args.materialization_receipt, args.trainer, args.training_python):
+    required_paths = [
+        args.materialization_receipt,
+        args.trainer,
+        args.training_python,
+    ]
+    if args.supplement_binding is not None:
+        required_paths.append(args.supplement_binding)
+    for required in required_paths:
         if not required.exists():
             raise FileNotFoundError(required)
+    if (
+        args.supplement_binding is not None
+        and sha256_file(args.supplement_binding)
+        != args.supplement_binding_sha256
+    ):
+        raise LoboWatcherError("supplement binding SHA-256 mismatch")
     gpu = gpu_identity()
     if "4090" not in gpu["name"] or gpu["uuid"] != args.expected_gpu_uuid:
         raise LoboWatcherError(f"unexpected GPU authority: {gpu}")
@@ -1497,7 +1560,12 @@ def main() -> int:
         completed_summary = fold_output / "training_summary.json"
         if completed_summary.is_file():
             fold_results.append(
-                summarize_fold(fold_output, held_out_body, binding_sha)
+                summarize_fold(
+                    fold_output,
+                    held_out_body,
+                    binding_sha,
+                    args.supplement_binding_sha256,
+                )
             )
             write_state(
                 "fold_already_complete",
@@ -1540,6 +1608,15 @@ def main() -> int:
             "--learning-rate", "0.0003",
             "--ensemble-seeds", *[str(seed) for seed in ENSEMBLE_SEEDS],
         ]
+        if args.supplement_binding is not None:
+            command.extend(
+                [
+                    "--supplement-binding",
+                    str(args.supplement_binding),
+                    "--supplement-binding-sha256",
+                    str(args.supplement_binding_sha256),
+                ]
+            )
         log_path = logs / f"outer_lobo_{held_out_body}.log"
         write_state(
             "training_fold",
@@ -1566,7 +1643,14 @@ def main() -> int:
             raise LoboWatcherError(
                 f"outer LOBO fold {held_out_body} failed with exit {training.returncode}"
             )
-        fold_results.append(summarize_fold(fold_output, held_out_body, binding_sha))
+        fold_results.append(
+            summarize_fold(
+                fold_output,
+                held_out_body,
+                binding_sha,
+                args.supplement_binding_sha256,
+            )
+        )
         write_state(
             "fold_complete",
             collection_audit=collection,
@@ -1612,6 +1696,15 @@ def main() -> int:
                 "path": str(args.binding),
                 "file_sha256": binding_sha,
                 "logical_sha256": binding["logical_sha256"],
+            },
+            "proper_world_supplement": {
+                "enabled": args.supplement_binding is not None,
+                "binding_path": (
+                    str(args.supplement_binding)
+                    if args.supplement_binding is not None
+                    else None
+                ),
+                "binding_file_sha256": args.supplement_binding_sha256,
             },
             "outer_folds": fold_results,
             "fold_count": len(fold_results),

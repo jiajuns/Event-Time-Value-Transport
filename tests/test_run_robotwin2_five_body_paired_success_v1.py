@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -423,6 +424,68 @@ def test_fold_specs_require_exactly_five_unique_bodies(tmp_path: Path) -> None:
     assert set(parsed) == set(runner.BODIES)
     with pytest.raises(runner.PairedExecutionError):
         runner.parse_fold_specs(specs[:-1])
+
+
+def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None:
+    supplement_sha = "a" * 64
+
+    def folds(enabled_by_body: dict[str, bool]) -> dict[str, dict]:
+        result = {}
+        for body in runner.BODIES:
+            summary_path = tmp_path / f"{body}-{int(enabled_by_body[body])}.json"
+            if enabled_by_body[body]:
+                supplement = {
+                    "enabled": True,
+                    "binding_file_sha256": supplement_sha,
+                    "proper_loss_weight": (
+                        runner.shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
+                    ),
+                    "usage_contract": dict(
+                        runner.shared_head.SUPPLEMENT_USAGE_CONTRACT
+                    ),
+                    "source_train_groups": 80,
+                    "source_train_rows": 320,
+                    "heldout_groups_deferred": 20,
+                    "rank_or_utility_rows_used": 0,
+                    "normalization_rows_used": 0,
+                    "source_validation_rows_used": 0,
+                    "checkpoint_selection_rows_used": 0,
+                    "calibration_rows_used": 0,
+                }
+            else:
+                supplement = {
+                    "enabled": False,
+                    "binding_file_sha256": None,
+                    "source_train_groups": 0,
+                    "source_train_rows": 0,
+                    "heldout_groups_deferred": 0,
+                }
+            summary_path.write_text(
+                json.dumps({"proper_world_supplement": supplement}),
+                encoding="utf-8",
+            )
+            result[body] = {
+                "training_summary": str(summary_path),
+                "training_summary_sha256": runner.sha256_file(summary_path),
+            }
+        return result
+
+    augmented = runner.inspect_fold_training_regime(
+        folds({body: True for body in runner.BODIES}),
+        required_supplement_binding_sha256=supplement_sha,
+    )
+    assert augmented["name"] == "c_plus_expert_root_supplement"
+    assert augmented["supplement_binding_file_sha256"] == supplement_sha
+
+    mixed = {body: True for body in runner.BODIES}
+    mixed[runner.BODIES[-1]] = False
+    with pytest.raises(runner.PairedExecutionError, match="mix"):
+        runner.inspect_fold_training_regime(folds(mixed))
+    with pytest.raises(runner.PairedExecutionError, match="required supplement"):
+        runner.inspect_fold_training_regime(
+            folds({body: False for body in runner.BODIES}),
+            required_supplement_binding_sha256=supplement_sha,
+        )
 
 
 def test_analytic_events_and_state27_goal_are_identical_offline_and_online() -> None:

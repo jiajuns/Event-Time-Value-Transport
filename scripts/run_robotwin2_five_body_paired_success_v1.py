@@ -477,6 +477,112 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
     }
 
 
+def inspect_fold_training_regime(
+    folds: Mapping[str, Mapping[str, Any]],
+    *,
+    required_supplement_binding_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Bind all five folds to one C-only or one exact C+supplement regime."""
+
+    if set(folds) != set(BODIES):
+        raise PairedExecutionError("training regime needs exactly five LOBO folds")
+    if required_supplement_binding_sha256 is not None and (
+        len(required_supplement_binding_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in required_supplement_binding_sha256
+        )
+    ):
+        raise PairedExecutionError(
+            "required supplement binding must be a lowercase SHA-256"
+        )
+
+    rows: dict[str, dict[str, Any]] = {}
+    regimes: set[tuple[bool, str | None]] = set()
+    for body in BODIES:
+        summary_path = Path(str(folds[body]["training_summary"]))
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        supplement = summary.get("proper_world_supplement")
+        if supplement is None:
+            enabled = False
+            binding_sha = None
+            source_groups = 0
+            source_rows = 0
+            heldout_groups = 0
+            declaration = "legacy_c_only_summary_without_supplement_field"
+        elif not isinstance(supplement, Mapping):
+            raise PairedExecutionError(
+                f"LOBO fold supplement declaration is invalid for {body}"
+            )
+        else:
+            enabled = supplement.get("enabled") is True
+            binding_sha = supplement.get("binding_file_sha256")
+            source_groups = supplement.get("source_train_groups")
+            source_rows = supplement.get("source_train_rows")
+            heldout_groups = supplement.get("heldout_groups_deferred")
+            declaration = "explicit_c_plus_supplement" if enabled else "explicit_c_only"
+            if enabled:
+                if (
+                    not isinstance(binding_sha, str)
+                    or len(binding_sha) != 64
+                    or any(character not in "0123456789abcdef" for character in binding_sha)
+                    or supplement.get("proper_loss_weight")
+                    != shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
+                    or supplement.get("usage_contract")
+                    != shared_head.SUPPLEMENT_USAGE_CONTRACT
+                    or source_groups != 80
+                    or source_rows != 320
+                    or heldout_groups != 20
+                    or supplement.get("rank_or_utility_rows_used") != 0
+                    or supplement.get("normalization_rows_used") != 0
+                    or supplement.get("source_validation_rows_used") != 0
+                    or supplement.get("checkpoint_selection_rows_used") != 0
+                    or supplement.get("calibration_rows_used") != 0
+                ):
+                    raise PairedExecutionError(
+                        f"LOBO fold augmented training contract changed for {body}"
+                    )
+            elif any(
+                value not in (None, 0)
+                for value in (binding_sha, source_groups, source_rows, heldout_groups)
+            ):
+                raise PairedExecutionError(
+                    f"LOBO fold claims C-only but contains supplement rows for {body}"
+                )
+            if not enabled:
+                binding_sha = None
+                source_groups = 0
+                source_rows = 0
+                heldout_groups = 0
+        regimes.add((enabled, str(binding_sha) if binding_sha is not None else None))
+        rows[body] = {
+            "declaration": declaration,
+            "supplement_enabled": enabled,
+            "supplement_binding_file_sha256": binding_sha,
+            "source_train_groups": int(source_groups),
+            "source_train_rows": int(source_rows),
+            "heldout_groups_deferred": int(heldout_groups),
+            "training_summary_sha256": folds[body]["training_summary_sha256"],
+        }
+    if len(regimes) != 1:
+        raise PairedExecutionError("five LOBO folds mix different training regimes")
+    enabled, binding_sha = next(iter(regimes))
+    if required_supplement_binding_sha256 is not None and (
+        not enabled or binding_sha != required_supplement_binding_sha256
+    ):
+        raise PairedExecutionError(
+            "LOBO folds do not use the explicitly required supplement binding"
+        )
+    base = {
+        "name": "c_plus_expert_root_supplement" if enabled else "c_only",
+        "supplement_enabled": enabled,
+        "supplement_binding_file_sha256": binding_sha,
+        "required_supplement_binding_sha256": required_supplement_binding_sha256,
+        "folds": rows,
+    }
+    return {**base, "regime_sha256": canonical_sha256(base)}
+
+
 def load_ensemble(
     fold: Mapping[str, Any], device: torch.device
 ) -> list[shared_head.EffectAlignedSharedEventHead]:
@@ -1330,6 +1436,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--lobo-fold", action="append", required=True,
         help="Repeat exactly five times as heldout-body=/absolute/fold/root.",
     )
+    parser.add_argument(
+        "--required-supplement-binding-sha256",
+        help=(
+            "Require every fold to be the C+supplement model trained from this "
+            "exact binding; omit only for a C-only evaluation."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--action-exec-steps", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=200)
@@ -1377,6 +1490,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     preregistration_receipt = load_preregistration(args.preregistration.resolve())
     fold_paths = parse_fold_specs(args.lobo_fold)
     folds = {body: inspect_fold(body, fold_paths[body]) for body in BODIES}
+    fold_training_regime = inspect_fold_training_regime(
+        folds,
+        required_supplement_binding_sha256=(
+            args.required_supplement_binding_sha256
+        ),
+    )
     actor_checkpoint = args.actor_checkpoint.expanduser().resolve()
     actor_tree_sha, actor_file_count, actor_size = shared_head.sha256_tree(actor_checkpoint)
     vlm_metadata = args.vlm_metadata_path.expanduser().resolve()
@@ -1423,6 +1542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vlm_metadata_file_count": vlm_file_count,
         "vlm_metadata_size_bytes": vlm_size,
         "folds": folds,
+        "fold_training_regime": fold_training_regime,
         "candidate_rank_ensemble_contract": (
             shared_head.risk_adjusted_rank_ensemble_contract()
         ),

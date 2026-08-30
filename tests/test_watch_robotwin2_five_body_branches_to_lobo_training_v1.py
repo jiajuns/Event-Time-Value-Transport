@@ -162,6 +162,44 @@ def test_fold_summary_accepts_strict_proper_selection_contract(
     assert result["heldout_labels_used_for_training_normalization_or_selection"] is False
 
 
+def test_fold_summary_requires_exact_augmented_binding_when_requested(
+    valid_fold_summary: tuple[Path, str, str, Path],
+) -> None:
+    fold_path, held_out_body, binding_sha256, summary_path = valid_fold_summary
+    supplement_sha = "e" * 64
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["proper_world_supplement"] = {
+        "enabled": True,
+        "binding_file_sha256": supplement_sha,
+        "proper_loss_weight": 0.25,
+        "source_train_groups": 80,
+        "source_train_rows": 320,
+        "heldout_groups_deferred": 20,
+        "source_validation_groups": 0,
+        "rank_or_utility_rows_used": 0,
+        "normalization_rows_used": 0,
+        "source_validation_rows_used": 0,
+        "checkpoint_selection_rows_used": 0,
+        "calibration_rows_used": 0,
+    }
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = watcher.summarize_fold(
+        fold_path,
+        held_out_body,
+        binding_sha256,
+        supplement_sha,
+    )
+    assert result["proper_world_supplement"]["binding_file_sha256"] == supplement_sha
+    with pytest.raises(watcher.LoboWatcherError, match="violates outer-LOBO"):
+        watcher.summarize_fold(
+            fold_path,
+            held_out_body,
+            binding_sha256,
+            "f" * 64,
+        )
+
+
 @pytest.mark.parametrize(
     ("tampered_field", "tampered_value"),
     [
