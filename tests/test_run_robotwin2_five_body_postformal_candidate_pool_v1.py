@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -89,6 +90,16 @@ def test_default_budget_is_raw_n_and_does_not_claim_subset_selection() -> None:
     assert contract["actor_call_budget_increased_beyond_raw_proposal_count"] is False
     language = contract["instruction_coverage_contract"]
     assert language["actor_training_seen_condition"] == runner.TRAINING_SEEN_INSTRUCTION
+    assert language["actor_training_seen_task_index"] == 1068
+    assert language["frozen_actor_training_tasks_parquet_sha256"] == (
+        runner.TRAINING_TASKS_PARQUET_SHA256
+    )
+    assert hashlib.sha256(
+        language["actor_training_seen_condition"].encode("utf-8")
+    ).hexdigest() == language["actor_training_seen_condition_utf8_sha256"]
+    assert "brown" not in language["actor_training_seen_condition"].lower()
+    assert "lid" not in language["actor_training_seen_condition"].lower()
+    assert "arm" not in language["actor_training_seen_condition"].lower()
     assert language["semantic_task_changed"] is False
     assert language["reads_outcomes_events_or_critic_scores"] is False
 

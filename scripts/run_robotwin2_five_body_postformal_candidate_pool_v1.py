@@ -67,14 +67,17 @@ EVENT_SPEC_SHA256 = formal.EVENT_SPEC_SHA256
 REFERENCE_PREREGISTRATION_SHA256 = formal.PREREGISTRATION_SHA256
 REPORT_BOOTSTRAP_REPLICATES = 10_000
 REPORT_BOOTSTRAP_SEED = 20260908
-# This exact task string is task_index=0 in the frozen 2,750-episode LeRobot
-# actor-training dataset.  The public source is the ``seen[0]`` instruction of
-# ``aloha-agilex_clean/instructions/episode0.json`` at the pinned RoboTwin2
-# snapshot.  It is deliberately embedded here so the remote evaluation does
-# not read training payloads or depend on mutable external files.
+# This exact task string is task_index=1068 in the frozen 2,750-episode
+# LeRobot actor-training metadata.  It was selected without rollout outcomes
+# because it states the same relation without binding color, lid, arm, or
+# other appearance attributes that change under randomized evaluation.  The
+# value is embedded so execution never reads mutable training metadata.
+TRAINING_SEEN_INSTRUCTION_TASK_INDEX = 1068
+TRAINING_TASKS_PARQUET_SHA256 = (
+    "576e5ff827cc6aae8a283f65e6196e11cd6577d65d99842cebb8aaf63f6dde34"
+)
 TRAINING_SEEN_INSTRUCTION = (
-    "Pick the brown top sauce can and position it next to the kitchenpot with "
-    "smooth metallic lid"
+    "Move the sauce can for condiments to be next to the metal cooking pot"
 )
 TRAINING_SEEN_INSTRUCTION_SHA256 = hashlib.sha256(
     TRAINING_SEEN_INSTRUCTION.encode("utf-8")
@@ -403,14 +406,14 @@ def pool_selection_audit(
         "raw_candidate_instruction_conditions": [
             "runtime_frozen_instruction"
             if index < raw_count // 2
-            else "actor_training_seen_task_index_0"
+            else f"actor_training_seen_task_index_{TRAINING_SEEN_INSTRUCTION_TASK_INDEX}"
             for index in range(raw_count)
         ],
         "retained_candidate_instruction_conditions": [
             (
                 "runtime_frozen_instruction"
                 if index < raw_count // 2
-                else "actor_training_seen_task_index_0"
+                else f"actor_training_seen_task_index_{TRAINING_SEEN_INSTRUCTION_TASK_INDEX}"
             )
             for index in selected_indices
         ],
@@ -520,14 +523,21 @@ def candidate_pool_contract(
             "actor_training_seen_condition_utf8_sha256": (
                 TRAINING_SEEN_INSTRUCTION_SHA256
             ),
+            "actor_training_seen_task_index": (
+                TRAINING_SEEN_INSTRUCTION_TASK_INDEX
+            ),
+            "frozen_actor_training_tasks_parquet_sha256": (
+                TRAINING_TASKS_PARQUET_SHA256
+            ),
             "actor_training_seen_source": (
-                "frozen_actor_training_lerobot_tasks_parquet_task_index_0_and_"
-                "public_seen_instruction_episode0"
+                "frozen_actor_training_lerobot_tasks_parquet_index_value_"
+                "selected_for_appearance_agnostic_semantic_equivalence_without_"
+                "rollout_outcomes"
             ),
             "raw_candidate_instruction_conditions": [
                 "runtime_frozen_instruction"
                 if index < raw_count // 2
-                else "actor_training_seen_task_index_0"
+                else f"actor_training_seen_task_index_{TRAINING_SEEN_INSTRUCTION_TASK_INDEX}"
                 for index in range(raw_count)
             ],
             "semantic_task_changed": False,
