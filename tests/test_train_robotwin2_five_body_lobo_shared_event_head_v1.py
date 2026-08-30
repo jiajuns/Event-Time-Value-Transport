@@ -1404,6 +1404,105 @@ def _model_batch(dt: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 
+def test_next_event_duration_mixture_moments_include_between_event_uncertainty() -> None:
+    probability = torch.tensor([[0.25, 0.75]])
+    component_mean = torch.tensor([[0.0, 2.0]])
+    component_log_scale = torch.zeros(1, 2)
+    mean, std, log_scale = trainer_entry._next_event_duration_mixture_moments(
+        probability, component_mean, component_log_scale
+    )
+    assert mean.item() == pytest.approx(1.5)
+    # E[var] = 1 and Var[E] = .25*(0-1.5)^2+.75*(2-1.5)^2 = .75.
+    assert std.item() == pytest.approx(math.sqrt(1.75))
+    assert torch.exp(log_scale).item() == pytest.approx(math.sqrt(1.75))
+
+
+def test_observed_duration_uses_observed_next_event_component_not_current_event() -> None:
+    target = math.log1p(3.0)
+    output = {
+        "next_event_logits": torch.zeros(1, 5),
+        "duration_component_log_mean": torch.tensor(
+            [[-7.0, -4.0, target, 4.0, 7.0]]
+        ),
+        "duration_component_log_scale": torch.zeros(1, 5),
+    }
+    batch = {
+        "duration": torch.tensor([3.0]),
+        "duration_observed": torch.tensor([1.0]),
+        "next_event_id": torch.tensor([2]),
+        "next_event_mask": torch.tensor([1.0]),
+        # Deliberately different: the legacy implementation selected event 0.
+        "current_event_id": torch.tensor([0]),
+    }
+    nll = trainer_entry._competing_risks_duration_nll_rows(output, batch)
+    assert nll.item() == pytest.approx(0.5 * math.log(2.0 * math.pi))
+
+
+def test_censored_duration_is_probability_weighted_competing_risks_survival() -> None:
+    logits = torch.tensor([[2.0, 0.5, -1.0, -2.0, -3.0]], requires_grad=True)
+    means = torch.tensor(
+        [[0.2, 0.8, 1.4, 2.0, 2.6]], requires_grad=True
+    )
+    log_scales = torch.full((1, 5), -0.3, requires_grad=True)
+    output = {
+        "next_event_logits": logits,
+        "duration_component_log_mean": means,
+        "duration_component_log_scale": log_scales,
+    }
+    batch = {
+        "duration": torch.tensor([3.0]),
+        "duration_observed": torch.tensor([0.0]),
+        "next_event_id": torch.tensor([0]),
+        "next_event_mask": torch.tensor([0.0]),
+    }
+    nll = trainer_entry._competing_risks_duration_nll_rows(output, batch)
+    z = (torch.log1p(batch["duration"])[:, None] - means) / torch.exp(log_scales)
+    expected = -torch.logsumexp(
+        torch.log_softmax(logits, dim=-1) + torch.special.log_ndtr(-z), dim=-1
+    )
+    assert torch.allclose(nll, expected)
+    nll.sum().backward()
+    assert logits.grad is not None and bool((logits.grad.abs() > 0).any())
+    assert means.grad is not None and bool((means.grad.abs() > 0).all())
+    assert log_scales.grad is not None and bool((log_scales.grad.abs() > 0).all())
+
+
+def test_forward_publishes_next_event_conditioned_duration_with_legacy_scalar() -> None:
+    model = EffectAlignedSharedEventHead().eval()
+    with torch.no_grad():
+        model.duration_mean.weight.zero_()
+        model.duration_mean.bias.copy_(torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0]))
+        model.duration_scale.weight.zero_()
+        model.duration_scale.bias.fill_(-5.0)
+        model.next_event.weight.zero_()
+        model.next_event.bias.copy_(torch.tensor([-8.0, -8.0, -8.0, 8.0, -8.0]))
+    output = model(_model_batch(torch.tensor([5.0 / 15.0])))
+    assert output["duration_component_log_mean"].shape == (1, 5)
+    assert output["duration_mixture_probability"].shape == (1, 5)
+    assert output["duration_log1p_mixture_std"].shape == (1,)
+    assert output["duration_selected_log_mean"].shape == (1,)
+    assert output["duration_selected_log_scale"].shape == (1,)
+    torch.testing.assert_close(
+        output["failure_probability"], 1.0 - output["success_probability"]
+    )
+    for name in (
+        "post_event_aleatoric_entropy",
+        "next_event_aleatoric_entropy",
+        "terminal_event_aleatoric_entropy",
+        "success_aleatoric_entropy",
+        "conditional_recovery_aleatoric_entropy",
+        "joint_recovery_aleatoric_entropy",
+    ):
+        assert output[name].shape == (1,)
+        assert bool(torch.isfinite(output[name]).all())
+        assert bool((output[name] >= 0.0).all())
+    # Current event is e0, but an almost-certain e4 destination selects its
+    # duration mode through the mixture rather than hard-gathering e0.
+    assert output["duration_selected_log_mean"].item() == pytest.approx(
+        1.5, abs=1e-5
+    )
+
+
 def test_rank_gradient_updates_only_consequence_utility_not_world_model() -> None:
     torch.manual_seed(7)
     model = EffectAlignedSharedEventHead().eval()
@@ -1901,6 +2000,8 @@ def _fixed_terminal_metrics(
             return {
                 "post_event_logits": event_logits,
                 "next_event_logits": event_logits,
+                "duration_component_log_mean": zero[:, None].expand(-1, 5),
+                "duration_component_log_scale": zero[:, None].expand(-1, 5),
                 "duration_selected_log_mean": zero,
                 "duration_selected_log_scale": zero,
                 "terminal_event_logits": terminal_probability.log(),
@@ -1967,7 +2068,7 @@ def _fixed_terminal_metrics(
     )
 
 
-def test_v11_validation_nll_uses_observed_event_conditionals_not_mixture_mean(
+def test_v12_validation_nll_uses_observed_event_conditionals_not_mixture_mean(
 ) -> None:
     metrics = _fixed_terminal_metrics(
         [
@@ -3463,7 +3564,7 @@ def test_ensemble_seeds_must_be_five_distinct_integers(
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
-    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v11"
+    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v12"
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
     torch.testing.assert_close(
@@ -3616,7 +3717,7 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert full_contract["strict_proper_components"] == [
         "post_event_categorical_nll_weight_1.0",
         "next_event_categorical_nll_weight_0.5",
-        "duration_censored_lognormal_nll_weight_0.5",
+        "duration_next_event_competing_risks_censored_lognormal_nll_weight_0.5",
         "success_binary_nll",
         "recovery_binary_nll_weight_0.5_when_supervised",
         "object_given_post_event_student_t3_nll_weight_0.5",

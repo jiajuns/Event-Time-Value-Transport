@@ -600,6 +600,12 @@ def evaluate_deployed_ensemble_predictions(
             "duration_log_scale": [
                 output["duration_selected_log_scale"] for output in outputs
             ],
+            "duration_component_log_mean": [
+                output["duration_component_log_mean"] for output in outputs
+            ],
+            "duration_component_log_scale": [
+                output["duration_component_log_scale"] for output in outputs
+            ],
             "recovery_probability": [
                 torch.sigmoid(output["recovery_logit"]) for output in outputs
             ],
@@ -696,24 +702,59 @@ def evaluate_deployed_ensemble_predictions(
     duration = values["duration"].astype(np.float64)
     duration_mask = values["duration_mask"] > 0.5
     duration_observed = (values["duration_observed"] > 0.5) & duration_mask
-    duration_mu = members["duration_log_mean"].astype(np.float64)
-    duration_scale = np.exp(members["duration_log_scale"].astype(np.float64)).clip(1e-4)
-    duration_member_mean = np.maximum(
-        np.expm1(np.clip(duration_mu + 0.5 * np.square(duration_scale), -30.0, 50.0)),
+    duration_mu = members["duration_component_log_mean"].astype(np.float64)
+    duration_scale = np.exp(
+        members["duration_component_log_scale"].astype(np.float64)
+    ).clip(1e-4)
+    duration_next_probability = members["next_probability"].astype(np.float64)
+    duration_component_mean = np.maximum(
+        np.expm1(
+            np.clip(
+                duration_mu + 0.5 * np.square(duration_scale), -30.0, 50.0
+            )
+        ),
         0.0,
+    )
+    duration_member_mean = np.sum(
+        duration_next_probability * duration_component_mean, axis=-1
     )
     duration_prediction = duration_member_mean.mean(axis=0)
     duration_uncertainty = duration_member_mean.std(axis=0)
-    transformed = np.log1p(np.maximum(duration, 0.0))[None]
+    transformed = np.log1p(np.maximum(duration, 0.0))[None, :, None]
     duration_z = (transformed - duration_mu) / duration_scale
     normal_log_pdf = (
         -0.5 * np.square(duration_z)
         - np.log(duration_scale)
         - 0.5 * math.log(2.0 * math.pi)
     )
-    duration_observed_nll_rows = -_logmeanexp(normal_log_pdf, axis=0)
+    next_label = values["next_label"].astype(np.int64)
+    next_label_index = next_label[None, :, None]
+    observed_component_log_pdf = np.take_along_axis(
+        normal_log_pdf, next_label_index, axis=-1
+    )[..., 0]
+    observed_next_probability = np.take_along_axis(
+        duration_next_probability, next_label_index, axis=-1
+    )[..., 0]
+    # The ensemble defines a mixture of joint p(e,D) models.  Condition that
+    # mixture on the observed destination instead of averaging component
+    # densities with equal weights when members disagree about p(e).
+    observed_log_joint = np.log(
+        np.clip(observed_next_probability, epsilon, 1.0)
+    ) + observed_component_log_pdf
+    observed_log_event = np.log(
+        np.clip(observed_next_probability, epsilon, 1.0)
+    )
+    duration_observed_nll_rows = -(
+        _logmeanexp(observed_log_joint, axis=0)
+        - _logmeanexp(observed_log_event, axis=0)
+    )
     log_survival = torch.special.log_ndtr(-torch.from_numpy(duration_z)).numpy()
-    censored_nll_rows = -_logmeanexp(log_survival, axis=0)
+    member_log_survival = np.logaddexp.reduce(
+        np.log(np.clip(duration_next_probability, epsilon, 1.0))
+        + log_survival,
+        axis=-1,
+    )
+    censored_nll_rows = -_logmeanexp(member_log_survival, axis=0)
     duration_all_nll = np.where(
         values["duration_observed"] > 0.5,
         duration_observed_nll_rows,

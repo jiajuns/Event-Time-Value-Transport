@@ -37,7 +37,7 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materia
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
-MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v11"
+MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v12"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v2_endpose_frame"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
 SUPPLEMENT_BINDING_FORMAT = (
@@ -609,6 +609,42 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "aleatoric_consequence_risk": (
             "law_of_total_variance_within_event_student_t3_plus_between_event"
         ),
+        "duration_joint_distribution": (
+            "p(next_event)_times_lognormal_log1p_duration_conditioned_on_"
+            "next_event"
+        ),
+        "duration_observed_likelihood": (
+            "observed_next_event_component_nll_with_separate_next_event_ce"
+        ),
+        "duration_censored_likelihood": (
+            "negative_log_sum_next_event_probability_times_component_survival"
+        ),
+        "censored_duration_updates_next_event_probability": True,
+        "duration_component_clock_gradient_updates_semantic_transition": False,
+        "censored_survival_event_evidence_updates_semantic_transition": True,
+        "duration_legacy_scalar_interface": (
+            "moment_equivalent_gaussian_in_log1p_time_preserving_first_two_"
+            "mixture_moments"
+        ),
+        "duration_aleatoric_uncertainty": (
+            "within_next_event_gaussian_plus_between_next_event_log1p_time_"
+            "variance"
+        ),
+        "native_probability_outputs": [
+            "success_probability",
+            "failure_probability",
+            "conditional_recovery_probability",
+            "joint_recovery_probability",
+        ],
+        "native_aleatoric_entropy_outputs": [
+            "post_event_aleatoric_entropy",
+            "next_event_aleatoric_entropy",
+            "terminal_event_aleatoric_entropy",
+            "success_aleatoric_entropy",
+            "conditional_recovery_aleatoric_entropy",
+            "joint_recovery_aleatoric_entropy",
+        ],
+        "epistemic_uncertainty_source": "five_member_source_group_bootstrap_ensemble",
         "pairwise_rank_loss_enabled": False,
         "group_listwise_success_mass_loss_enabled": variant != "success_only",
         "all_failure_dense_listwise_loss_enabled": variant != "success_only",
@@ -699,7 +735,10 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
                 *(
                     []
                     if variant == "no_time_duration"
-                    else ["duration_censored_lognormal_nll_weight_0.5"]
+                    else [
+                        "duration_next_event_competing_risks_censored_"
+                        "lognormal_nll_weight_0.5"
+                    ]
                 ),
                 "success_binary_nll",
                 "recovery_binary_nll_weight_0.5_when_supervised",
@@ -927,6 +966,39 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ],
         "aleatoric_consequence_risk": checkpoint[
             "aleatoric_consequence_risk"
+        ],
+        "duration_joint_distribution": checkpoint[
+            "duration_joint_distribution"
+        ],
+        "duration_observed_likelihood": checkpoint[
+            "duration_observed_likelihood"
+        ],
+        "duration_censored_likelihood": checkpoint[
+            "duration_censored_likelihood"
+        ],
+        "censored_duration_updates_next_event_probability": checkpoint[
+            "censored_duration_updates_next_event_probability"
+        ],
+        "duration_component_clock_gradient_updates_semantic_transition": checkpoint[
+            "duration_component_clock_gradient_updates_semantic_transition"
+        ],
+        "censored_survival_event_evidence_updates_semantic_transition": checkpoint[
+            "censored_survival_event_evidence_updates_semantic_transition"
+        ],
+        "duration_legacy_scalar_interface": checkpoint[
+            "duration_legacy_scalar_interface"
+        ],
+        "duration_aleatoric_uncertainty": checkpoint[
+            "duration_aleatoric_uncertainty"
+        ],
+        "native_probability_outputs": checkpoint[
+            "native_probability_outputs"
+        ],
+        "native_aleatoric_entropy_outputs": checkpoint[
+            "native_aleatoric_entropy_outputs"
+        ],
+        "epistemic_uncertainty_source": checkpoint[
+            "epistemic_uncertainty_source"
         ],
         "cross_body_input_normalization": checkpoint[
             "cross_body_input_normalization"
@@ -2597,6 +2669,20 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
         raise FiveBodyContractError(f"{path} contains empty/non-finite canonical rows")
     if np.any((arrays["current_event_id"] < 0) | (arrays["current_event_id"] >= 5)):
         raise FiveBodyContractError(f"{path} current event ids are invalid")
+    if (
+        not np.array_equal(
+            arrays["next_event_id"], arrays["next_event_id"].astype(np.int64)
+        )
+        or np.any((arrays["next_event_id"] < 0) | (arrays["next_event_id"] >= 5))
+        or np.any((arrays["next_event_mask"] < 0.0) | (arrays["next_event_mask"] > 1.0))
+        or np.any(
+            (arrays["duration_observed"] > 0.5)
+            & ~(arrays["next_event_mask"] > 0.5)
+        )
+    ):
+        raise FiveBodyContractError(
+            f"{path} next-event/duration supervision is invalid"
+        )
     terminal_event = arrays["terminal_max_event_id"]
     terminal_event_mask = arrays["terminal_event_mask"]
     terminal_goal_mask = arrays["terminal_goal_progress_mask"]
@@ -3153,6 +3239,111 @@ def _event_conditioned_student_t3_mixture_moments(
     return mixture_mean, mixture_std, moment_equivalent_log_scale
 
 
+def _next_event_duration_mixture_moments(
+    next_event_probability: torch.Tensor,
+    component_log_mean: torch.Tensor,
+    component_log_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Moment-match ``log1p(D)`` under the next-event mixture.
+
+    Duration is not a property of the current event alone: the time to an e3
+    boundary and the time to an e4 boundary can be different modes from the
+    same root.  The five clock outputs therefore parameterize
+    ``p(log1p(D) | next_event=e)``.  This helper returns the exact first two
+    moments of that Gaussian mixture and a scalar log scale for legacy callers
+    that accept one moment-equivalent lognormal per candidate.
+
+    Keeping the moment calculation in log-time avoids the overflow and severe
+    tail domination caused by taking raw shifted-lognormal moments during
+    early training.  The proper likelihood below is still evaluated against
+    the individual mixture components without moment matching.
+    """
+
+    if (
+        next_event_probability.ndim != 2
+        or component_log_mean.shape != next_event_probability.shape
+        or component_log_scale.shape != next_event_probability.shape
+        or not bool(torch.isfinite(next_event_probability).all())
+        or not bool(torch.isfinite(component_log_mean).all())
+        or not bool(torch.isfinite(component_log_scale).all())
+        or bool((next_event_probability < 0.0).any())
+        or not bool(
+            torch.allclose(
+                next_event_probability.sum(dim=-1),
+                torch.ones_like(next_event_probability[:, 0]),
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+    ):
+        raise FiveBodyContractError("next-event duration mixture is invalid")
+    mixture_mean = (next_event_probability * component_log_mean).sum(dim=-1)
+    component_variance = torch.exp(2.0 * component_log_scale)
+    centered = component_log_mean - mixture_mean[:, None]
+    mixture_variance = (
+        next_event_probability * (component_variance + centered.square())
+    ).sum(dim=-1).clamp_min(math.exp(-10.0))
+    mixture_std = torch.sqrt(mixture_variance)
+    return mixture_mean, mixture_std, torch.log(mixture_std)
+
+
+def _competing_risks_duration_nll_rows(
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Proper duration rows for observed and right-censored event boundaries.
+
+    Observed rows use the component belonging to the observed next event; the
+    separate next-event CE supplies ``-log p(e_next)``.  On censored rows the
+    destination is unknown, so the likelihood is the exact competing-risks
+    survival ``sum_e p(e) S(D_censor | e)``.  Consequently censored examples
+    supervise all plausible destinations instead of being mislabelled as a
+    current-event duration.
+    """
+
+    logits = output["next_event_logits"]
+    mean = output["duration_component_log_mean"]
+    log_scale = output["duration_component_log_scale"]
+    duration = batch["duration"].to(mean)
+    observed = batch["duration_observed"].bool()
+    next_event = batch["next_event_id"].long()
+    next_mask = batch["next_event_mask"].bool()
+    if (
+        logits.ndim != 2
+        or mean.shape != logits.shape
+        or log_scale.shape != logits.shape
+        or duration.shape != logits.shape[:1]
+        or observed.shape != duration.shape
+        or next_event.shape != duration.shape
+        or next_mask.shape != duration.shape
+        or bool(((next_event < 0) | (next_event >= logits.shape[-1])).any())
+        or bool((observed & ~next_mask).any())
+        or not bool(torch.isfinite(logits).all())
+        or not bool(torch.isfinite(mean).all())
+        or not bool(torch.isfinite(log_scale).all())
+        or not bool(torch.isfinite(duration).all())
+        or bool((duration < 0.0).any())
+    ):
+        raise FiveBodyContractError(
+            "competing-risks duration supervision is invalid"
+        )
+    target = torch.log1p(duration)
+    scale = torch.exp(log_scale).clamp_min(1e-4)
+    z = (target[:, None] - mean) / scale
+    component_observed_nll = (
+        0.5 * z.square() + log_scale + 0.5 * math.log(2.0 * math.pi)
+    )
+    observed_nll = component_observed_nll.gather(
+        1, next_event[:, None]
+    ).squeeze(1)
+    component_log_survival = torch.special.log_ndtr(-z)
+    censored_nll = -torch.logsumexp(
+        torch.log_softmax(logits, dim=-1) + component_log_survival,
+        dim=-1,
+    )
+    return torch.where(observed, observed_nll, censored_nll)
+
+
 def _gather_observed_event_component(
     component: torch.Tensor,
     observed_event_id: torch.Tensor,
@@ -3322,16 +3513,38 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         duration_log_scale = torch.clamp(
             self.duration_scale(age_clock_hidden), -5.0, 2.0
         )
+        next_event_probability = torch.softmax(
+            output["next_event_logits"], dim=-1
+        )
+        (
+            duration_mixture_log_mean,
+            duration_mixture_log_std,
+            duration_moment_equivalent_log_scale,
+        ) = _next_event_duration_mixture_moments(
+            next_event_probability,
+            duration_log_mean,
+            duration_log_scale,
+        )
         current = batch["current_event_id"].long()[:, None]
         output["clock_hidden"] = age_clock_hidden
+        # Five components now mean p(log1p(D) | next_event=e), not five
+        # current-event slots.  Preserve the legacy tensor names/shapes while
+        # publishing explicit semantics for new consumers.
         output["duration_log_mean"] = duration_log_mean
         output["duration_log_scale"] = duration_log_scale
-        output["duration_selected_log_mean"] = duration_log_mean.gather(
-            1, current
-        ).squeeze(1)
-        output["duration_selected_log_scale"] = duration_log_scale.gather(
-            1, current
-        ).squeeze(1)
+        output["duration_component_log_mean"] = duration_log_mean
+        output["duration_component_log_scale"] = duration_log_scale
+        output["duration_mixture_probability"] = next_event_probability
+        output["duration_log1p_mixture_mean"] = duration_mixture_log_mean
+        output["duration_log1p_mixture_std"] = duration_mixture_log_std
+        # Backward-compatible scalar interface: these are the first-two-moment
+        # equivalent Gaussian in log1p-time, no longer a hard current-event
+        # component.  Existing ensemble/calibration code can consume it
+        # without a tensor-schema migration.
+        output["duration_selected_log_mean"] = duration_mixture_log_mean
+        output["duration_selected_log_scale"] = (
+            duration_moment_equivalent_log_scale
+        )
 
         remaining_budget = batch.get("remaining_action_budget")
         if (
@@ -3408,6 +3621,45 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             terminal_goal_progress_log_scale
         )
         output["terminal_goal_progress_std"] = terminal_goal_progress_std
+        terminal_success_probability = terminal_event_probability[:, -1]
+        conditional_recovery_probability = torch.sigmoid(
+            terminal_recovery_logit
+        )
+        output["success_probability"] = terminal_success_probability
+        output["failure_probability"] = 1.0 - terminal_success_probability
+        output["conditional_recovery_probability"] = (
+            conditional_recovery_probability
+        )
+
+        def categorical_entropy(probability: torch.Tensor) -> torch.Tensor:
+            return -(
+                probability
+                * torch.log(probability.clamp_min(torch.finfo(probability.dtype).tiny))
+            ).sum(dim=-1)
+
+        def binary_entropy(probability: torch.Tensor) -> torch.Tensor:
+            epsilon = torch.finfo(probability.dtype).eps
+            probability = probability.clamp(epsilon, 1.0 - epsilon)
+            return -(
+                probability * torch.log(probability)
+                + (1.0 - probability) * torch.log1p(-probability)
+            )
+
+        output["post_event_aleatoric_entropy"] = categorical_entropy(
+            post_probability
+        )
+        output["next_event_aleatoric_entropy"] = categorical_entropy(
+            next_event_probability
+        )
+        output["terminal_event_aleatoric_entropy"] = categorical_entropy(
+            terminal_event_probability
+        )
+        output["success_aleatoric_entropy"] = binary_entropy(
+            terminal_success_probability
+        )
+        output["conditional_recovery_aleatoric_entropy"] = binary_entropy(
+            conditional_recovery_probability
+        )
 
         # The deployed score is deliberately a function of predicted
         # consequences, never a free projection of ``transitioned`` or
@@ -3415,8 +3667,8 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         # proper event/outcome/effect likelihoods calibrated: listwise rank
         # supervision learns how to combine their predictions, not how to
         # rewrite them into an unconstrained latent critic.
-        next_probability = torch.softmax(output["next_event_logits"], dim=-1)
-        success_probability = torch.sigmoid(output["success_logit"])
+        next_probability = next_event_probability
+        success_probability = terminal_success_probability
         # Recovery is conditional on an operational regression.  Compose the
         # conditional head with the predicted post-event distribution so the
         # deployed feature is the identifiable joint consequence.  At e0 the
@@ -3427,21 +3679,26 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         regression_probability = (
             post_probability * (event_index < current).to(post_probability)
         ).sum(dim=-1, keepdim=True)
-        joint_recovery_probability = regression_probability * torch.sigmoid(
-            output["recovery_logit"]
-        )[:, None]
+        joint_recovery_probability = (
+            regression_probability * conditional_recovery_probability[:, None]
+        )
         output["regression_probability"] = regression_probability.squeeze(-1)
         output["joint_recovery_probability"] = (
             joint_recovery_probability.squeeze(-1)
         )
-        duration_log_scale = output["duration_selected_log_scale"]
-        duration_sigma = torch.exp(duration_log_scale)
-        expected_duration_seconds = torch.expm1(
+        output["joint_recovery_aleatoric_entropy"] = binary_entropy(
+            joint_recovery_probability.squeeze(-1)
+        )
+        duration_component_sigma = torch.exp(duration_log_scale)
+        duration_component_expectation = torch.expm1(
             (
-                output["duration_selected_log_mean"]
-                + 0.5 * duration_sigma.square()
+                duration_log_mean
+                + 0.5 * duration_component_sigma.square()
             ).clamp(min=0.0, max=10.0)
         )
+        expected_duration_seconds = (
+            next_probability * duration_component_expectation
+        ).sum(dim=-1)
         object_mean = output["object_delta_mean"]
         state = batch["state"]
         if state.ndim != 2 or state.shape[-1] != core.STATE_DIM:
@@ -3760,11 +4017,8 @@ def evaluate_terminal_consequences(
             if variant != "no_time_duration":
                 tensors.update(
                     {
-                        "duration_nll": core.censored_lognormal_loss(
-                            output["duration_selected_log_mean"],
-                            output["duration_selected_log_scale"],
-                            batch["duration"],
-                            batch["duration_observed"],
+                        "duration_nll": _competing_risks_duration_nll_rows(
+                            output, batch
                         ),
                         "duration_proper_mask": batch["duration_mask"],
                     }
@@ -4419,6 +4673,51 @@ def _lexicographic_compare_values(
     return 0
 
 
+def _compute_shared_multitask_loss(
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+    *,
+    sample_weight: torch.Tensor | None = None,
+    loss_weights: Mapping[str, float] = core.DEFAULT_LOSS_WEIGHTS,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Core proper heads plus next-event competing-risks duration.
+
+    The core trainer's legacy duration term gathers a component by
+    ``current_event_id``.  v12 keeps every other core loss unchanged, disables
+    only that term, and inserts the destination-conditional likelihood.  This
+    makes the change auditable and avoids duplicating the event, success and
+    recovery implementations.
+    """
+
+    batch_size = output["success_logit"].shape[0]
+    if sample_weight is None:
+        sample_weight = output["success_logit"].new_ones(batch_size)
+    if sample_weight.shape != (batch_size,):
+        raise FiveBodyContractError("sample weight must be [B]")
+    core_weights = dict(loss_weights)
+    if set(core_weights) != set(core.DEFAULT_LOSS_WEIGHTS):
+        raise FiveBodyContractError("shared multitask loss weight schema changed")
+    duration_weight = float(core_weights["duration"])
+    core_weights["duration"] = 0.0
+    core_total, pieces = core.compute_multitask_loss(
+        output,
+        batch,
+        sample_weight=sample_weight,
+        loss_weights=core_weights,
+    )
+    duration_rows = _competing_risks_duration_nll_rows(output, batch)
+    duration = core._weighted_mean(
+        duration_rows,
+        sample_weight * batch["duration_mask"].to(sample_weight),
+    )
+    total = core_total + duration_weight * duration
+    pieces = dict(pieces)
+    pieces["duration"] = duration
+    pieces["duration_next_event_competing_risks"] = duration
+    pieces["total"] = total
+    return total, pieces
+
+
 def _robust_object_effect_loss(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, Any],
@@ -4593,7 +4892,7 @@ def _supplement_proper_world_model_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Apply the fixed train-only supplement weight to proper heads only."""
 
-    multitask, multitask_pieces = core.compute_multitask_loss(
+    multitask, multitask_pieces = _compute_shared_multitask_loss(
         output,
         batch,
         sample_weight=sample_weight,
@@ -6947,7 +7246,7 @@ def _train_fold(
                 device=device,
             )
             proper_prediction = model(proper_batch)
-            multitask_loss, pieces = core.compute_multitask_loss(
+            multitask_loss, pieces = _compute_shared_multitask_loss(
                 proper_prediction,
                 proper_batch,
                 sample_weight=proper_weights,

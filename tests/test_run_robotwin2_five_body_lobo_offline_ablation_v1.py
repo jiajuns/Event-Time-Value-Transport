@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -118,6 +119,13 @@ class _PerfectPredictionModel(torch.nn.Module):
             "duration_selected_log_mean": torch.log1p(duration)
             + self.member_offset * 0.001,
             "duration_selected_log_scale": torch.full_like(duration, -3.0),
+            "duration_component_log_mean": (
+                torch.log1p(duration)[:, None].expand(-1, 5)
+                + self.member_offset * 0.001
+            ),
+            "duration_component_log_scale": torch.full(
+                (count, 5), -3.0, dtype=duration.dtype
+            ),
             "recovery_logit": (recovery * 2.0 - 1.0) * (7.0 + self.member_offset),
             "object_delta_mean": object_delta + self.member_offset * 0.001,
             "object_delta_log_scale": torch.full_like(object_delta, -3.0),
@@ -227,6 +235,40 @@ def test_recovery_pr_is_explicitly_unavailable_without_positive_labels() -> None
         "average_precision": None,
         "points": [],
     }
+
+
+def test_duration_evaluator_uses_exact_next_event_competing_risks_survival() -> None:
+    probability = torch.tensor([0.50, 0.20, 0.15, 0.10, 0.05])
+    component_mean = torch.tensor([0.0, 0.4, 0.8, 1.2, 1.6])
+    component_scale = torch.tensor([0.5, 0.6, 0.7, 0.8, 0.9])
+
+    class FixedCompetingRiskModel(_PerfectPredictionModel):
+        def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            output = super().forward(batch)
+            count = len(batch["duration"])
+            output["next_event_logits"] = probability.log()[None].expand(count, -1)
+            output["duration_component_log_mean"] = component_mean[None].expand(
+                count, -1
+            )
+            output["duration_component_log_scale"] = component_scale.log()[
+                None
+            ].expand(count, -1)
+            return output
+
+    batch = _prediction_batch()
+    batch["duration"] = torch.ones(8)
+    batch["duration_observed"] = torch.zeros(8)
+    models = [FixedCompetingRiskModel(0.0) for _ in range(5)]
+    result = ablation.evaluate_deployed_ensemble_predictions(
+        models, [batch], torch.device("cpu")
+    )
+    z = (math.log(2.0) - component_mean) / component_scale
+    expected = -torch.logsumexp(
+        probability.log() + torch.special.log_ndtr(-z), dim=-1
+    )
+    assert result["metrics"][
+        "duration_mixture_censored_nll_log1p"
+    ] == pytest.approx(float(expected), abs=1e-6)
 
 
 def test_risk_coverage_retains_low_uncertainty_first() -> None:
