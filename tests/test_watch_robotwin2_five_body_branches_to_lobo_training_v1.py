@@ -23,10 +23,31 @@ STRICT_PROPER_SELECTION_RULE = (
 )
 
 
+@pytest.fixture(autouse=True)
+def reset_execution_protocol() -> None:
+    watcher.configure_execution_protocol(
+        watcher.actor_execution.execution_protocol(5)
+    )
+    yield
+    watcher.configure_execution_protocol(
+        watcher.actor_execution.execution_protocol(5)
+    )
+
+
 @pytest.fixture
 def valid_fold_summary(
     tmp_path: Path,
 ) -> tuple[Path, str, str, Path]:
+    protocol = watcher.actor_execution.execution_protocol(5)
+    protocol_path = tmp_path / "actor-execution-protocol.json"
+    protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+    protocol_sha = watcher.sha256_file(protocol_path)
+    protocol_binding = watcher.actor_execution.execution_protocol_file_binding(
+        protocol_path, protocol_sha, path_root=tmp_path
+    )
+    watcher.configure_execution_protocol(
+        protocol, protocol_binding=protocol_binding
+    )
     held_out_body = "franka"
     binding_sha256 = "b" * 64
     trainer_sha256 = "c" * 64
@@ -50,6 +71,9 @@ def valid_fold_summary(
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": held_out_body,
         "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol_file_sha256": protocol_sha,
         "source_bodies": [body for body in watcher.BODIES if body != held_out_body],
         "heldout_group_npz_opened": 0,
         "heldout_labels_used_for_normalization_training_or_selection": False,
@@ -58,6 +82,9 @@ def valid_fold_summary(
         "preflight": {
             "binding_file_sha256": binding_sha256,
             "event_derivation_implementation_sha256": "d" * 64,
+            "actor_execution_protocol": protocol,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol_file_sha256": protocol_sha,
         },
         "trainer_file_sha256": trainer_sha256,
         "rank_supervision_available": True,
@@ -83,8 +110,8 @@ def valid_fold_summary(
     return tmp_path, held_out_body, binding_sha256, summary_path
 
 
-def _core(path: Path) -> np.ndarray:
-    count, horizon = 4, 5
+def _core(path: Path, *, stride: int = 5) -> np.ndarray:
+    count, horizon = 4, stride
     actions = np.zeros((count, horizon, 14), dtype=np.float32)
     actions[1, :, 0] = 1.0
     actions[2, :, 1] = 2.0
@@ -102,7 +129,7 @@ def _core(path: Path) -> np.ndarray:
         elif name == "candidate_index":
             arrays[name] = np.arange(count, dtype=np.int64)
         elif name == "dt":
-            arrays[name] = np.full(count, 5.0 / 15.0, dtype=np.float32)
+            arrays[name] = np.full(count, stride / 15.0, dtype=np.float32)
         elif name == "remaining_action_budget":
             arrays[name] = np.full(count, 150, dtype=np.float32)
         elif name == "success_height_reference_z":
@@ -166,6 +193,118 @@ def test_decision_npz_requires_exact_float64_height_authority(
     )
     with pytest.raises(watcher.LoboWatcherError, match="NPZ member set mismatch"):
         watcher.validate_decision_npz(core_path, watcher.sha256_file(core_path))
+
+
+@pytest.mark.parametrize(
+    ("stride", "query_count", "target_per_query"),
+    ((5, 40, 5), (50, 4, 50)),
+)
+def test_execute_protocol_decision_golden(
+    tmp_path: Path,
+    stride: int,
+    query_count: int,
+    target_per_query: int,
+) -> None:
+    protocol = watcher.actor_execution.execution_protocol(stride)
+    core_path = tmp_path / f"group-{stride}.npz"
+    _core(core_path, stride=stride)
+    result = watcher.validate_decision_npz(
+        core_path,
+        watcher.sha256_file(core_path),
+        execution_protocol=protocol,
+    )
+    assert result["planned_steps"] == stride
+    assert result["planned_dt_seconds"] == pytest.approx(stride / 15.0)
+    assert len(protocol["query_indices"]) == query_count
+    assert protocol["target_per_condition_query"] == target_per_query
+
+
+@pytest.mark.parametrize("stride", (5, 50))
+def test_execute_protocol_mask_and_dt_fail_closed(
+    tmp_path: Path, stride: int
+) -> None:
+    protocol = watcher.actor_execution.execution_protocol(stride)
+    core_path = tmp_path / f"group-{stride}.npz"
+    _core(core_path, stride=stride)
+    with np.load(core_path, allow_pickle=False) as payload:
+        arrays = {name: np.asarray(payload[name]) for name in payload.files}
+    arrays["action_mask"] = arrays["action_mask"].copy()
+    arrays["action_mask"][:, -1] = False
+    np.savez(core_path, **arrays)
+    with pytest.raises(watcher.LoboWatcherError, match="planned prefix"):
+        watcher.validate_decision_npz(
+            core_path,
+            watcher.sha256_file(core_path),
+            execution_protocol=protocol,
+        )
+
+
+@pytest.mark.parametrize("stride", (5, 50))
+def test_primary_binding_loads_protocol_without_opening_branch_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stride: int
+) -> None:
+    protocol = watcher.actor_execution.execution_protocol(stride)
+    protocol_path = tmp_path / "execution-protocol.json"
+    protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+    protocol_sha = watcher.sha256_file(protocol_path)
+    protocol_binding = watcher.actor_execution.execution_protocol_file_binding(
+        protocol_path, protocol_sha, path_root=tmp_path
+    )
+    binding = watcher.signed(
+        {
+            "format": watcher.BINDING_FORMAT,
+            "path_root": str(tmp_path.resolve()),
+            "actor_execution_protocol": protocol,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol_file_sha256": protocol_sha,
+        }
+    )
+    binding_path = tmp_path / "primary-binding.json"
+    binding_path.write_text(json.dumps(binding), encoding="utf-8")
+    branch_payload = tmp_path / "heldout.npz"
+    branch_payload.write_bytes(b"must-not-open")
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args: object, **kwargs: object):
+        if path == branch_payload:
+            raise AssertionError("protocol load opened a held-out branch payload")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    loaded = watcher.load_primary_execution_protocol(binding_path)
+    assert loaded["stride"] == stride
+    assert watcher._ACTIVE_EXECUTION_PROTOCOL_BINDING == protocol_binding
+    assert watcher.QUERY_INDICES == tuple(protocol["query_indices"])
+    assert watcher.SEEDS_PER_CONDITION_QUERY == protocol[
+        "target_per_condition_query"
+    ]
+
+
+@pytest.mark.parametrize("stride", (5, 50))
+def test_primary_binding_protocol_file_tamper_fails_closed(
+    tmp_path: Path, stride: int
+) -> None:
+    protocol = watcher.actor_execution.execution_protocol(stride)
+    protocol_path = tmp_path / "execution-protocol.json"
+    protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+    protocol_sha = watcher.sha256_file(protocol_path)
+    protocol_binding = watcher.actor_execution.execution_protocol_file_binding(
+        protocol_path, protocol_sha, path_root=tmp_path
+    )
+    binding = watcher.signed(
+        {
+            "format": watcher.BINDING_FORMAT,
+            "path_root": str(tmp_path.resolve()),
+            "actor_execution_protocol": protocol,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol_file_sha256": protocol_sha,
+        }
+    )
+    binding_path = tmp_path / "primary-binding.json"
+    binding_path.write_text(json.dumps(binding), encoding="utf-8")
+    protocol_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(watcher.LoboWatcherError, match="SHA-256 mismatch"):
+        watcher.load_primary_execution_protocol(binding_path)
 
 
 @pytest.mark.parametrize(

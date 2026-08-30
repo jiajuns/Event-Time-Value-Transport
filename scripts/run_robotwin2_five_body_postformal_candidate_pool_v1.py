@@ -13,7 +13,8 @@ from actor training.  A separately budgeted run may explicitly draw more than N
 proposals, in which case legacy
 proposal zero remains final candidate zero and the remaining N-1 proposals are
 selected with deterministic farthest-point sampling in the canonical
-first-five-action effect space.  Selection is label/outcome/critic blind.  The
+executed-prefix effect space fixed by the actor-execution protocol.  Selection
+is label/outcome/critic blind.  The
 same frozen five-member LOBO critic then scores the retained candidates.
 
 The baseline always executes raw proposal zero, which keeps both the legacy
@@ -47,9 +48,11 @@ import run_robotwin2_five_body_paired_success_v1 as formal
 collector = formal.collector
 shared_head = formal.shared_head
 analytic_event = formal.analytic_event
-FORMAT = "etsf_robotwin2_five_body_postformal_candidate_pool_v1"
-PAIR_FORMAT = "etsf_robotwin2_postformal_actor_flow_pool_paired_execution_v1"
-CONTRACT_FORMAT = "etsf_robotwin2_postformal_candidate_pool_contract_v1"
+FORMAT = "etsf_robotwin2_five_body_postformal_candidate_pool_v2_actor_protocol"
+PAIR_FORMAT = (
+    "etsf_robotwin2_postformal_actor_flow_pool_paired_execution_v2_actor_protocol"
+)
+CONTRACT_FORMAT = "etsf_robotwin2_postformal_candidate_pool_contract_v2_actor_protocol"
 OUTCOME_FORMAT = "etsf_robotwin2_postformal_candidate_pool_outcomes_v1"
 REPORT_FORMAT = "etsf_robotwin2_postformal_candidate_pool_report_v1"
 BENCHMARK = formal.BENCHMARK
@@ -64,6 +67,7 @@ NATIVE_EE_DIM = formal.NATIVE_EE_DIM
 ACTION_EXEC_STEPS = formal.ACTION_EXEC_STEPS
 ACTOR_DATASET_FPS = formal.ACTOR_DATASET_FPS
 PLANNED_DT_SECONDS = formal.PLANNED_DT_SECONDS
+CONDITIONAL_FIRST_FIVE_STEPS = 5
 QUERY_CANONICALIZATION_STEPS = formal.QUERY_CANONICALIZATION_STEPS
 STAGE_DENOMINATOR = formal.STAGE_DENOMINATOR
 EVENT_SPEC_SHA256 = formal.EVENT_SPEC_SHA256
@@ -88,7 +92,7 @@ TRAINING_SEEN_INSTRUCTION_SHA256 = hashlib.sha256(
 SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT = (
     "etsf_source_train_normalized_canonical_effect_diversity_v1"
 )
-POOL_AUDIT_FORMAT = "etsf_robotwin2_canonical_effect_candidate_pool_audit_v2"
+POOL_AUDIT_FORMAT = "etsf_robotwin2_canonical_effect_candidate_pool_audit_v3_actor_protocol"
 FLOW_NOISE_CONTRACT_FORMAT = (
     "etsf_postformal_conditional_translation_flow_noise_contract_v2"
 )
@@ -100,6 +104,30 @@ CANONICAL_TRANSLATION_EFFECT_CHANNELS = (0, 1, 2, 7, 8, 9)
 
 class PostformalCandidatePoolError(RuntimeError):
     """A postformal pool, paired reset, checkpoint, or receipt changed."""
+
+
+def configure_actor_execution_protocol(
+    protocol: Mapping[str, Any],
+    *,
+    path: Path,
+    file_sha256: str,
+    path_root: Path,
+) -> dict[str, Any]:
+    """Configure formal and postformal consumers from one file binding."""
+
+    try:
+        validated = formal.configure_actor_execution_protocol(
+            protocol,
+            path=path,
+            file_sha256=file_sha256,
+            path_root=path_root,
+        )
+    except formal.PairedExecutionError as error:
+        raise PostformalCandidatePoolError(str(error)) from error
+    global ACTION_EXEC_STEPS, PLANNED_DT_SECONDS
+    ACTION_EXEC_STEPS = int(validated["stride"])
+    PLANNED_DT_SECONDS = ACTION_EXEC_STEPS / ACTOR_DATASET_FPS
+    return dict(validated)
 
 
 canonical_sha256 = formal.canonical_sha256
@@ -159,7 +187,8 @@ def validate_candidates(
         or not np.isfinite(value).all()
     ):
         raise PostformalCandidatePoolError(
-            f"{label} must be finite [{expected_count},H>=5,16]"
+            f"{label} must be finite "
+            f"[{expected_count},H>={ACTION_EXEC_STEPS},16]"
         )
     return value
 
@@ -307,7 +336,7 @@ def postformal_rostered_noise(
     base = postformal_make_noise(config, scene_seed, query_index, 0, device)
     result = base.clone()
     stop = (
-        min(ACTION_EXEC_STEPS, int(config.chunk_size))
+        min(CONDITIONAL_FIRST_FIVE_STEPS, int(config.chunk_size))
         if kind == "conditional_first5_xyz"
         else int(config.chunk_size)
     )
@@ -415,7 +444,7 @@ def generate_postformal_flow_candidates(
 def canonical_effect_embeddings(
     current_ee: np.ndarray, proposals: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return first-five canonical effects and their raw flattened vectors."""
+    """Return protocol-executed-prefix effects and flattened vectors."""
 
     current = np.asarray(current_ee, dtype=np.float32)
     if current.shape != (NATIVE_EE_DIM,) or not np.isfinite(current).all():
@@ -489,7 +518,7 @@ def source_train_normalized_translation_effect_embeddings(
     action_std: np.ndarray,
     normalization_clip: float,
 ) -> np.ndarray:
-    """Return the source-only normalized first-five dual-arm XYZ geometry."""
+    """Return source-only normalized executed-prefix dual-arm XYZ geometry."""
 
     full = source_train_normalized_effect_embeddings(
         effects,
@@ -573,7 +602,7 @@ def pool_selection_audit(
             embeddings, retain_count=candidate_count
         )
         selection_algorithm = (
-            "greedy_maximize_minimum_rms_in_flattened_first_five_"
+            "greedy_maximize_minimum_rms_in_flattened_executed_prefix_"
             "canonical_action_effect14_anchor_raw_zero_tie_lowest_raw_index"
         )
     final = raw[np.asarray(selected_indices, dtype=np.int64)].copy()
@@ -587,7 +616,8 @@ def pool_selection_audit(
         "retained_candidate_count": candidate_count,
         "raw_proposal_shape": list(raw.shape),
         "raw_ordered_proposals_sha256": array_sha256(raw),
-        "canonical_first_five_effects_sha256": array_sha256(effects),
+        "canonical_executed_prefix_effects_sha256": array_sha256(effects),
+        "executed_effect_horizon_actions": ACTION_EXEC_STEPS,
         "embedding_shape": list(embeddings.shape),
         "selected_raw_proposal_indices": selected_indices,
         "raw_candidate_instruction_conditions": [
@@ -706,7 +736,7 @@ def postformal_noise_contract(
             list(NATIVE_XYZ_NOISE_CHANNELS) if conditional_raw16 else []
         ),
         "conditional_translation_prefix_steps": (
-            ACTION_EXEC_STEPS if conditional_raw16 else 0
+            CONDITIONAL_FIRST_FIVE_STEPS if conditional_raw16 else 0
         ),
         "conditional_translation_fullchunk_uses_config_chunk_size": (
             conditional_raw16
@@ -1712,6 +1742,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--event-spec", type=Path, required=True)
     parser.add_argument("--reference-preregistration", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol-sha256", required=True)
+    parser.add_argument("--path-root", type=Path, required=True)
     parser.add_argument(
         "--lobo-fold",
         action="append",
@@ -1736,8 +1769,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--action-exec-steps", type=int, default=ACTION_EXEC_STEPS)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--action-exec-steps", type=int)
+    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--fps", type=float, default=ACTOR_DATASET_FPS)
     parser.add_argument("--instruction", default=collector.DEFAULT_INSTRUCTION)
     return parser.parse_args(argv)
@@ -1745,12 +1778,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        execution_protocol = formal.actor_execution.load_execution_protocol_file(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+        )
+    except formal.actor_execution.ActorExecutionProtocolError as error:
+        raise PostformalCandidatePoolError(str(error)) from error
+    configure_actor_execution_protocol(
+        execution_protocol,
+        path=args.actor_execution_protocol,
+        file_sha256=args.actor_execution_protocol_sha256,
+        path_root=args.path_root,
+    )
+    if args.action_exec_steps is None:
+        args.action_exec_steps = ACTION_EXEC_STEPS
+    if args.max_steps is None:
+        args.max_steps = int(execution_protocol["max_steps"])
     candidate_count = validate_candidate_count(args.candidate_count)
     raw_proposal_count = proposal_count(candidate_count, args.proposal_count)
     if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
         raise PostformalCandidatePoolError("postformal execution requires remote RTX 4090")
-    if args.action_exec_steps != ACTION_EXEC_STEPS or args.max_steps != 200:
-        raise PostformalCandidatePoolError("action-exec-steps/max-steps must remain 5/200")
+    if (
+        args.action_exec_steps != ACTION_EXEC_STEPS
+        or args.max_steps != execution_protocol["max_steps"]
+    ):
+        raise PostformalCandidatePoolError(
+            "action-exec-steps/max-steps differ from the bound protocol"
+        )
     if args.fps != ACTOR_DATASET_FPS:
         raise PostformalCandidatePoolError("actor control interval must remain 15 Hz")
     if args.instruction != collector.DEFAULT_INSTRUCTION:
@@ -1761,6 +1816,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.robotwin_root,
         args.event_spec,
         args.reference_preregistration,
+        args.actor_execution_protocol,
+        args.path_root,
     )
     if any(not path.expanduser().resolve().exists() for path in inputs):
         raise FileNotFoundError("one or more required static inputs are missing")
@@ -1811,6 +1868,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_path = output / "paired_candidate_pool_report.json"
     contract_path = output / "execution_contract.json"
     schedule = evaluation_schedule(candidate_count)
+    execution_protocol_binding = formal.actor_execution_protocol_binding()
+    try:
+        output.relative_to(Path(execution_protocol_binding["path_root"]))
+    except ValueError as error:
+        raise PostformalCandidatePoolError(
+            "postformal output must be contained by the protocol path_root"
+        ) from error
     contract_base = {
         "format": CONTRACT_FORMAT,
         "runner_format": FORMAT,
@@ -1849,6 +1913,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "analytic_event_contract": analytic_event.event_contract(calibration),
         "reference_preregistration": str(args.reference_preregistration.resolve()),
         "reference_preregistration_sha256": reference_receipt["preregistration_sha256"],
+        "path_root": execution_protocol_binding["path_root"],
+        "actor_execution_protocol": execution_protocol_binding["protocol"],
+        "actor_execution_protocol_binding": execution_protocol_binding,
+        "actor_execution_protocol_file_sha256": execution_protocol_binding[
+            "file_sha256"
+        ],
         "postformal_not_part_of_reference_preregistration": True,
         "formal_best_of_four_result_must_be_reported_separately": True,
         "action_exec_steps": ACTION_EXEC_STEPS,

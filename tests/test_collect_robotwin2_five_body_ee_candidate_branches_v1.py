@@ -64,7 +64,21 @@ def test_current_ee_action16_uses_training_endpose_api_and_exact_layout() -> Non
     )
 
 
-def test_state_action_frame_contract_is_explicit_and_rejects_old_tcp_artifacts() -> None:
+def test_state_action_frame_contract_is_explicit_and_rejects_old_tcp_artifacts(
+    tmp_path: Path,
+) -> None:
+    protocol_path = tmp_path / "execute5.json"
+    protocol_value = watcher.actor_execution.execution_protocol(5)
+    protocol_sha = watcher.actor_execution.write_execution_protocol_file(
+        protocol_path, protocol_value
+    )
+    watcher.configure_execution_protocol(
+        protocol_value,
+        protocol_path=protocol_path,
+        protocol_file_sha256=protocol_sha,
+        run_root=tmp_path / "run",
+        path_root=tmp_path,
+    )
     assert collector.STATE_ACTION_FRAME_CONTRACT == watcher.STATE_ACTION_FRAME_CONTRACT
     assert watcher.STATE_ACTION_FRAME_CONTRACT["runtime_state_api"] == (
         "task.get_arm_pose(left/right)"
@@ -93,6 +107,10 @@ def test_state_action_frame_contract_is_explicit_and_rejects_old_tcp_artifacts()
         {
             "format": watcher.BINDING_FORMAT,
             "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
+            "path_root": str(tmp_path.resolve()),
+            "actor_execution_protocol_binding": (
+                watcher.require_execution_protocol_binding()
+            ),
         }
     )
 

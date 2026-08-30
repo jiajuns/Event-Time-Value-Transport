@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 
 
 FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_guardian_v1"
-WATCHER_FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2"
+WATCHER_FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v3_actor_protocol"
 RECOVERABLE_INTERRUPTION_STATUS = "recoverable_child_signal_interruption"
 RECOVERABLE_WATCHER_EXIT_CODE = 75
 RECOVERABLE_INTERRUPTION_SIGNALS = frozenset(

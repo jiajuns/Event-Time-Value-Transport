@@ -34,13 +34,16 @@ import torch
 import collect_robotwin2_five_body_ee_candidate_branches_v1 as collector
 import evaluate_robotwin2_cross_embodiment_paired_success_v1 as evaluator
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as preregister
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as shared_head
 
 
-FORMAT = "etsf_robotwin2_five_body_paired_success_execution_v1"
-PAIR_FORMAT = "etsf_robotwin2_move_can_pot_live_paired_execution_v1"
-CONTRACT_FORMAT = "etsf_robotwin2_move_can_pot_live_paired_execution_contract_v1"
+FORMAT = "etsf_robotwin2_five_body_paired_success_execution_v2_actor_protocol"
+PAIR_FORMAT = "etsf_robotwin2_move_can_pot_live_paired_execution_v2_actor_protocol"
+CONTRACT_FORMAT = (
+    "etsf_robotwin2_move_can_pot_live_paired_execution_contract_v2_actor_protocol"
+)
 OUTCOME_FORMAT = evaluator.INPUT_FORMAT
 OUTCOME_STATUS = evaluator.INPUT_STATUS
 BENCHMARK = evaluator.BENCHMARK
@@ -58,6 +61,10 @@ ACTION_EXEC_STEPS = 5
 QUERY_CANONICALIZATION_STEPS = 1
 MINIMUM_CANDIDATE_HORIZON = ACTION_EXEC_STEPS
 PLANNED_DT_SECONDS = ACTION_EXEC_STEPS / ACTOR_DATASET_FPS
+ACTIVE_EXECUTION_PROTOCOL = actor_execution.execution_protocol(ACTION_EXEC_STEPS)
+ACTIVE_EXECUTION_PROTOCOL_PATH: Path | None = None
+ACTIVE_EXECUTION_PROTOCOL_FILE_SHA256: str | None = None
+ACTIVE_EXECUTION_PROTOCOL_BINDING: dict[str, Any] | None = None
 PREREGISTRATION_SHA256 = evaluator.APPROVED_PREREGISTRATION_SHA256
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
 SUPPLEMENT_SPLIT_SEED = 20260901
@@ -102,6 +109,83 @@ STATE_ACTION_FRAME_CONTRACT = shared_head.state_action_frame_contract()
 
 class PairedExecutionError(RuntimeError):
     """The actor, fold, reset, paired candidate, or output contract changed."""
+
+
+def configure_actor_execution_protocol(
+    protocol: Mapping[str, Any],
+    *,
+    path: Path,
+    file_sha256: str,
+    path_root: Path,
+) -> dict[str, Any]:
+    """Bind one frozen execute-5/execute-50 protocol for this process.
+
+    The module retains execute-5 defaults only so pure helpers remain
+    importable.  Every production ``main`` invocation calls this function
+    before inspecting folds, constructing candidates, or opening an output.
+    """
+
+    try:
+        validated = actor_execution.validate_execution_protocol(protocol)
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise PairedExecutionError(str(error)) from error
+    try:
+        protocol_binding = actor_execution.execution_protocol_file_binding(
+            path,
+            file_sha256,
+            path_root=path_root,
+            expected_stride=int(validated["stride"]),
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise PairedExecutionError(str(error)) from error
+    resolved = actor_execution.resolve_execution_protocol_file_binding_path(
+        protocol_binding
+    )
+    if (
+        validated["max_steps"] != actor_execution.MAX_STEPS
+        or validated["fps"] != actor_execution.FPS
+        or validated["native_chunk_steps"] != actor_execution.NATIVE_CHUNK_STEPS
+        or validated["candidate_count"] != CANDIDATE_COUNT
+    ):
+        raise PairedExecutionError("actor execution protocol binding is invalid")
+    global ACTION_EXEC_STEPS, MINIMUM_CANDIDATE_HORIZON, PLANNED_DT_SECONDS
+    global ACTIVE_EXECUTION_PROTOCOL, ACTIVE_EXECUTION_PROTOCOL_PATH
+    global ACTIVE_EXECUTION_PROTOCOL_FILE_SHA256
+    global ACTIVE_EXECUTION_PROTOCOL_BINDING
+    ACTION_EXEC_STEPS = int(validated["stride"])
+    MINIMUM_CANDIDATE_HORIZON = ACTION_EXEC_STEPS
+    PLANNED_DT_SECONDS = ACTION_EXEC_STEPS / ACTOR_DATASET_FPS
+    ACTIVE_EXECUTION_PROTOCOL = dict(validated)
+    ACTIVE_EXECUTION_PROTOCOL_PATH = resolved
+    ACTIVE_EXECUTION_PROTOCOL_FILE_SHA256 = file_sha256
+    ACTIVE_EXECUTION_PROTOCOL_BINDING = dict(protocol_binding)
+    return dict(validated)
+
+
+def actor_execution_protocol_binding() -> dict[str, Any]:
+    if (
+        ACTIVE_EXECUTION_PROTOCOL_PATH is None
+        or ACTIVE_EXECUTION_PROTOCOL_FILE_SHA256 is None
+        or ACTIVE_EXECUTION_PROTOCOL_BINDING is None
+    ):
+        raise PairedExecutionError(
+            "production paired execution requires a file-bound actor protocol"
+        )
+    validated = actor_execution.validate_execution_protocol(
+        ACTIVE_EXECUTION_PROTOCOL,
+        expected_stride=ACTION_EXEC_STEPS,
+    )
+    try:
+        binding = actor_execution.validate_execution_protocol_file_binding(
+            ACTIVE_EXECUTION_PROTOCOL_BINDING,
+            expected_path_root=Path(ACTIVE_EXECUTION_PROTOCOL_BINDING["path_root"]),
+            expected_stride=ACTION_EXEC_STEPS,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise PairedExecutionError(str(error)) from error
+    if binding["protocol_logical_sha256"] != validated["logical_sha256"]:
+        raise PairedExecutionError("actor execution protocol binding changed")
+    return binding
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -149,6 +233,7 @@ def implementation_binding(robotwin_root: Path) -> dict[str, Any]:
         Path(inspect.getsourcefile(collector.canonical_adapter) or "").resolve(),
         Path(inspect.getsourcefile(shared_head) or "").resolve(),
         Path(inspect.getsourcefile(evaluator) or "").resolve(),
+        Path(inspect.getsourcefile(actor_execution) or "").resolve(),
         robotwin_root / "envs" / f"{TASK}.py",
         robotwin_root / "envs" / "_base_task.py",
         robotwin_root / "envs" / "robot" / "robot.py",
@@ -386,7 +471,8 @@ def validate_candidates(candidates: np.ndarray) -> np.ndarray:
         or not np.isfinite(value).all()
     ):
         raise PairedExecutionError(
-            "actor candidates must be finite [4,H>=5,16] before commitment"
+            "actor candidates must be finite "
+            f"[4,H>={MINIMUM_CANDIDATE_HORIZON},16] before commitment"
         )
     return value
 
@@ -445,6 +531,8 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
     )
     current_trainer_sha = sha256_file(Path(shared_head.__file__).resolve())
     ensemble_selection = summary.get("ensemble_checkpoint_selection")
+    expected_execution_binding = actor_execution_protocol_binding()
+    expected_execution_protocol = expected_execution_binding["protocol"]
     expected_source_bodies = [candidate for candidate in BODIES if candidate != body]
     if (
         summary.get("format") != shared_head.FORMAT
@@ -465,7 +553,13 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         != shared_head.summary_candidate_rank_contract("full")
         or summary.get("event_age_contract") != shared_head.event_age_contract()
         or summary.get("terminal_horizon_contract")
-        != shared_head.terminal_horizon_contract()
+        != shared_head.terminal_horizon_contract(expected_execution_protocol)
+        or summary.get("actor_execution_protocol")
+        != expected_execution_protocol
+        or summary.get("actor_execution_protocol_binding")
+        != expected_execution_binding
+        or summary.get("actor_execution_protocol_file_sha256")
+        != expected_execution_binding["file_sha256"]
         or summary.get("ablation") != shared_head.ablation_contract("full")
         or summary.get("trainer_file_sha256") != current_trainer_sha
         or summary.get("rank_supervision_available") is not True
@@ -540,6 +634,11 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "source_bodies": expected_source_bodies,
         "body_adapter": "single_shared_row_zero_heldout_parameters",
+        "actor_execution_protocol": expected_execution_protocol,
+        "actor_execution_protocol_binding": expected_execution_binding,
+        "actor_execution_protocol_file_sha256": expected_execution_binding[
+            "file_sha256"
+        ],
         "fold_root": str(fold_root),
         "training_summary": str(summary_path),
         "training_summary_sha256": sha256_file(summary_path),
@@ -929,6 +1028,8 @@ def load_ensemble(
         fold.get("source_bodies") != expected_source_bodies
         or fold.get("body_adapter")
         != "single_shared_row_zero_heldout_parameters"
+        or fold.get("actor_execution_protocol_binding")
+        != actor_execution_protocol_binding()
     ):
         raise PairedExecutionError("LOBO fold source-body roster changed")
     for item in fold["members"]:
@@ -952,7 +1053,15 @@ def load_ensemble(
             or checkpoint.get("event_age_contract")
             != shared_head.event_age_contract()
             or checkpoint.get("terminal_horizon_contract")
-            != shared_head.terminal_horizon_contract()
+            != shared_head.terminal_horizon_contract(
+                fold["actor_execution_protocol"]
+            )
+            or checkpoint.get("actor_execution_protocol")
+            != fold["actor_execution_protocol"]
+            or checkpoint.get("actor_execution_protocol_binding")
+            != fold["actor_execution_protocol_binding"]
+            or checkpoint.get("actor_execution_protocol_file_sha256")
+            != fold["actor_execution_protocol_file_sha256"]
             or checkpoint.get("model_family") != shared_head.MODEL_FAMILY
             or checkpoint.get("candidate_rank_contract")
             != shared_head.checkpoint_candidate_rank_contract("full")
@@ -1012,7 +1121,9 @@ def scoring_batch(
         raise PairedExecutionError("shared critic state must be 27-D")
     candidates = validate_candidates(candidates)
     if action_exec_steps != ACTION_EXEC_STEPS:
-        raise PairedExecutionError("formal candidate execution is fixed to five actions")
+        raise PairedExecutionError(
+            "candidate execution differs from the bound actor protocol"
+        )
     if not np.isclose(dt, 1.0 / ACTOR_DATASET_FPS, atol=1e-12, rtol=0.0):
         raise PairedExecutionError("formal actor control interval is fixed to 1/15 second")
     if not 0 <= current_event <= STAGE_DENOMINATOR:
@@ -1347,7 +1458,9 @@ def execute_rollout(
     device: torch.device,
 ) -> dict[str, Any]:
     if action_exec_steps != ACTION_EXEC_STEPS:
-        raise PairedExecutionError("formal rollout execution is fixed to five actions")
+        raise PairedExecutionError(
+            "rollout execution differs from the bound actor protocol"
+        )
     if not np.isclose(dt, 1.0 / ACTOR_DATASET_FPS, atol=1e-12, rtol=0.0):
         raise PairedExecutionError("formal rollout control interval is fixed to 1/15 second")
     required_names = {str(calibration["moving"])}
@@ -1794,6 +1907,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--event-spec", type=Path, required=True)
     parser.add_argument("--preregistration", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol-sha256", required=True)
+    parser.add_argument("--path-root", type=Path, required=True)
     parser.add_argument(
         "--lobo-fold", action="append", required=True,
         help="Repeat exactly five times as heldout-body=/absolute/fold/root.",
@@ -1806,8 +1922,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--action-exec-steps", type=int, default=5)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--action-exec-steps", type=int)
+    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--fps", type=float, default=ACTOR_DATASET_FPS)
     parser.add_argument("--instruction", default=collector.DEFAULT_INSTRUCTION)
     return parser.parse_args(argv)
@@ -1815,15 +1931,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        execution_protocol = actor_execution.load_execution_protocol_file(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise PairedExecutionError(str(error)) from error
+    configure_actor_execution_protocol(
+        execution_protocol,
+        path=args.actor_execution_protocol,
+        file_sha256=args.actor_execution_protocol_sha256,
+        path_root=args.path_root,
+    )
+    if args.action_exec_steps is None:
+        args.action_exec_steps = ACTION_EXEC_STEPS
+    if args.max_steps is None:
+        args.max_steps = int(execution_protocol["max_steps"])
     validate_state_action_frame_authority()
     if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
         raise PairedExecutionError("formal paired execution requires remote RTX 4090 CUDA")
     if args.action_exec_steps != ACTION_EXEC_STEPS:
-        raise PairedExecutionError("formal paired execution fixes action-exec-steps=5")
-    if args.max_steps != shared_head.TERMINAL_HORIZON_CONTRACT[
-        "formal_episode_action_steps"
-    ]:
-        raise PairedExecutionError("formal paired execution fixes max-steps=200")
+        raise PairedExecutionError(
+            "action-exec-steps differs from the bound execution protocol"
+        )
+    if args.max_steps != execution_protocol["max_steps"]:
+        raise PairedExecutionError(
+            "max-steps differs from the bound execution protocol"
+        )
     if args.fps <= 0:
         raise PairedExecutionError("fps must be positive")
     if args.fps != ACTOR_DATASET_FPS:
@@ -1834,7 +1969,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise PairedExecutionError("formal paired execution fixes the actor instruction")
     inputs = (
         args.actor_checkpoint, args.vlm_metadata_path, args.robotwin_root,
-        args.event_spec, args.preregistration,
+        args.event_spec, args.preregistration, args.actor_execution_protocol,
+        args.path_root,
     )
     if any(not path.expanduser().resolve().exists() for path in inputs):
         raise FileNotFoundError("one or more required public/static inputs are missing")
@@ -1884,6 +2020,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures_dir.mkdir(exist_ok=True)
     outcome_path = output / "paired_outcomes.json"
     contract_path = output / "execution_contract.json"
+    execution_protocol_binding = actor_execution_protocol_binding()
+    try:
+        output.relative_to(Path(execution_protocol_binding["path_root"]))
+    except ValueError as error:
+        raise PairedExecutionError(
+            "formal output must be contained by the protocol path_root"
+        ) from error
     contract_base = {
         "format": CONTRACT_FORMAT,
         "runner_format": FORMAT,
@@ -1923,6 +2066,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "preregistration": str(args.preregistration.resolve()),
         "preregistration_sha256": preregistration_receipt["preregistration_sha256"],
+        "path_root": execution_protocol_binding["path_root"],
+        "actor_execution_protocol": execution_protocol_binding["protocol"],
+        "actor_execution_protocol_binding": execution_protocol_binding,
+        "actor_execution_protocol_file_sha256": execution_protocol_binding[
+            "file_sha256"
+        ],
         "action_exec_steps": ACTION_EXEC_STEPS,
         "max_steps": args.max_steps,
         "fps": args.fps,

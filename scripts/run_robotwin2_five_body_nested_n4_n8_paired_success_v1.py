@@ -5,7 +5,7 @@ For every policy query this runner draws one ordered set of sixteen proposals
 from the frozen actor using the frozen two-instruction conditional-translation
 flow roster.  A deterministic, outcome/event/critic-score-blind mixed
 translation/full-effect farthest-point order in the held-out fold's
-source-train-normalized first-five-action effect space is frozen once.
+source-train-normalized executed-prefix effect space is frozen once.
 The first four entries form N4 and the first eight form N8, so N4 is an exact
 ordered prefix of N8 and raw proposal zero is candidate zero in every arm.
 
@@ -43,13 +43,15 @@ collector = formal.collector
 shared_head = formal.shared_head
 analytic_event = formal.analytic_event
 STATE_ACTION_FRAME_CONTRACT = formal.STATE_ACTION_FRAME_CONTRACT
-FORMAT = "etsf_robotwin2_five_body_nested_n4_n8_execution_v2"
-PAIR_FORMAT = "etsf_robotwin2_actor_nested_n4_n8_paired_execution_v2"
-CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v1"
+FORMAT = "etsf_robotwin2_five_body_nested_n4_n8_execution_v3_actor_protocol"
+PAIR_FORMAT = "etsf_robotwin2_actor_nested_n4_n8_paired_execution_v3_actor_protocol"
+CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v2_actor_protocol"
 OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
 REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
 COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
-NESTED_POOL_AUDIT_FORMAT = "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v3"
+NESTED_POOL_AUDIT_FORMAT = (
+    "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v4_actor_protocol"
+)
 SOURCE_ACTION_NORMALIZER_FORMAT = (
     "etsf_robotwin2_fold_source_action_normalizer_binding_v1"
 )
@@ -93,6 +95,30 @@ EVENT_SPEC_SHA256 = formal.EVENT_SPEC_SHA256
 REFERENCE_PREREGISTRATION_SHA256 = formal.PREREGISTRATION_SHA256
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20260909
+
+
+def configure_actor_execution_protocol(
+    protocol: Mapping[str, Any],
+    *,
+    path: Path,
+    file_sha256: str,
+    path_root: Path,
+) -> dict[str, Any]:
+    """Configure every nested-runner consumer from one immutable binding."""
+
+    try:
+        validated = pool_runner.configure_actor_execution_protocol(
+            protocol,
+            path=path,
+            file_sha256=file_sha256,
+            path_root=path_root,
+        )
+    except pool_runner.PostformalCandidatePoolError as error:
+        raise NestedCandidatePoolError(str(error)) from error
+    global ACTION_EXEC_STEPS, PLANNED_DT_SECONDS
+    ACTION_EXEC_STEPS = int(validated["stride"])
+    PLANNED_DT_SECONDS = ACTION_EXEC_STEPS / ACTOR_DATASET_FPS
+    return dict(validated)
 
 
 def nested_evaluation_protocol() -> dict[str, Any]:
@@ -432,7 +458,7 @@ def nested_pool_contract() -> dict[str, Any]:
         "ordering": (
             "fixed_anchor_translation_translation_full_translation_translation_"
             "translation_full_greedy_maximin_rms_in_source_train_zscore_clip5_"
-            "first_five_canonical_effects_tie_lowest_raw_index"
+            "executed_prefix_canonical_effects_tie_lowest_raw_index"
         ),
         "ordered_selection_metrics_n8": list(MIXED_SELECTION_METRIC_ORDER),
         "ordered_selection_metrics_n4": list(
@@ -598,7 +624,8 @@ def nested_pool_selection_audit(
         "raw_shape": list(raw.shape),
         "raw_ordered_proposals_sha256": array_sha256(raw),
         "raw_proposal_zero_sha256": array_sha256(raw[:1]),
-        "canonical_first_five_effects_sha256": array_sha256(effects),
+        "canonical_executed_prefix_effects_sha256": array_sha256(effects),
+        "executed_effect_horizon_actions": ACTION_EXEC_STEPS,
         "canonical_effect_embedding_shape": list(full_embeddings.shape),
         "canonical_translation_effect_embedding_shape": list(
             translation_embeddings.shape
@@ -688,6 +715,7 @@ def validate_nested_pool_audit(value: Mapping[str, Any]) -> None:
         or value.get("n4_is_exact_ordered_prefix_of_n8") is not True
         or value.get("raw_proposal_zero_is_candidate_zero_for_actor_n4_n8")
         is not True
+        or value.get("executed_effect_horizon_actions") != ACTION_EXEC_STEPS
         or value.get("canonical_effect_diversity_metric_format")
         != pool_runner.SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT
         or value.get("ordered_selection_metrics_n8")
@@ -2157,11 +2185,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--event-spec", type=Path, required=True)
     parser.add_argument("--reference-preregistration", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol-sha256", required=True)
+    parser.add_argument("--path-root", type=Path, required=True)
     parser.add_argument("--lobo-fold", action="append", required=True)
     parser.add_argument("--required-supplement-binding-sha256")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--action-exec-steps", type=int, default=ACTION_EXEC_STEPS)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--action-exec-steps", type=int)
+    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--fps", type=float, default=ACTOR_DATASET_FPS)
     parser.add_argument("--instruction", default=collector.DEFAULT_INSTRUCTION)
     return parser.parse_args(argv)
@@ -2185,11 +2216,34 @@ def implementation_binding(robotwin_root: Path) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        execution_protocol = formal.actor_execution.load_execution_protocol_file(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+        )
+    except formal.actor_execution.ActorExecutionProtocolError as error:
+        raise NestedCandidatePoolError(str(error)) from error
+    configure_actor_execution_protocol(
+        execution_protocol,
+        path=args.actor_execution_protocol,
+        file_sha256=args.actor_execution_protocol_sha256,
+        path_root=args.path_root,
+    )
+    if args.action_exec_steps is None:
+        args.action_exec_steps = ACTION_EXEC_STEPS
+    if args.max_steps is None:
+        args.max_steps = int(execution_protocol["max_steps"])
     formal.validate_state_action_frame_authority()
     if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
         raise NestedCandidatePoolError("nested execution requires remote RTX 4090")
-    if args.action_exec_steps != ACTION_EXEC_STEPS or args.max_steps != 200:
-        raise NestedCandidatePoolError("action-exec-steps/max-steps must remain 5/200")
+    if args.action_exec_steps != ACTION_EXEC_STEPS:
+        raise NestedCandidatePoolError(
+            "action-exec-steps differs from the bound execution protocol"
+        )
+    if args.max_steps != execution_protocol["max_steps"]:
+        raise NestedCandidatePoolError(
+            "max-steps differs from the bound execution protocol"
+        )
     if args.fps != ACTOR_DATASET_FPS:
         raise NestedCandidatePoolError("actor control interval must remain 15 Hz")
     if args.instruction != collector.DEFAULT_INSTRUCTION:
@@ -2200,6 +2254,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.robotwin_root,
         args.event_spec,
         args.reference_preregistration,
+        args.actor_execution_protocol,
+        args.path_root,
     )
     if any(not path.expanduser().resolve().exists() for path in inputs):
         raise FileNotFoundError("one or more required static inputs are missing")
@@ -2267,6 +2323,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     contract_path = output / "execution_contract.json"
     completion_path = output / "completion_receipt.json"
     schedule = evaluation_schedule()
+    execution_protocol_binding = formal.actor_execution_protocol_binding()
+    try:
+        output.relative_to(Path(execution_protocol_binding["path_root"]))
+    except ValueError as error:
+        raise NestedCandidatePoolError(
+            "nested output must be contained by the protocol path_root"
+        ) from error
     contract_base = {
         "format": CONTRACT_FORMAT,
         "runner_format": FORMAT,
@@ -2325,6 +2388,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "reference_preregistration_sha256": reference["preregistration_sha256"],
         "nested_evaluation_protocol": nested_evaluation_protocol(),
         "postformal_not_part_of_reference_preregistration": True,
+        "path_root": execution_protocol_binding["path_root"],
+        "actor_execution_protocol": execution_protocol_binding["protocol"],
+        "actor_execution_protocol_binding": execution_protocol_binding,
+        "actor_execution_protocol_file_sha256": execution_protocol_binding[
+            "file_sha256"
+        ],
         "action_exec_steps": ACTION_EXEC_STEPS,
         "max_steps": args.max_steps,
         "fps": args.fps,

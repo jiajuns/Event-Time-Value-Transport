@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import robotwin2_actor_execution_protocol_v1 as actor_execution
+
 
 FORMAT = "etsf_robotwin2_five_body_lobo_to_paired_success_watcher_v1"
 BINDING_FORMAT = "etsf_robotwin2_five_body_paired_success_execution_binding_v1"
@@ -43,10 +45,10 @@ EXPECTED_EVENT_SPEC_SHA256 = (
     "4df5b7242d1c7bf8e3f5dac65c0eb4376043dbf6c60ef2633d086ab06e7e3aee"
 )
 EXPECTED_EVENT_MODULE_SHA256 = (
-    "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
+    "fc07fa2f9b9293fdc0b4e2da323286fb98fa48e56288d1cd781a14fa2b2c00ab"
 )
 EXPECTED_RUNNER_SHA256 = (
-    "049017f53c0f9a3e462ea29db7d351075cc6f3d427f5c63a851fd1a154db9093"
+    "01db8b556366b31f4643857eaad4d61ad544f327ee6dc9c73d387929e47379c4"
 )
 EXPECTED_EVALUATOR_SHA256 = (
     "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"
@@ -77,6 +79,8 @@ EXPECTED_MEMBERS_PER_FOLD = 5
 ACTION_EXEC_STEPS = 5
 MAX_STEPS = 200
 FPS = 15
+ACTIVE_EXECUTION_PROTOCOL: dict[str, Any] | None = None
+ACTIVE_EXECUTION_PROTOCOL_BINDING: dict[str, Any] | None = None
 RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT = {
     "format": "etsf_bounded_utility_epistemic_lcb_ensemble_v1",
     "member_count": 5,
@@ -104,6 +108,46 @@ STATE_ACTION_FRAME_CONTRACT = {
 
 class PairedWatcherError(RuntimeError):
     """The upstream, static input, GPU, execution, or report contract failed."""
+
+
+def configure_actor_execution_protocol(
+    path: Path,
+    file_sha256: str,
+    *,
+    path_root: Path,
+) -> dict[str, Any]:
+    """Bind the watcher to one immutable protocol selected upstream."""
+
+    try:
+        protocol = actor_execution.load_execution_protocol_file(path, file_sha256)
+        binding = actor_execution.execution_protocol_file_binding(
+            path,
+            file_sha256,
+            path_root=path_root,
+            expected_stride=int(protocol["stride"]),
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise PairedWatcherError(str(error)) from error
+    global ACTIVE_EXECUTION_PROTOCOL, ACTIVE_EXECUTION_PROTOCOL_BINDING
+    global ACTION_EXEC_STEPS, MAX_STEPS, FPS
+    ACTIVE_EXECUTION_PROTOCOL = dict(protocol)
+    ACTIVE_EXECUTION_PROTOCOL_BINDING = dict(binding)
+    ACTION_EXEC_STEPS = int(protocol["stride"])
+    MAX_STEPS = int(protocol["max_steps"])
+    FPS = int(protocol["fps"])
+    return dict(protocol)
+
+
+def require_actor_execution_protocol_binding() -> dict[str, Any]:
+    if ACTIVE_EXECUTION_PROTOCOL_BINDING is None:
+        raise PairedWatcherError("actor execution protocol was not configured")
+    try:
+        return actor_execution.validate_execution_protocol_file_binding(
+            ACTIVE_EXECUTION_PROTOCOL_BINDING,
+            expected_stride=ACTION_EXEC_STEPS,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise PairedWatcherError(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -388,6 +432,7 @@ def inspect_fold(paths: FormalPaths, body: str) -> dict[str, Any]:
     summary_path = root / "training_summary.json"
     summary = read_json(summary_path, f"{body} training summary")
     members = summary.get("members")
+    protocol_binding = require_actor_execution_protocol_binding()
     if (
         summary.get("format") != FOLD_FORMAT
         or summary.get("status") != FOLD_STATUS
@@ -401,6 +446,11 @@ def inspect_fold(paths: FormalPaths, body: str) -> dict[str, Any]:
         is not False
         or summary.get("heldout_specific_trainable_parameters") != 0
         or summary.get("actor_frozen") is not True
+        or summary.get("actor_execution_protocol")
+        != protocol_binding["protocol"]
+        or summary.get("actor_execution_protocol_binding") != protocol_binding
+        or summary.get("actor_execution_protocol_file_sha256")
+        != protocol_binding["file_sha256"]
         or not isinstance(members, list)
         or len(members) != EXPECTED_MEMBERS_PER_FOLD
     ):
@@ -446,6 +496,7 @@ def inspect_fold(paths: FormalPaths, body: str) -> dict[str, Any]:
 
 
 def validate_upstream_complete(paths: FormalPaths, state: Mapping[str, Any]) -> dict[str, Any]:
+    protocol_binding = require_actor_execution_protocol_binding()
     if (
         state.get("format") != UPSTREAM_FORMAT
         or state.get("status") != "complete"
@@ -471,6 +522,11 @@ def validate_upstream_complete(paths: FormalPaths, state: Mapping[str, Any]) -> 
         or final.get("cross_embodiment_task_success_claim_authorized") is not False
         or final.get("state_action_frame_contract")
         != STATE_ACTION_FRAME_CONTRACT
+        or final.get("actor_execution_protocol")
+        != protocol_binding["protocol"]
+        or final.get("actor_execution_protocol_binding") != protocol_binding
+        or final.get("actor_execution_protocol_file_sha256")
+        != protocol_binding["file_sha256"]
     ):
         raise PairedWatcherError("five-fold aggregate contract changed")
     folds = {body: inspect_fold(paths, body) for body in BODIES}
@@ -499,6 +555,8 @@ def validate_upstream_complete(paths: FormalPaths, state: Mapping[str, Any]) -> 
         "upstream_run_exit_file_sha256": sha256_file(paths.upstream_run_exit),
         "final_summary": str(paths.final_summary),
         "final_summary_file_sha256": final_sha,
+        "actor_execution_protocol": protocol_binding["protocol"],
+        "actor_execution_protocol_binding": protocol_binding,
         "folds": folds,
     }
 
@@ -533,6 +591,7 @@ def code_binding(paths: FormalPaths) -> list[dict[str, Any]]:
     names = (
         "watch_robotwin2_five_body_lobo_to_paired_success_v1.py",
         "run_robotwin2_five_body_paired_success_v1.py",
+        "robotwin2_actor_execution_protocol_v1.py",
         "evaluate_robotwin2_cross_embodiment_paired_success_v1.py",
         "collect_robotwin2_five_body_ee_candidate_branches_v1.py",
         "preregister_robotwin2_move_can_pot_five_body_lobo_v1.py",
@@ -748,6 +807,10 @@ def wait_for_idle_gpu(
 
 
 def build_runner_command(paths: FormalPaths) -> list[str]:
+    protocol_binding = require_actor_execution_protocol_binding()
+    protocol_path = actor_execution.resolve_execution_protocol_file_binding_path(
+        protocol_binding
+    )
     command = [
         str(paths.runner_python),
         str(paths.runner),
@@ -761,6 +824,12 @@ def build_runner_command(paths: FormalPaths) -> list[str]:
         str(paths.event_spec),
         "--preregistration",
         str(paths.metrics_preregistration),
+        "--actor-execution-protocol",
+        str(protocol_path),
+        "--actor-execution-protocol-sha256",
+        str(protocol_binding["file_sha256"]),
+        "--path-root",
+        str(protocol_binding["path_root"]),
     ]
     for body in BODIES:
         command.extend(("--lobo-fold", f"{body}={paths.fold_root(body)}"))
@@ -842,6 +911,10 @@ def build_execution_binding(
             key: value for key, value in upstream.items() if key != "folds"
         },
         "code_files": static["code_files"],
+        "actor_execution_protocol": ACTIVE_EXECUTION_PROTOCOL,
+        "actor_execution_protocol_binding": (
+            require_actor_execution_protocol_binding()
+        ),
         "runner_command": build_runner_command(paths),
         "evaluator": str(paths.evaluator),
         "gpu_authority": {
@@ -859,6 +932,7 @@ def build_execution_binding(
 
 def validate_runner_contract(paths: FormalPaths, binding: Mapping[str, Any]) -> None:
     contract = read_json(paths.execution_contract, "runner execution contract")
+    protocol_binding = require_actor_execution_protocol_binding()
     if (
         contract.get("pair_count") != EXPECTED_PAIRS
         or contract.get("rollout_count") != EXPECTED_ROLLOUTS
@@ -876,6 +950,12 @@ def validate_runner_contract(paths: FormalPaths, binding: Mapping[str, Any]) -> 
         or contract.get("preregistration") != str(paths.metrics_preregistration)
         or contract.get("preregistration_sha256")
         != EXPECTED_METRICS_PREREGISTRATION_SHA256
+        or contract.get("path_root") != protocol_binding["path_root"]
+        or contract.get("actor_execution_protocol")
+        != protocol_binding["protocol"]
+        or contract.get("actor_execution_protocol_binding") != protocol_binding
+        or contract.get("actor_execution_protocol_file_sha256")
+        != protocol_binding["file_sha256"]
         or contract.get("action_exec_steps") != ACTION_EXEC_STEPS
         or contract.get("max_steps") != MAX_STEPS
         or contract.get("fps") != float(FPS)
@@ -995,6 +1075,9 @@ def release_gpu_lock(paths: FormalPaths) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--actor-execution-protocol", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol-sha256", required=True)
+    parser.add_argument("--path-root", type=Path, required=True)
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--idle-confirmation-seconds", type=float, default=5.0)
     args = parser.parse_args(argv)
@@ -1005,6 +1088,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
+    configure_actor_execution_protocol(
+        arguments.actor_execution_protocol,
+        arguments.actor_execution_protocol_sha256,
+        path_root=arguments.path_root,
+    )
     paths = formal_paths()
     instance_lock = acquire_instance_lock(paths)
     atomic_text(paths.pid, f"{os.getpid()}\n")

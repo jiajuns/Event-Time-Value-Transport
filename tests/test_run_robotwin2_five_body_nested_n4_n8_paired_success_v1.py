@@ -101,7 +101,8 @@ def test_raw16_blind_fps_produces_exact_nested_prefix_and_candidate_zero() -> No
     assert audit[
         "selection_reads_outcomes_events_labels_or_critic_scores"
     ] is False
-    assert audit["format"].endswith("audit_v3")
+    assert audit["format"] == runner.NESTED_POOL_AUDIT_FORMAT
+    assert audit["executed_effect_horizon_actions"] == runner.ACTION_EXEC_STEPS
     assert audit["ordered_selection_metrics_n8"] == list(
         runner.MIXED_SELECTION_METRIC_ORDER
     )
@@ -146,6 +147,44 @@ def test_raw16_blind_fps_produces_exact_nested_prefix_and_candidate_zero() -> No
     )
     with pytest.raises(runner.NestedCandidatePoolError):
         runner.validate_nested_pool_audit(tampered_noise)
+
+
+def test_execute50_binding_propagates_effect_horizon_but_not_first5_noise(
+    tmp_path: Path,
+) -> None:
+    def bind(stride: int) -> None:
+        protocol = runner.formal.actor_execution.execution_protocol(stride)
+        path = tmp_path / f"actor_execution_protocol_{stride}.json"
+        path.write_text(
+            json.dumps(protocol, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        runner.configure_actor_execution_protocol(
+            protocol,
+            path=path,
+            file_sha256=runner.sha256_file(path),
+            path_root=tmp_path,
+        )
+
+    try:
+        bind(50)
+        assert runner.ACTION_EXEC_STEPS == 50
+        assert runner.formal.ACTION_EXEC_STEPS == 50
+        assert runner.pool_runner.ACTION_EXEC_STEPS == 50
+        raw = np.repeat(_raw16()[:, :1], 50, axis=1)
+        pools, audit = runner.nested_pool_selection_audit(
+            current_ee=_current(),
+            raw_proposals=raw,
+            source_action_normalizer=_normalizer(),
+        )
+        assert pools[runner.N8_CANDIDATE_COUNT].shape == (8, 50, 16)
+        assert audit["executed_effect_horizon_actions"] == 50
+        assert audit["canonical_effect_embedding_shape"] == [16, 50 * 14]
+        noise = runner.pool_runner.postformal_noise_contract(8, 16)
+        assert noise["conditional_translation_prefix_steps"] == 5
+        assert runner.nested_pool_contract()["raw16_flow_noise_contract"] == noise
+    finally:
+        bind(5)
 
 
 def test_source_normalized_fps_reverses_raw_unit_dominance_toward_translation() -> None:

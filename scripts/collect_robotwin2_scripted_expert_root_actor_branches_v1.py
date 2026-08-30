@@ -32,13 +32,16 @@ import numpy as np
 import torch
 
 import collect_robotwin2_five_body_ee_candidate_branches_v1 as base
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 
 
-FORMAT = "etsf_robotwin2_scripted_expert_root_actor_branches_v3_endpose_frame"
+FORMAT = (
+    "etsf_robotwin2_scripted_expert_root_actor_branches_v4_actor_execution_protocol"
+)
 MANIFEST_FORMAT = (
-    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v3_endpose_frame"
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v4_actor_execution_protocol"
 )
 TARGET_EVENTS = ("e12", "e3", "e4")
 HORIZON_SCHEDULE = (10, 25, 50, 100, 200)
@@ -120,20 +123,30 @@ ROOT_SELECTION_CONTRACT = {
     "cross_body_common_success_seed_selection": False,
     "planner_after_root": "scripted_expert_ends_and_is_never_used_for_continuation",
 }
-HORIZON_CONTRACT = {
-    "values": list(HORIZON_SCHEDULE),
-    "slot_count_per_condition": len(HORIZON_SCHEDULE),
-    "binding": (
-        "body_condition_horizon_slot_has_pre_registered_ordered_reserve_"
-        "seeds_before_any_rollout"
-    ),
-    "same_horizon_for_e12_e3_e4_of_one_seed": True,
-    "new_actor_branch_take_action_count_at_root": 0,
-    "remaining_action_budget_at_root_equals_bound_horizon": True,
-    "expert_physics_steps_or_planner_frames_used_to_compute_horizon": False,
-    "candidate_or_terminal_outcomes_used_to_choose_horizon": False,
-    "actor_query_stride_actions": base.FORMAL_ACTION_EXEC_STEPS,
-}
+def horizon_contract(protocol: Mapping[str, Any]) -> dict[str, Any]:
+    validated = actor_execution.validate_execution_protocol(protocol)
+    return {
+        "values": list(HORIZON_SCHEDULE),
+        "slot_count_per_condition": len(HORIZON_SCHEDULE),
+        "binding": (
+            "body_condition_horizon_slot_has_pre_registered_ordered_reserve_"
+            "seeds_before_any_rollout"
+        ),
+        "same_horizon_for_e12_e3_e4_of_one_seed": True,
+        "new_actor_branch_take_action_count_at_root": 0,
+        "remaining_action_budget_at_root_equals_bound_horizon": True,
+        "expert_physics_steps_or_planner_frames_used_to_compute_horizon": False,
+        "candidate_or_terminal_outcomes_used_to_choose_horizon": False,
+        "actor_query_stride_actions": validated["stride"],
+        "root_action_plans": [
+            actor_execution.supplement_action_plan(validated, horizon)
+            for horizon in HORIZON_SCHEDULE
+        ],
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+    }
+
+
+HORIZON_CONTRACT = horizon_contract(actor_execution.execution_protocol(5))
 RESERVE_ROSTER_CONTRACT = {
     "scope": "body_local_condition_local_horizon_slot_local",
     "ordered_reserve_seeds_per_slot": RESERVE_SEEDS_PER_SLOT,
@@ -149,20 +162,27 @@ RESERVE_ROSTER_CONTRACT = {
     "formal_primary_seed_start": FORMAL_PRIMARY_SEED_START,
 }
 ROOT_PAIR_BUNDLE_FORMAT = "etsf_robotwin2_scripted_root_triplet_resume_bundle_v2"
-ACTOR_BRANCH_CONTRACT = {
-    "candidate_count": base.CANDIDATE_COUNT,
-    "candidate_generator": (
-        "collect_robotwin2_five_body_ee_candidate_branches_v1.generate_candidates"
-    ),
-    "fresh_scene_candidate_evaluator": (
-        "collect_robotwin2_five_body_ee_candidate_branches_v1._evaluate_candidate"
-    ),
-    "snapshot_restore_contract": base.BRANCH_ROOT_SNAPSHOT_CONTRACT,
-    "candidate_noise_contract": base.CANDIDATE_NOISE_CONTRACT,
-    "terminal_supervision_contract": base.TERMINAL_SUPERVISION_CONTRACT,
-    "expert_actions_after_root": 0,
-    "continuation_controller": "same_frozen_actor_as_four_root_candidates",
-}
+def actor_branch_contract(protocol: Mapping[str, Any]) -> dict[str, Any]:
+    validated = actor_execution.validate_execution_protocol(protocol)
+    return {
+        "candidate_count": base.CANDIDATE_COUNT,
+        "candidate_generator": (
+            "collect_robotwin2_five_body_ee_candidate_branches_v1.generate_candidates"
+        ),
+        "fresh_scene_candidate_evaluator": (
+            "collect_robotwin2_five_body_ee_candidate_branches_v1._evaluate_candidate"
+        ),
+        "snapshot_restore_contract": base.BRANCH_ROOT_SNAPSHOT_CONTRACT,
+        "candidate_noise_contract": base.CANDIDATE_NOISE_CONTRACT,
+        "terminal_supervision_contract": base.TERMINAL_SUPERVISION_CONTRACT,
+        "expert_actions_after_root": 0,
+        "continuation_controller": "same_frozen_actor_as_four_root_candidates",
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+        "actor_query_stride_actions": validated["stride"],
+    }
+
+
+ACTOR_BRANCH_CONTRACT = actor_branch_contract(actor_execution.execution_protocol(5))
 
 
 class ScriptedRootCollectionError(base.BranchCollectionError):
@@ -269,8 +289,24 @@ def sha256_path(path: Path) -> str:
 
 
 def load_actor_authority(
-    path: Path, *, body: str, actor_checkpoint_sha256: str
+    path: Path,
+    *,
+    body: str,
+    actor_checkpoint_sha256: str,
+    execution_protocol: Mapping[str, Any],
+    execution_protocol_binding: Mapping[str, Any],
 ) -> tuple[dict[str, Any], str]:
+    validated_protocol = actor_execution.validate_execution_protocol(
+        execution_protocol
+    )
+    try:
+        validated_protocol_binding = (
+            actor_execution.validate_execution_protocol_file_binding(
+                execution_protocol_binding
+            )
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise ScriptedRootCollectionError(str(error)) from error
     resolved = path.expanduser().resolve()
     if not resolved.is_file() or resolved.is_symlink():
         raise ScriptedRootCollectionError("actor authority must be a real JSON file")
@@ -281,11 +317,14 @@ def load_actor_authority(
     logical = unsigned.pop("logical_sha256", None)
     actors = value.get("actors")
     actor = actors.get(body) if isinstance(actors, Mapping) else None
+    sampling_contract = value.get("sampling_contract")
     if (
         logical != base.canonical_sha256(unsigned)
         or value.get("format")
-        != "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
+        != "etsf_robotwin2_frozen_native_actor_authority_v3_actor_execution_protocol"
         or value.get("task") != base.TASK
+        or value.get("path_root")
+        != validated_protocol_binding["path_root"]
         or value.get("state_action_frame_contract")
         != base.STATE_ACTION_FRAME_CONTRACT
         or not isinstance(actor, Mapping)
@@ -293,6 +332,15 @@ def load_actor_authority(
         or actor.get("optimizer_updates_allowed") is not False
         or actor.get("candidate_count") != base.CANDIDATE_COUNT
         or actor.get("checkpoint_sha256") != actor_checkpoint_sha256
+        or not isinstance(sampling_contract, Mapping)
+        or sampling_contract.get("actor_execution_protocol")
+        != validated_protocol
+        or sampling_contract.get("actor_execution_protocol_binding")
+        != validated_protocol_binding
+        or sampling_contract.get("actor_execution_protocol_file_sha256")
+        != validated_protocol_binding["file_sha256"]
+        or sampling_contract.get("actor_execution_protocol_logical_sha256")
+        != validated_protocol["logical_sha256"]
     ):
         raise ScriptedRootCollectionError(
             "actor authority does not bind this body's frozen checkpoint"
@@ -1128,7 +1176,7 @@ def validate_completed_design_metadata(
     return selected_pairs
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--body", choices=base.BODIES, required=True)
     parser.add_argument("--actor-checkpoint", type=Path, required=True)
@@ -1136,25 +1184,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm-metadata-path", type=Path, required=True)
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--event-spec", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol-sha256", required=True)
+    parser.add_argument(
+        "--path-root",
+        type=Path,
+        required=True,
+        help="Absolute root used to resolve every relative artifact binding",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--conditions", nargs="+", choices=base.CONDITIONS, default=list(base.CONDITIONS)
     )
     parser.add_argument(
-        "--action-exec-steps", type=int, default=base.FORMAL_ACTION_EXEC_STEPS
+        "--action-exec-steps", type=int
     )
     parser.add_argument("--instruction", default=base.DEFAULT_INSTRUCTION)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
-    if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
-        raise ScriptedRootCollectionError(
-            "real scripted-root collection requires remote RTX 4090 CUDA"
+def bind_execution_protocol_arguments(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    """Normalize supplement stride/path values from one frozen protocol."""
+
+    try:
+        execution_protocol = actor_execution.load_execution_protocol_file(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
         )
-    if args.action_exec_steps != base.FORMAL_ACTION_EXEC_STEPS:
-        raise ScriptedRootCollectionError("actor query stride is fixed to five actions")
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise ScriptedRootCollectionError(str(error)) from error
+    action_exec_steps = int(execution_protocol["stride"])
+    args.action_exec_steps = (
+        action_exec_steps
+        if args.action_exec_steps is None
+        else int(args.action_exec_steps)
+    )
+    try:
+        protocol_binding = actor_execution.execution_protocol_file_binding(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+            path_root=args.path_root,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise ScriptedRootCollectionError(str(error)) from error
+    path_root = Path(protocol_binding["path_root"])
+    if args.action_exec_steps != action_exec_steps:
+        raise ScriptedRootCollectionError(
+            "actor query stride differs from the bound execution protocol"
+        )
     if list(args.conditions) != list(base.CONDITIONS):
         raise ScriptedRootCollectionError(
             "the complete supplement requires clean and randomized in frozen order"
@@ -1163,6 +1242,31 @@ def main() -> None:
         raise ScriptedRootCollectionError("the supplement fixes the actor instruction")
     if len(set(args.conditions)) != len(args.conditions):
         raise ScriptedRootCollectionError("conditions must be unique")
+    output = args.output.expanduser().resolve()
+    try:
+        output.relative_to(path_root)
+    except ValueError as error:
+        raise ScriptedRootCollectionError(
+            "supplement output must be contained by path_root"
+        ) from error
+    return execution_protocol, protocol_binding, path_root
+
+
+def main() -> None:
+    args = parse_args()
+    execution_protocol, protocol_binding, path_root = (
+        bind_execution_protocol_arguments(args)
+    )
+    action_exec_steps = int(execution_protocol["stride"])
+    dynamic_horizon_contract = horizon_contract(execution_protocol)
+    dynamic_actor_branch_contract = actor_branch_contract(execution_protocol)
+    dynamic_terminal_horizon_contract = base.terminal_horizon_contract(
+        execution_protocol
+    )
+    if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
+        raise ScriptedRootCollectionError(
+            "real scripted-root collection requires remote RTX 4090 CUDA"
+        )
     body_roster = reserve_roster(args.body)
     seed_horizons = reserve_horizon_by_seed(args.body)
     flattened_roster_seeds = [
@@ -1176,6 +1280,7 @@ def main() -> None:
         args.vlm_metadata_path,
         args.robotwin_root,
         args.event_spec,
+        args.actor_execution_protocol,
     ):
         if not path.exists():
             raise FileNotFoundError(path)
@@ -1210,6 +1315,10 @@ def main() -> None:
         config.input_features["observation.state"].shape[0]
     ) != base.NATIVE_EE_DIM:
         raise ScriptedRootCollectionError("actor checkpoint must have 16-D EE state")
+    if int(config.chunk_size) != int(execution_protocol["native_chunk_steps"]):
+        raise ScriptedRootCollectionError(
+            "actor native action chunk differs from the bound execution protocol"
+        )
     policy = SmolVLAPolicy.from_pretrained(
         args.actor_checkpoint, config=config, local_files_only=True, strict=True
     ).eval().to(device)
@@ -1241,6 +1350,8 @@ def main() -> None:
         args.actor_authority,
         body=args.body,
         actor_checkpoint_sha256=actor_sha,
+        execution_protocol=execution_protocol,
+        execution_protocol_binding=protocol_binding,
     )
     robotwin_commit = git_head(args.robotwin_root)
 
@@ -1266,13 +1377,19 @@ def main() -> None:
         "target_events": list(TARGET_EVENTS),
         "collector_file_sha256": collector_sha,
         "base_collector_file_sha256": base_collector_sha,
+        "path_root": str(path_root),
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol": execution_protocol,
+        "actor_execution_protocol_file_sha256": (
+            args.actor_execution_protocol_sha256
+        ),
         "actor_checkpoint": str(args.actor_checkpoint.resolve()),
         "actor_checkpoint_tree_or_file_sha256": actor_sha,
         "actor_authority_sha256": actor_authority_sha,
         "vlm_metadata_path": str(args.vlm_metadata_path.resolve()),
         "instruction": base.DEFAULT_INSTRUCTION,
         "candidate_count": base.CANDIDATE_COUNT,
-        "action_exec_steps": base.FORMAL_ACTION_EXEC_STEPS,
+        "action_exec_steps": action_exec_steps,
         "supplement_role": (
             "expert_event_root_outer_source_crossfit_proper_world_and_utility_rank"
         ),
@@ -1285,12 +1402,12 @@ def main() -> None:
         "usage_contract": SUPPLEMENT_USAGE_CONTRACT,
         "expert_root_provenance_contract": EXPERT_ROOT_PROVENANCE_CONTRACT,
         "root_selection_contract": ROOT_SELECTION_CONTRACT,
-        "horizon_contract": HORIZON_CONTRACT,
-        "actor_branch_contract": ACTOR_BRANCH_CONTRACT,
+        "horizon_contract": dynamic_horizon_contract,
+        "actor_branch_contract": dynamic_actor_branch_contract,
         "candidate_noise_contract": base.CANDIDATE_NOISE_CONTRACT,
         "terminal_supervision_contract": base.TERMINAL_SUPERVISION_CONTRACT,
         "event_age_contract": base.EVENT_AGE_CONTRACT,
-        "terminal_horizon_contract": base.TERMINAL_HORIZON_CONTRACT,
+        "terminal_horizon_contract": dynamic_terminal_horizon_contract,
         "branch_root_snapshot_contract": base.BRANCH_ROOT_SNAPSHOT_CONTRACT,
         "object_effect_schema": base.OBJECT_EFFECT_SCHEMA,
         "branch_diagnostic_contract": base.BRANCH_DIAGNOSTIC_CONTRACT,
@@ -1322,11 +1439,19 @@ def main() -> None:
             "policy_action_call_count_used_as_time": False,
             "wall_clock_used_as_time": False,
             "dt_semantics": "planned_first_candidate_chunk_seconds",
-            "planned_action_steps": base.FORMAL_ACTION_EXEC_STEPS,
+            "planned_action_steps_by_horizon": {
+                str(horizon): actor_execution.supplement_action_plan(
+                    execution_protocol, horizon
+                )["planned_steps"]
+                for horizon in HORIZON_SCHEDULE
+            },
             "actor_control_hz": base.SOURCE_EVENT_SAMPLING_HZ,
-            "planned_dt_seconds": (
-                base.FORMAL_ACTION_EXEC_STEPS / base.SOURCE_EVENT_SAMPLING_HZ
-            ),
+            "planned_dt_seconds_by_horizon": {
+                str(horizon): actor_execution.supplement_action_plan(
+                    execution_protocol, horizon
+                )["planned_dt_seconds"]
+                for horizon in HORIZON_SCHEDULE
+            },
             "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
             "zero_elapsed_duration_masked": True,
             "event_thresholds": dict(calibration["thresholds"]),
@@ -1334,7 +1459,12 @@ def main() -> None:
         },
         "candidate_action_contract": {
             "critic_observation_time": "before_candidate_execution",
-            "planned_action_horizon": base.FORMAL_ACTION_EXEC_STEPS,
+            "planned_action_horizon_by_remaining_budget": {
+                str(horizon): actor_execution.supplement_action_plan(
+                    execution_protocol, horizon
+                )["planned_steps"]
+                for horizon in HORIZON_SCHEDULE
+            },
             "action_mask_source": "planned_first_chunk_not_executed_count",
             "executed_action_count_used_for_action_mask": False,
             "executed_action_count_used_for_sim_time_accounting_only": True,

@@ -12,6 +12,7 @@ internal HDF/label payloads and it performs no local training.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -25,14 +26,27 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 
-FORMAT = "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v5_endpose_frame"
-COLLECTOR_FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v2_endpose_frame"
-ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
-BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v2_endpose_frame"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
+FORMAT = (
+    "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v6_"
+    "actor_execution_protocol"
+)
+COLLECTOR_FORMAT = (
+    "etsf_robotwin2_five_body_ee_candidate_branches_v3_actor_execution_protocol"
+)
+ACTOR_FORMAT = (
+    "etsf_robotwin2_frozen_native_actor_authority_v3_actor_execution_protocol"
+)
+BINDING_FORMAT = (
+    "etsf_robotwin2_five_body_lobo_training_binding_v3_actor_execution_protocol"
+)
+MANIFEST_FORMAT = (
+    "etsf_robotwin2_canonical_transition_manifest_v3_actor_execution_protocol"
+)
 RECEIPT_FORMAT = (
-    "etsf_robotwin2_five_body_complete_branch_collection_receipt_v2_endpose_frame"
+    "etsf_robotwin2_five_body_complete_branch_collection_receipt_v3_"
+    "actor_execution_protocol"
 )
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
@@ -216,10 +230,130 @@ ETSF_SITE = HOME_ROOT / (
 )
 _STATE_WRITE_LOCK = threading.Lock()
 MAX_CONSECUTIVE_SUPPLEMENTAL_FAILURES = 8
+ACTOR_EXECUTION_PROTOCOL: dict[str, Any] | None = None
+ACTOR_EXECUTION_PROTOCOL_PATH: Path | None = None
+ACTOR_EXECUTION_PROTOCOL_FILE_SHA256: str | None = None
+ACTOR_EXECUTION_PROTOCOL_BINDING: dict[str, Any] | None = None
+PATH_ROOT = HOME_ROOT
 
 
 class ContinuationError(RuntimeError):
     """A frozen actor, collection, or binding contract was violated."""
+
+
+def configure_execution_protocol(
+    protocol: Mapping[str, Any],
+    *,
+    protocol_path: Path,
+    protocol_file_sha256: str,
+    run_root: Path,
+    path_root: Path = HOME_ROOT,
+) -> dict[str, Any]:
+    """Configure one process from an explicit immutable protocol binding."""
+
+    try:
+        validated = actor_execution.validate_execution_protocol(protocol)
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise ContinuationError(str(error)) from error
+    try:
+        protocol_binding = actor_execution.execution_protocol_file_binding(
+            protocol_path,
+            protocol_file_sha256,
+            path_root=path_root,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise ContinuationError(str(error)) from error
+    if protocol_binding["protocol"] != validated:
+        raise ContinuationError("configured protocol differs from its frozen file")
+    resolved_path_root = Path(protocol_binding["path_root"])
+    resolved_protocol_path = actor_execution.resolve_execution_protocol_file_binding_path(
+        protocol_binding
+    )
+    resolved_run_root = run_root.expanduser().resolve()
+    if (
+        resolved_run_root == resolved_path_root
+        or resolved_run_root.parent != resolved_path_root
+    ):
+        raise ContinuationError(
+            "formal run root must be one new direct child of path_root"
+        )
+    if resolved_run_root.exists() and not resolved_run_root.is_dir():
+        raise ContinuationError("formal run root exists but is not a directory")
+
+    global ROOT_QUERIES, QUERY_BLOCK_SIZE, TARGET_PER_CONDITION_QUERY
+    global BASE_SEED_COUNT, SUPPLEMENTAL_SEED_START, ACTION_EXEC_STEPS, MAX_STEPS
+    global EXPECTED_GROUPS_PER_BODY, EXPECTED_BRANCHES_PER_BODY
+    global EXPECTED_TOTAL_BRANCHES, TERMINAL_HORIZON_CONTRACT
+    global OUTPUT_ROOT, WATCHER_STATE, WATCHER_PID, WATCHER_LOG
+    global ACTOR_AUTHORITY, TRAINING_BINDING
+    global ACTOR_EXECUTION_PROTOCOL, ACTOR_EXECUTION_PROTOCOL_PATH
+    global ACTOR_EXECUTION_PROTOCOL_FILE_SHA256
+    global ACTOR_EXECUTION_PROTOCOL_BINDING, PATH_ROOT
+
+    ROOT_QUERIES = tuple(int(value) for value in validated["query_indices"])
+    QUERY_BLOCK_SIZE = min(4, len(ROOT_QUERIES))
+    TARGET_PER_CONDITION_QUERY = int(validated["target_per_condition_query"])
+    ACTION_EXEC_STEPS = int(validated["stride"])
+    MAX_STEPS = int(validated["max_steps"])
+    base_block_count = (len(ROOT_QUERIES) + QUERY_BLOCK_SIZE - 1) // QUERY_BLOCK_SIZE
+    BASE_SEED_COUNT = base_block_count * TARGET_PER_CONDITION_QUERY
+    SUPPLEMENTAL_SEED_START = BASE_SEED_START + BASE_SEED_COUNT
+    EXPECTED_GROUPS_PER_BODY = (
+        len(CONDITIONS) * len(ROOT_QUERIES) * TARGET_PER_CONDITION_QUERY
+    )
+    EXPECTED_BRANCHES_PER_BODY = EXPECTED_GROUPS_PER_BODY * CANDIDATE_COUNT
+    EXPECTED_TOTAL_BRANCHES = EXPECTED_BRANCHES_PER_BODY * len(BODIES)
+    if EXPECTED_TOTAL_BRANCHES != actor_execution.EXPECTED_TOTAL_BRANCHES:
+        raise ContinuationError("execution protocol no longer allocates 8,000 branches")
+    TERMINAL_HORIZON_CONTRACT = {
+        "array": "remaining_action_budget",
+        "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+        "available_before_candidate_execution": True,
+        "same_value_for_all_candidates_at_one_root": True,
+        "conditions_only_terminal_consequence_heads": True,
+        "direct_rank_path": False,
+        "formal_episode_action_steps": MAX_STEPS,
+        "formal_actor_query_stride_actions": ACTION_EXEC_STEPS,
+        "development_remaining_action_budgets": list(
+            validated["primary_remaining_action_budgets"]
+        ),
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+    }
+    OUTPUT_ROOT = resolved_run_root / "primary_branches"
+    WATCHER_STATE = resolved_run_root / "watcher_state.json"
+    WATCHER_PID = resolved_run_root / "watcher.pid"
+    WATCHER_LOG = resolved_run_root / "watcher.log"
+    ACTOR_AUTHORITY = resolved_run_root / "actor_authority.json"
+    TRAINING_BINDING = resolved_run_root / "primary_training_binding.json"
+    ACTOR_EXECUTION_PROTOCOL = dict(validated)
+    ACTOR_EXECUTION_PROTOCOL_PATH = resolved_protocol_path
+    ACTOR_EXECUTION_PROTOCOL_FILE_SHA256 = protocol_file_sha256
+    ACTOR_EXECUTION_PROTOCOL_BINDING = protocol_binding
+    PATH_ROOT = resolved_path_root
+    return dict(validated)
+
+
+def require_configured_execution_protocol() -> dict[str, Any]:
+    if (
+        ACTOR_EXECUTION_PROTOCOL is None
+        or ACTOR_EXECUTION_PROTOCOL_PATH is None
+        or ACTOR_EXECUTION_PROTOCOL_FILE_SHA256 is None
+        or ACTOR_EXECUTION_PROTOCOL_BINDING is None
+    ):
+        raise ContinuationError("actor execution protocol was not configured")
+    return actor_execution.validate_execution_protocol(ACTOR_EXECUTION_PROTOCOL)
+
+
+def require_execution_protocol_binding() -> dict[str, Any]:
+    if ACTOR_EXECUTION_PROTOCOL_BINDING is None:
+        raise ContinuationError("actor execution protocol binding was not configured")
+    try:
+        return actor_execution.validate_execution_protocol_file_binding(
+            ACTOR_EXECUTION_PROTOCOL_BINDING,
+            expected_path_root=PATH_ROOT,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise ContinuationError(str(error)) from error
 
 
 def canonical_sha256(value: Any) -> str:
@@ -273,6 +407,7 @@ def atomic_json(path: Path, value: Any) -> None:
 
 
 def write_state(status: str, **extra: Any) -> None:
+    protocol = require_configured_execution_protocol()
     payload = {
         "format": FORMAT,
         "status": status,
@@ -285,6 +420,13 @@ def write_state(status: str, **extra: Any) -> None:
         "watcher_log": str(WATCHER_LOG),
         "expected_complete_decisions": EXPECTED_TOTAL_BRANCHES // CANDIDATE_COUNT,
         "expected_candidate_branches": EXPECTED_TOTAL_BRANCHES,
+        "path_root": str(PATH_ROOT),
+        "actor_execution_protocol_binding": require_execution_protocol_binding(),
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_path": str(ACTOR_EXECUTION_PROTOCOL_PATH),
+        "actor_execution_protocol_file_sha256": (
+            ACTOR_EXECUTION_PROTOCOL_FILE_SHA256
+        ),
         **extra,
     }
     with _STATE_WRITE_LOCK:
@@ -312,6 +454,12 @@ def validate_training_binding_contract(value: Mapping[str, Any]) -> None:
     if value.get("format") != BINDING_FORMAT:
         raise ContinuationError("training binding format is not the end-pose-frame version")
     require_state_action_frame_contract(value, artifact="training binding")
+    if (
+        value.get("path_root") != str(PATH_ROOT)
+        or value.get("actor_execution_protocol_binding")
+        != require_execution_protocol_binding()
+    ):
+        raise ContinuationError("training binding protocol/path-root binding changed")
 
 
 def write_static(path: Path, value: Mapping[str, Any]) -> str:
@@ -328,9 +476,9 @@ def write_static(path: Path, value: Mapping[str, Any]) -> str:
 def relative_to_home(path: Path) -> str:
     resolved = path.resolve()
     try:
-        return resolved.relative_to(HOME_ROOT).as_posix()
+        return resolved.relative_to(PATH_ROOT).as_posix()
     except ValueError as error:
-        raise ContinuationError(f"authority path escapes /home/user: {resolved}") from error
+        raise ContinuationError(f"authority path escapes path_root: {resolved}") from error
 
 
 def feature_shape(config: Mapping[str, Any], lane: str, key: str) -> list[int] | None:
@@ -381,6 +529,7 @@ def validate_static_inputs() -> dict[str, Any]:
         ROBOTWIN_ROOT,
         VLM_METADATA,
         EVENT_SPEC,
+        ACTOR_EXECUTION_PROTOCOL_PATH,
         REMOTE_PYTHON,
         LEROBOT_ROOT,
         LEROBOT_SITE,
@@ -414,6 +563,8 @@ def validate_static_inputs() -> dict[str, Any]:
 def freeze_actor_authority(
     upstream: Mapping[str, Any], upstream_sha: str, static: Mapping[str, Any]
 ) -> tuple[dict[str, Any], str]:
+    execution_protocol = require_configured_execution_protocol()
+    protocol_binding = require_execution_protocol_binding()
     config_path = ACTOR_CHECKPOINT / "config.json"
     if not config_path.is_file() or config_path.is_symlink():
         raise ContinuationError("final actor lacks a real config.json")
@@ -427,7 +578,10 @@ def freeze_actor_authority(
         )
     checkpoint_sha, checkpoint_files, checkpoint_bytes = sha256_tree(ACTOR_CHECKPOINT)
     sampling_contract = {
-        "format": "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v2_endpose_frame",
+        "format": (
+            "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v3_"
+            "actor_execution_protocol"
+        ),
         "frozen_actor_checkpoint_tree_sha256": checkpoint_sha,
         "collector_file_sha256": static["collector_sha256"],
         "canonical_adapter_file_sha256": static["adapter_sha256"],
@@ -453,7 +607,8 @@ def freeze_actor_authority(
         "base_development_seed_start": BASE_SEED_START,
         "base_development_seed_count": BASE_SEED_COUNT,
         "supplemental_seed_rule": (
-            "same_condition_and_query_until_5_complete_decisions_per_stratum"
+            "same_condition_and_query_until_"
+            f"{TARGET_PER_CONDITION_QUERY}_complete_decisions_per_stratum"
         ),
         "formal_evaluation_seed_lower_bound_inclusive": FORMAL_EVALUATION_SEED_START,
         "critic_dt_semantics": "planned_first_candidate_chunk_seconds",
@@ -471,6 +626,14 @@ def freeze_actor_authority(
         "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
         "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
         "wall_clock_used_as_physical_time": False,
+        "actor_execution_protocol": execution_protocol,
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol_logical_sha256": execution_protocol[
+            "logical_sha256"
+        ],
+        "actor_execution_protocol_file_sha256": (
+            ACTOR_EXECUTION_PROTOCOL_FILE_SHA256
+        ),
     }
     sampling_sha = canonical_sha256(sampling_contract)
     common = {
@@ -503,6 +666,7 @@ def freeze_actor_authority(
     authority = signed(
         {
             "format": ACTOR_FORMAT,
+            "path_root": str(PATH_ROOT),
             "task": TASK,
             "instruction": DEFAULT_INSTRUCTION,
             "dataset_repo": DATASET_REPO,
@@ -578,6 +742,12 @@ def collector_command(
         str(ROBOTWIN_ROOT),
         "--event-spec",
         str(EVENT_SPEC),
+        "--actor-execution-protocol",
+        str(ACTOR_EXECUTION_PROTOCOL_PATH),
+        "--actor-execution-protocol-sha256",
+        str(ACTOR_EXECUTION_PROTOCOL_FILE_SHA256),
+        "--path-root",
+        str(PATH_ROOT),
         "--output",
         str(OUTPUT_ROOT / body),
         "--conditions",
@@ -665,6 +835,7 @@ def run_collector(
 
 
 def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
+    execution_protocol = require_configured_execution_protocol()
     path = OUTPUT_ROOT / body / "manifest.json"
     if not path.is_file() or path.is_symlink():
         raise ContinuationError(f"body manifest missing: {path}")
@@ -683,6 +854,12 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("instruction") != DEFAULT_INSTRUCTION
         or value.get("body") != body
         or value.get("collector_file_sha256") != static["collector_sha256"]
+        or value.get("path_root") != str(PATH_ROOT)
+        or value.get("actor_execution_protocol_binding")
+        != require_execution_protocol_binding()
+        or value.get("actor_execution_protocol") != execution_protocol
+        or value.get("actor_execution_protocol_file_sha256")
+        != ACTOR_EXECUTION_PROTOCOL_FILE_SHA256
         or value.get("actor_checkpoint") != str(ACTOR_CHECKPOINT)
         or value.get("candidate_count") != CANDIDATE_COUNT
         or value.get("action_exec_steps") != ACTION_EXEC_STEPS
@@ -946,6 +1123,14 @@ def finalize_body_manifest(
             "complete_candidate_branch_count": EXPECTED_BRANCHES_PER_BODY,
             "complete_per_condition_query": TARGET_PER_CONDITION_QUERY,
             "collector_file_sha256": static["collector_sha256"],
+            "path_root": str(PATH_ROOT),
+            "actor_execution_protocol_binding": (
+                require_execution_protocol_binding()
+            ),
+            "actor_execution_protocol": require_configured_execution_protocol(),
+            "actor_execution_protocol_file_sha256": (
+                ACTOR_EXECUTION_PROTOCOL_FILE_SHA256
+            ),
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
@@ -974,6 +1159,9 @@ def finalize_body_manifest(
                 "base_seed_start": BASE_SEED_START,
                 "supplemental_seeds_below": FORMAL_EVALUATION_SEED_START,
                 "formal_evaluation_seeds_used": False,
+                "actor_execution_protocol_logical_sha256": (
+                    require_configured_execution_protocol()["logical_sha256"]
+                ),
             },
         }
     )
@@ -1012,11 +1200,19 @@ def freeze_training_binding(
     binding = signed(
         {
             "format": BINDING_FORMAT,
+            "path_root": str(PATH_ROOT),
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
             "instruction": DEFAULT_INSTRUCTION,
             "event_spec_sha256": EVENT_SPEC_SHA256,
+            "actor_execution_protocol": require_configured_execution_protocol(),
+            "actor_execution_protocol_binding": (
+                require_execution_protocol_binding()
+            ),
+            "actor_execution_protocol_file_sha256": (
+                ACTOR_EXECUTION_PROTOCOL_FILE_SHA256
+            ),
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
@@ -1054,9 +1250,46 @@ def freeze_training_binding(
     return binding, write_static(TRAINING_BINDING, binding)
 
 
-def main() -> int:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--actor-execution-protocol", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol-sha256", required=True)
+    parser.add_argument(
+        "--path-root",
+        type=Path,
+        required=True,
+        help="Absolute root used by every relative path in frozen artifacts",
+    )
+    parser.add_argument(
+        "--run-root",
+        type=Path,
+        required=True,
+        help="New direct /home/user child containing every protocol-specific output",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = parse_args(argv)
     if Path.home().resolve() != HOME_ROOT:
         raise ContinuationError("this continuation watcher is remote /home/user only")
+    if arguments.path_root.expanduser().resolve() != HOME_ROOT:
+        raise ContinuationError("production path_root must be exactly /home/user")
+    try:
+        protocol = actor_execution.load_execution_protocol_file(
+            arguments.actor_execution_protocol,
+            arguments.actor_execution_protocol_sha256,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise ContinuationError(str(error)) from error
+    configure_execution_protocol(
+        protocol,
+        protocol_path=arguments.actor_execution_protocol,
+        protocol_file_sha256=arguments.actor_execution_protocol_sha256,
+        run_root=arguments.run_root,
+        path_root=arguments.path_root,
+    )
+    arguments.run_root.expanduser().resolve().mkdir(parents=False, exist_ok=True)
     WATCHER_PID.write_text(f"{os.getpid()}\n", encoding="utf-8")
     upstream, upstream_sha = wait_for_frozen_actor()
     static = validate_static_inputs()
@@ -1170,11 +1403,19 @@ def main() -> int:
     receipt = signed(
         {
             "format": RECEIPT_FORMAT,
+            "path_root": str(PATH_ROOT),
             "status": "complete",
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
             "event_spec_sha256": EVENT_SPEC_SHA256,
+            "actor_execution_protocol": require_configured_execution_protocol(),
+            "actor_execution_protocol_binding": (
+                require_execution_protocol_binding()
+            ),
+            "actor_execution_protocol_file_sha256": (
+                ACTOR_EXECUTION_PROTOCOL_FILE_SHA256
+            ),
             "event_derivation_implementation_sha256": static[
                 "event_derivation_implementation_sha256"
             ],

@@ -30,8 +30,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 
-FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2"
+
+FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v3_actor_protocol"
 CODE_MANIFEST_FORMAT = "etsf_robotwin2_postformal_code_manifest_v1"
 RECOVERABLE_INTERRUPTION_STATUS = "recoverable_child_signal_interruption"
 RECOVERABLE_WATCHER_EXIT_CODE = 75
@@ -40,17 +42,23 @@ RECOVERABLE_INTERRUPTION_SIGNALS = frozenset(
     for member in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGKILL)
 )
 UPSTREAM_FORMAT = "etsf_robotwin2_five_body_postformal_ablation_watcher_v1"
+PRIMARY_COLLECTION_UPSTREAM_FORMAT = (
+    "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v6_"
+    "actor_execution_protocol"
+)
 SUPPLEMENT_MANIFEST_FORMAT = (
-    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v3_endpose_frame"
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v4_actor_execution_protocol"
 )
 SUPPLEMENT_BINDING_FORMAT = (
-    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v3_endpose_frame"
+    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v4_"
+    "actor_execution_protocol"
 )
 SUPPLEMENT_COLLECTOR_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_actor_branches_v3_endpose_frame"
+    "etsf_robotwin2_scripted_expert_root_actor_branches_v4_actor_execution_protocol"
 )
 SUPPLEMENT_MATERIALIZER_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v3_endpose_frame"
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v4_"
+    "actor_execution_protocol"
 )
 STATE_ACTION_FRAME_CONTRACT = {
     "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
@@ -77,8 +85,12 @@ EXPECTED_SUPPLEMENT_DECISIONS = 150
 EXPECTED_SUPPLEMENT_BRANCHES = 600
 N8_RETAINED_CANDIDATE_COUNT = 8
 N8_RAW_PROPOSAL_COUNT = 16
-NESTED_RUNNER_FORMAT = "etsf_robotwin2_five_body_nested_n4_n8_execution_v2"
-NESTED_CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v1"
+NESTED_RUNNER_FORMAT = (
+    "etsf_robotwin2_five_body_nested_n4_n8_execution_v3_actor_protocol"
+)
+NESTED_CONTRACT_FORMAT = (
+    "etsf_robotwin2_nested_n4_n8_execution_contract_v2_actor_protocol"
+)
 NESTED_OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
 NESTED_REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
 NESTED_COMPLETION_FORMAT = (
@@ -107,6 +119,7 @@ CRITICAL_CODE_FILES = (
     "watch_robotwin2_postformal_shared_head_upgrade_v1.py",
     "guard_robotwin2_postformal_shared_head_upgrade_v1.py",
     "collect_robotwin2_scripted_expert_root_actor_branches_v1.py",
+    "robotwin2_actor_execution_protocol_v1.py",
     "materialize_robotwin2_scripted_expert_root_supplement_binding_v1.py",
     "watch_robotwin2_five_body_branches_to_lobo_training_v1.py",
     "train_robotwin2_five_body_lobo_shared_event_head_v1.py",
@@ -211,6 +224,47 @@ def read_json(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise SharedHeadUpgradeError(f"{label} must be a JSON object")
     return value
+
+
+def bound_actor_execution_protocol(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load the one byte-bound protocol used by every downstream stage."""
+
+    cached_protocol = getattr(args, "_actor_execution_protocol", None)
+    cached_binding = getattr(args, "_actor_execution_protocol_binding", None)
+    if isinstance(cached_protocol, dict) and isinstance(cached_binding, dict):
+        return dict(cached_protocol), dict(cached_binding)
+    try:
+        protocol = actor_execution.load_execution_protocol_file(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+        )
+        binding = actor_execution.execution_protocol_file_binding(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+            path_root=args.path_root,
+            expected_stride=int(protocol["stride"]),
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise SharedHeadUpgradeError(str(error)) from error
+    args._actor_execution_protocol = dict(protocol)
+    args._actor_execution_protocol_binding = dict(binding)
+    return dict(protocol), dict(binding)
+
+
+def execution_protocol_cli(args: argparse.Namespace) -> list[str]:
+    protocol, _binding = bound_actor_execution_protocol(args)
+    return [
+        "--actor-execution-protocol",
+        str(args.actor_execution_protocol),
+        "--actor-execution-protocol-sha256",
+        args.actor_execution_protocol_sha256,
+        "--path-root",
+        str(args.path_root),
+        "--action-exec-steps",
+        str(protocol["stride"]),
+    ]
 
 
 def verify_logical_sha(value: Mapping[str, Any], label: str) -> None:
@@ -364,7 +418,11 @@ def validate_nested_protocol(value: Mapping[str, Any]) -> str:
     return str(value["logical_sha256"])
 
 
-def validate_nested_completion(root: Path) -> dict[str, Any]:
+def validate_nested_completion(
+    root: Path,
+    *,
+    expected_actor_execution_protocol_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate the complete contract→outcomes→report→receipt SHA chain."""
 
     root = root.expanduser().resolve()
@@ -383,6 +441,58 @@ def validate_nested_completion(root: Path) -> dict[str, Any]:
         raise SharedHeadUpgradeError("nested contract lacks its evaluation protocol")
     protocol_sha = validate_nested_protocol(protocol)
     persistence = contract.get("method_result_persistence")
+    observed_execution_binding = contract.get(
+        "actor_execution_protocol_binding"
+    )
+    if expected_actor_execution_protocol_binding is not None:
+        try:
+            validated_execution_binding = (
+                actor_execution.validate_execution_protocol_file_binding(
+                    observed_execution_binding,
+                    expected_path_root=Path(
+                        str(expected_actor_execution_protocol_binding["path_root"])
+                    ),
+                    expected_stride=int(
+                        expected_actor_execution_protocol_binding["protocol"][
+                            "stride"
+                        ]
+                    ),
+                )
+            )
+        except (
+            actor_execution.ActorExecutionProtocolError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise SharedHeadUpgradeError(
+                "nested execution protocol binding is invalid"
+            ) from error
+        if dict(validated_execution_binding) != dict(
+            expected_actor_execution_protocol_binding
+        ):
+            raise SharedHeadUpgradeError(
+                "nested execution used a different actor protocol binding"
+            )
+        expected_execution_protocol = expected_actor_execution_protocol_binding[
+            "protocol"
+        ]
+        if (
+            contract.get("path_root")
+            != expected_actor_execution_protocol_binding["path_root"]
+            or contract.get("actor_execution_protocol")
+            != expected_execution_protocol
+            or contract.get("actor_execution_protocol_file_sha256")
+            != expected_actor_execution_protocol_binding["file_sha256"]
+            or contract.get("action_exec_steps")
+            != expected_execution_protocol["stride"]
+            or contract.get("max_steps")
+            != expected_execution_protocol["max_steps"]
+            or contract.get("fps") != float(expected_execution_protocol["fps"])
+        ):
+            raise SharedHeadUpgradeError(
+                "nested execution timing fields disagree with its actor protocol"
+            )
     if (
         contract.get("format") != NESTED_CONTRACT_FORMAT
         or contract.get("runner_format") != NESTED_RUNNER_FORMAT
@@ -532,6 +642,46 @@ def validate_upstream_state(value: Mapping[str, Any]) -> None:
         raise SharedHeadUpgradeError("formal postformal-ablation summary is missing/tampered")
 
 
+def validate_primary_collection_upstream_state(
+    value: Mapping[str, Any],
+    *,
+    primary_branches_root: Path,
+    primary_binding: Path,
+    actor_authority: Path,
+    expected_actor_execution_protocol_binding: Mapping[str, Any],
+) -> None:
+    """Accept only the complete protocol-bound 8,000-branch primary source."""
+
+    if (
+        value.get("format") != PRIMARY_COLLECTION_UPSTREAM_FORMAT
+        or value.get("status") != "complete"
+        or value.get("output_root") != str(primary_branches_root)
+        or value.get("training_binding") != str(primary_binding)
+        or value.get("actor_authority") != str(actor_authority)
+        or value.get("complete_decisions") != 2_000
+        or value.get("candidate_branches") != 8_000
+        or value.get("path_root")
+        != expected_actor_execution_protocol_binding.get("path_root")
+        or value.get("actor_execution_protocol_binding")
+        != dict(expected_actor_execution_protocol_binding)
+    ):
+        raise SharedHeadUpgradeError(
+            "primary collection upstream is not the complete bound 8,000-branch source"
+        )
+    for path, field in (
+        (primary_binding, "training_binding_file_sha256"),
+        (actor_authority, "actor_authority_file_sha256"),
+    ):
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or sha256_file(path) != value.get(field)
+        ):
+            raise SharedHeadUpgradeError(
+                "primary collection upstream artifact SHA chain is invalid"
+            )
+
+
 def supplement_reserve_roster(body: str) -> list[dict[str, Any]]:
     if body not in BODIES:
         raise SharedHeadUpgradeError("unknown supplement body")
@@ -569,7 +719,12 @@ def supplement_reserve_roster(body: str) -> list[dict[str, Any]]:
     return rows
 
 
-def supplement_manifest_complete(path: Path, body: str) -> bool:
+def supplement_manifest_complete(
+    path: Path,
+    body: str,
+    *,
+    expected_actor_execution_protocol_binding: Mapping[str, Any] | None = None,
+) -> bool:
     """Metadata-only resumability check; the materializer performs full validation."""
 
     try:
@@ -599,6 +754,36 @@ def supplement_manifest_complete(path: Path, body: str) -> bool:
         or set(selected) != {row["slot_key"] for row in roster}
     ):
         return False
+    if expected_actor_execution_protocol_binding is not None:
+        observed_binding = value.get("actor_execution_protocol_binding")
+        if (
+            value.get("path_root")
+            != expected_actor_execution_protocol_binding.get("path_root")
+            or value.get("actor_execution_protocol")
+            != expected_actor_execution_protocol_binding.get("protocol")
+            or value.get("actor_execution_protocol_file_sha256")
+            != expected_actor_execution_protocol_binding.get("file_sha256")
+        ):
+            return False
+        try:
+            validated_binding = actor_execution.validate_execution_protocol_file_binding(
+                observed_binding,
+                expected_path_root=Path(
+                    str(expected_actor_execution_protocol_binding["path_root"])
+                ),
+                expected_stride=int(
+                    expected_actor_execution_protocol_binding["protocol"]["stride"]
+                ),
+            )
+        except (
+            actor_execution.ActorExecutionProtocolError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            return False
+        if dict(validated_binding) != dict(expected_actor_execution_protocol_binding):
+            return False
     attempt_by_id = {
         item.get("attempt_id"): item
         for item in attempts
@@ -665,11 +850,16 @@ def supplement_manifest_complete(path: Path, body: str) -> bool:
     return design == expected and consumed_attempts == set(attempt_by_id)
 
 
-def validate_supplement_binding(value: Mapping[str, Any]) -> None:
-    """Require the exact trainer-compatible v3 end-pose supplement binding."""
+def validate_supplement_binding(
+    value: Mapping[str, Any],
+    *,
+    expected_actor_execution_protocol_binding: Mapping[str, Any] | None = None,
+) -> None:
+    """Require the exact trainer-compatible protocol-bound supplement."""
 
     verify_logical_sha(value, "supplement binding")
     materializer = value.get("materializer_provenance")
+    observed_execution_binding = value.get("actor_execution_protocol_binding")
     if (
         value.get("format") != SUPPLEMENT_BINDING_FORMAT
         or value.get("state_action_frame_contract")
@@ -682,8 +872,49 @@ def validate_supplement_binding(value: Mapping[str, Any]) -> None:
         != EXPECTED_SUPPLEMENT_BRANCHES
     ):
         raise SharedHeadUpgradeError(
-            "supplement binding is not the complete v3 end-pose-frame 150/600 design"
+            "supplement binding is not the complete v4 protocol-bound 150/600 design"
         )
+    if expected_actor_execution_protocol_binding is not None:
+        if (
+            value.get("path_root")
+            != expected_actor_execution_protocol_binding.get("path_root")
+            or value.get("actor_execution_protocol")
+            != expected_actor_execution_protocol_binding.get("protocol")
+            or value.get("actor_execution_protocol_file_sha256")
+            != expected_actor_execution_protocol_binding.get("file_sha256")
+        ):
+            raise SharedHeadUpgradeError(
+                "supplement top-level actor protocol fields disagree with its binding"
+            )
+        try:
+            validated_execution_binding = (
+                actor_execution.validate_execution_protocol_file_binding(
+                    observed_execution_binding,
+                    expected_path_root=Path(
+                        str(expected_actor_execution_protocol_binding["path_root"])
+                    ),
+                    expected_stride=int(
+                        expected_actor_execution_protocol_binding["protocol"][
+                            "stride"
+                        ]
+                    ),
+                )
+            )
+        except (
+            actor_execution.ActorExecutionProtocolError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise SharedHeadUpgradeError(
+                "supplement actor execution protocol binding is invalid"
+            ) from error
+        if dict(validated_execution_binding) != dict(
+            expected_actor_execution_protocol_binding
+        ):
+            raise SharedHeadUpgradeError(
+                "supplement used a different actor execution protocol binding"
+            )
 
 
 def gpu_compute_pids(expected_uuid: str) -> list[int]:
@@ -753,12 +984,11 @@ def supplement_collector_command(args: argparse.Namespace, body: str) -> list[st
         str(args.robotwin_root),
         "--event-spec",
         str(args.event_spec),
+        *execution_protocol_cli(args),
         "--output",
         str(args.supplement_root / body),
         "--conditions",
         *CONDITIONS,
-        "--action-exec-steps",
-        "5",
     ]
 
 
@@ -830,6 +1060,7 @@ def fold_arguments(args: argparse.Namespace) -> list[str]:
 
 
 def paired_n4_command(args: argparse.Namespace, supplement_sha256: str) -> list[str]:
+    protocol, _binding = bound_actor_execution_protocol(args)
     return [
         str(args.robotwin_python),
         str(args.code_root / "run_robotwin2_five_body_paired_success_v1.py"),
@@ -843,21 +1074,21 @@ def paired_n4_command(args: argparse.Namespace, supplement_sha256: str) -> list[
         str(args.event_spec),
         "--preregistration",
         str(args.metrics_preregistration),
+        *execution_protocol_cli(args),
         *fold_arguments(args),
         "--required-supplement-binding-sha256",
         supplement_sha256,
         "--output",
         str(args.augmented_n4_root),
-        "--action-exec-steps",
-        "5",
         "--max-steps",
-        "200",
+        str(protocol["max_steps"]),
         "--fps",
         "15.0",
     ]
 
 
 def paired_n8_command(args: argparse.Namespace, supplement_sha256: str) -> list[str]:
+    protocol, _binding = bound_actor_execution_protocol(args)
     return [
         str(args.robotwin_python),
         str(args.code_root / "run_robotwin2_five_body_postformal_candidate_pool_v1.py"),
@@ -871,6 +1102,7 @@ def paired_n8_command(args: argparse.Namespace, supplement_sha256: str) -> list[
         str(args.event_spec),
         "--reference-preregistration",
         str(args.metrics_preregistration),
+        *execution_protocol_cli(args),
         *fold_arguments(args),
         "--required-supplement-binding-sha256",
         supplement_sha256,
@@ -880,10 +1112,8 @@ def paired_n8_command(args: argparse.Namespace, supplement_sha256: str) -> list[
         str(N8_RAW_PROPOSAL_COUNT),
         "--output",
         str(args.augmented_n8_root),
-        "--action-exec-steps",
-        "5",
         "--max-steps",
-        "200",
+        str(protocol["max_steps"]),
         "--fps",
         "15.0",
     ]
@@ -894,6 +1124,7 @@ def nested_n4_n8_command(
 ) -> list[str]:
     """Run the strong shared-raw16 actor/N4/N8 comparison in one job."""
 
+    protocol, _binding = bound_actor_execution_protocol(args)
     return [
         str(args.robotwin_python),
         str(
@@ -910,15 +1141,14 @@ def nested_n4_n8_command(
         str(args.event_spec),
         "--reference-preregistration",
         str(args.metrics_preregistration),
+        *execution_protocol_cli(args),
         *fold_arguments(args),
         "--required-supplement-binding-sha256",
         supplement_sha256,
         "--output",
         str(args.augmented_n8_root),
-        "--action-exec-steps",
-        "5",
         "--max-steps",
-        "200",
+        str(protocol["max_steps"]),
         "--fps",
         "15.0",
     ]
@@ -941,11 +1171,19 @@ def evaluator_command(args: argparse.Namespace) -> list[str]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream-state", type=Path, required=True)
+    parser.add_argument(
+        "--upstream-kind",
+        choices=("postformal_ablation", "primary_collection"),
+        default="postformal_ablation",
+    )
     parser.add_argument("--code-root", type=Path, required=True)
     parser.add_argument("--code-manifest", type=Path)
     parser.add_argument("--code-commit-marker", required=True)
     parser.add_argument("--primary-branches-root", type=Path, required=True)
     parser.add_argument("--primary-binding", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol", type=Path, required=True)
+    parser.add_argument("--actor-execution-protocol-sha256", required=True)
+    parser.add_argument("--path-root", type=Path, required=True)
     parser.add_argument("--actor-authority", type=Path, required=True)
     parser.add_argument("--actor-checkpoint", type=Path, required=True)
     parser.add_argument("--materialization-receipt", type=Path, required=True)
@@ -1006,6 +1244,8 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         "code_root",
         "primary_branches_root",
         "primary_binding",
+        "actor_execution_protocol",
+        "path_root",
         "actor_authority",
         "actor_checkpoint",
         "materialization_receipt",
@@ -1032,6 +1272,10 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         "robotwin_eval_site",
         "etsf_site",
     )
+    for name in ("actor_execution_protocol", "path_root"):
+        expanded = getattr(args, name).expanduser()
+        if expanded.is_symlink():
+            raise SharedHeadUpgradeError(f"{name} may not be a symbolic link")
     for name in path_names:
         setattr(args, name, getattr(args, name).expanduser().resolve())
     if args.code_manifest is None:
@@ -1052,11 +1296,15 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         )
     if args.poll_seconds <= 0:
         raise SharedHeadUpgradeError("poll interval must be positive")
+    bound_actor_execution_protocol(args)
     return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = normalize_args(parse_args(argv))
+    execution_protocol, execution_protocol_binding = (
+        bound_actor_execution_protocol(args)
+    )
     args.state.parent.mkdir(parents=True, exist_ok=True)
     args.log_root.mkdir(parents=True, exist_ok=True)
     args.lock.parent.mkdir(parents=True, exist_ok=True)
@@ -1089,6 +1337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "expected_supplement_decisions": EXPECTED_SUPPLEMENT_DECISIONS,
                 "expected_supplement_branches": EXPECTED_SUPPLEMENT_BRANCHES,
                 "gpu_uuid": args.expected_gpu_uuid,
+                "actor_execution_protocol_binding": execution_protocol_binding,
                 "code_commit_marker": args.code_commit_marker,
                 "code_manifest": str(args.code_manifest),
                 "code_manifest_logical_sha256": code_manifest[
@@ -1158,16 +1407,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_file_sha256=code_manifest_file_sha256,
         )
         try:
-            upstream = read_json(args.upstream_state, "upstream ablation state")
+            upstream = read_json(args.upstream_state, "upstream state")
         except (OSError, ValueError, json.JSONDecodeError, SharedHeadUpgradeError):
             upstream = {}
         if upstream.get("status") == "failed":
             raise SharedHeadUpgradeError("formal upstream pipeline failed")
         if upstream.get("status") == "complete":
-            validate_upstream_state(upstream)
+            if args.upstream_kind == "primary_collection":
+                validate_primary_collection_upstream_state(
+                    upstream,
+                    primary_branches_root=args.primary_branches_root,
+                    primary_binding=args.primary_binding,
+                    actor_authority=args.actor_authority,
+                    expected_actor_execution_protocol_binding=(
+                        execution_protocol_binding
+                    ),
+                )
+            else:
+                validate_upstream_state(upstream)
             break
         write_state(
-            "waiting_for_complete_formal_c_only_pipeline",
+            (
+                "waiting_for_complete_protocol_bound_primary_collection"
+                if args.upstream_kind == "primary_collection"
+                else "waiting_for_complete_formal_c_only_pipeline"
+            ),
+            upstream_kind=args.upstream_kind,
             upstream_status=upstream.get("status"),
             gpu_reserved_by_watcher=False,
         )
@@ -1177,6 +1442,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.code_root,
         args.primary_branches_root,
         args.primary_binding,
+        args.actor_execution_protocol,
+        args.path_root,
         args.actor_authority,
         args.actor_checkpoint,
         args.materialization_receipt,
@@ -1206,7 +1473,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     completed_bodies = []
     for body in BODIES:
         manifest_path = args.supplement_root / body / "manifest.json"
-        if not supplement_manifest_complete(manifest_path, body):
+        if not supplement_manifest_complete(
+            manifest_path,
+            body,
+            expected_actor_execution_protocol_binding=execution_protocol_binding,
+        ):
             wait_idle("waiting_for_idle_rtx4090_before_supplement_collection")
             run_stage(
                 f"collecting_scripted_expert_root_supplement_{body}",
@@ -1215,7 +1486,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cwd=args.robotwin_root,
                 environment=environment,
             )
-        if not supplement_manifest_complete(manifest_path, body):
+        if not supplement_manifest_complete(
+            manifest_path,
+            body,
+            expected_actor_execution_protocol_binding=execution_protocol_binding,
+        ):
             raise SharedHeadUpgradeError(f"{body} supplement did not complete 30 decisions")
         completed_bodies.append(body)
         write_state(
@@ -1232,7 +1507,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         environment=environment,
     )
     binding = read_json(args.supplement_binding, "supplement binding")
-    validate_supplement_binding(binding)
+    validate_supplement_binding(
+        binding,
+        expected_actor_execution_protocol_binding=execution_protocol_binding,
+    )
     supplement_sha256 = sha256_file(args.supplement_binding)
 
     run_stage(
@@ -1253,7 +1531,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         cwd=args.robotwin_root,
         environment=environment,
     )
-    nested_completion = validate_nested_completion(args.augmented_n8_root)
+    nested_completion = validate_nested_completion(
+        args.augmented_n8_root,
+        expected_actor_execution_protocol_binding=execution_protocol_binding,
+    )
     nested_report = Path(str(nested_completion["report"]))
 
     validate_frozen_code_manifest(
@@ -1282,6 +1563,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "completed_rollouts_by_method"
         ],
         n4_is_exact_ordered_prefix_of_n8=True,
+        actor_execution_stride_actions=execution_protocol["stride"],
+        actor_execution_protocol_binding=execution_protocol_binding,
         gpu_reserved_by_watcher=False,
     )
     lock_stream.flush()

@@ -17,11 +17,13 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import collect_robotwin2_scripted_expert_root_actor_branches_v1 as collector
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer
 
 
 FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v3_endpose_frame"
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v4_"
+    "actor_execution_protocol"
 )
 
 
@@ -60,8 +62,8 @@ def parse_body_manifest_bindings(values: Sequence[str]) -> dict[str, Path]:
     return result
 
 
-def _contained_relative(parent: Path, child: Path, label: str) -> str:
-    resolved_parent = parent.expanduser().resolve()
+def _contained_relative(path_root: Path, child: Path, label: str) -> str:
+    resolved_parent = path_root.expanduser().resolve()
     resolved_child = child.expanduser().resolve()
     if resolved_child.is_symlink():
         raise SupplementBindingError(f"{label} may not be a symbolic link")
@@ -69,14 +71,16 @@ def _contained_relative(parent: Path, child: Path, label: str) -> str:
         relative = resolved_child.relative_to(resolved_parent)
     except ValueError as error:
         raise SupplementBindingError(
-            f"{label} must be inside the supplement binding directory"
+            f"{label} must be inside path_root"
         ) from error
     if not relative.parts:
         raise SupplementBindingError(f"{label} path is empty")
     return relative.as_posix()
 
 
-def _primary_seed_pairs(primary: Mapping[str, Any], primary_dir: Path) -> dict[str, set[tuple[str, int]]]:
+def _primary_seed_pairs(
+    primary: Mapping[str, Any], path_root: Path
+) -> dict[str, set[tuple[str, int]]]:
     bindings = primary.get("body_manifests")
     if not isinstance(bindings, Mapping) or set(bindings) != set(trainer.BODIES):
         raise SupplementBindingError("primary binding lacks five body manifests")
@@ -88,7 +92,11 @@ def _primary_seed_pairs(primary: Mapping[str, Any], primary_dir: Path) -> dict[s
         relative = Path(str(item.get("path", "")))
         if relative.is_absolute() or ".." in relative.parts or not relative.parts:
             raise SupplementBindingError("primary manifest path is not contained")
-        manifest_path = (primary_dir / relative).resolve()
+        manifest_path = (path_root / relative).resolve()
+        try:
+            manifest_path.relative_to(path_root)
+        except ValueError as error:
+            raise SupplementBindingError("primary manifest path escapes path_root") from error
         manifest, observed_sha = _read_signed(
             manifest_path, f"{body} primary body manifest"
         )
@@ -137,6 +145,40 @@ def build_binding(
     output = output_path.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     primary, primary_sha = _read_signed(primary_binding_path, "primary binding")
+    path_root_raw = primary.get("path_root")
+    if not isinstance(path_root_raw, str) or not path_root_raw:
+        raise SupplementBindingError("primary binding lacks an explicit path_root")
+    path_root = Path(path_root_raw).expanduser().resolve()
+    if (
+        path_root_raw != str(path_root)
+        or not path_root.is_dir()
+        or path_root.is_symlink()
+    ):
+        raise SupplementBindingError("primary binding path_root must be a real directory")
+    for path, label in (
+        (primary_binding_path, "primary binding"),
+        (actor_authority_path, "actor authority"),
+        (output, "supplement binding output"),
+    ):
+        try:
+            path.expanduser().resolve().relative_to(path_root)
+        except ValueError as error:
+            raise SupplementBindingError(f"{label} must be inside path_root") from error
+    try:
+        protocol_binding = actor_execution.validate_execution_protocol_file_binding(
+            primary.get("actor_execution_protocol_binding"),
+            expected_path_root=path_root,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise SupplementBindingError(str(error)) from error
+    execution_protocol = protocol_binding["protocol"]
+    if (
+        protocol_binding["path_root"] != path_root_raw
+        or primary.get("actor_execution_protocol") != execution_protocol
+        or primary.get("actor_execution_protocol_file_sha256")
+        != protocol_binding["file_sha256"]
+    ):
+        raise SupplementBindingError("primary protocol fields disagree with its binding")
     if (
         primary.get("format") != trainer.BINDING_FORMAT
         or primary.get("dataset_repo") != trainer.DATASET_REPO
@@ -157,6 +199,7 @@ def build_binding(
         actor_authority_path, "actor authority"
     )
     declared_actor = primary.get("actor_authority")
+    authority_sampling = actor_authority.get("sampling_contract")
     if (
         actor_authority.get("format") != trainer.ACTOR_FORMAT
         or actor_authority.get("task") != trainer.TASK
@@ -164,11 +207,23 @@ def build_binding(
         != trainer.STATE_ACTION_FRAME_CONTRACT
         or not isinstance(declared_actor, Mapping)
         or declared_actor.get("sha256") != actor_authority_sha
+        or actor_authority.get("path_root") != str(path_root)
+        or not isinstance(authority_sampling, Mapping)
+        or authority_sampling.get("actor_execution_protocol_binding")
+        != protocol_binding
     ):
         raise SupplementBindingError(
             "actor authority is not the exact primary binding authority"
         )
-    primary_pairs = _primary_seed_pairs(primary, primary_binding_path.resolve().parent)
+    declared_actor_path = Path(str(declared_actor.get("path", "")))
+    if (
+        declared_actor_path.is_absolute()
+        or ".." in declared_actor_path.parts
+        or (path_root / declared_actor_path).resolve()
+        != actor_authority_path.expanduser().resolve()
+    ):
+        raise SupplementBindingError("actor authority path differs from primary binding")
+    primary_pairs = _primary_seed_pairs(primary, path_root)
 
     body_bindings: dict[str, dict[str, Any]] = {}
     event_implementations: set[str] = set()
@@ -185,6 +240,17 @@ def build_binding(
             raise SupplementBindingError(
                 f"{body} raw manifest does not bind the primary actor authority"
             )
+        if (
+            manifest.get("path_root") != str(path_root)
+            or manifest.get("actor_execution_protocol_binding")
+            != protocol_binding
+            or manifest.get("actor_execution_protocol") != execution_protocol
+            or manifest.get("actor_execution_protocol_file_sha256")
+            != protocol_binding["file_sha256"]
+        ):
+            raise SupplementBindingError(
+                f"{body} raw manifest does not bind the primary execution protocol"
+            )
         supplement_pairs = _validate_complete_design(manifest, body=body)
         try:
             validated = trainer.validate_supplement_body_manifest(
@@ -194,6 +260,9 @@ def build_binding(
                 expected_actor_checkpoint_sha256=str(
                     primary_audit["actor"]["checkpoint_sha256_by_body"][body]
                 ),
+                execution_protocol=execution_protocol,
+                execution_protocol_binding=protocol_binding,
+                execution_protocol_file_sha256=protocol_binding["file_sha256"],
             )
         except trainer.FiveBodyContractError as error:
             raise SupplementBindingError(
@@ -215,7 +284,7 @@ def build_binding(
         selected_seed_count += len(manifest["selected_seed_by_slot"])
         body_bindings[body] = {
             "path": _contained_relative(
-                output.parent, manifest_path, f"{body} supplement manifest"
+                path_root, manifest_path, f"{body} supplement manifest"
             ),
             "sha256": manifest_sha,
             "group_count": len(validated["groups"]),
@@ -233,6 +302,7 @@ def build_binding(
 
     binding: dict[str, Any] = {
         "format": trainer.SUPPLEMENT_BINDING_FORMAT,
+        "path_root": str(path_root),
         "dataset_repo": trainer.DATASET_REPO,
         "dataset_revision": trainer.DATASET_REVISION,
         "task": trainer.TASK,
@@ -242,10 +312,19 @@ def build_binding(
         "candidate_noise_contract": trainer.CANDIDATE_NOISE_CONTRACT,
         "terminal_supervision_contract": trainer.TERMINAL_SUPERVISION_CONTRACT,
         "event_age_contract": trainer.EVENT_AGE_CONTRACT,
-        "terminal_horizon_contract": trainer.TERMINAL_HORIZON_CONTRACT,
+        "terminal_horizon_contract": primary["terminal_horizon_contract"],
         "branch_root_snapshot_contract": trainer.BRANCH_ROOT_SNAPSHOT_CONTRACT,
         "object_effect_schema": trainer.OBJECT_EFFECT_SCHEMA,
         "branch_diagnostic_contract": trainer.BRANCH_DIAGNOSTIC_CONTRACT,
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol": execution_protocol,
+        "actor_execution_protocol_file_sha256": protocol_binding["file_sha256"],
+        "primary_binding": {
+            "path": _contained_relative(
+                path_root, primary_binding_path, "primary binding"
+            ),
+            "sha256": primary_sha,
+        },
         "primary_binding_file_sha256": primary_sha,
         "actor_authority_sha256": actor_authority_sha,
         "proper_loss_weight": trainer.SUPPLEMENT_PROPER_LOSS_WEIGHT,

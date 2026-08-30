@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import train_multibody_canonical_event_world_model as core  # noqa: E402
+import robotwin2_actor_execution_protocol_v1 as actor_execution  # noqa: E402
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer_entry  # noqa: E402
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event  # noqa: E402
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E402
@@ -172,8 +173,9 @@ def _group(
     *,
     current_event: int = 0,
     remaining_action_budget: int = 175,
+    planned_steps: int = 5,
 ) -> None:
-    count, horizon = 4, 5
+    count, horizon = 4, planned_steps
     state = np.full((count, core.STATE_DIM), offset, dtype=np.float32)
     state[:, 18:27] = 0.0
     state[:, 18 + current_event] = 1.0
@@ -226,11 +228,20 @@ def _group(
             count, float(remaining_action_budget), dtype=np.float32
         ),
         success_height_reference_z=np.full(count, 0.75, dtype=np.float64),
-        dt=np.full(count, 5.0 / SOURCE_EVENT_SAMPLING_HZ, dtype=np.float32),
+        dt=np.full(
+            count, planned_steps / SOURCE_EVENT_SAMPLING_HZ, dtype=np.float32
+        ),
     )
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, str]:
+def _fixture(tmp_path: Path, *, stride: int = 5) -> tuple[Path, str]:
+    protocol = actor_execution.execution_protocol(stride)
+    protocol_path = tmp_path / f"actor-execution-protocol-{stride}.json"
+    protocol_sha = _write_json(protocol_path, protocol)
+    protocol_binding = actor_execution.execution_protocol_file_binding(
+        protocol_path, protocol_sha, path_root=tmp_path
+    )
+    terminal_contract = trainer_entry.terminal_horizon_contract(protocol)
     files = [
         {
             "path": f"dataset/move_can_pot/file-{index}.zip",
@@ -321,8 +332,17 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
     actor_authority = _signed(
         {
             "format": ACTOR_FORMAT,
+            "path_root": str(tmp_path.resolve()),
             "task": TASK,
             "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
+            "sampling_contract": {
+                "actor_execution_protocol": protocol,
+                "actor_execution_protocol_binding": protocol_binding,
+                "actor_execution_protocol_logical_sha256": protocol[
+                    "logical_sha256"
+                ],
+                "actor_execution_protocol_file_sha256": protocol_sha,
+            },
             "actors": actors,
         }
     )
@@ -334,14 +354,22 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
         groups = []
         for condition in ("clean", "randomized"):
             for group_index in range(2):
+                query = group_index
+                plan = protocol["primary_query_schedule"][query]
                 name = f"{body}-{condition}-{group_index}.npz"
                 group_path = tmp_path / name
-                _group(group_path, float(body_index + group_index + 1))
+                _group(
+                    group_path,
+                    float(body_index + group_index + 1),
+                    remaining_action_budget=int(plan["remaining_action_budget"]),
+                    planned_steps=int(plan["planned_steps"]),
+                )
                 groups.append(
                     {
                         "group_id": name.removesuffix(".npz"),
                         "condition": condition,
                         "requested_seed": body_index * 100 + group_index,
+                        "root_query_index": query,
                         "path": name,
                         "sha256": sha256_file(group_path),
                         "branch_root_snapshot_sha256": "a" * 64,
@@ -355,6 +383,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
         manifest = _signed(
             {
                 "format": MANIFEST_FORMAT,
+                "path_root": str(tmp_path.resolve()),
                 "dataset_repo": DATASET_REPO,
                 "dataset_revision": DATASET_REVISION,
                 "task": TASK,
@@ -400,9 +429,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                     "policy_action_call_count_used_as_time": False,
                     "wall_clock_used_as_time": False,
                     "dt_semantics": "planned_first_candidate_chunk_seconds",
-                    "planned_action_steps": 5,
+                    "planned_action_steps": stride,
                     "actor_control_hz": SOURCE_EVENT_SAMPLING_HZ,
-                    "planned_dt_seconds": 5.0 / SOURCE_EVENT_SAMPLING_HZ,
+                    "planned_dt_seconds": stride / SOURCE_EVENT_SAMPLING_HZ,
                     "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
                     "zero_elapsed_duration_masked": True,
                     "event_thresholds": dict(analytic_event.THRESHOLDS),
@@ -410,7 +439,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                 },
                 "candidate_action_contract": {
                     "critic_observation_time": "before_candidate_execution",
-                    "planned_action_horizon": 5,
+                    "planned_action_horizon": stride,
                     "action_mask_source": "planned_first_chunk_not_executed_count",
                     "executed_action_count_used_for_action_mask": False,
                     "executed_action_count_used_for_sim_time_accounting_only": True,
@@ -421,7 +450,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                 "object_effect_schema": OBJECT_EFFECT_SCHEMA,
                 "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
                 "event_age_contract": EVENT_AGE_CONTRACT,
-                "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+                "terminal_horizon_contract": terminal_contract,
+                "actor_execution_protocol": protocol,
+                "actor_execution_protocol_binding": protocol_binding,
+                "actor_execution_protocol_file_sha256": protocol_sha,
                 "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
                 "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
                 "groups": groups,
@@ -436,6 +468,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
     binding = _signed(
         {
             "format": BINDING_FORMAT,
+            "path_root": str(tmp_path.resolve()),
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
@@ -445,7 +478,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
-            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "terminal_horizon_contract": terminal_contract,
+            "actor_execution_protocol": protocol,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol_file_sha256": protocol_sha,
             "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
@@ -475,6 +511,10 @@ def _supplement_fixture(
     primary_binding_sha256: str,
 ) -> tuple[Path, str]:
     primary_binding = json.loads(primary_binding_path.read_text(encoding="utf-8"))
+    protocol = primary_binding["actor_execution_protocol"]
+    protocol_binding = primary_binding["actor_execution_protocol_binding"]
+    protocol_sha = primary_binding["actor_execution_protocol_file_sha256"]
+    terminal_contract = trainer_entry.terminal_horizon_contract(protocol)
     actor_authority_sha256 = primary_binding["actor_authority"]["sha256"]
     actor_authority = json.loads(
         (tmp_path / primary_binding["actor_authority"]["path"]).read_text(
@@ -551,6 +591,7 @@ def _supplement_fixture(
                     float(body_index + condition_index + root_event + 1),
                     current_event=root_event,
                     remaining_action_budget=horizon,
+                    planned_steps=min(int(protocol["stride"]), horizon),
                 )
                 groups.append(
                     {
@@ -584,6 +625,7 @@ def _supplement_fixture(
                 )
         manifest = {
             "format": SUPPLEMENT_MANIFEST_FORMAT,
+            "path_root": str(tmp_path.resolve()),
             "collector_format": SUPPLEMENT_COLLECTOR_FORMAT,
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
@@ -611,7 +653,7 @@ def _supplement_fixture(
             "actor_authority_sha256": actor_authority_sha256,
             "instruction": DEFAULT_INSTRUCTION,
             "candidate_count": 4,
-            "action_exec_steps": 5,
+            "action_exec_steps": int(protocol["stride"]),
             "supplement_role": (
                 "expert_event_root_outer_source_crossfit_proper_world_and_utility_rank"
             ),
@@ -626,12 +668,19 @@ def _supplement_fixture(
                 EXPERT_ROOT_PROVENANCE_CONTRACT
             ),
             "root_selection_contract": dict(SUPPLEMENT_ROOT_SELECTION_CONTRACT),
-            "horizon_contract": dict(SUPPLEMENT_HORIZON_CONTRACT),
-            "actor_branch_contract": dict(SUPPLEMENT_ACTOR_BRANCH_CONTRACT),
+            "horizon_contract": trainer_entry.supplement_horizon_contract(
+                protocol
+            ),
+            "actor_branch_contract": (
+                trainer_entry.supplement_actor_branch_contract(protocol)
+            ),
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
-            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "terminal_horizon_contract": terminal_contract,
+            "actor_execution_protocol": protocol,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol_file_sha256": protocol_sha,
             "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
@@ -668,6 +717,7 @@ def _supplement_fixture(
     binding = _signed(
         {
             "format": SUPPLEMENT_BINDING_FORMAT,
+            "path_root": str(tmp_path.resolve()),
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
@@ -677,7 +727,10 @@ def _supplement_fixture(
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
-            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "terminal_horizon_contract": terminal_contract,
+            "actor_execution_protocol": protocol,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol_file_sha256": protocol_sha,
             "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
@@ -801,7 +854,12 @@ def test_source_split_keeps_all_queries_from_one_seed_in_one_lane() -> None:
                     )
         manifests[body] = {"groups": groups}
     train, validation, _heldout = source_group_split(
-        {"manifests": manifests}, held_out_body="franka", split_seed=19
+        {
+            "manifests": manifests,
+            "execution_protocol": actor_execution.execution_protocol(5),
+        },
+        held_out_body="franka",
+        split_seed=19,
     )
     for body in BODIES:
         if body == "franka":
@@ -856,7 +914,12 @@ def test_source_split_validation_and_training_cover_every_formal_horizon() -> No
                         )
         manifests[body] = {"groups": groups}
     train, validation, _heldout = source_group_split(
-        {"manifests": manifests}, held_out_body="franka", split_seed=19
+        {
+            "manifests": manifests,
+            "execution_protocol": actor_execution.execution_protocol(5),
+        },
+        held_out_body="franka",
+        split_seed=19,
     )
     for body in BODIES:
         if body == "franka":
@@ -884,10 +947,12 @@ def test_source_split_validation_and_training_cover_every_formal_horizon() -> No
             } == set(range(40))
 
 
+@pytest.mark.parametrize("stride", (5, 50))
 def test_heldout_payload_is_not_stat_hashed_or_deserialized_in_preflight(
     tmp_path: Path,
+    stride: int,
 ) -> None:
-    binding, digest = _fixture(tmp_path)
+    binding, digest = _fixture(tmp_path, stride=stride)
     decoded = json.loads(binding.read_text(encoding="utf-8"))
     manifest_path = tmp_path / decoded["body_manifests"]["franka"]["path"]
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -901,7 +966,6 @@ def test_heldout_payload_is_not_stat_hashed_or_deserialized_in_preflight(
     )
     assert receipt["heldout_group_payload_bytes_read"] == 0
     assert receipt["heldout_group_payload_deserialized"] == 0
-
     # The same missing files fail once Franka becomes a source body and its
     # source payload boundary is deliberately crossed.
     train, _, _ = source_group_split(audit, held_out_body="piper", split_seed=23)
@@ -909,6 +973,76 @@ def test_heldout_payload_is_not_stat_hashed_or_deserialized_in_preflight(
     with pytest.raises(FiveBodyContractError, match="missing/tampered"):
         materialize_source_rows(franka, held_out_body="piper")
 
+
+@pytest.mark.parametrize(
+    ("stride", "query_count", "target_per_query", "expected_dt"),
+    ((5, 40, 5, 5.0 / 15.0), (50, 4, 50, 50.0 / 15.0)),
+)
+def test_primary_binding_execute_protocol_golden_plans(
+    tmp_path: Path,
+    stride: int,
+    query_count: int,
+    target_per_query: int,
+    expected_dt: float,
+) -> None:
+    binding, digest = _fixture(tmp_path, stride=stride)
+    audit = load_binding(binding, digest)
+    protocol = audit["execution_protocol"]
+    assert protocol["stride"] == stride
+    assert len(protocol["query_indices"]) == query_count
+    assert protocol["target_per_condition_query"] == target_per_query
+    assert audit["execution_protocol_binding"]["protocol_logical_sha256"] == (
+        protocol["logical_sha256"]
+    )
+    group = audit["manifests"][BODIES[0]]["groups"][0]
+    rows = trainer_entry._npz_rows(group, body=BODIES[0])
+    assert len(rows) == 4
+    assert all(int(np.asarray(row["action_mask"]).sum()) == stride for row in rows)
+    assert all(float(row["dt"]) == pytest.approx(expected_dt) for row in rows)
+    assert all(float(row["remaining_action_budget"]) == 200.0 for row in rows)
+
+
+@pytest.mark.parametrize("stride", (5, 50))
+def test_primary_binding_execution_protocol_tamper_fails_closed(
+    tmp_path: Path, stride: int
+) -> None:
+    binding, _digest = _fixture(tmp_path, stride=stride)
+    value = json.loads(binding.read_text(encoding="utf-8"))
+    value["actor_execution_protocol"]["fps"] = 16
+    value.pop("logical_sha256")
+    digest = _write_json(binding, _signed(value))
+    with pytest.raises(FiveBodyContractError, match="execution protocol"):
+        load_binding(binding, digest)
+
+
+def test_supplement_binding_must_share_primary_protocol_sha(tmp_path: Path) -> None:
+    primary, primary_digest = _fixture(tmp_path, stride=5)
+    primary_audit = load_binding(primary, primary_digest)
+    supplement, _supplement_digest = _supplement_fixture(
+        tmp_path, primary, primary_digest
+    )
+    value = json.loads(supplement.read_text(encoding="utf-8"))
+    other = actor_execution.execution_protocol(50)
+    other_path = tmp_path / "other-protocol.json"
+    other_sha = _write_json(other_path, other)
+    other_binding = actor_execution.execution_protocol_file_binding(
+        other_path, other_sha, path_root=tmp_path
+    )
+    value["actor_execution_protocol"] = other
+    value["actor_execution_protocol_binding"] = other_binding
+    value["actor_execution_protocol_file_sha256"] = other_sha
+    value["terminal_horizon_contract"] = trainer_entry.terminal_horizon_contract(
+        other
+    )
+    value.pop("logical_sha256")
+    supplement_digest = _write_json(supplement, _signed(value))
+    with pytest.raises(FiveBodyContractError, match="supplement binding"):
+        load_supplement_binding(
+            supplement,
+            supplement_digest,
+            primary_audit=primary_audit,
+            held_out_body="franka",
+        )
 
 def test_supplement_heldout_manifest_and_payload_are_zero_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1507,6 +1641,9 @@ def test_source_loader_rejects_nonbinary_duration_event_masks(
         "condition": "clean",
         "group_id": "soft-mask",
         "requested_seed": 7,
+        "_query_plan": actor_execution.execution_protocol(5)[
+            "primary_query_schedule"
+        ][5],
     }
     with pytest.raises(
         FiveBodyContractError, match="next-event/duration supervision is invalid"

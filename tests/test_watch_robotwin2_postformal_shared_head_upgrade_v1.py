@@ -76,6 +76,11 @@ def test_stage_returncode_only_authorizes_direct_interruption_signals(
 
 
 def _args(tmp_path: Path) -> SimpleNamespace:
+    protocol_path = tmp_path / "actor_execution_protocol.json"
+    protocol_sha256 = watcher.actor_execution.write_execution_protocol_file(
+        protocol_path,
+        watcher.actor_execution.execution_protocol(5),
+    )
     return SimpleNamespace(
         robotwin_python=tmp_path / "robotwin-python",
         training_python=tmp_path / "training-python",
@@ -90,6 +95,9 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         supplement_binding=tmp_path / "supplement" / "binding.json",
         primary_binding=tmp_path / "primary-binding.json",
         primary_branches_root=tmp_path / "primary-branches",
+        actor_execution_protocol=protocol_path,
+        actor_execution_protocol_sha256=protocol_sha256,
+        path_root=tmp_path,
         materialization_receipt=tmp_path / "materialization.json",
         augmented_lobo_root=tmp_path / "augmented-lobo",
         augmented_lobo_state=tmp_path / "augmented-lobo.state.json",
@@ -137,10 +145,12 @@ def test_commands_bind_complete_supplement_and_nested_candidate_study(
     assert collector[collector.index("--body") + 1] == "piper"
     assert "--seeds" not in collector
     action_index = collector.index("--action-exec-steps")
-    assert collector[collector.index("--conditions") + 1 : action_index] == [
+    assert collector[collector.index("--conditions") + 1 :] == [
         "clean",
         "randomized",
     ]
+    assert collector[action_index + 1] == "5"
+    assert collector[collector.index("--path-root") + 1] == str(tmp_path)
 
     materializer = watcher.materializer_command(args)
     declarations = [
@@ -165,6 +175,10 @@ def test_commands_bind_complete_supplement_and_nested_candidate_study(
             command.index("--required-supplement-binding-sha256") + 1
         ] == supplement_sha
         assert sum(value == "--lobo-fold" for value in command) == 5
+        assert command[command.index("--actor-execution-protocol") + 1] == str(
+            args.actor_execution_protocol
+        )
+        assert command[command.index("--action-exec-steps") + 1] == "5"
     assert "--candidate-count" not in n4
     assert n8[n8.index("--candidate-count") + 1] == "8"
     assert n8[n8.index("--proposal-count") + 1] == "16"
@@ -173,6 +187,32 @@ def test_commands_bind_complete_supplement_and_nested_candidate_study(
     assert "--candidate-count" not in nested
     assert watcher.N8_RETAINED_CANDIDATE_COUNT == 8
     assert watcher.N8_RAW_PROPOSAL_COUNT == 16
+
+
+def test_commands_propagate_execute50_without_fixed5_fallback(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    protocol_path = tmp_path / "actor_execution_protocol_execute50.json"
+    args.actor_execution_protocol_sha256 = (
+        watcher.actor_execution.write_execution_protocol_file(
+            protocol_path,
+            watcher.actor_execution.execution_protocol(50),
+        )
+    )
+    args.actor_execution_protocol = protocol_path
+    supplement_sha = "b" * 64
+    for command in (
+        watcher.supplement_collector_command(args, "franka"),
+        watcher.paired_n4_command(args, supplement_sha),
+        watcher.paired_n8_command(args, supplement_sha),
+        watcher.nested_n4_n8_command(args, supplement_sha),
+    ):
+        assert command[command.index("--action-exec-steps") + 1] == "50"
+        assert command[command.index("--actor-execution-protocol") + 1] == str(
+            protocol_path
+        )
+        assert command[command.index("--path-root") + 1] == str(tmp_path)
 
 
 def test_runtime_environment_includes_explicit_etsf_dependency_site(
@@ -254,6 +294,8 @@ def test_code_manifest_requires_full_explicit_commit_sha(tmp_path: Path) -> None
 def test_supplement_completion_is_exact_design_not_just_group_count(
     tmp_path: Path,
 ) -> None:
+    args = _args(tmp_path)
+    protocol, protocol_binding = watcher.bound_actor_execution_protocol(args)
     roster = watcher.supplement_reserve_roster("franka")
     selected = {
         row["slot_key"]: row["ordered_requested_seeds"][1] for row in roster
@@ -298,6 +340,10 @@ def test_supplement_completion_is_exact_design_not_just_group_count(
         "body": "franka",
         "conditions": list(watcher.CONDITIONS),
         "collection_status": "complete",
+        "path_root": str(tmp_path),
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol_file_sha256": protocol_binding["file_sha256"],
         "reserve_roster": roster,
         "pre_registered_seeds": [
             seed for row in roster for seed in row["ordered_requested_seeds"]
@@ -310,6 +356,21 @@ def test_supplement_completion_is_exact_design_not_just_group_count(
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(value), encoding="utf-8")
     assert watcher.supplement_manifest_complete(path, "franka") is True
+    assert watcher.supplement_manifest_complete(
+        path,
+        "franka",
+        expected_actor_execution_protocol_binding=protocol_binding,
+    ) is True
+    top_level_tamper = _signed(
+        {**value, "actor_execution_protocol_file_sha256": "0" * 64}
+    )
+    path.write_text(json.dumps(top_level_tamper), encoding="utf-8")
+    assert watcher.supplement_manifest_complete(
+        path,
+        "franka",
+        expected_actor_execution_protocol_binding=protocol_binding,
+    ) is False
+    path.write_text(json.dumps(value), encoding="utf-8")
 
     for incompatible in (
         {
@@ -339,10 +400,20 @@ def test_supplement_completion_is_exact_design_not_just_group_count(
     assert watcher.supplement_manifest_complete(path, "franka") is False
 
 
-def test_supplement_binding_requires_v3_endpose_frame_chain() -> None:
+def test_supplement_binding_requires_v4_protocol_bound_chain(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    protocol, protocol_binding = watcher.bound_actor_execution_protocol(args)
     value = _signed(
         {
             "format": watcher.SUPPLEMENT_BINDING_FORMAT,
+            "path_root": str(tmp_path),
+            "actor_execution_protocol": protocol,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol_file_sha256": protocol_binding[
+                "file_sha256"
+            ],
             "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
             "materializer_provenance": {
                 "format": watcher.SUPPLEMENT_MATERIALIZER_FORMAT,
@@ -351,7 +422,15 @@ def test_supplement_binding_requires_v3_endpose_frame_chain() -> None:
             },
         }
     )
-    watcher.validate_supplement_binding(value)
+    watcher.validate_supplement_binding(
+        value,
+        expected_actor_execution_protocol_binding=protocol_binding,
+    )
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="top-level"):
+        watcher.validate_supplement_binding(
+            _signed({**value, "actor_execution_protocol": watcher.actor_execution.execution_protocol(50)}),
+            expected_actor_execution_protocol_binding=protocol_binding,
+        )
 
     old_binding = _signed(
         {
@@ -362,7 +441,7 @@ def test_supplement_binding_requires_v3_endpose_frame_chain() -> None:
             ),
         }
     )
-    with pytest.raises(watcher.SharedHeadUpgradeError, match="v3 end-pose-frame"):
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="v4 protocol-bound"):
         watcher.validate_supplement_binding(old_binding)
 
     old_materializer = _signed(
@@ -377,7 +456,7 @@ def test_supplement_binding_requires_v3_endpose_frame_chain() -> None:
             },
         }
     )
-    with pytest.raises(watcher.SharedHeadUpgradeError, match="v3 end-pose-frame"):
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="v4 protocol-bound"):
         watcher.validate_supplement_binding(old_materializer)
 
     missing_frame = _signed(
@@ -387,7 +466,7 @@ def test_supplement_binding_requires_v3_endpose_frame_chain() -> None:
             if key != "state_action_frame_contract"
         }
     )
-    with pytest.raises(watcher.SharedHeadUpgradeError, match="v3 end-pose-frame"):
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="v4 protocol-bound"):
         watcher.validate_supplement_binding(missing_frame)
 
 
@@ -459,8 +538,60 @@ def test_upstream_gate_requires_complete_bound_ablation(tmp_path: Path) -> None:
         )
 
 
-def _write_nested_completion_chain(root: Path) -> None:
+def test_primary_upstream_gate_requires_same_protocol_and_sha_chain(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    args.primary_branches_root.mkdir()
+    args.primary_binding.write_text("{}", encoding="utf-8")
+    args.actor_authority.write_text("{}", encoding="utf-8")
+    _protocol, binding = watcher.bound_actor_execution_protocol(args)
+    state = {
+        "format": watcher.PRIMARY_COLLECTION_UPSTREAM_FORMAT,
+        "status": "complete",
+        "output_root": str(args.primary_branches_root),
+        "training_binding": str(args.primary_binding),
+        "actor_authority": str(args.actor_authority),
+        "complete_decisions": 2_000,
+        "candidate_branches": 8_000,
+        "path_root": str(tmp_path),
+        "actor_execution_protocol_binding": binding,
+        "training_binding_file_sha256": watcher.sha256_file(
+            args.primary_binding
+        ),
+        "actor_authority_file_sha256": watcher.sha256_file(
+            args.actor_authority
+        ),
+    }
+    watcher.validate_primary_collection_upstream_state(
+        state,
+        primary_branches_root=args.primary_branches_root,
+        primary_binding=args.primary_binding,
+        actor_authority=args.actor_authority,
+        expected_actor_execution_protocol_binding=binding,
+    )
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="8,000-branch"):
+        watcher.validate_primary_collection_upstream_state(
+            {**state, "actor_execution_protocol_binding": {**binding, "file_sha256": "0" * 64}},
+            primary_branches_root=args.primary_branches_root,
+            primary_binding=args.primary_binding,
+            actor_authority=args.actor_authority,
+            expected_actor_execution_protocol_binding=binding,
+        )
+
+
+def _write_nested_completion_chain(root: Path) -> dict[str, object]:
     root.mkdir()
+    protocol_path = root.parent / "nested_actor_execution_protocol.json"
+    protocol_sha256 = watcher.actor_execution.write_execution_protocol_file(
+        protocol_path,
+        watcher.actor_execution.execution_protocol(5),
+    )
+    protocol_binding = watcher.actor_execution.execution_protocol_file_binding(
+        protocol_path,
+        protocol_sha256,
+        path_root=root.parent,
+    )
     protocol_base = {
         "format": watcher.NESTED_PROTOCOL_FORMAT,
         "evaluation_seed_base": watcher.NESTED_SEED_BASE,
@@ -493,6 +624,13 @@ def _write_nested_completion_chain(root: Path) -> None:
         "same_requested_seed_and_complete_reset_tripled": True,
         "method_order_rotated_before_outcomes": True,
         "no_training": True,
+        "path_root": str(root.parent),
+        "actor_execution_protocol": protocol_binding["protocol"],
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol_file_sha256": protocol_binding["file_sha256"],
+        "action_exec_steps": 5,
+        "max_steps": 200,
+        "fps": 15.0,
         "method_result_persistence": {
             "existing_result_overwrite_or_retry_allowed": False,
             "automatic_noninformative_resume_limit_per_method": 1,
@@ -577,14 +715,18 @@ def _write_nested_completion_chain(root: Path) -> None:
     (root / "completion_receipt.json").write_text(
         json.dumps(completion), encoding="utf-8"
     )
+    return protocol_binding
 
 
 def test_nested_completion_gate_validates_exact_roster_and_sha_chain(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "nested"
-    _write_nested_completion_chain(root)
-    audit = watcher.validate_nested_completion(root)
+    protocol_binding = _write_nested_completion_chain(root)
+    audit = watcher.validate_nested_completion(
+        root,
+        expected_actor_execution_protocol_binding=protocol_binding,
+    )
     assert audit["completed_initial_condition_triplets"] == 1000
     assert audit["completed_rollouts"] == 3000
     assert audit["completed_rollouts_by_method"] == {

@@ -439,6 +439,19 @@ def test_fold_specs_require_exactly_five_unique_bodies(tmp_path: Path) -> None:
 
 
 def _write_fold_summary(tmp_path: Path, seeds: list[int]) -> Path:
+    protocol = runner.actor_execution.execution_protocol(5)
+    protocol_path = tmp_path / "actor_execution_protocol.json"
+    protocol_path.write_text(
+        json.dumps(protocol, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    runner.configure_actor_execution_protocol(
+        protocol,
+        path=protocol_path,
+        file_sha256=runner.sha256_file(protocol_path),
+        path_root=tmp_path,
+    )
+    protocol_binding = runner.actor_execution_protocol_binding()
     fold_root = tmp_path / "fold"
     fold_root.mkdir()
     trainer_sha = runner.sha256_file(Path(runner.shared_head.__file__).resolve())
@@ -473,7 +486,12 @@ def _write_fold_summary(tmp_path: Path, seeds: list[int]) -> Path:
             "full"
         ),
         "event_age_contract": runner.shared_head.event_age_contract(),
-        "terminal_horizon_contract": runner.shared_head.terminal_horizon_contract(),
+        "terminal_horizon_contract": runner.shared_head.terminal_horizon_contract(
+            protocol
+        ),
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol_file_sha256": protocol_binding["file_sha256"],
         "ablation": runner.shared_head.ablation_contract("full"),
         "trainer_file_sha256": trainer_sha,
         "rank_supervision_available": True,
@@ -502,11 +520,28 @@ def test_inspect_fold_rejects_duplicate_summary_member_seeds(tmp_path: Path) -> 
 
 def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    protocol = runner.actor_execution.execution_protocol(5)
+    protocol_path = tmp_path / "actor_execution_protocol.json"
+    protocol_path.write_text(
+        json.dumps(protocol, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    runner.configure_actor_execution_protocol(
+        protocol,
+        path=protocol_path,
+        file_sha256=runner.sha256_file(protocol_path),
+        path_root=tmp_path,
+    )
+    protocol_binding = runner.actor_execution_protocol_binding()
     fold = {
         "heldout_body": "franka",
         "source_bodies": [body for body in runner.BODIES if body != "franka"],
         "body_adapter": "single_shared_row_zero_heldout_parameters",
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol_file_sha256": protocol_binding["file_sha256"],
         "event_derivation_implementation_sha256": "a" * 64,
         "trainer_file_sha256": "b" * 64,
         "ensemble_common_selection_step": 100,
@@ -524,7 +559,12 @@ def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
         "canonical_action_schema": runner.shared_head.CANONICAL_ACTION_SCHEMA,
         "state_action_frame_contract": runner.STATE_ACTION_FRAME_CONTRACT,
         "event_age_contract": runner.shared_head.event_age_contract(),
-        "terminal_horizon_contract": runner.shared_head.terminal_horizon_contract(),
+        "terminal_horizon_contract": runner.shared_head.terminal_horizon_contract(
+            protocol
+        ),
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_binding": protocol_binding,
+        "actor_execution_protocol_file_sha256": protocol_binding["file_sha256"],
         "model_family": runner.shared_head.MODEL_FAMILY,
         "candidate_rank_contract": runner.shared_head.checkpoint_candidate_rank_contract(
             "full"

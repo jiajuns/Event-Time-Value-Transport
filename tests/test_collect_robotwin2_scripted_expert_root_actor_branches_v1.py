@@ -18,6 +18,7 @@ if str(SCRIPTS) not in sys.path:
 import collect_robotwin2_five_body_ee_candidate_branches_v1 as base  # noqa: E402
 import collect_robotwin2_scripted_expert_root_actor_branches_v1 as collector  # noqa: E402
 import materialize_robotwin2_scripted_expert_root_supplement_binding_v1 as materializer  # noqa: E402
+import robotwin2_actor_execution_protocol_v1 as actor_execution  # noqa: E402
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event  # noqa: E402
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer  # noqa: E402
 
@@ -580,11 +581,28 @@ def test_completed_design_requires_full_ordered_reject_history() -> None:
 
 def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Path]]:
     checkpoint_sha = "c" * 64
+    protocol_value = actor_execution.execution_protocol(5)
+    protocol_path = tmp_path / "protocols" / "execute5.json"
+    protocol_sha = actor_execution.write_execution_protocol_file(
+        protocol_path, protocol_value
+    )
+    protocol_binding = actor_execution.execution_protocol_file_binding(
+        protocol_path, protocol_sha, path_root=tmp_path
+    )
     actor = _signed(
         {
             "format": trainer.ACTOR_FORMAT,
+            "path_root": str(tmp_path.resolve()),
             "task": trainer.TASK,
             "state_action_frame_contract": trainer.STATE_ACTION_FRAME_CONTRACT,
+            "sampling_contract": {
+                "actor_execution_protocol": protocol_value,
+                "actor_execution_protocol_logical_sha256": protocol_value[
+                    "logical_sha256"
+                ],
+                "actor_execution_protocol_binding": protocol_binding,
+                "actor_execution_protocol_file_sha256": protocol_sha,
+            },
             "actors": {
                 body: {"checkpoint_sha256": checkpoint_sha}
                 for body in trainer.BODIES
@@ -621,11 +639,16 @@ def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Pa
     primary = _signed(
         {
             "format": trainer.BINDING_FORMAT,
+            "path_root": str(tmp_path.resolve()),
             "dataset_repo": trainer.DATASET_REPO,
             "dataset_revision": trainer.DATASET_REVISION,
             "task": trainer.TASK,
             "instruction": trainer.DEFAULT_INSTRUCTION,
             "state_action_frame_contract": trainer.STATE_ACTION_FRAME_CONTRACT,
+            "terminal_horizon_contract": trainer.TERMINAL_HORIZON_CONTRACT,
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol": protocol_value,
+            "actor_execution_protocol_file_sha256": protocol_sha,
             "actor_authority": {"path": actor_path.name, "sha256": actor_sha},
             "body_manifests": primary_body_bindings,
         }
@@ -637,9 +660,21 @@ def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Pa
     supplements = {}
     for body in trainer.BODIES:
         path = tmp_path / "supplement" / body / "manifest.json"
+        supplement = _supplement_manifest(
+            body, actor_sha, checkpoint_sha, event_sha
+        )
+        supplement.pop("logical_sha256")
+        supplement.update(
+            {
+                "path_root": str(tmp_path.resolve()),
+                "actor_execution_protocol_binding": protocol_binding,
+                "actor_execution_protocol": protocol_value,
+                "actor_execution_protocol_file_sha256": protocol_sha,
+            }
+        )
         _write_json(
             path,
-            _supplement_manifest(body, actor_sha, checkpoint_sha, event_sha),
+            _signed(supplement),
         )
         supplements[body] = path
     return primary_path, primary_sha, actor_path, actor_sha, supplements
@@ -651,7 +686,14 @@ def _reserve_aware_trainer_validator(
     expected_body: str,
     manifest_dir: Path,
     expected_actor_checkpoint_sha256: str,
+    execution_protocol: dict,
+    execution_protocol_binding: dict,
+    execution_protocol_file_sha256: str,
 ) -> dict:
+    assert execution_protocol_binding["protocol"] == execution_protocol
+    assert execution_protocol_binding["file_sha256"] == (
+        execution_protocol_file_sha256
+    )
     assert value["actor_checkpoint_tree_or_file_sha256"] == (
         expected_actor_checkpoint_sha256
     )
@@ -728,6 +770,13 @@ def test_five_body_materializer_emits_exact_trainer_binding_without_payload_open
             for body in trainer.BODIES
         },
         "event_derivation_implementation_sha256": "e" * 64,
+        "execution_protocol": primary["actor_execution_protocol"],
+        "execution_protocol_binding": primary[
+            "actor_execution_protocol_binding"
+        ],
+        "execution_protocol_file_sha256": primary[
+            "actor_execution_protocol_file_sha256"
+        ],
         "actor": {
             "checkpoint_sha256_by_body": {
                 body: "c" * 64 for body in trainer.BODIES

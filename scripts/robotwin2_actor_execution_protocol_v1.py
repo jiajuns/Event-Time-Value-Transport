@@ -19,12 +19,16 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 
 FORMAT = "etsf_robotwin2_actor_execution_protocol_v1"
+FILE_BINDING_FORMAT = "etsf_robotwin2_actor_execution_protocol_file_binding_v1"
 TASK = "move_can_pot"
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
@@ -63,6 +67,22 @@ _PINNED_LOGICAL_SHA256_BY_STRIDE = MappingProxyType(
 
 class ActorExecutionProtocolError(ValueError):
     """A protocol, method mapping, schedule entry, or action plan is invalid."""
+
+
+def sha256_file(path: Path) -> str:
+    """Hash one real, non-symbolic protocol file."""
+
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise ActorExecutionProtocolError("execution protocol file may not be symbolic")
+    resolved = expanded.resolve()
+    if not resolved.is_file() or resolved.is_symlink():
+        raise ActorExecutionProtocolError("execution protocol file must be a real file")
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -279,6 +299,234 @@ def validate_execution_protocol(
     return copy.deepcopy(expected)
 
 
+def load_execution_protocol_file(
+    path: Path,
+    expected_file_sha256: str,
+    *,
+    expected_stride: int | None = None,
+    expected_actor_report_method: str | None = None,
+) -> dict[str, Any]:
+    """Load an explicitly byte-bound frozen execution protocol.
+
+    Consumers must bind both identities: ``expected_file_sha256`` protects the
+    deployed bytes and the protocol's pinned ``logical_sha256`` protects its
+    canonical meaning.  A path alone is deliberately insufficient.
+    """
+
+    if (
+        not isinstance(expected_file_sha256, str)
+        or len(expected_file_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_file_sha256)
+    ):
+        raise ActorExecutionProtocolError(
+            "expected execution protocol file SHA-256 must be lowercase hexadecimal"
+        )
+    observed_file_sha256 = sha256_file(path)
+    if observed_file_sha256 != expected_file_sha256:
+        raise ActorExecutionProtocolError("execution protocol file SHA-256 mismatch")
+    resolved = path.expanduser().resolve()
+    try:
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ActorExecutionProtocolError(
+            "execution protocol file is not valid UTF-8 JSON"
+        ) from error
+    return validate_execution_protocol(
+        value,
+        expected_stride=expected_stride,
+        expected_actor_report_method=expected_actor_report_method,
+    )
+
+
+def _resolved_path_root(path_root: Path) -> Path:
+    expanded = path_root.expanduser()
+    if expanded.is_symlink():
+        raise ActorExecutionProtocolError("path_root may not be symbolic")
+    resolved = expanded.resolve()
+    if not resolved.is_dir() or resolved.is_symlink():
+        raise ActorExecutionProtocolError("path_root must be a real directory")
+    return resolved
+
+
+def execution_protocol_file_binding(
+    path: Path,
+    expected_file_sha256: str,
+    *,
+    path_root: Path,
+    expected_stride: int | None = None,
+    expected_actor_report_method: str | None = None,
+) -> dict[str, Any]:
+    """Bind one frozen protocol file relative to one explicit artifact root.
+
+    The absolute root is intentionally part of the contract.  All downstream
+    artifacts can therefore resolve the same relative path without guessing
+    whether it is relative to the artifact file, run directory, or HOME.
+    """
+
+    root = _resolved_path_root(path_root)
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise ActorExecutionProtocolError("execution protocol file may not be symbolic")
+    resolved = expanded.resolve()
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as error:
+        raise ActorExecutionProtocolError(
+            "execution protocol file must be contained by path_root"
+        ) from error
+    if not relative.parts:
+        raise ActorExecutionProtocolError("execution protocol relative path is empty")
+    protocol = load_execution_protocol_file(
+        resolved,
+        expected_file_sha256,
+        expected_stride=expected_stride,
+        expected_actor_report_method=expected_actor_report_method,
+    )
+    return {
+        "format": FILE_BINDING_FORMAT,
+        "path_root": str(root),
+        "path": relative.as_posix(),
+        "file_sha256": expected_file_sha256,
+        "protocol_logical_sha256": protocol["logical_sha256"],
+        "protocol": protocol,
+    }
+
+
+def resolve_execution_protocol_file_binding_path(
+    value: Mapping[str, Any],
+) -> Path:
+    """Resolve only the contained path encoded by a protocol file binding."""
+
+    if not isinstance(value, Mapping):
+        raise ActorExecutionProtocolError("execution protocol binding must be a mapping")
+    root_raw = value.get("path_root")
+    relative_raw = value.get("path")
+    if not isinstance(root_raw, str) or not root_raw:
+        raise ActorExecutionProtocolError("execution protocol binding path_root is invalid")
+    if not isinstance(relative_raw, str) or not relative_raw:
+        raise ActorExecutionProtocolError("execution protocol binding path is invalid")
+    root = _resolved_path_root(Path(root_raw))
+    if root_raw != str(root):
+        raise ActorExecutionProtocolError(
+            "execution protocol binding path_root must be canonical absolute"
+        )
+    relative = Path(relative_raw)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ActorExecutionProtocolError(
+            "execution protocol binding path must be a contained relative path"
+        )
+    resolved = (root / relative).resolve()
+    try:
+        canonical_relative = resolved.relative_to(root)
+    except ValueError as error:
+        raise ActorExecutionProtocolError(
+            "execution protocol binding path escapes path_root"
+        ) from error
+    if relative_raw != canonical_relative.as_posix():
+        raise ActorExecutionProtocolError(
+            "execution protocol binding path must be canonical relative"
+        )
+    return resolved
+
+
+def validate_execution_protocol_file_binding(
+    value: Any,
+    *,
+    expected_path_root: Path | None = None,
+    expected_stride: int | None = None,
+    expected_actor_report_method: str | None = None,
+) -> dict[str, Any]:
+    """Validate both identities and the live bytes of a protocol binding."""
+
+    if not isinstance(value, Mapping):
+        raise ActorExecutionProtocolError("execution protocol binding must be a mapping")
+    observed = copy.deepcopy(dict(value))
+    required = {
+        "format",
+        "path_root",
+        "path",
+        "file_sha256",
+        "protocol_logical_sha256",
+        "protocol",
+    }
+    if set(observed) != required or observed.get("format") != FILE_BINDING_FORMAT:
+        raise ActorExecutionProtocolError("execution protocol binding fields changed")
+    resolved = resolve_execution_protocol_file_binding_path(observed)
+    root = _resolved_path_root(Path(str(observed["path_root"])))
+    if expected_path_root is not None:
+        expected_root = _resolved_path_root(expected_path_root)
+        if root != expected_root:
+            raise ActorExecutionProtocolError(
+                "execution protocol binding path_root is not expected"
+            )
+    file_sha = observed.get("file_sha256")
+    if not isinstance(file_sha, str):
+        raise ActorExecutionProtocolError("execution protocol binding file SHA is invalid")
+    live = load_execution_protocol_file(
+        resolved,
+        file_sha,
+        expected_stride=expected_stride,
+        expected_actor_report_method=expected_actor_report_method,
+    )
+    recorded = validate_execution_protocol(
+        observed.get("protocol"),
+        expected_stride=expected_stride,
+        expected_actor_report_method=expected_actor_report_method,
+    )
+    if (
+        observed.get("protocol_logical_sha256") != live["logical_sha256"]
+        or canonical_json_bytes(recorded) != canonical_json_bytes(live)
+    ):
+        raise ActorExecutionProtocolError(
+            "execution protocol binding document or logical SHA changed"
+        )
+    return copy.deepcopy(observed)
+
+
+def write_execution_protocol_file(path: Path, protocol: Mapping[str, Any]) -> str:
+    """Create one canonical protocol file once, or verify its exact bytes."""
+
+    validated = validate_execution_protocol(protocol)
+    payload = json.dumps(
+        validated,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8") + b"\n"
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise ActorExecutionProtocolError("execution protocol output may not be symbolic")
+    resolved = expanded.resolve()
+    if resolved.exists():
+        if not resolved.is_file() or resolved.is_symlink() or resolved.read_bytes() != payload:
+            raise ActorExecutionProtocolError(
+                "existing execution protocol file differs from the frozen value"
+            )
+        return sha256_file(resolved)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{resolved.name}.", suffix=".create", dir=resolved.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o444)
+        try:
+            os.link(temporary, resolved)
+        except FileExistsError:
+            if resolved.is_symlink() or not resolved.is_file() or resolved.read_bytes() != payload:
+                raise ActorExecutionProtocolError(
+                    "racing execution protocol file differs from the frozen value"
+                )
+    finally:
+        temporary.unlink(missing_ok=True)
+    return sha256_file(resolved)
+
+
 def action_plan(
     protocol: Mapping[str, Any],
     *,
@@ -365,6 +613,7 @@ __all__ = [
     "EXECUTE5_LOGICAL_SHA256",
     "EXECUTE50_LOGICAL_SHA256",
     "EXPECTED_TOTAL_BRANCHES",
+    "FILE_BINDING_FORMAT",
     "FORMAT",
     "FPS",
     "LEGAL_STRIDES",
@@ -378,8 +627,14 @@ __all__ = [
     "canonical_json_bytes",
     "canonical_sha256",
     "execution_protocol",
+    "execution_protocol_file_binding",
     "execution_protocol_for_actor_report_method",
+    "load_execution_protocol_file",
     "primary_action_plan",
+    "resolve_execution_protocol_file_binding_path",
+    "sha256_file",
     "supplement_action_plan",
     "validate_execution_protocol",
+    "validate_execution_protocol_file_binding",
+    "write_execution_protocol_file",
 ]

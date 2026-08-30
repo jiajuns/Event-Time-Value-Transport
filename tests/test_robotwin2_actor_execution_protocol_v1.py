@@ -46,6 +46,9 @@ def test_module_is_independent_of_all_production_modules() -> None:
         "copy",
         "hashlib",
         "json",
+        "os",
+        "pathlib",
+        "tempfile",
         "types",
         "typing",
     }
@@ -408,3 +411,63 @@ def test_canonical_hash_is_key_order_invariant_and_rejects_nonfinite_json() -> N
         protocol.canonical_sha256({"value": math.nan})
     with pytest.raises(protocol.ActorExecutionProtocolError):
         protocol.canonical_sha256({"value": math.inf})
+
+
+@pytest.mark.parametrize("stride", [5, 50])
+def test_file_binding_freezes_common_root_bytes_and_logical_protocol(
+    tmp_path: Path, stride: int
+) -> None:
+    path_root = tmp_path / "artifact-root"
+    protocol_path = path_root / "protocols" / f"execute{stride}.json"
+    file_sha = protocol.write_execution_protocol_file(
+        protocol_path, protocol.execution_protocol(stride)
+    )
+    binding = protocol.execution_protocol_file_binding(
+        protocol_path,
+        file_sha,
+        path_root=path_root,
+        expected_stride=stride,
+    )
+    assert binding == {
+        "format": protocol.FILE_BINDING_FORMAT,
+        "path_root": str(path_root.resolve()),
+        "path": f"protocols/execute{stride}.json",
+        "file_sha256": file_sha,
+        "protocol_logical_sha256": protocol.execution_protocol(stride)[
+            "logical_sha256"
+        ],
+        "protocol": protocol.execution_protocol(stride),
+    }
+    assert protocol.validate_execution_protocol_file_binding(
+        binding,
+        expected_path_root=path_root,
+        expected_stride=stride,
+    ) == binding
+    assert protocol.resolve_execution_protocol_file_binding_path(binding) == (
+        protocol_path.resolve()
+    )
+
+
+def test_file_binding_rejects_escape_wrong_root_and_live_byte_tampering(
+    tmp_path: Path,
+) -> None:
+    path_root = tmp_path / "root"
+    protocol_path = path_root / "protocol.json"
+    file_sha = protocol.write_execution_protocol_file(
+        protocol_path, protocol.execution_protocol(5)
+    )
+    binding = protocol.execution_protocol_file_binding(
+        protocol_path, file_sha, path_root=path_root
+    )
+    escaped = copy.deepcopy(binding)
+    escaped["path"] = "../protocol.json"
+    with pytest.raises(protocol.ActorExecutionProtocolError):
+        protocol.validate_execution_protocol_file_binding(escaped)
+    with pytest.raises(protocol.ActorExecutionProtocolError):
+        protocol.validate_execution_protocol_file_binding(
+            binding, expected_path_root=tmp_path
+        )
+    protocol_path.chmod(0o644)
+    protocol_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(protocol.ActorExecutionProtocolError):
+        protocol.validate_execution_protocol_file_binding(binding)

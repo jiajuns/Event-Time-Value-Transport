@@ -32,27 +32,37 @@ from torch.utils.data import DataLoader
 
 import train_multibody_canonical_event_world_model as core
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materialization
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
 MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v12"
-BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v2_endpose_frame"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
+BINDING_FORMAT = (
+    "etsf_robotwin2_five_body_lobo_training_binding_v3_actor_execution_protocol"
+)
+MANIFEST_FORMAT = (
+    "etsf_robotwin2_canonical_transition_manifest_v3_actor_execution_protocol"
+)
 SUPPLEMENT_BINDING_FORMAT = (
-    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v3_endpose_frame"
+    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v4_"
+    "actor_execution_protocol"
 )
 SUPPLEMENT_MANIFEST_FORMAT = (
-    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v3_endpose_frame"
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v4_"
+    "actor_execution_protocol"
 )
 SUPPLEMENT_COLLECTOR_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_actor_branches_v3_endpose_frame"
+    "etsf_robotwin2_scripted_expert_root_actor_branches_v4_actor_execution_protocol"
 )
 SUPPLEMENT_MATERIALIZER_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v3_endpose_frame"
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v4_"
+    "actor_execution_protocol"
 )
-ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
+ACTOR_FORMAT = (
+    "etsf_robotwin2_frozen_native_actor_authority_v3_actor_execution_protocol"
+)
 MATERIALIZATION_FORMAT = public_materialization.FORMAT
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
@@ -62,7 +72,7 @@ PREREGISTRATION_SHA256 = (
     "75fc9c6e487e60c3ff274a2fb8c90f6a738b30999b9e74e00c98a54f1dce52ee"
 )
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
-SOURCE_EVENT_SAMPLING_HZ = 15.0
+SOURCE_EVENT_SAMPLING_HZ = float(actor_execution.FPS)
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 CANDIDATE_COUNT = 4
@@ -203,6 +213,12 @@ SUPPLEMENT_HORIZON_CONTRACT = {
     "expert_physics_steps_or_planner_frames_used_to_compute_horizon": False,
     "candidate_or_terminal_outcomes_used_to_choose_horizon": False,
     "actor_query_stride_actions": 5,
+    "root_action_plans": actor_execution.execution_protocol(5)[
+        "supplement_root_schedule"
+    ],
+    "actor_execution_protocol_logical_sha256": actor_execution.execution_protocol(5)[
+        "logical_sha256"
+    ],
 }
 SUPPLEMENT_RESERVE_ROSTER_CONTRACT = {
     "scope": "body_local_condition_local_horizon_slot_local",
@@ -293,6 +309,9 @@ TERMINAL_HORIZON_CONTRACT = {
     "formal_episode_action_steps": 200,
     "formal_actor_query_stride_actions": 5,
     "development_remaining_action_budgets": list(range(200, 0, -5)),
+    "actor_execution_protocol_logical_sha256": actor_execution.execution_protocol(5)[
+        "logical_sha256"
+    ],
 }
 ROOT_POSE_RESTORE_ATOL = 2.384185791015625e-7
 BRANCH_ROOT_SNAPSHOT_CONTRACT = {
@@ -343,6 +362,10 @@ SUPPLEMENT_ACTOR_BRANCH_CONTRACT = {
     "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
     "expert_actions_after_root": 0,
     "continuation_controller": "same_frozen_actor_as_four_root_candidates",
+    "actor_execution_protocol_logical_sha256": actor_execution.execution_protocol(5)[
+        "logical_sha256"
+    ],
+    "actor_query_stride_actions": 5,
 }
 ABLATION_VARIANTS = (
     "success_only",
@@ -1182,10 +1205,125 @@ def state_action_frame_contract() -> dict[str, Any]:
     return dict(STATE_ACTION_FRAME_CONTRACT)
 
 
-def terminal_horizon_contract() -> dict[str, Any]:
+def validate_execution_protocol(value: Any) -> dict[str, Any]:
+    """Validate one of the two frozen actor protocols without choosing one."""
+
+    try:
+        return actor_execution.validate_execution_protocol(value)
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise FiveBodyContractError(str(error)) from error
+
+
+def validate_execution_protocol_binding(
+    value: Any, *, expected_path_root: Path | None = None
+) -> dict[str, Any]:
+    """Validate the protocol meaning and its immutable on-disk bytes."""
+
+    try:
+        return actor_execution.validate_execution_protocol_file_binding(
+            value, expected_path_root=expected_path_root
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise FiveBodyContractError(str(error)) from error
+
+
+def terminal_horizon_contract(
+    protocol: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the pre-action finite-horizon conditioning contract."""
 
-    return dict(TERMINAL_HORIZON_CONTRACT)
+    validated = validate_execution_protocol(
+        protocol if protocol is not None else actor_execution.execution_protocol(5)
+    )
+    return {
+        "array": "remaining_action_budget",
+        "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+        "available_before_candidate_execution": True,
+        "same_value_for_all_candidates_at_one_root": True,
+        "conditions_only_terminal_consequence_heads": True,
+        "direct_rank_path": False,
+        "formal_episode_action_steps": int(validated["max_steps"]),
+        "formal_actor_query_stride_actions": int(validated["stride"]),
+        "development_remaining_action_budgets": list(
+            validated["primary_remaining_action_budgets"]
+        ),
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+    }
+
+
+def supplement_horizon_contract(
+    protocol: Mapping[str, Any],
+) -> dict[str, Any]:
+    validated = validate_execution_protocol(protocol)
+    return {
+        "values": list(SUPPLEMENT_HORIZON_SCHEDULE),
+        "slot_count_per_condition": len(SUPPLEMENT_HORIZON_SCHEDULE),
+        "binding": (
+            "body_condition_horizon_slot_has_pre_registered_ordered_reserve_"
+            "seeds_before_any_rollout"
+        ),
+        "same_horizon_for_e12_e3_e4_of_one_seed": True,
+        "new_actor_branch_take_action_count_at_root": 0,
+        "remaining_action_budget_at_root_equals_bound_horizon": True,
+        "expert_physics_steps_or_planner_frames_used_to_compute_horizon": False,
+        "candidate_or_terminal_outcomes_used_to_choose_horizon": False,
+        "actor_query_stride_actions": int(validated["stride"]),
+        "root_action_plans": list(validated["supplement_root_schedule"]),
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+    }
+
+
+def supplement_actor_branch_contract(
+    protocol: Mapping[str, Any],
+) -> dict[str, Any]:
+    validated = validate_execution_protocol(protocol)
+    return {
+        "candidate_count": CANDIDATE_COUNT,
+        "candidate_generator": (
+            "collect_robotwin2_five_body_ee_candidate_branches_v1.generate_candidates"
+        ),
+        "fresh_scene_candidate_evaluator": (
+            "collect_robotwin2_five_body_ee_candidate_branches_v1._evaluate_candidate"
+        ),
+        "snapshot_restore_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
+        "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+        "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
+        "expert_actions_after_root": 0,
+        "continuation_controller": "same_frozen_actor_as_four_root_candidates",
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+        "actor_query_stride_actions": int(validated["stride"]),
+    }
+
+
+def _primary_query_plan(
+    protocol: Mapping[str, Any], query_index: int
+) -> dict[str, Any]:
+    validated = validate_execution_protocol(protocol)
+    schedule = {
+        int(row["query_index"]): row
+        for row in validated["primary_query_schedule"]
+    }
+    try:
+        return dict(schedule[query_index])
+    except KeyError as error:
+        raise FiveBodyContractError(
+            f"root query {query_index} is outside the frozen execution protocol"
+        ) from error
+
+
+def _supplement_action_plan(
+    protocol: Mapping[str, Any], horizon: int
+) -> dict[str, Any]:
+    validated = validate_execution_protocol(protocol)
+    schedule = {
+        int(row["horizon"]): row for row in validated["supplement_root_schedule"]
+    }
+    try:
+        return dict(schedule[horizon])
+    except KeyError as error:
+        raise FiveBodyContractError(
+            f"supplement horizon {horizon} is outside the frozen execution protocol"
+        ) from error
 
 
 def aggregate_risk_adjusted_rank_scores(
@@ -1358,14 +1496,46 @@ def validate_materialization_receipt(value: Mapping[str, Any]) -> dict[str, Any]
 
 
 def validate_actor_authority(
-    value: Mapping[str, Any], *, authority_dir: Path
+    value: Mapping[str, Any],
+    *,
+    authority_dir: Path,
+    execution_protocol: Mapping[str, Any] | None = None,
+    execution_protocol_binding: Mapping[str, Any] | None = None,
+    execution_protocol_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     _verify_signed(value, "actor authority")
+    protocol = validate_execution_protocol(
+        execution_protocol
+        if execution_protocol is not None
+        else value.get("actor_execution_protocol")
+    )
+    protocol_binding = (
+        dict(execution_protocol_binding)
+        if execution_protocol_binding is not None
+        else validate_execution_protocol_binding(
+            value.get("actor_execution_protocol_binding")
+        )
+    )
+    protocol_file_sha256 = (
+        execution_protocol_file_sha256
+        if execution_protocol_file_sha256 is not None
+        else protocol_binding.get("file_sha256")
+    )
+    sampling_contract = value.get("sampling_contract")
     if (
         value.get("format") != ACTOR_FORMAT
+        or value.get("path_root") != protocol_binding.get("path_root")
         or value.get("task") != TASK
         or value.get("state_action_frame_contract")
         != STATE_ACTION_FRAME_CONTRACT
+        or not isinstance(sampling_contract, Mapping)
+        or sampling_contract.get("actor_execution_protocol") != protocol
+        or sampling_contract.get("actor_execution_protocol_binding")
+        != protocol_binding
+        or sampling_contract.get("actor_execution_protocol_logical_sha256")
+        != protocol["logical_sha256"]
+        or sampling_contract.get("actor_execution_protocol_file_sha256")
+        != protocol_file_sha256
     ):
         raise FiveBodyContractError("actor authority format/task mismatch")
     actors = value.get("actors")
@@ -1402,6 +1572,8 @@ def validate_actor_authority(
         "candidate_count": CANDIDATE_COUNT,
         "same_ordered_candidate_set": True,
         "checkpoint_sha256_by_body": checkpoint_sha256_by_body,
+        "execution_protocol_logical_sha256": protocol["logical_sha256"],
+        "execution_protocol_file_sha256": protocol_file_sha256,
     }
 
 
@@ -1410,11 +1582,34 @@ def validate_body_manifest(
     *,
     expected_body: str,
     manifest_dir: Path,
+    execution_protocol: Mapping[str, Any] | None = None,
+    execution_protocol_binding: Mapping[str, Any] | None = None,
+    execution_protocol_file_sha256: str | None = None,
     expected_format: str = MANIFEST_FORMAT,
 ) -> dict[str, Any]:
     _verify_signed(value, f"{expected_body} canonical manifest")
+    protocol = validate_execution_protocol(
+        execution_protocol
+        if execution_protocol is not None
+        else value.get("actor_execution_protocol")
+    )
+    protocol_binding = (
+        dict(execution_protocol_binding)
+        if execution_protocol_binding is not None
+        else validate_execution_protocol_binding(
+            value.get("actor_execution_protocol_binding")
+        )
+    )
+    protocol_file_sha256 = (
+        execution_protocol_file_sha256
+        if execution_protocol_file_sha256 is not None
+        else protocol_binding.get("file_sha256")
+    )
+    stride = int(protocol["stride"])
+    query_indices = tuple(int(query) for query in protocol["query_indices"])
     if (
         value.get("format") != expected_format
+        or value.get("path_root") != protocol_binding.get("path_root")
         or value.get("dataset_repo") != DATASET_REPO
         or value.get("dataset_revision") != DATASET_REVISION
         or value.get("task") != TASK
@@ -1422,6 +1617,11 @@ def validate_body_manifest(
         or value.get("body") != expected_body
         or value.get("state_action_frame_contract")
         != STATE_ACTION_FRAME_CONTRACT
+        or value.get("actor_execution_protocol") != protocol
+        or value.get("actor_execution_protocol_binding")
+        != protocol_binding
+        or value.get("actor_execution_protocol_file_sha256")
+        != protocol_file_sha256
     ):
         raise FiveBodyContractError(f"canonical manifest identity mismatch for {expected_body}")
     adapter = value.get("schema_adapter")
@@ -1464,9 +1664,10 @@ def validate_body_manifest(
         or physical_time.get("wall_clock_used_as_time") is not False
         or physical_time.get("dt_semantics")
         != "planned_first_candidate_chunk_seconds"
-        or physical_time.get("planned_action_steps") != 5
+        or physical_time.get("planned_action_steps") != stride
         or physical_time.get("actor_control_hz") != SOURCE_EVENT_SAMPLING_HZ
-        or physical_time.get("planned_dt_seconds") != 5.0 / SOURCE_EVENT_SAMPLING_HZ
+        or physical_time.get("planned_dt_seconds")
+        != stride / SOURCE_EVENT_SAMPLING_HZ
         or physical_time.get("duration_semantics")
         != "simulator_elapsed_seconds_to_event_boundary"
         or physical_time.get("zero_elapsed_duration_masked") is not True
@@ -1480,7 +1681,7 @@ def validate_body_manifest(
     candidate_action = value.get("candidate_action_contract")
     if candidate_action != {
         "critic_observation_time": "before_candidate_execution",
-        "planned_action_horizon": 5,
+        "planned_action_horizon": stride,
         "action_mask_source": "planned_first_chunk_not_executed_count",
         "executed_action_count_used_for_action_mask": False,
         "executed_action_count_used_for_sim_time_accounting_only": True,
@@ -1496,7 +1697,8 @@ def validate_body_manifest(
         or value.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or value.get("event_age_contract") != EVENT_AGE_CONTRACT
-        or value.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or value.get("terminal_horizon_contract")
+        != terminal_horizon_contract(protocol)
         or value.get("branch_root_snapshot_contract")
         != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or value.get("branch_diagnostic_contract")
@@ -1516,11 +1718,21 @@ def validate_body_manifest(
             raise FiveBodyContractError("canonical group entry must be an object")
         group_id = item.get("group_id")
         condition = item.get("condition")
+        query = item.get("root_query_index")
+        primary_group = expected_format == MANIFEST_FORMAT
         if (
             not isinstance(group_id, str)
             or not group_id
             or group_id in identities
             or condition not in CONDITIONS
+            or (
+                primary_group
+                and (
+                    isinstance(query, bool)
+                    or not isinstance(query, int)
+                    or query not in query_indices
+                )
+            )
             or isinstance(item.get("requested_seed"), bool)
             or not isinstance(item.get("requested_seed"), int)
             or not _is_sha(item.get("sha256"))
@@ -1544,15 +1756,47 @@ def validate_body_manifest(
         )
         identities.add(group_id)
         conditions.add(condition)
-        normalized.append(
-            {
-                **dict(item),
-                "resolved_path": str(path),
-                "resolved_diagnostics_path": str(diagnostics_path),
-            }
-        )
+        normalized_group = {
+            **dict(item),
+            "resolved_path": str(path),
+            "resolved_diagnostics_path": str(diagnostics_path),
+            "_execution_protocol_logical_sha256": protocol[
+                "logical_sha256"
+            ],
+        }
+        if primary_group:
+            normalized_group["_query_plan"] = _primary_query_plan(
+                protocol, int(query)
+            )
+        normalized.append(normalized_group)
     if conditions != set(CONDITIONS):
         raise FiveBodyContractError(f"{expected_body} lacks clean/randomized groups")
+    if expected_format == MANIFEST_FORMAT and value.get("status") is not None:
+        expected_groups = int(protocol["branch_accounting"]["groups_per_body"])
+        expected_target = int(protocol["target_per_condition_query"])
+        counts = {
+            (condition, query): sum(
+                1
+                for group in normalized
+                if group.get("condition") == condition
+                and group.get("root_query_index") == query
+            )
+            for condition in CONDITIONS
+            for query in query_indices
+        }
+        if (
+            value.get("status")
+            != "complete_400_decisions_1600_candidate_branches"
+            or value.get("complete_decision_count") != expected_groups
+            or value.get("complete_candidate_branch_count")
+            != expected_groups * CANDIDATE_COUNT
+            or value.get("complete_per_condition_query") != expected_target
+            or len(normalized) != expected_groups
+            or set(counts.values()) != {expected_target}
+        ):
+            raise FiveBodyContractError(
+                f"{expected_body} is not complete on the frozen query allocation"
+            )
     return {
         "body": expected_body,
         "groups": normalized,
@@ -1561,6 +1805,10 @@ def validate_body_manifest(
         "event_derivation_implementation_sha256": value[
             "event_derivation_implementation_sha256"
         ],
+        "execution_protocol_logical_sha256": protocol["logical_sha256"],
+        "formal_protocol_grid_complete": (
+            expected_format == MANIFEST_FORMAT and value.get("status") is not None
+        ),
     }
 
 
@@ -1767,6 +2015,9 @@ def validate_supplement_body_manifest(
     expected_body: str,
     manifest_dir: Path,
     expected_actor_checkpoint_sha256: str,
+    execution_protocol: Mapping[str, Any] | None = None,
+    execution_protocol_binding: Mapping[str, Any] | None = None,
+    execution_protocol_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate a complete reserve-roster manifest without opening any NPZ."""
 
@@ -1774,7 +2025,15 @@ def validate_supplement_body_manifest(
         value,
         expected_body=expected_body,
         manifest_dir=manifest_dir,
+        execution_protocol=execution_protocol,
+        execution_protocol_binding=execution_protocol_binding,
+        execution_protocol_file_sha256=execution_protocol_file_sha256,
         expected_format=SUPPLEMENT_MANIFEST_FORMAT,
+    )
+    protocol = validate_execution_protocol(
+        execution_protocol
+        if execution_protocol is not None
+        else value.get("actor_execution_protocol")
     )
     _verify_signed(value, f"{expected_body} supplement manifest")
     adapter = value.get("schema_adapter")
@@ -1789,7 +2048,7 @@ def validate_supplement_body_manifest(
         or value.get("target_events") != list(SUPPLEMENT_TARGET_EVENTS)
         or value.get("instruction") != DEFAULT_INSTRUCTION
         or value.get("candidate_count") != CANDIDATE_COUNT
-        or value.get("action_exec_steps") != 5
+        or value.get("action_exec_steps") != int(protocol["stride"])
         or value.get("supplement_role")
         != "expert_event_root_outer_source_crossfit_proper_world_and_utility_rank"
         or value.get("root_policy") != "robotwin_scripted_expert"
@@ -1811,7 +2070,8 @@ def validate_supplement_body_manifest(
         or value.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or value.get("event_age_contract") != EVENT_AGE_CONTRACT
-        or value.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or value.get("terminal_horizon_contract")
+        != terminal_horizon_contract(protocol)
         or value.get("branch_root_snapshot_contract")
         != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or value.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
@@ -1832,9 +2092,9 @@ def validate_supplement_body_manifest(
         or not _is_sha(adapter.get("implementation_sha256"))
         or value.get("root_selection_contract")
         != SUPPLEMENT_ROOT_SELECTION_CONTRACT
-        or value.get("horizon_contract") != SUPPLEMENT_HORIZON_CONTRACT
+        or value.get("horizon_contract") != supplement_horizon_contract(protocol)
         or value.get("actor_branch_contract")
-        != SUPPLEMENT_ACTOR_BRANCH_CONTRACT
+        != supplement_actor_branch_contract(protocol)
     ):
         raise FiveBodyContractError(
             f"{expected_body} raw scripted-root supplement contract changed"
@@ -1905,6 +2165,12 @@ def validate_supplement_body_manifest(
                 "source_role": "proper_world_supplement",
                 "resolved_path": str(payload_path),
                 "resolved_diagnostics_path": str(diagnostics_path),
+                "_execution_protocol_logical_sha256": protocol[
+                    "logical_sha256"
+                ],
+                "_query_plan": _supplement_action_plan(
+                    protocol, int(branch_horizon)
+                ),
             }
         )
     if conditions != set(CONDITIONS):
@@ -1925,6 +2191,7 @@ def validate_supplement_body_manifest(
         ),
         "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
         "rank_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
+        "execution_protocol_logical_sha256": protocol["logical_sha256"],
         **design,
     }
 
@@ -1932,8 +2199,19 @@ def validate_supplement_body_manifest(
 def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
     binding = _read_bound_json(path, expected_sha256, "training binding")
     _verify_signed(binding, "training binding")
+    protocol = validate_execution_protocol(binding.get("actor_execution_protocol"))
+    protocol_binding = validate_execution_protocol_binding(
+        binding.get("actor_execution_protocol_binding")
+    )
+    protocol_file_sha256 = binding.get("actor_execution_protocol_file_sha256")
     if (
         binding.get("format") != BINDING_FORMAT
+        or binding.get("path_root") != protocol_binding.get("path_root")
+        or protocol_binding.get("protocol") != protocol
+        or protocol_binding.get("protocol_logical_sha256")
+        != protocol["logical_sha256"]
+        or not _is_sha(protocol_file_sha256)
+        or protocol_binding.get("file_sha256") != protocol_file_sha256
         or binding.get("dataset_repo") != DATASET_REPO
         or binding.get("dataset_revision") != DATASET_REVISION
         or binding.get("task") != TASK
@@ -1945,7 +2223,8 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
-        or binding.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or binding.get("terminal_horizon_contract")
+        != terminal_horizon_contract(protocol)
         or binding.get("branch_root_snapshot_contract")
         != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
@@ -1963,7 +2242,7 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         "remote_cuda_only": True,
     }:
         raise FiveBodyContractError("training binding lacks explicit public remote authority")
-    root = path.expanduser().resolve().parent
+    root = Path(str(protocol_binding["path_root"])).expanduser().resolve()
     materialization_path = _resolve_contained(
         root, str(binding.get("materialization_receipt", {}).get("path", "")), "materialization"
     )
@@ -1981,7 +2260,13 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         str(binding.get("actor_authority", {}).get("sha256", "")),
         "actor authority",
     )
-    actor_audit = validate_actor_authority(actors, authority_dir=actor_path.parent)
+    actor_audit = validate_actor_authority(
+        actors,
+        authority_dir=actor_path.parent,
+        execution_protocol=protocol,
+        execution_protocol_binding=protocol_binding,
+        execution_protocol_file_sha256=str(protocol_file_sha256),
+    )
     body_bindings = binding.get("body_manifests")
     if not isinstance(body_bindings, Mapping) or set(body_bindings) != set(BODIES):
         raise FiveBodyContractError("binding must contain exactly five body manifests")
@@ -1995,7 +2280,12 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
             manifest_path, str(item.get("sha256", "")), f"{body} body manifest"
         )
         manifests[body] = validate_body_manifest(
-            manifest, expected_body=body, manifest_dir=manifest_path.parent
+            manifest,
+            expected_body=body,
+            manifest_dir=manifest_path.parent,
+            execution_protocol=protocol,
+            execution_protocol_binding=protocol_binding,
+            execution_protocol_file_sha256=str(protocol_file_sha256),
         )
     event_implementations = {
         item["event_derivation_implementation_sha256"] for item in manifests.values()
@@ -2012,6 +2302,9 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         "manifests": manifests,
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": event_implementations.pop(),
+        "execution_protocol": protocol,
+        "execution_protocol_binding": protocol_binding,
+        "execution_protocol_file_sha256": protocol_file_sha256,
     }
 
 
@@ -2036,6 +2329,9 @@ def load_supplement_binding(
         actor_binding.get("sha256") if isinstance(actor_binding, Mapping) else None
     )
     materializer = binding.get("materializer_provenance")
+    protocol = validate_execution_protocol(primary_audit.get("execution_protocol"))
+    protocol_binding = primary_audit.get("execution_protocol_binding")
+    protocol_file_sha256 = primary_audit.get("execution_protocol_file_sha256")
     rejected_attempt_count = (
         materializer.get("rejected_attempt_count")
         if isinstance(materializer, Mapping)
@@ -2043,6 +2339,11 @@ def load_supplement_binding(
     )
     if (
         binding.get("format") != SUPPLEMENT_BINDING_FORMAT
+        or binding.get("path_root") != protocol_binding.get("path_root")
+        or binding.get("actor_execution_protocol") != protocol
+        or binding.get("actor_execution_protocol_binding") != protocol_binding
+        or binding.get("actor_execution_protocol_file_sha256")
+        != protocol_file_sha256
         or binding.get("dataset_repo") != DATASET_REPO
         or binding.get("dataset_revision") != DATASET_REVISION
         or binding.get("task") != TASK
@@ -2054,7 +2355,8 @@ def load_supplement_binding(
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
-        or binding.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or binding.get("terminal_horizon_contract")
+        != terminal_horizon_contract(protocol)
         or binding.get("branch_root_snapshot_contract")
         != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
@@ -2102,7 +2404,7 @@ def load_supplement_binding(
         raise FiveBodyContractError(
             "supplement binding must contain exactly five body manifests"
         )
-    root = path.expanduser().resolve().parent
+    root = Path(str(protocol_binding["path_root"])).expanduser().resolve()
     manifests: dict[str, dict[str, Any]] = {}
     heldout_manifest_binding: dict[str, Any] | None = None
     source_rejected_attempt_count = 0
@@ -2160,6 +2462,9 @@ def load_supplement_binding(
             expected_actor_checkpoint_sha256=str(
                 primary_audit["actor"]["checkpoint_sha256_by_body"][body]
             ),
+            execution_protocol=protocol,
+            execution_protocol_binding=protocol_binding,
+            execution_protocol_file_sha256=str(protocol_file_sha256),
         )
         if len(manifests[body]["groups"]) != int(item["group_count"]):
             raise FiveBodyContractError(
@@ -2230,6 +2535,8 @@ def load_supplement_binding(
         "heldout_manifest_binding": heldout_manifest_binding,
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": implementations.pop(),
+        "execution_protocol_logical_sha256": protocol["logical_sha256"],
+        "execution_protocol_file_sha256": protocol_file_sha256,
         "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
         "rank_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
         "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
@@ -2239,9 +2546,12 @@ def load_supplement_binding(
     }
 
 
-def _declared_root_query_index(group: Mapping[str, Any]) -> int | None:
+def _declared_root_query_index(
+    group: Mapping[str, Any], *, query_indices: Sequence[int]
+) -> int | None:
+    legal = {int(query) for query in query_indices}
     value = group.get("root_query_index")
-    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 40:
+    if isinstance(value, int) and not isinstance(value, bool) and value in legal:
         return int(value)
     identity = str(group.get("group_id", ""))
     marker = "|query="
@@ -2252,7 +2562,7 @@ def _declared_root_query_index(group: Mapping[str, Any]) -> int | None:
         parsed = int(suffix)
     except ValueError:
         return None
-    return parsed if 0 <= parsed < 40 else None
+    return parsed if parsed in legal else None
 
 
 def _horizon_covering_validation_seeds(
@@ -2260,6 +2570,7 @@ def _horizon_covering_validation_seeds(
     *,
     ordered_seeds: Sequence[int],
     target_count: int,
+    query_indices: Sequence[int],
 ) -> set[int]:
     """Choose label-blind validation seeds covering every formal horizon.
 
@@ -2277,11 +2588,16 @@ def _horizon_covering_validation_seeds(
         seed: {
             query
             for group in by_seed[seed]
-            if (query := _declared_root_query_index(group)) is not None
+            if (
+                query := _declared_root_query_index(
+                    group, query_indices=query_indices
+                )
+            )
+            is not None
         }
         for seed in ordered_seeds
     }
-    formal_queries = set(range(40))
+    formal_queries = {int(query) for query in query_indices}
     if set().union(*query_by_seed.values()) != formal_queries:
         return set(ordered_seeds[:target_count])
 
@@ -2349,6 +2665,8 @@ def source_group_split(
     training: list[dict[str, Any]] = []
     validation: list[dict[str, Any]] = []
     heldout: list[dict[str, Any]] = []
+    protocol = validate_execution_protocol(audit.get("execution_protocol"))
+    query_indices = tuple(int(query) for query in protocol["query_indices"])
     for body in BODIES:
         groups = list(audit["manifests"][body]["groups"])
         if body == held_out_body:
@@ -2376,6 +2694,7 @@ def source_group_split(
                 by_seed,
                 ordered_seeds=ordered_seeds,
                 target_count=validation_seed_count,
+                query_indices=query_indices,
             )
             for seed in ordered_seeds:
                 target = validation if seed in validation_seeds else training
@@ -2466,6 +2785,8 @@ def build_preflight_receipt(
     training, validation, heldout = source_group_split(
         audit, held_out_body=held_out_body, split_seed=split_seed
     )
+    protocol = validate_execution_protocol(audit.get("execution_protocol"))
+    query_indices = [int(query) for query in protocol["query_indices"]]
 
     def identity(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         return sorted(f"{row.get('body', held_out_body)}|{row['group_id']}" for row in rows)
@@ -2475,7 +2796,9 @@ def build_preflight_receipt(
     ) -> dict[str, list[int]]:
         result: dict[str, set[int]] = defaultdict(set)
         for row in rows:
-            query = _declared_root_query_index(row)
+            query = _declared_root_query_index(
+                row, query_indices=query_indices
+            )
             if query is not None:
                 result[f"{row['body']}|{row['condition']}"].add(query)
         return {key: sorted(values) for key, values in sorted(result.items())}
@@ -2488,14 +2811,15 @@ def build_preflight_receipt(
         if body != held_out_body
         for condition in CONDITIONS
     }
-    formal_horizon_coverage = bool(training_query_coverage) or bool(
-        validation_query_coverage
+    formal_horizon_coverage = all(
+        bool(audit["manifests"][body].get("formal_protocol_grid_complete"))
+        for body in BODIES
     )
     if formal_horizon_coverage and (
         set(training_query_coverage) != expected_units
         or set(validation_query_coverage) != expected_units
-        or any(values != list(range(40)) for values in training_query_coverage.values())
-        or any(values != list(range(40)) for values in validation_query_coverage.values())
+        or any(values != query_indices for values in training_query_coverage.values())
+        or any(values != query_indices for values in validation_query_coverage.values())
     ):
         raise FiveBodyContractError(
             "source train/validation split does not cover every formal query"
@@ -2531,6 +2855,13 @@ def build_preflight_receipt(
             "event_derivation_implementation_sha256"
         ],
         "binding_file_sha256": audit["binding_file_sha256"],
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_binding": audit[
+            "execution_protocol_binding"
+        ],
+        "actor_execution_protocol_file_sha256": audit[
+            "execution_protocol_file_sha256"
+        ],
         "held_out_body": held_out_body,
         "source_bodies": [body for body in BODIES if body != held_out_body],
         "split_seed": split_seed,
@@ -2637,6 +2968,26 @@ def build_preflight_receipt(
 
 
 def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
+    query_plan = group.get("_query_plan")
+    if not isinstance(query_plan, Mapping):
+        raise FiveBodyContractError(
+            "source group is missing its frozen execution-protocol action plan"
+        )
+    planned_steps = query_plan.get("planned_steps")
+    planned_dt_seconds = query_plan.get("planned_dt_seconds")
+    expected_remaining_budget = query_plan.get("remaining_action_budget")
+    if (
+        isinstance(planned_steps, bool)
+        or not isinstance(planned_steps, int)
+        or planned_steps <= 0
+        or isinstance(planned_dt_seconds, bool)
+        or not isinstance(planned_dt_seconds, (int, float))
+        or not math.isfinite(float(planned_dt_seconds))
+        or isinstance(expected_remaining_budget, bool)
+        or not isinstance(expected_remaining_budget, int)
+        or expected_remaining_budget <= 0
+    ):
+        raise FiveBodyContractError("source group execution-protocol plan is invalid")
     path = Path(str(group["resolved_path"]))
     if not path.is_file() or sha256_file(path) != group["sha256"]:
         raise FiveBodyContractError(f"source canonical group missing/tampered: {path}")
@@ -2736,9 +3087,11 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
     if np.any(arrays["dt"] <= 0):
         raise FiveBodyContractError(f"{path} contains non-positive planned dt")
     if not np.allclose(
-        arrays["dt"], 5.0 / SOURCE_EVENT_SAMPLING_HZ, atol=1e-6, rtol=0.0
+        arrays["dt"], float(planned_dt_seconds), atol=1e-6, rtol=0.0
     ):
-        raise FiveBodyContractError(f"{path} planned dt is not fixed 5/15 seconds")
+        raise FiveBodyContractError(
+            f"{path} planned dt differs from the frozen execution protocol"
+        )
     if np.any(arrays["event_age_seconds"] < 0.0) or not np.allclose(
         arrays["event_age_seconds"],
         arrays["event_age_seconds"][:1],
@@ -2757,12 +3110,14 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
         raise FiveBodyContractError(
             f"{path} candidates do not share one positive remaining action budget"
         )
-    if not np.all(np.isin(
+    if not np.allclose(
         arrays["remaining_action_budget"],
-        TERMINAL_HORIZON_CONTRACT["development_remaining_action_budgets"],
-    )):
+        float(expected_remaining_budget),
+        atol=0.0,
+        rtol=0.0,
+    ):
         raise FiveBodyContractError(
-            f"{path} remaining action budget is outside the formal query grid"
+            f"{path} remaining action budget differs from its frozen query plan"
         )
     height_reference = np.asarray(
         arrays["success_height_reference_z"], dtype=np.float64
@@ -2798,8 +3153,8 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
             "administrative finite-horizon censoring"
         )
     horizon = arrays["actions"].shape[1]
-    planned_mask = np.arange(horizon) < 5
-    if horizon < 5 or not np.array_equal(
+    planned_mask = np.arange(horizon) < planned_steps
+    if horizon < planned_steps or not np.array_equal(
         np.asarray(arrays["action_mask"], dtype=bool),
         np.repeat(planned_mask[None], CANDIDATE_COUNT, axis=0),
     ):
@@ -7675,7 +8030,18 @@ def _train_fold(
                 "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
                 "state_action_frame_contract": state_action_frame_contract(),
                 "event_age_contract": event_age_contract(),
-                "terminal_horizon_contract": terminal_horizon_contract(),
+                "terminal_horizon_contract": terminal_horizon_contract(
+                    preflight["actor_execution_protocol"]
+                ),
+                "actor_execution_protocol": preflight[
+                    "actor_execution_protocol"
+                ],
+                "actor_execution_protocol_binding": preflight[
+                    "actor_execution_protocol_binding"
+                ],
+                "actor_execution_protocol_file_sha256": preflight[
+                    "actor_execution_protocol_file_sha256"
+                ],
                 "event_spec_sha256": EVENT_SPEC_SHA256,
                 "event_derivation_implementation_sha256": preflight[
                     "event_derivation_implementation_sha256"
@@ -7753,7 +8119,16 @@ def _train_fold(
         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
         "state_action_frame_contract": state_action_frame_contract(),
         "event_age_contract": event_age_contract(),
-        "terminal_horizon_contract": terminal_horizon_contract(),
+        "terminal_horizon_contract": terminal_horizon_contract(
+            preflight["actor_execution_protocol"]
+        ),
+        "actor_execution_protocol": preflight["actor_execution_protocol"],
+        "actor_execution_protocol_binding": preflight[
+            "actor_execution_protocol_binding"
+        ],
+        "actor_execution_protocol_file_sha256": preflight[
+            "actor_execution_protocol_file_sha256"
+        ],
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": preflight[
             "event_derivation_implementation_sha256"

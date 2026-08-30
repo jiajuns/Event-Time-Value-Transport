@@ -34,14 +34,23 @@ from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Sequence
 
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 
 
 FORMAT = "etsf_robotwin2_five_body_branches_to_lobo_watcher_v1"
 FINAL_FORMAT = "etsf_robotwin2_five_body_lobo_source_validation_aggregate_v1"
-BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v2_endpose_frame"
-ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
-COLLECTOR_FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v2_endpose_frame"
+BINDING_FORMAT = (
+    "etsf_robotwin2_five_body_lobo_training_binding_v3_actor_execution_protocol"
+)
+ACTOR_FORMAT = (
+    "etsf_robotwin2_frozen_native_actor_authority_v3_actor_execution_protocol"
+)
+MANIFEST_FORMAT = (
+    "etsf_robotwin2_canonical_transition_manifest_v3_actor_execution_protocol"
+)
+COLLECTOR_FORMAT = (
+    "etsf_robotwin2_five_body_ee_candidate_branches_v3_actor_execution_protocol"
+)
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
@@ -69,9 +78,10 @@ STATE_ACTION_FRAME_CONTRACT = {
 SEED_START = 2026082000
 DEVELOPMENT_SEED_STOP = 2026090000
 SEEDS_PER_CONDITION_QUERY = 5
-# Preserve exactly 200 decisions per body/condition while covering every
-# remaining-budget value used by the formal five-action online scorer.
+# Import-time execute-5 compatibility values.  Production reconfigures these
+# only from the frozen primary binding before inspecting collection progress.
 QUERY_INDICES = tuple(range(40))
+ACTION_EXEC_STEPS = 5
 CANDIDATE_NOISE_CONTRACT = {
     "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
     "candidate_indices": [0, 1, 2, 3],
@@ -113,6 +123,9 @@ TERMINAL_HORIZON_CONTRACT = {
     "formal_episode_action_steps": 200,
     "formal_actor_query_stride_actions": 5,
     "development_remaining_action_budgets": list(range(200, 0, -5)),
+    "actor_execution_protocol_logical_sha256": actor_execution.execution_protocol(5)[
+        "logical_sha256"
+    ],
 }
 ROOT_POSE_RESTORE_ATOL = 2.384185791015625e-7
 BRANCH_ROOT_SNAPSHOT_CONTRACT = {
@@ -168,6 +181,8 @@ DECISIONS_PER_BODY_CONDITION = SEEDS_PER_CONDITION_QUERY * len(QUERY_INDICES)
 DECISIONS_PER_BODY = len(CONDITIONS) * DECISIONS_PER_BODY_CONDITION
 TOTAL_DECISIONS = len(BODIES) * DECISIONS_PER_BODY
 TOTAL_BRANCHES = TOTAL_DECISIONS * CANDIDATE_COUNT
+_ACTIVE_EXECUTION_PROTOCOL = actor_execution.execution_protocol(5)
+_ACTIVE_EXECUTION_PROTOCOL_BINDING: dict[str, Any] | None = None
 EXPECTED_GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
 ENSEMBLE_SEEDS = (20260901, 20260902, 20260903, 20260904, 20260905)
 SUPPLEMENT_SPLIT_SEED = 20260901
@@ -403,6 +418,89 @@ def verify_logical_sha(value: Mapping[str, Any], label: str) -> None:
     observed = unsigned.pop("logical_sha256", None)
     if observed != canonical_sha256(unsigned):
         raise LoboWatcherError(f"{label} logical SHA-256 mismatch")
+
+
+def terminal_horizon_contract(
+    protocol: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        validated = actor_execution.validate_execution_protocol(protocol)
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise LoboWatcherError(str(error)) from error
+    return {
+        "array": "remaining_action_budget",
+        "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+        "available_before_candidate_execution": True,
+        "same_value_for_all_candidates_at_one_root": True,
+        "conditions_only_terminal_consequence_heads": True,
+        "direct_rank_path": False,
+        "formal_episode_action_steps": int(validated["max_steps"]),
+        "formal_actor_query_stride_actions": int(validated["stride"]),
+        "development_remaining_action_budgets": list(
+            validated["primary_remaining_action_budgets"]
+        ),
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+    }
+
+
+def configure_execution_protocol(
+    protocol: Mapping[str, Any],
+    *,
+    protocol_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Configure the watcher only from an already bound frozen protocol."""
+
+    try:
+        validated = actor_execution.validate_execution_protocol(protocol)
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise LoboWatcherError(str(error)) from error
+    global QUERY_INDICES, SEEDS_PER_CONDITION_QUERY, ACTION_EXEC_STEPS
+    global TERMINAL_HORIZON_CONTRACT, DECISIONS_PER_BODY_CONDITION
+    global DECISIONS_PER_BODY, TOTAL_DECISIONS, TOTAL_BRANCHES
+    global _ACTIVE_EXECUTION_PROTOCOL, _ACTIVE_EXECUTION_PROTOCOL_BINDING
+    QUERY_INDICES = tuple(int(query) for query in validated["query_indices"])
+    SEEDS_PER_CONDITION_QUERY = int(validated["target_per_condition_query"])
+    ACTION_EXEC_STEPS = int(validated["stride"])
+    TERMINAL_HORIZON_CONTRACT = terminal_horizon_contract(validated)
+    DECISIONS_PER_BODY_CONDITION = SEEDS_PER_CONDITION_QUERY * len(QUERY_INDICES)
+    DECISIONS_PER_BODY = len(CONDITIONS) * DECISIONS_PER_BODY_CONDITION
+    TOTAL_DECISIONS = len(BODIES) * DECISIONS_PER_BODY
+    TOTAL_BRANCHES = TOTAL_DECISIONS * CANDIDATE_COUNT
+    if TOTAL_BRANCHES != actor_execution.EXPECTED_TOTAL_BRANCHES:
+        raise LoboWatcherError("execution protocol no longer allocates 8,000 branches")
+    _ACTIVE_EXECUTION_PROTOCOL = dict(validated)
+    _ACTIVE_EXECUTION_PROTOCOL_BINDING = (
+        dict(protocol_binding) if protocol_binding is not None else None
+    )
+    return dict(validated)
+
+
+def load_primary_execution_protocol(binding_path: Path) -> dict[str, Any]:
+    """Load and byte-verify the frozen protocol declared by the primary binding."""
+
+    binding = read_json(binding_path, "training binding")
+    verify_logical_sha(binding, "training binding")
+    if binding.get("format") != BINDING_FORMAT:
+        raise LoboWatcherError("training binding format is not protocol-bound")
+    try:
+        protocol_binding = actor_execution.validate_execution_protocol_file_binding(
+            binding.get("actor_execution_protocol_binding")
+        )
+        protocol = actor_execution.validate_execution_protocol(
+            binding.get("actor_execution_protocol")
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise LoboWatcherError(str(error)) from error
+    if (
+        binding.get("path_root") != protocol_binding.get("path_root")
+        or protocol_binding.get("protocol") != protocol
+        or binding.get("actor_execution_protocol_file_sha256")
+        != protocol_binding.get("file_sha256")
+    ):
+        raise LoboWatcherError("training binding execution protocol changed")
+    return configure_execution_protocol(
+        protocol, protocol_binding=protocol_binding
+    )
 
 
 def fold_training_command(
@@ -982,7 +1080,21 @@ def expected_shape(name: str, horizon: int) -> tuple[int, ...]:
     return (CANDIDATE_COUNT,)
 
 
-def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
+def validate_decision_npz(
+    path: Path,
+    expected_sha256: str,
+    *,
+    execution_protocol: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        protocol = actor_execution.validate_execution_protocol(
+            execution_protocol
+            if execution_protocol is not None
+            else _ACTIVE_EXECUTION_PROTOCOL
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise LoboWatcherError(str(error)) from error
+    planned_steps = int(protocol["stride"])
     if not path.is_file() or path.is_symlink():
         raise LoboWatcherError(f"decision payload is missing/symlink: {path}")
     if sha256_file(path) != expected_sha256:
@@ -1028,10 +1140,15 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                 action_mask = _read_exact(
                     stream, CANDIDATE_COUNT * horizon, "action_mask"
                 )
-            planned_row = bytes([1] * 5 + [0] * (horizon - 5)) if horizon >= 5 else b""
-            if horizon < 5 or action_mask != planned_row * CANDIDATE_COUNT:
+            planned_row = (
+                bytes([1] * planned_steps + [0] * (horizon - planned_steps))
+                if horizon >= planned_steps
+                else b""
+            )
+            if horizon < planned_steps or action_mask != planned_row * CANDIDATE_COUNT:
                 raise LoboWatcherError(
-                    f"decision action mask is not the full planned first five steps: {path}"
+                    "decision action mask is not the frozen planned prefix: "
+                    f"{path}"
                 )
             with archive.open("candidate_index.npy") as stream:
                 header = read_npy_header(stream, f"{path}:candidate_index")
@@ -1047,8 +1164,11 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                 elapsed = struct.unpack(byte_order + "4f", _read_exact(stream, 16, "dt"))
             if any(not math.isfinite(value) or value <= 0 for value in elapsed):
                 raise LoboWatcherError(f"decision contains non-positive planned dt: {path}")
-            if any(abs(value - 5.0 / 15.0) > 1e-6 for value in elapsed):
-                raise LoboWatcherError(f"decision planned dt is not fixed 5/15 seconds: {path}")
+            expected_dt = planned_steps / float(protocol["fps"])
+            if any(abs(value - expected_dt) > 1e-6 for value in elapsed):
+                raise LoboWatcherError(
+                    f"decision planned dt differs from the frozen protocol: {path}"
+                )
             with archive.open("event_age_seconds.npy") as stream:
                 header = read_npy_header(stream, f"{path}:event_age_seconds")
                 byte_order = "<" if header["descr"] == "<f4" else "="
@@ -1075,8 +1195,8 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                 raise LoboWatcherError(
                     f"decision candidates do not share one positive remaining budget: {path}"
                 )
-            if remaining_budget[0] not in TERMINAL_HORIZON_CONTRACT[
-                "development_remaining_action_budgets"
+            if remaining_budget[0] not in protocol[
+                "primary_remaining_action_budgets"
             ]:
                 raise LoboWatcherError(
                     f"decision remaining budget is outside the formal query grid: {path}"
@@ -1117,11 +1237,12 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                 if stream.read(1):
                     raise LoboWatcherError(f"decision actions contain trailing bytes: {path}")
             pairwise_rms: list[list[float]] = []
+            diagnostic_prefix = min(5, planned_steps)
             for left in range(CANDIDATE_COUNT):
                 row = []
                 for right in range(CANDIDATE_COUNT):
                     squared = 0.0
-                    for step in range(5):
+                    for step in range(diagnostic_prefix):
                         for channel in range(14):
                             left_index = (left * horizon + step) * 14 + channel
                             right_index = (right * horizon + step) * 14 + channel
@@ -1129,7 +1250,7 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                                 action_values[left_index] - action_values[right_index]
                             )
                             squared += difference * difference
-                    row.append(math.sqrt(squared / float(5 * 14)))
+                    row.append(math.sqrt(squared / float(diagnostic_prefix * 14)))
                 pairwise_rms.append(row)
             first_translation_norm: list[list[float]] = []
             later_translation_norm_median: list[list[float]] = []
@@ -1150,7 +1271,9 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
 
                     first_row.append(norm_at(0))
                     later_row.append(
-                        statistics.median(norm_at(step) for step in range(1, 5))
+                        statistics.median(
+                            norm_at(step) for step in range(1, diagnostic_prefix)
+                        )
                     )
                 first_translation_norm.append(first_row)
                 later_translation_norm_median.append(later_row)
@@ -1159,6 +1282,8 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
     return {
         "candidate_count": 4,
         "action_horizon": horizon,
+        "planned_steps": planned_steps,
+        "planned_dt_seconds": planned_steps / float(protocol["fps"]),
         "remaining_action_budget": float(remaining_budget[0]),
         "candidate_action_pairwise_rms": pairwise_rms,
         "candidate_first_token_translation_norm_m": first_translation_norm,
@@ -1220,9 +1345,11 @@ def validate_diagnostic_npz(
                     raise LoboWatcherError(
                         f"diagnostic first_executed contains trailing bytes: {path}"
                     )
-            if any(value < 0 or value > 5 for value in first_executed):
+            planned_steps = int(expected_diagnostics["planned_steps"])
+            if any(value < 0 or value > planned_steps for value in first_executed):
                 raise LoboWatcherError(
-                    f"diagnostic first_executed is outside planned first five steps: {path}"
+                    "diagnostic first_executed is outside the frozen planned "
+                    f"prefix: {path}"
                 )
             with archive.open("branch_error.npy") as stream:
                 read_npy_header(stream, f"{path}:branch_error")
@@ -1353,7 +1480,12 @@ def collection_progress(branches_root: Path) -> dict[str, Any]:
     }
 
 
-def validate_supplement_frame_binding(path: Path) -> dict[str, Any]:
+def validate_supplement_frame_binding(
+    path: Path,
+    *,
+    execution_protocol: Mapping[str, Any] | None = None,
+    execution_protocol_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Reject legacy supplement bindings before any manifest/payload access."""
 
     value = read_json(path, "supplement binding")
@@ -1363,6 +1495,24 @@ def validate_supplement_frame_binding(path: Path) -> dict[str, Any]:
             "supplement binding is legacy/diagnostic-only: missing the "
             "endpose state/action frame contract"
         )
+    if execution_protocol is not None:
+        try:
+            protocol = actor_execution.validate_execution_protocol(
+                execution_protocol
+            )
+        except actor_execution.ActorExecutionProtocolError as error:
+            raise LoboWatcherError(str(error)) from error
+        if (
+            value.get("actor_execution_protocol") != protocol
+            or value.get("actor_execution_protocol_binding")
+            != execution_protocol_binding
+            or not isinstance(execution_protocol_binding, Mapping)
+            or value.get("actor_execution_protocol_file_sha256")
+            != execution_protocol_binding.get("file_sha256")
+        ):
+            raise LoboWatcherError(
+                "supplement binding does not share the primary execution protocol SHA"
+            )
     return dict(value)
 
 
@@ -1410,8 +1560,24 @@ def reject_irrecoverable_progress(progress: Mapping[str, Any]) -> None:
 
 
 def validate_complete_collection(
-    branches_root: Path, actor_checkpoint: Path
+    branches_root: Path,
+    actor_checkpoint: Path,
+    *,
+    execution_protocol: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    try:
+        protocol = actor_execution.validate_execution_protocol(
+            execution_protocol
+            if execution_protocol is not None
+            else _ACTIVE_EXECUTION_PROTOCOL
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise LoboWatcherError(str(error)) from error
+    query_indices = tuple(int(query) for query in protocol["query_indices"])
+    target_per_query = int(protocol["target_per_condition_query"])
+    stride = int(protocol["stride"])
+    expected_groups_per_body = int(protocol["branch_accounting"]["groups_per_body"])
+    protocol_binding = _ACTIVE_EXECUTION_PROTOCOL_BINDING
     manifest_bindings: dict[str, dict[str, str]] = {}
     manifest_audits: dict[str, Any] = {}
     shared_adapter_sha: str | None = None
@@ -1438,6 +1604,12 @@ def validate_complete_collection(
             ) from error
         if (
             manifest.get("format") != MANIFEST_FORMAT
+            or manifest.get("path_root")
+            != (
+                protocol_binding.get("path_root")
+                if isinstance(protocol_binding, Mapping)
+                else None
+            )
             or manifest.get("collector_format") != COLLECTOR_FORMAT
             or manifest.get("dataset_repo") != DATASET_REPO
             or manifest.get("dataset_revision") != DATASET_REVISION
@@ -1446,23 +1618,32 @@ def validate_complete_collection(
             or manifest.get("body") != body
             or manifest.get("state_action_frame_contract")
             != STATE_ACTION_FRAME_CONTRACT
+            or manifest.get("actor_execution_protocol") != protocol
+            or manifest.get("actor_execution_protocol_binding")
+            != protocol_binding
+            or manifest.get("actor_execution_protocol_file_sha256")
+            != (
+                protocol_binding.get("file_sha256")
+                if isinstance(protocol_binding, Mapping)
+                else None
+            )
             or manifest.get("status")
             != "complete_400_decisions_1600_candidate_branches"
             or not isinstance(manifest.get("collector_file_sha256"), str)
             or len(manifest["collector_file_sha256"]) != 64
             or manifest.get("actor_checkpoint") != str(actor_checkpoint)
             or manifest.get("candidate_count") != CANDIDATE_COUNT
-            or manifest.get("action_exec_steps") != 5
-            or manifest.get("max_episode_action_steps") != 200
+            or manifest.get("action_exec_steps") != stride
+            or manifest.get("max_episode_action_steps") != protocol["max_steps"]
             or manifest.get("candidate_zero_is_actor_baseline") is not True
             or manifest.get("same_ordered_candidate_set_for_baseline_and_etsf") is not True
-            or manifest.get("root_query_indices") != list(QUERY_INDICES)
+            or manifest.get("root_query_indices") != list(query_indices)
             or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
             or manifest.get("terminal_supervision_contract")
             != TERMINAL_SUPERVISION_CONTRACT
             or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
             or manifest.get("terminal_horizon_contract")
-            != TERMINAL_HORIZON_CONTRACT
+            != terminal_horizon_contract(protocol)
             or manifest.get("branch_root_snapshot_contract")
             != BRANCH_ROOT_SNAPSHOT_CONTRACT
             or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
@@ -1498,9 +1679,10 @@ def validate_complete_collection(
             or physical_time.get("wall_clock_used_as_time") is not False
             or physical_time.get("dt_semantics")
             != "planned_first_candidate_chunk_seconds"
-            or physical_time.get("planned_action_steps") != 5
-            or physical_time.get("actor_control_hz") != 15.0
-            or physical_time.get("planned_dt_seconds") != 5.0 / 15.0
+            or physical_time.get("planned_action_steps") != stride
+            or physical_time.get("actor_control_hz") != float(protocol["fps"])
+            or physical_time.get("planned_dt_seconds")
+            != stride / float(protocol["fps"])
             or physical_time.get("duration_semantics")
             != "simulator_elapsed_seconds_to_event_boundary"
             or physical_time.get("zero_elapsed_duration_masked") is not True
@@ -1510,7 +1692,7 @@ def validate_complete_collection(
             or candidate_action
             != {
                 "critic_observation_time": "before_candidate_execution",
-                "planned_action_horizon": 5,
+                "planned_action_horizon": stride,
                 "action_mask_source": "planned_first_chunk_not_executed_count",
                 "executed_action_count_used_for_action_mask": False,
                 "executed_action_count_used_for_sim_time_accounting_only": True,
@@ -1545,7 +1727,7 @@ def validate_complete_collection(
                 "five bodies do not share one adapter/event specification/implementation"
             )
         groups = manifest.get("groups")
-        if not isinstance(groups, list) or len(groups) != DECISIONS_PER_BODY:
+        if not isinstance(groups, list) or len(groups) != expected_groups_per_body:
             raise LoboWatcherError(f"{body} does not contain exactly 400 decisions")
         observed_ids: set[str] = set()
         observed_paths: set[str] = set()
@@ -1554,7 +1736,7 @@ def validate_complete_collection(
         seeds_by_unit = {
             (condition, query): set()
             for condition in CONDITIONS
-            for query in QUERY_INDICES
+            for query in query_indices
         }
         for item in groups:
             if not isinstance(item, Mapping):
@@ -1571,7 +1753,7 @@ def validate_complete_collection(
                 or not isinstance(seed, int)
                 or not SEED_START <= seed < DEVELOPMENT_SEED_STOP
                 or isinstance(query, bool)
-                or query not in QUERY_INDICES
+                or query not in query_indices
                 or seed in seeds_by_unit[(str(condition), int(query))]
             ):
                 raise LoboWatcherError(f"{body} has an unexpected/duplicate group identity")
@@ -1611,8 +1793,22 @@ def validate_complete_collection(
                 payload.resolve().relative_to((branches_root / body).resolve())
             except ValueError as error:
                 raise LoboWatcherError(f"{body}/{group_id} payload escapes body root") from error
-            decision = validate_decision_npz(payload, str(item["sha256"]))
-            if decision["remaining_action_budget"] != 200.0 - 5.0 * query:
+            decision = validate_decision_npz(
+                payload,
+                str(item["sha256"]),
+                execution_protocol=protocol,
+            )
+            expected_plan = protocol["primary_query_schedule"][int(query)]
+            if (
+                decision["remaining_action_budget"]
+                != float(expected_plan["remaining_action_budget"])
+                or decision["planned_steps"] != expected_plan["planned_steps"]
+                or abs(
+                    decision["planned_dt_seconds"]
+                    - float(expected_plan["planned_dt_seconds"])
+                )
+                > 1e-9
+            ):
                 raise LoboWatcherError(
                     f"{body}/{group_id} remaining budget disagrees with query index"
                 )
@@ -1639,12 +1835,13 @@ def validate_complete_collection(
             decision_count += 1
             branch_count += int(decision["candidate_count"])
         if any(
-            len(seeds_by_unit[(condition, query)]) != SEEDS_PER_CONDITION_QUERY
+            len(seeds_by_unit[(condition, query)]) != target_per_query
             for condition in CONDITIONS
-            for query in QUERY_INDICES
+            for query in query_indices
         ):
             raise LoboWatcherError(
-                f"{body} does not contain five unique development seeds per condition/query"
+                f"{body} does not contain the protocol target of unique "
+                "development seeds per condition/query"
             )
         disk_paths = {
             path.relative_to(branches_root / body).as_posix()
@@ -1682,7 +1879,7 @@ def validate_complete_collection(
                     ),
                 }
                 for condition in CONDITIONS
-                for query in QUERY_INDICES
+                for query in query_indices
             },
             "manifest_file_sha256": before_sha,
             "manifest_logical_sha256": manifest["logical_sha256"],
@@ -1707,7 +1904,9 @@ def validate_complete_collection(
         "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
         "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
         "event_age_contract": EVENT_AGE_CONTRACT,
-        "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+        "terminal_horizon_contract": terminal_horizon_contract(protocol),
+        "actor_execution_protocol": protocol,
+        "actor_execution_protocol_binding": protocol_binding,
         "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
         "object_effect_schema": OBJECT_EFFECT_SCHEMA,
         "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
@@ -1996,6 +2195,10 @@ def summarize_fold(
     members = summary.get("members")
     ensemble_selection = summary.get("ensemble_checkpoint_selection")
     supplement = summary.get("proper_world_supplement")
+    protocol = actor_execution.validate_execution_protocol(
+        _ACTIVE_EXECUTION_PROTOCOL
+    )
+    protocol_binding = _ACTIVE_EXECUTION_PROTOCOL_BINDING
     supplement_selection_audit: dict[str, Any] | None = None
     if expected_supplement_binding_sha256 is None:
         supplement_matches = (
@@ -2077,6 +2280,11 @@ def summarize_fold(
         summary.get("status") != "source_only_checkpoint_selection_complete"
         or summary.get("state_action_frame_contract")
         != STATE_ACTION_FRAME_CONTRACT
+        or summary.get("actor_execution_protocol") != protocol
+        or summary.get("actor_execution_protocol_binding") != protocol_binding
+        or not isinstance(protocol_binding, Mapping)
+        or summary.get("actor_execution_protocol_file_sha256")
+        != protocol_binding.get("file_sha256")
         or summary.get("held_out_body") != held_out_body
         or not isinstance(members, list)
         or len(members) != 5
@@ -2092,6 +2300,11 @@ def summarize_fold(
         or not isinstance(summary.get("preflight"), Mapping)
         or summary["preflight"].get("binding_file_sha256")
         != expected_binding_sha256
+        or summary["preflight"].get("actor_execution_protocol") != protocol
+        or summary["preflight"].get("actor_execution_protocol_binding")
+        != protocol_binding
+        or summary["preflight"].get("actor_execution_protocol_file_sha256")
+        != protocol_binding.get("file_sha256")
         or not supplement_matches
         or not isinstance(summary.get("trainer_file_sha256"), str)
         or len(summary["trainer_file_sha256"]) != 64
@@ -2302,8 +2515,15 @@ def validate_existing_authorities(
     verify_logical_sha(actor_authority, "actor authority")
     sampling_contract = actor_authority.get("sampling_contract")
     actors = actor_authority.get("actors")
+    protocol = actor_execution.validate_execution_protocol(
+        _ACTIVE_EXECUTION_PROTOCOL
+    )
+    protocol_binding = _ACTIVE_EXECUTION_PROTOCOL_BINDING
+    if not isinstance(protocol_binding, Mapping):
+        raise LoboWatcherError("primary execution protocol was not file-bound")
     if (
         actor_authority.get("format") != ACTOR_FORMAT
+        or actor_authority.get("path_root") != protocol_binding["path_root"]
         or actor_authority.get("task") != TASK
         or actor_authority.get("dataset_repo") != DATASET_REPO
         or actor_authority.get("dataset_revision") != DATASET_REVISION
@@ -2313,7 +2533,10 @@ def validate_existing_authorities(
         != STATE_ACTION_FRAME_CONTRACT
         or not isinstance(sampling_contract, Mapping)
         or sampling_contract.get("format")
-        != "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v2_endpose_frame"
+        != (
+            "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v3_"
+            "actor_execution_protocol"
+        )
         or sampling_contract.get("frozen_actor_checkpoint_tree_sha256")
         != checkpoint_sha
         or sampling_contract.get("collector_file_sha256")
@@ -2331,9 +2554,11 @@ def validate_existing_authorities(
         != CANDIDATE_NOISE_CONTRACT
         or sampling_contract.get("instruction") != DEFAULT_INSTRUCTION
         or sampling_contract.get("conditions") != list(CONDITIONS)
-        or sampling_contract.get("root_query_indices") != list(QUERY_INDICES)
-        or sampling_contract.get("action_exec_steps") != 5
-        or sampling_contract.get("max_policy_action_calls") != 200
+        or sampling_contract.get("root_query_indices")
+        != list(protocol["query_indices"])
+        or sampling_contract.get("action_exec_steps") != protocol["stride"]
+        or sampling_contract.get("max_policy_action_calls")
+        != protocol["max_steps"]
         or sampling_contract.get("event_spec_sha256") != EVENT_SPEC_SHA256
         or sampling_contract.get("event_derivation_implementation_sha256")
         != collection["event_derivation_implementation_sha256"]
@@ -2342,11 +2567,18 @@ def validate_existing_authorities(
         != TERMINAL_SUPERVISION_CONTRACT
         or sampling_contract.get("event_age_contract") != EVENT_AGE_CONTRACT
         or sampling_contract.get("terminal_horizon_contract")
-        != TERMINAL_HORIZON_CONTRACT
+        != terminal_horizon_contract(protocol)
         or sampling_contract.get("branch_root_snapshot_contract")
         != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or sampling_contract.get("branch_diagnostic_contract")
         != BRANCH_DIAGNOSTIC_CONTRACT
+        or sampling_contract.get("actor_execution_protocol") != protocol
+        or sampling_contract.get("actor_execution_protocol_binding")
+        != protocol_binding
+        or sampling_contract.get("actor_execution_protocol_logical_sha256")
+        != protocol["logical_sha256"]
+        or sampling_contract.get("actor_execution_protocol_file_sha256")
+        != protocol_binding["file_sha256"]
         or not isinstance(actors, Mapping)
         or set(actors) != set(BODIES)
     ):
@@ -2388,7 +2620,7 @@ def validate_existing_authorities(
 
     binding = read_json(args.binding, "training binding")
     verify_logical_sha(binding, "training binding")
-    binding_dir = args.binding.parent.resolve()
+    binding_dir = Path(str(protocol_binding["path_root"])).resolve()
     materialization_relative = contained_relative(
         binding_dir, args.materialization_receipt, "materialization receipt"
     )
@@ -2402,6 +2634,11 @@ def validate_existing_authorities(
         }
     if (
         binding.get("format") != BINDING_FORMAT
+        or binding.get("path_root") != protocol_binding["path_root"]
+        or binding.get("actor_execution_protocol") != protocol
+        or binding.get("actor_execution_protocol_binding") != protocol_binding
+        or binding.get("actor_execution_protocol_file_sha256")
+        != protocol_binding["file_sha256"]
         or binding.get("dataset_repo") != DATASET_REPO
         or binding.get("dataset_revision") != DATASET_REVISION
         or binding.get("task") != TASK
@@ -2413,7 +2650,8 @@ def validate_existing_authorities(
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or binding.get("event_age_contract") != EVENT_AGE_CONTRACT
-        or binding.get("terminal_horizon_contract") != TERMINAL_HORIZON_CONTRACT
+        or binding.get("terminal_horizon_contract")
+        != terminal_horizon_contract(protocol)
         or binding.get("branch_root_snapshot_contract")
         != BRANCH_ROOT_SNAPSHOT_CONTRACT
         or binding.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
@@ -2510,6 +2748,14 @@ def main() -> int:
                 "output_root": str(args.output_root),
                 "expected_decisions": TOTAL_DECISIONS,
                 "expected_branches": TOTAL_BRANCHES,
+                "actor_execution_protocol": (
+                    _ACTIVE_EXECUTION_PROTOCOL if protocol_loaded else None
+                ),
+                "actor_execution_protocol_binding": (
+                    _ACTIVE_EXECUTION_PROTOCOL_BINDING
+                    if protocol_loaded
+                    else None
+                ),
                 **extra,
             },
         )
@@ -2530,14 +2776,33 @@ def main() -> int:
         != args.supplement_binding_sha256
     ):
         raise LoboWatcherError("supplement binding SHA-256 mismatch")
-    if args.supplement_binding is not None:
-        validate_supplement_frame_binding(args.supplement_binding)
     gpu = gpu_identity()
     if "4090" not in gpu["name"] or gpu["uuid"] != args.expected_gpu_uuid:
         raise LoboWatcherError(f"unexpected GPU authority: {gpu}")
 
     collection: dict[str, Any] | None = None
+    protocol_loaded = False
     while collection is None:
+        if not args.binding.is_file():
+            write_state(
+                "waiting_for_primary_protocol_binding",
+                primary_binding_present=False,
+                gpu=gpu,
+                gpu_reserved_by_watcher=False,
+            )
+            time.sleep(args.poll_seconds)
+            continue
+        if not protocol_loaded:
+            load_primary_execution_protocol(args.binding)
+            protocol_loaded = True
+            if args.supplement_binding is not None:
+                validate_supplement_frame_binding(
+                    args.supplement_binding,
+                    execution_protocol=_ACTIVE_EXECUTION_PROTOCOL,
+                    execution_protocol_binding=(
+                        _ACTIVE_EXECUTION_PROTOCOL_BINDING
+                    ),
+                )
         progress = collection_progress(args.branches_root)
         reject_irrecoverable_progress(progress)
         actor_ready = args.actor_checkpoint.is_dir()
@@ -2566,7 +2831,11 @@ def main() -> int:
             gpu=gpu,
             outcome_or_event_arrays_interpreted_by_watcher=False,
         )
-        collection = validate_complete_collection(args.branches_root, args.actor_checkpoint)
+        collection = validate_complete_collection(
+            args.branches_root,
+            args.actor_checkpoint,
+            execution_protocol=_ACTIVE_EXECUTION_PROTOCOL,
+        )
 
     write_state("hashing_frozen_actor_checkpoint", collection_audit=collection, gpu=gpu)
     checkpoint_sha, checkpoint_files, checkpoint_bytes = sha256_tree(args.actor_checkpoint)
@@ -2750,6 +3019,15 @@ def main() -> int:
             "task": TASK,
             "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
             "event_spec_sha256": EVENT_SPEC_SHA256,
+            "actor_execution_protocol": _ACTIVE_EXECUTION_PROTOCOL,
+            "actor_execution_protocol_binding": (
+                _ACTIVE_EXECUTION_PROTOCOL_BINDING
+            ),
+            "actor_execution_protocol_file_sha256": (
+                _ACTIVE_EXECUTION_PROTOCOL_BINDING["file_sha256"]
+                if isinstance(_ACTIVE_EXECUTION_PROTOCOL_BINDING, Mapping)
+                else None
+            ),
             "event_derivation_implementation_sha256": collection[
                 "event_derivation_implementation_sha256"
             ],

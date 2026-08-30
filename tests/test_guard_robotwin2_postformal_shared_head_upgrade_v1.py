@@ -76,7 +76,7 @@ if count >= 3:
     run_exit.write_text("0\\n")
     raise SystemExit(0)
 state.write_text(json.dumps({
-    "format": "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2",
+    "format": "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v3_actor_protocol",
     "status": "recoverable_child_signal_interruption",
     "error_type": "RecoverableChildSignalInterruption",
     "error_message": "nested interrupted by SIGTERM (15)",
@@ -215,7 +215,7 @@ from pathlib import Path
 import json, sys
 state = Path(sys.argv[1])
 state.write_text(json.dumps({
-    "format": "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2",
+    "format": "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v3_actor_protocol",
     "status": "recoverable_child_signal_interruption",
     "error_type": "RecoverableChildSignalInterruption",
     "child_stage": "nested",

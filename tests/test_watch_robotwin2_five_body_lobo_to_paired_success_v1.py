@@ -10,6 +10,9 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 SCRIPT = ROOT / "scripts/watch_robotwin2_five_body_lobo_to_paired_success_v1.py"
 SPEC = importlib.util.spec_from_file_location("lobo_to_paired_watcher", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -40,6 +43,17 @@ def _json(path: Path, value: object) -> None:
 
 def _paths(tmp_path: Path) -> watcher.FormalPaths:
     home = tmp_path / "home"
+    home.mkdir()
+    protocol_path = home / "actor_execution_protocol.json"
+    protocol_sha256 = watcher.actor_execution.write_execution_protocol_file(
+        protocol_path,
+        watcher.actor_execution.execution_protocol(5),
+    )
+    watcher.configure_actor_execution_protocol(
+        protocol_path,
+        protocol_sha256,
+        path_root=home,
+    )
     code = tmp_path / "code"
     prefix = home / "paired"
     return watcher.FormalPaths(
@@ -101,6 +115,13 @@ def _complete_upstream(paths: watcher.FormalPaths) -> dict[str, object]:
                 "heldout_labels_used_for_normalization_training_or_selection": False,
                 "heldout_specific_trainable_parameters": 0,
                 "actor_frozen": True,
+                "actor_execution_protocol": watcher.ACTIVE_EXECUTION_PROTOCOL,
+                "actor_execution_protocol_binding": (
+                    watcher.require_actor_execution_protocol_binding()
+                ),
+                "actor_execution_protocol_file_sha256": (
+                    watcher.require_actor_execution_protocol_binding()["file_sha256"]
+                ),
                 "members": members,
             },
         )
@@ -122,6 +143,13 @@ def _complete_upstream(paths: watcher.FormalPaths) -> dict[str, object]:
             "heldout_task_success_measured": False,
             "cross_embodiment_task_success_claim_authorized": False,
             "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
+            "actor_execution_protocol": watcher.ACTIVE_EXECUTION_PROTOCOL,
+            "actor_execution_protocol_binding": (
+                watcher.require_actor_execution_protocol_binding()
+            ),
+            "actor_execution_protocol_file_sha256": (
+                watcher.require_actor_execution_protocol_binding()["file_sha256"]
+            ),
             "outer_folds": fold_rows,
         },
     )
@@ -213,6 +241,11 @@ def test_runner_command_has_only_the_fixed_formal_inputs(tmp_path: Path) -> None
         paths.metrics_preregistration
     )
     assert command[command.index("--output") + 1] == str(paths.output_root)
+    protocol_binding = watcher.require_actor_execution_protocol_binding()
+    assert command[command.index("--actor-execution-protocol-sha256") + 1] == (
+        protocol_binding["file_sha256"]
+    )
+    assert command[command.index("--path-root") + 1] == str(paths.home)
     assert command[-6:] == [
         "--action-exec-steps",
         "5",
@@ -221,6 +254,25 @@ def test_runner_command_has_only_the_fixed_formal_inputs(tmp_path: Path) -> None
         "--fps",
         "15",
     ]
+
+
+def test_runner_command_uses_execute50_from_bound_training_protocol(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    protocol_path = paths.home / "actor_execution_protocol_execute50.json"
+    protocol_sha256 = watcher.actor_execution.write_execution_protocol_file(
+        protocol_path,
+        watcher.actor_execution.execution_protocol(50),
+    )
+    watcher.configure_actor_execution_protocol(
+        protocol_path,
+        protocol_sha256,
+        path_root=paths.home,
+    )
+    command = watcher.build_runner_command(paths)
+    assert command[command.index("--action-exec-steps") + 1] == "50"
+    assert command[command.index("--max-steps") + 1] == "200"
 
 
 def test_gpu_wait_does_not_reserve_while_busy_and_requires_two_idle_audits() -> None:
@@ -278,10 +330,10 @@ def test_analytic_and_execution_code_identities_are_frozen() -> None:
         "4df5b7242d1c7bf8e3f5dac65c0eb4376043dbf6c60ef2633d086ab06e7e3aee"
     )
     assert watcher.EXPECTED_EVENT_MODULE_SHA256 == (
-        "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
+        "fc07fa2f9b9293fdc0b4e2da323286fb98fa48e56288d1cd781a14fa2b2c00ab"
     )
     assert watcher.EXPECTED_RUNNER_SHA256 == (
-        "049017f53c0f9a3e462ea29db7d351075cc6f3d427f5c63a851fd1a154db9093"
+        "01db8b556366b31f4643857eaad4d61ad544f327ee6dc9c73d387929e47379c4"
     )
     assert watcher.EXPECTED_EVALUATOR_SHA256 == (
         "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"

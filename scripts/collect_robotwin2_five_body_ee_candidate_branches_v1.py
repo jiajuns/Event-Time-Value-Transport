@@ -35,10 +35,15 @@ import yaml
 
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
+import robotwin2_actor_execution_protocol_v1 as actor_execution
 
 
-FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v2_endpose_frame"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
+FORMAT = (
+    "etsf_robotwin2_five_body_ee_candidate_branches_v3_actor_execution_protocol"
+)
+MANIFEST_FORMAT = (
+    "etsf_robotwin2_canonical_transition_manifest_v3_actor_execution_protocol"
+)
 DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v2_endpose_frame"
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
@@ -117,19 +122,34 @@ EVENT_AGE_CONTRACT = {
     "available_before_candidate_execution": True,
     "same_value_for_all_candidates_at_one_root": True,
 }
-TERMINAL_HORIZON_CONTRACT = {
-    "array": "remaining_action_budget",
-    "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
-    "available_before_candidate_execution": True,
-    "same_value_for_all_candidates_at_one_root": True,
-    "conditions_only_terminal_consequence_heads": True,
-    "direct_rank_path": False,
-    "formal_episode_action_steps": FORMAL_MAX_STEPS,
-    "formal_actor_query_stride_actions": FORMAL_ACTION_EXEC_STEPS,
-    "development_remaining_action_budgets": list(
-        range(FORMAL_MAX_STEPS, 0, -FORMAL_ACTION_EXEC_STEPS)
-    ),
-}
+def terminal_horizon_contract(
+    protocol: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind terminal budgets to one validated actor execution protocol."""
+
+    validated = actor_execution.validate_execution_protocol(protocol)
+    return {
+        "array": "remaining_action_budget",
+        "semantics": "max_episode_action_steps_minus_pre_action_take_action_count",
+        "available_before_candidate_execution": True,
+        "same_value_for_all_candidates_at_one_root": True,
+        "conditions_only_terminal_consequence_heads": True,
+        "direct_rank_path": False,
+        "formal_episode_action_steps": validated["max_steps"],
+        "formal_actor_query_stride_actions": validated["stride"],
+        "development_remaining_action_budgets": list(
+            validated["primary_remaining_action_budgets"]
+        ),
+        "actor_execution_protocol_logical_sha256": validated["logical_sha256"],
+    }
+
+
+# Import-time compatibility value for code that only inspects the module.  A
+# production invocation always replaces this with its explicitly file-bound
+# protocol before creating or validating any artifact.
+TERMINAL_HORIZON_CONTRACT = terminal_horizon_contract(
+    actor_execution.execution_protocol(FORMAL_ACTION_EXEC_STEPS)
+)
 BRANCH_ROOT_SNAPSHOT_CONTRACT = {
     "format": "etsf_sapien_explicit_fresh_scene_branch_root_v2_float32_roundtrip",
     "physics_state": "keyed_rigid_articulation_drive_task_render_rng_snapshot",
@@ -165,6 +185,7 @@ BRANCH_DIAGNOSTIC_CONTRACT = {
         "candidate_tokens"
     ),
 }
+DIAGNOSTIC_ACTION_PREFIX_STEPS = 5
 BODY_EMBODIMENT = {
     "aloha-agilex": ["aloha-agilex"],
     "arx-x5": ["ARX-X5", "ARX-X5", 0.6],
@@ -1169,6 +1190,13 @@ def _root_prefix(
         remaining_action_budget = max_steps - int(
             getattr(task, "take_action_cnt", 0)
         )
+        expected_remaining_action_budget = max_steps - root_query * action_exec_steps
+        if remaining_action_budget != expected_remaining_action_budget:
+            raise BranchCollectionError(
+                "actor prefix action budget disagrees with the frozen query grid: "
+                f"observed={remaining_action_budget}, "
+                f"expected={expected_remaining_action_budget}"
+            )
         if remaining_action_budget <= 0:
             raise BranchCollectionError(
                 "non-terminal branch root has no remaining action budget"
@@ -1556,7 +1584,12 @@ def materialize_group(
         # complete planned first chunk even when planning/execution later
         # fails.  Executed action count is used only for physical timing and
         # must never censor the action that caused a negative outcome.
-        mask = np.arange(horizon) < min(int(action_exec_steps), horizon)
+        planned_steps = min(
+            int(action_exec_steps),
+            int(root["remaining_action_budget"]),
+            horizon,
+        )
+        mask = np.arange(horizon) < planned_steps
         trajectory = np.asarray(outcome["trajectory"], dtype=np.float64)
         sim_times = np.asarray(outcome["sim_times"], dtype=np.float64)
         predicates, events = derive_predicates_and_events(
@@ -1672,7 +1705,12 @@ def materialize_group(
         # event ``duration`` above uses counted simulator seconds.
         "dt": np.full(
             count,
-            min(int(action_exec_steps), horizon) / SOURCE_EVENT_SAMPLING_HZ,
+            min(
+                int(action_exec_steps),
+                int(root["remaining_action_budget"]),
+                horizon,
+            )
+            / SOURCE_EVENT_SAMPLING_HZ,
             dtype=np.float32,
         ),
     }
@@ -1724,20 +1762,28 @@ def materialize_branch_diagnostics(
     effects = np.stack(
         [canonical_action_chunk(current, candidate) for candidate in candidates]
     ).astype(np.float32)
-    planned = min(int(action_exec_steps), int(effects.shape[1]))
-    if planned < 2:
+    planned_execution = min(
+        int(action_exec_steps),
+        int(root["remaining_action_budget"]),
+        int(effects.shape[1]),
+    )
+    diagnostic_prefix = min(DIAGNOSTIC_ACTION_PREFIX_STEPS, planned_execution)
+    if diagnostic_prefix < 2:
         raise BranchCollectionError(
             "branch diagnostics require first and subsequent planned action tokens"
         )
-    first = effects[:, None, :planned, :]
-    second = effects[None, :, :planned, :]
+    # This label-free continuity/noise diagnostic intentionally remains a
+    # first-five-token measurement for both execute-5 and execute-50.  It is
+    # not the critic action mask and must never be widened with the stride.
+    first = effects[:, None, :diagnostic_prefix, :]
+    second = effects[None, :, :diagnostic_prefix, :]
     pairwise_rms = np.sqrt(np.mean(np.square(first - second), axis=(2, 3))).astype(
         np.float32
     )
     translation_norm = np.stack(
         (
-            np.linalg.norm(effects[:, :planned, 0:3], axis=2),
-            np.linalg.norm(effects[:, :planned, 7:10], axis=2),
+            np.linalg.norm(effects[:, :diagnostic_prefix, 0:3], axis=2),
+            np.linalg.norm(effects[:, :diagnostic_prefix, 7:10], axis=2),
         ),
         axis=2,
     ).astype(np.float32)
@@ -1755,7 +1801,8 @@ def materialize_branch_diagnostics(
         ).astype(np.float32),
     }
     if arrays["first_executed"].shape != (CANDIDATE_COUNT,) or np.any(
-        (arrays["first_executed"] < 0) | (arrays["first_executed"] > planned)
+        (arrays["first_executed"] < 0)
+        | (arrays["first_executed"] > planned_execution)
     ):
         raise BranchCollectionError("first-executed diagnostic is outside planned horizon")
     if arrays["branch_error"].shape != (CANDIDATE_COUNT,):
@@ -1805,19 +1852,31 @@ def resolve_query_contract(
     return requested_queries, manifest_queries
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--body", choices=BODIES, required=True)
     parser.add_argument("--actor-checkpoint", type=Path, required=True)
     parser.add_argument("--vlm-metadata-path", type=Path, required=True)
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--event-spec", type=Path, required=True)
+    parser.add_argument(
+        "--actor-execution-protocol", type=Path, required=True
+    )
+    parser.add_argument(
+        "--actor-execution-protocol-sha256", required=True
+    )
+    parser.add_argument(
+        "--path-root",
+        type=Path,
+        required=True,
+        help="Absolute root used to resolve every relative artifact binding",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=list(CONDITIONS))
     parser.add_argument("--seed-start", type=int, default=2026081000)
-    parser.add_argument("--seed-count", type=int, default=50)
+    parser.add_argument("--seed-count", type=int)
     parser.add_argument(
-        "--root-query-indices", nargs="+", type=int, default=list(range(40))
+        "--root-query-indices", nargs="+", type=int
     )
     parser.add_argument(
         "--manifest-root-query-indices",
@@ -1830,26 +1889,68 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--action-exec-steps", type=int, default=FORMAL_ACTION_EXEC_STEPS
+        "--action-exec-steps", type=int
     )
-    parser.add_argument("--max-steps", type=int, default=FORMAL_MAX_STEPS)
+    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
-    if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
-        raise BranchCollectionError("real branch collection requires remote RTX 4090 CUDA")
+def bind_execution_protocol_arguments(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any], Path, list[int], list[int]]:
+    """Normalize all stride-dependent CLI values from one frozen file."""
+
+    try:
+        execution_protocol = actor_execution.load_execution_protocol_file(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise BranchCollectionError(str(error)) from error
+    action_exec_steps = int(execution_protocol["stride"])
+    max_steps = int(execution_protocol["max_steps"])
+    args.action_exec_steps = (
+        action_exec_steps
+        if args.action_exec_steps is None
+        else int(args.action_exec_steps)
+    )
+    args.max_steps = max_steps if args.max_steps is None else int(args.max_steps)
+    args.seed_count = (
+        int(execution_protocol["target_per_condition_query"])
+        if args.seed_count is None
+        else int(args.seed_count)
+    )
+    args.root_query_indices = (
+        list(execution_protocol["query_indices"])
+        if args.root_query_indices is None
+        else list(args.root_query_indices)
+    )
+    if args.manifest_root_query_indices is None:
+        args.manifest_root_query_indices = list(execution_protocol["query_indices"])
+    try:
+        protocol_binding = actor_execution.execution_protocol_file_binding(
+            args.actor_execution_protocol,
+            args.actor_execution_protocol_sha256,
+            path_root=args.path_root,
+        )
+    except actor_execution.ActorExecutionProtocolError as error:
+        raise BranchCollectionError(str(error)) from error
+    path_root = Path(protocol_binding["path_root"])
+    output = args.output.expanduser().resolve()
+    try:
+        output.relative_to(path_root)
+    except ValueError as error:
+        raise BranchCollectionError("collector output must be contained by path_root") from error
     if args.seed_count <= 0 or args.action_exec_steps <= 0:
         raise BranchCollectionError("seed-count/action-exec-steps must be positive")
     if (
-        args.action_exec_steps != FORMAL_ACTION_EXEC_STEPS
-        or args.max_steps != FORMAL_MAX_STEPS
+        args.action_exec_steps != action_exec_steps
+        or args.max_steps != max_steps
     ):
         raise BranchCollectionError(
-            "formal consequence collection is fixed to five-action queries "
-            "and a 200-action episode"
+            "formal consequence collection arguments disagree with the bound "
+            "actor execution protocol"
         )
     if args.instruction != DEFAULT_INSTRUCTION:
         raise BranchCollectionError(
@@ -1859,11 +1960,40 @@ def main() -> None:
         args.root_query_indices,
         args.manifest_root_query_indices,
     )
+    if manifest_queries != list(execution_protocol["query_indices"]):
+        raise BranchCollectionError(
+            "manifest root query universe differs from the bound actor execution protocol"
+        )
+    return (
+        execution_protocol,
+        protocol_binding,
+        path_root,
+        requested_queries,
+        manifest_queries,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    (
+        execution_protocol,
+        protocol_binding,
+        path_root,
+        requested_queries,
+        manifest_queries,
+    ) = bind_execution_protocol_arguments(args)
+    action_exec_steps = int(execution_protocol["stride"])
+    max_steps = int(execution_protocol["max_steps"])
+    terminal_contract = terminal_horizon_contract(execution_protocol)
+    output = args.output.expanduser().resolve()
+    if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
+        raise BranchCollectionError("real branch collection requires remote RTX 4090 CUDA")
     for path in (
         args.actor_checkpoint,
         args.vlm_metadata_path,
         args.robotwin_root,
         args.event_spec,
+        args.actor_execution_protocol,
     ):
         if not path.exists():
             raise FileNotFoundError(path)
@@ -1898,6 +2028,10 @@ def main() -> None:
         config.input_features["observation.state"].shape[0]
     ) != NATIVE_EE_DIM:
         raise BranchCollectionError("actor checkpoint must have a 16-D EE state feature")
+    if int(config.chunk_size) != int(execution_protocol["native_chunk_steps"]):
+        raise BranchCollectionError(
+            "actor native action chunk differs from the bound execution protocol"
+        )
     policy = SmolVLAPolicy.from_pretrained(
         args.actor_checkpoint, config=config, local_files_only=True, strict=True
     ).eval().to(device)
@@ -1920,7 +2054,6 @@ def main() -> None:
     event_source = Path(inspect.getsourcefile(analytic_event) or "")
     event_implementation_sha = sha256_file(event_source)
     collector_sha = sha256_file(Path(__file__).resolve())
-    output = args.output.expanduser().resolve()
     groups_dir = output / "groups"
     groups_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output / "manifest.json"
@@ -1935,6 +2068,12 @@ def main() -> None:
             or manifest.get("collector_format") != FORMAT
             or manifest.get("body") != args.body
             or manifest.get("collector_file_sha256") != collector_sha
+            or manifest.get("path_root") != str(path_root)
+            or manifest.get("actor_execution_protocol_binding")
+            != protocol_binding
+            or manifest.get("actor_execution_protocol") != execution_protocol
+            or manifest.get("actor_execution_protocol_file_sha256")
+            != args.actor_execution_protocol_sha256
             or manifest.get("actor_checkpoint") != str(args.actor_checkpoint.resolve())
             or manifest.get("instruction") != DEFAULT_INSTRUCTION
             or manifest.get("candidate_count") != CANDIDATE_COUNT
@@ -1948,7 +2087,7 @@ def main() -> None:
             != TERMINAL_SUPERVISION_CONTRACT
             or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
             or manifest.get("terminal_horizon_contract")
-            != TERMINAL_HORIZON_CONTRACT
+            != terminal_contract
             or manifest.get("branch_root_snapshot_contract")
             != BRANCH_ROOT_SNAPSHOT_CONTRACT
             or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
@@ -1965,6 +2104,12 @@ def main() -> None:
             "task": TASK,
             "body": args.body,
             "collector_file_sha256": collector_sha,
+            "path_root": str(path_root),
+            "actor_execution_protocol_binding": protocol_binding,
+            "actor_execution_protocol": execution_protocol,
+            "actor_execution_protocol_file_sha256": (
+                args.actor_execution_protocol_sha256
+            ),
             "actor_checkpoint": str(args.actor_checkpoint.resolve()),
             "instruction": DEFAULT_INSTRUCTION,
             "actor_checkpoint_tree_or_file_sha256_recorded_separately": True,
@@ -2028,7 +2173,7 @@ def main() -> None:
             },
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
-            "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
+            "terminal_horizon_contract": terminal_contract,
             "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
