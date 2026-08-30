@@ -36,6 +36,7 @@ DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
 DEFAULT_INSTRUCTION = "Move the can to the side of the pot."
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
+COLLECTION_PRIORITY = ("piper", "arx-x5", "ur5", "aloha-agilex", "franka")
 CONDITIONS = ("clean", "randomized")
 ROOT_QUERIES = tuple(range(40))
 CANDIDATE_COUNT = 4
@@ -981,9 +982,13 @@ def main() -> int:
     # device limit and turn throughput optimization into avoidable OOM risk.
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="body-collector") as pool:
         futures = []
-        for index, body in enumerate(BODIES):
+        if set(COLLECTION_PRIORITY) != set(BODIES) or len(COLLECTION_PRIORITY) != len(
+            BODIES
+        ):
+            raise ContinuationError("collection priority must contain every body once")
+        for index, body in enumerate(COLLECTION_PRIORITY):
             futures.append(pool.submit(collect_body, body))
-            if index + 1 < len(BODIES):
+            if index + 1 < len(COLLECTION_PRIORITY):
                 time.sleep(20.0)
         for future in as_completed(futures):
             body, manifest = future.result()
