@@ -2674,7 +2674,8 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
             arrays["next_event_id"], arrays["next_event_id"].astype(np.int64)
         )
         or np.any((arrays["next_event_id"] < 0) | (arrays["next_event_id"] >= 5))
-        or np.any((arrays["next_event_mask"] < 0.0) | (arrays["next_event_mask"] > 1.0))
+        or not np.all(np.isin(arrays["next_event_mask"], [0.0, 1.0]))
+        or not np.all(np.isin(arrays["duration_observed"], [0.0, 1.0]))
         or np.any(
             (arrays["duration_observed"] > 0.5)
             & ~(arrays["next_event_mask"] > 0.5)
@@ -3305,19 +3306,20 @@ def _competing_risks_duration_nll_rows(
     mean = output["duration_component_log_mean"]
     log_scale = output["duration_component_log_scale"]
     duration = batch["duration"].to(mean)
-    observed = batch["duration_observed"].bool()
+    raw_observed = batch["duration_observed"]
     next_event = batch["next_event_id"].long()
-    next_mask = batch["next_event_mask"].bool()
+    raw_next_mask = batch["next_event_mask"]
     if (
         logits.ndim != 2
         or mean.shape != logits.shape
         or log_scale.shape != logits.shape
         or duration.shape != logits.shape[:1]
-        or observed.shape != duration.shape
+        or raw_observed.shape != duration.shape
         or next_event.shape != duration.shape
-        or next_mask.shape != duration.shape
+        or raw_next_mask.shape != duration.shape
         or bool(((next_event < 0) | (next_event >= logits.shape[-1])).any())
-        or bool((observed & ~next_mask).any())
+        or not bool(((raw_observed == 0) | (raw_observed == 1)).all())
+        or not bool(((raw_next_mask == 0) | (raw_next_mask == 1)).all())
         or not bool(torch.isfinite(logits).all())
         or not bool(torch.isfinite(mean).all())
         or not bool(torch.isfinite(log_scale).all())
@@ -3326,6 +3328,12 @@ def _competing_risks_duration_nll_rows(
     ):
         raise FiveBodyContractError(
             "competing-risks duration supervision is invalid"
+        )
+    observed = raw_observed.bool()
+    next_mask = raw_next_mask.bool()
+    if bool((observed & ~next_mask).any()):
+        raise FiveBodyContractError(
+            "observed duration requires an observed next-event label"
         )
     target = torch.log1p(duration)
     scale = torch.exp(log_scale).clamp_min(1e-4)
@@ -4694,27 +4702,85 @@ def _compute_shared_multitask_loss(
         sample_weight = output["success_logit"].new_ones(batch_size)
     if sample_weight.shape != (batch_size,):
         raise FiveBodyContractError("sample weight must be [B]")
-    core_weights = dict(loss_weights)
-    if set(core_weights) != set(core.DEFAULT_LOSS_WEIGHTS):
+    weights = dict(loss_weights)
+    if set(weights) != set(core.DEFAULT_LOSS_WEIGHTS):
         raise FiveBodyContractError("shared multitask loss weight schema changed")
-    duration_weight = float(core_weights["duration"])
-    core_weights["duration"] = 0.0
-    core_total, pieces = core.compute_multitask_loss(
-        output,
-        batch,
-        sample_weight=sample_weight,
-        loss_weights=core_weights,
+    action_available = batch["action_available"].to(sample_weight)
+    post = core._weighted_mean(
+        torch.nn.functional.cross_entropy(
+            output["post_event_logits"],
+            batch["post_event_id"].long(),
+            reduction="none",
+        ),
+        sample_weight * batch["post_event_mask"].to(sample_weight),
     )
+    next_event = core._weighted_mean(
+        torch.nn.functional.cross_entropy(
+            output["next_event_logits"],
+            batch["next_event_id"].long(),
+            reduction="none",
+        ),
+        sample_weight * batch["next_event_mask"].to(sample_weight),
+    )
+    success = core._weighted_mean(
+        torch.nn.functional.binary_cross_entropy_with_logits(
+            output["success_logit"],
+            batch["success"].to(output["success_logit"]),
+            reduction="none",
+        ),
+        sample_weight * batch["success_mask"].to(sample_weight),
+    )
+    recovery_weight = (
+        sample_weight
+        * action_available
+        * batch["recovery_mask"].to(sample_weight)
+    )
+    recovery = core._weighted_mean(
+        torch.nn.functional.binary_cross_entropy_with_logits(
+            output["recovery_logit"],
+            batch["recovery"].to(output["recovery_logit"]),
+            reduction="none",
+        ),
+        recovery_weight,
+    )
+    object_scale = torch.exp(output["object_delta_log_scale"]).clamp_min(1e-4)
+    object_nll = (
+        0.5
+        * (
+            (batch["object_delta"] - output["object_delta_mean"])
+            / object_scale
+        ).square()
+        + output["object_delta_log_scale"]
+        + 0.5 * math.log(2.0 * math.pi)
+    ).mean(-1)
+    object_weight = (
+        sample_weight
+        * action_available
+        * batch["object_delta_mask"].to(sample_weight)
+    )
+    object_loss = core._weighted_mean(object_nll, object_weight)
     duration_rows = _competing_risks_duration_nll_rows(output, batch)
     duration = core._weighted_mean(
         duration_rows,
         sample_weight * batch["duration_mask"].to(sample_weight),
     )
-    total = core_total + duration_weight * duration
-    pieces = dict(pieces)
-    pieces["duration"] = duration
-    pieces["duration_next_event_competing_risks"] = duration
+    pieces = {
+        "post_event": post,
+        "next_event": next_event,
+        "duration": duration,
+        "duration_next_event_competing_risks": duration,
+        "success": success,
+        "recovery": recovery,
+        "object": object_loss,
+    }
+    total = output["success_logit"].sum() * 0.0
+    for name in core.DEFAULT_LOSS_WEIGHTS:
+        weight = float(weights[name])
+        if weight != 0.0:
+            total = total + weight * pieces[name]
     pieces["total"] = total
+    pieces["recovery_supervised_rows"] = (recovery_weight > 0).sum().to(total)
+    pieces["object_supervised_rows"] = (object_weight > 0).sum().to(total)
     return total, pieces
 
 

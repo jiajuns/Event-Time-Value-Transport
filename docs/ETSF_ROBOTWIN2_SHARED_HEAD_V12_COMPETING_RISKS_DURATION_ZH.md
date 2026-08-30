@@ -105,6 +105,12 @@ Var[Y] = sum_e p_e (σ_e² + (μ_e - E[Y])²)
 按 ensemble 联合分布条件化，对 censored duration 先在每成员内对目的事件求和，再在五成员
 间做 mixture，而不是对一个矩匹配单峰计算伪精确 NLL。
 
+离线 duration 风险覆盖同时报告两条曲线：epistemic 曲线使用五成员 raw-time 分布均值的
+总体标准差；primary total 曲线使用
+`sqrt(mean(member aleatoric raw-time variance) + epistemic variance)`。成员内 aleatoric
+variance 同时包含 next-event 分量内方差与 next-event 分量间方差。`duration_error_aurc`
+明确指向 total 曲线，epistemic-only AURC 另列，二者不能混称。
+
 模型还显式输出 `success_probability`、`failure_probability`、
 `conditional_recovery_probability`、`joint_recovery_probability`，以及 post/next/terminal
 event、success、conditional recovery 和 joint recovery 的单成员 aleatoric entropy。它们不替代
@@ -157,6 +163,11 @@ paired runner、postformal candidate pool 和校准器，保留：
 5. 旧标量输出保持 `[B]`，组件输出保持 `[B,5]`；
 6. 完整共享头训练/排序/消融合同回归不退化。
 
+训练器在 v12 内部直接计算 post/next/success/recovery/object 的既有 proper loss 与新的
+competing-risks duration loss，不再调用 core 的 current-event duration。权重为零的 loss
+不会进入求和，避免旧 duration 出现非有限值时发生 `0 * inf -> NaN`。数据加载和 tensor
+NLL 两层都要求 `duration_observed`、`next_event_mask` 精确属于 `{0,1}`。
+
 真实效果仍必须由五折 LOBO 回答，至少报告：
 
 - held-out body next-event macro-F1/NLL/ECE；
@@ -168,3 +179,11 @@ paired runner、postformal candidate pool 和校准器，保留：
 
 只有五个留出本体均有完整预测证据，且正式配对成功率置信区间支持改善，才能声称 v12
 实现了可迁移、可改善的事件世界模型；离线 loss 下降本身不等于跨本体任务成功率提升。
+
+## 8. 已知限制
+
+v12 沿用既有 `Y=log1p(D)` Gaussian 参数化。由 `D=exp(Y)-1` 反变换时，未截断的
+Gaussian 会给 `Y<0`、即 `D<0` 分配非零概率，而部署点预测会截到非负值。这是继承自
+旧 duration 头的分布—点预测不完全一致；本次竞争风险升级没有更改它，正式结果必须明确
+披露。后续若改为零截断分布或严格正支持参数化，必须作为新的模型版本重新训练、校准并
+单独比较，不能静默改变 v12 likelihood。

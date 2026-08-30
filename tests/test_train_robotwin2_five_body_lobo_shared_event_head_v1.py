@@ -1467,6 +1467,184 @@ def test_censored_duration_is_probability_weighted_competing_risks_survival() ->
     assert log_scales.grad is not None and bool((log_scales.grad.abs() > 0).all())
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("duration_observed", 0.1), ("next_event_mask", 0.9)),
+)
+def test_competing_risks_duration_rejects_nonbinary_masks(
+    field: str, value: float
+) -> None:
+    output = {
+        "next_event_logits": torch.zeros(1, 5),
+        "duration_component_log_mean": torch.zeros(1, 5),
+        "duration_component_log_scale": torch.zeros(1, 5),
+    }
+    batch = {
+        "duration": torch.tensor([1.0]),
+        "duration_observed": torch.tensor([0.0]),
+        "next_event_id": torch.tensor([0]),
+        "next_event_mask": torch.tensor([0.0]),
+    }
+    batch[field] = torch.tensor([value])
+    with pytest.raises(FiveBodyContractError, match="supervision is invalid"):
+        trainer_entry._competing_risks_duration_nll_rows(output, batch)
+
+
+@pytest.mark.parametrize("field", ("duration_observed", "next_event_mask"))
+def test_source_loader_rejects_nonbinary_duration_event_masks(
+    tmp_path: Path, field: str
+) -> None:
+    path = tmp_path / "soft-mask.npz"
+    _group(path, 0.1)
+    with np.load(path, allow_pickle=False) as values:
+        arrays = {name: np.asarray(values[name]) for name in values.files}
+    arrays[field] = arrays[field].copy()
+    arrays[field][0] = np.float32(0.25)
+    np.savez(path, **arrays)
+    group = {
+        "resolved_path": str(path),
+        "sha256": sha256_file(path),
+        "condition": "clean",
+        "group_id": "soft-mask",
+        "requested_seed": 7,
+    }
+    with pytest.raises(
+        FiveBodyContractError, match="next-event/duration supervision is invalid"
+    ):
+        trainer_entry._npz_rows(group, body=BODIES[0])
+
+
+def _duration_only_training_batch(*, observed: bool) -> dict[str, torch.Tensor]:
+    batch = _model_batch(torch.full((4,), 5.0 / 15.0))
+    batch.update(
+        {
+            "post_event_id": torch.zeros(4, dtype=torch.long),
+            "post_event_mask": torch.zeros(4),
+            "next_event_id": torch.tensor([1, 2, 3, 4]),
+            "next_event_mask": torch.full((4,), float(observed)),
+            "duration": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            "duration_observed": torch.full((4,), float(observed)),
+            "duration_mask": torch.ones(4),
+            "success": torch.zeros(4),
+            "success_mask": torch.zeros(4),
+            "recovery": torch.zeros(4),
+            "recovery_mask": torch.zeros(4),
+            "object_delta": torch.zeros(4, core.OBJECT_DELTA_DIM),
+            "object_delta_mask": torch.zeros(4),
+        }
+    )
+    return batch
+
+
+@pytest.mark.parametrize("observed", (True, False))
+def test_full_model_duration_gradient_contract(observed: bool) -> None:
+    torch.manual_seed(20260831)
+    model = EffectAlignedSharedEventHead().train()
+    batch = _duration_only_training_batch(observed=observed)
+    output = model(batch)
+    weights = {name: 0.0 for name in core.DEFAULT_LOSS_WEIGHTS}
+    weights["duration"] = 1.0
+    loss, _pieces = trainer_entry._compute_shared_multitask_loss(
+        output, batch, loss_weights=weights
+    )
+    loss.backward()
+
+    def has_gradient(module: torch.nn.Module) -> bool:
+        return any(
+            parameter.grad is not None
+            and bool((parameter.grad.abs() > 0).any())
+            for parameter in module.parameters()
+        )
+
+    assert has_gradient(model.duration_mean)
+    assert has_gradient(model.duration_scale)
+    assert has_gradient(model.clock)
+    assert has_gradient(model.event_age_encoder)
+    assert has_gradient(model.next_event) is (not observed)
+    assert has_gradient(model.semantic) is (not observed)
+    assert has_gradient(model.action) is (not observed)
+    assert has_gradient(model.transition) is (not observed)
+    assert not has_gradient(model.post_event)
+    assert not has_gradient(model.terminal_event)
+
+
+def test_shared_multitask_never_calls_or_reads_legacy_core_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = EffectAlignedSharedEventHead().eval()
+    batch = _duration_only_training_batch(observed=True)
+    output = model(batch)
+    output["duration_selected_log_mean"] = torch.full((4,), float("inf"))
+    output["duration_selected_log_scale"] = torch.full((4,), float("inf"))
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("legacy core multitask/duration path was called")
+
+    monkeypatch.setattr(core, "compute_multitask_loss", forbidden)
+    weights = {name: 0.0 for name in core.DEFAULT_LOSS_WEIGHTS}
+    weights["duration"] = 1.0
+    loss, pieces = trainer_entry._compute_shared_multitask_loss(
+        output, batch, loss_weights=weights
+    )
+    assert torch.isfinite(loss)
+    assert torch.isfinite(pieces["duration_next_event_competing_risks"])
+
+
+def test_shared_multitask_preserves_every_non_duration_core_loss() -> None:
+    torch.manual_seed(9)
+    model = EffectAlignedSharedEventHead().eval()
+    batch = _duration_only_training_batch(observed=True)
+    batch["post_event_id"] = torch.tensor([0, 1, 2, 3])
+    batch["post_event_mask"] = torch.ones(4)
+    batch["success"] = torch.tensor([0.0, 1.0, 0.0, 1.0])
+    batch["success_mask"] = torch.ones(4)
+    batch["recovery"] = torch.tensor([0.0, 1.0, 1.0, 0.0])
+    batch["recovery_mask"] = torch.ones(4)
+    batch["object_delta"] = torch.randn(4, core.OBJECT_DELTA_DIM)
+    batch["object_delta_mask"] = torch.ones(4)
+    output = model(batch)
+    weights = dict(core.DEFAULT_LOSS_WEIGHTS)
+    weights["duration"] = 0.0
+    legacy_total, legacy_pieces = core.compute_multitask_loss(
+        output, batch, loss_weights=weights
+    )
+    shared_total, shared_pieces = trainer_entry._compute_shared_multitask_loss(
+        output, batch, loss_weights=weights
+    )
+    torch.testing.assert_close(shared_total, legacy_total)
+    for name in ("post_event", "next_event", "success", "recovery", "object"):
+        torch.testing.assert_close(shared_pieces[name], legacy_pieces[name])
+    torch.testing.assert_close(
+        shared_pieces["recovery_supervised_rows"],
+        legacy_pieces["recovery_supervised_rows"],
+    )
+    torch.testing.assert_close(
+        shared_pieces["object_supervised_rows"],
+        legacy_pieces["object_supervised_rows"],
+    )
+
+
+def test_shared_multitask_all_zero_weights_returns_device_scalar_and_counts() -> None:
+    model = EffectAlignedSharedEventHead().train()
+    batch = _duration_only_training_batch(observed=True)
+    batch["recovery_mask"] = torch.ones(4)
+    batch["object_delta_mask"] = torch.ones(4)
+    output = model(batch)
+    weights = {name: 0.0 for name in core.DEFAULT_LOSS_WEIGHTS}
+    total, pieces = trainer_entry._compute_shared_multitask_loss(
+        output, batch, loss_weights=weights
+    )
+    assert isinstance(total, torch.Tensor)
+    assert total.shape == ()
+    assert total.device == output["success_logit"].device
+    assert torch.isfinite(total)
+    assert total.item() == 0.0
+    assert total.requires_grad
+    assert pieces["recovery_supervised_rows"].item() == 4
+    assert pieces["object_supervised_rows"].item() == 4
+    total.backward()
+
+
 def test_forward_publishes_next_event_conditioned_duration_with_legacy_scalar() -> None:
     model = EffectAlignedSharedEventHead().eval()
     with torch.no_grad():

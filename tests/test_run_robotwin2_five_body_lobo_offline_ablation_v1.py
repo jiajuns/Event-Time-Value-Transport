@@ -208,6 +208,7 @@ def test_deployed_ensemble_prediction_metrics_cover_all_heads_and_uncertainty() 
         "next_event",
         "terminal_event",
         "duration",
+        "duration_epistemic",
         "object",
         "terminal_goal_progress",
         "recovery",
@@ -269,6 +270,125 @@ def test_duration_evaluator_uses_exact_next_event_competing_risks_survival() -> 
     assert result["metrics"][
         "duration_mixture_censored_nll_log1p"
     ] == pytest.approx(float(expected), abs=1e-6)
+
+
+def test_duration_observed_ensemble_conditions_by_member_event_probability_and_reports_total_uncertainty(
+) -> None:
+    probabilities = torch.tensor(
+        [
+            [0.05, 0.05, 0.70, 0.10, 0.10],
+            [0.10, 0.10, 0.50, 0.15, 0.15],
+            [0.15, 0.15, 0.30, 0.20, 0.20],
+            [0.20, 0.20, 0.15, 0.25, 0.20],
+            [0.24, 0.24, 0.04, 0.24, 0.24],
+        ]
+    )
+    means = torch.tensor(
+        [
+            [0.0, 0.2, 0.60, 1.0, 1.2],
+            [0.1, 0.3, 0.75, 1.1, 1.3],
+            [0.2, 0.4, 0.90, 1.2, 1.4],
+            [0.3, 0.5, 1.05, 1.3, 1.5],
+            [0.4, 0.6, 1.20, 1.4, 1.6],
+        ]
+    )
+    scales = torch.tensor(
+        [
+            [0.25, 0.30, 0.35, 0.40, 0.45],
+            [0.30, 0.35, 0.40, 0.45, 0.50],
+            [0.35, 0.40, 0.45, 0.50, 0.55],
+            [0.40, 0.45, 0.50, 0.55, 0.60],
+            [0.45, 0.50, 0.55, 0.60, 0.65],
+        ]
+    )
+
+    class FixedObservedCompetingRiskModel(_PerfectPredictionModel):
+        def __init__(self, member: int) -> None:
+            super().__init__(0.0)
+            self.member = member
+
+        def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            output = super().forward(batch)
+            count = len(batch["duration"])
+            output["next_event_logits"] = probabilities[self.member].log()[
+                None
+            ].expand(count, -1)
+            output["duration_component_log_mean"] = means[self.member][
+                None
+            ].expand(count, -1)
+            output["duration_component_log_scale"] = scales[self.member].log()[
+                None
+            ].expand(count, -1)
+            return output
+
+    batch = _prediction_batch()
+    batch["duration"] = torch.ones(8)
+    batch["duration_observed"] = torch.ones(8)
+    batch["next_event_id"] = torch.full((8,), 2, dtype=torch.long)
+    result = ablation.evaluate_deployed_ensemble_predictions(
+        [FixedObservedCompetingRiskModel(member) for member in range(5)],
+        [batch],
+        torch.device("cpu"),
+    )
+
+    target = math.log(2.0)
+    event_probability = probabilities[:, 2].double()
+    event_mean = means[:, 2].double()
+    event_scale = scales[:, 2].double()
+    log_pdf = (
+        -0.5 * torch.square((target - event_mean) / event_scale)
+        - torch.log(event_scale)
+        - 0.5 * math.log(2.0 * math.pi)
+    )
+    expected_observed_nll = -(
+        torch.logsumexp(torch.log(event_probability) + log_pdf, dim=0)
+        - torch.logsumexp(torch.log(event_probability), dim=0)
+    )
+    assert result["metrics"][
+        "duration_mixture_observed_nll_log1p"
+    ] == pytest.approx(float(expected_observed_nll), abs=1e-6)
+
+    probability_np = probabilities.double().numpy()
+    mean_np = means.double().numpy()
+    variance_np = np.square(scales.double().numpy())
+    component_raw_mean = np.expm1(mean_np + 0.5 * variance_np)
+    component_raw_variance = (
+        np.expm1(variance_np) * np.exp(2.0 * mean_np + variance_np)
+    )
+    member_mean = np.sum(probability_np * component_raw_mean, axis=-1)
+    member_aleatoric = np.sum(
+        probability_np
+        * (
+            component_raw_variance
+            + np.square(component_raw_mean - member_mean[:, None])
+        ),
+        axis=-1,
+    )
+    expected_epistemic_std = math.sqrt(float(np.var(member_mean, ddof=0)))
+    expected_mean_aleatoric = float(np.mean(member_aleatoric))
+    expected_total_std = math.sqrt(
+        expected_mean_aleatoric + expected_epistemic_std**2
+    )
+    metrics = result["metrics"]
+    assert metrics["duration_epistemic_std_mean_seconds"] == pytest.approx(
+        expected_epistemic_std, abs=1e-6
+    )
+    assert metrics[
+        "duration_mean_member_aleatoric_variance_mean_seconds2"
+    ] == pytest.approx(expected_mean_aleatoric, abs=1e-6)
+    assert metrics["duration_total_std_mean_seconds"] == pytest.approx(
+        expected_total_std, abs=1e-6
+    )
+    assert metrics["duration_error_aurc"] == metrics["duration_total_error_aurc"]
+    assert result["uncertainty_risk_coverage"]["duration"][
+        "uncertainty_kind"
+    ].startswith("sqrt_mean_member_raw_time_aleatoric")
+    assert result["uncertainty_risk_coverage"]["duration_epistemic"][
+        "uncertainty_kind"
+    ].startswith("five_member_raw_time_distribution_mean")
+    assert result["duration_uncertainty_decomposition"][
+        "primary_duration_aurc_uses"
+    ] == "total_standard_deviation"
 
 
 def test_risk_coverage_retains_low_uncertainty_first() -> None:

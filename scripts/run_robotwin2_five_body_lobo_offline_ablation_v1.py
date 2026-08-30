@@ -206,6 +206,9 @@ POSTHOC_ENSEMBLE_METRICS = (
     "duration_mixture_nll_log1p",
     "duration_mixture_observed_nll_log1p",
     "duration_mixture_censored_nll_log1p",
+    "duration_epistemic_std_mean_seconds",
+    "duration_mean_member_aleatoric_variance_mean_seconds2",
+    "duration_total_std_mean_seconds",
     "object_mixture_rmse",
     "object_student_t3_mixture_nll",
     "terminal_goal_progress_mixture_mae_meters",
@@ -229,6 +232,8 @@ POSTHOC_ENSEMBLE_METRICS = (
     "next_event_error_aurc",
     "terminal_event_error_aurc",
     "duration_error_aurc",
+    "duration_epistemic_error_aurc",
+    "duration_total_error_aurc",
     "object_error_aurc",
     "terminal_goal_progress_error_aurc",
     "recovery_error_aurc",
@@ -707,19 +712,51 @@ def evaluate_deployed_ensemble_predictions(
         members["duration_component_log_scale"].astype(np.float64)
     ).clip(1e-4)
     duration_next_probability = members["next_probability"].astype(np.float64)
-    duration_component_mean = np.maximum(
-        np.expm1(
-            np.clip(
-                duration_mu + 0.5 * np.square(duration_scale), -30.0, 50.0
+    duration_component_log_first_moment = np.clip(
+        duration_mu + 0.5 * np.square(duration_scale), -30.0, 50.0
+    )
+    duration_component_distribution_mean = np.expm1(
+        duration_component_log_first_moment
+    )
+    duration_component_log_variance = (
+        np.log(np.expm1(np.square(duration_scale)))
+        + 2.0 * duration_mu
+        + np.square(duration_scale)
+    )
+    duration_component_distribution_variance = np.exp(
+        np.clip(duration_component_log_variance, -60.0, 100.0)
+    )
+    duration_member_distribution_mean = np.sum(
+        duration_next_probability * duration_component_distribution_mean,
+        axis=-1,
+    )
+    duration_member_aleatoric_variance = np.sum(
+        duration_next_probability
+        * (
+            duration_component_distribution_variance
+            + np.square(
+                duration_component_distribution_mean
+                - duration_member_distribution_mean[..., None]
             )
         ),
-        0.0,
+        axis=-1,
     )
-    duration_member_mean = np.sum(
-        duration_next_probability * duration_component_mean, axis=-1
+    duration_prediction = np.maximum(
+        duration_member_distribution_mean.mean(axis=0), 0.0
     )
-    duration_prediction = duration_member_mean.mean(axis=0)
-    duration_uncertainty = duration_member_mean.std(axis=0)
+    duration_epistemic_variance = duration_member_distribution_mean.var(
+        axis=0, ddof=0
+    )
+    duration_mean_aleatoric_variance = duration_member_aleatoric_variance.mean(
+        axis=0
+    )
+    duration_total_variance = (
+        duration_mean_aleatoric_variance + duration_epistemic_variance
+    )
+    duration_epistemic_std = np.sqrt(
+        np.maximum(duration_epistemic_variance, 0.0)
+    )
+    duration_total_std = np.sqrt(np.maximum(duration_total_variance, 0.0))
     transformed = np.log1p(np.maximum(duration, 0.0))[None, :, None]
     duration_z = (transformed - duration_mu) / duration_scale
     normal_log_pdf = (
@@ -948,9 +985,20 @@ def evaluate_deployed_ensemble_predictions(
         ),
         "duration": _risk_coverage(
             np.abs(duration_prediction[duration_observed] - duration[duration_observed]),
-            duration_uncertainty[duration_observed],
+            duration_total_std[duration_observed],
             error_kind="absolute_observed_duration_error_seconds",
-            uncertainty_kind="five_member_predicted_duration_mean_population_std_seconds",
+            uncertainty_kind=(
+                "sqrt_mean_member_raw_time_aleatoric_variance_plus_"
+                "member_mean_epistemic_variance_seconds"
+            ),
+        ),
+        "duration_epistemic": _risk_coverage(
+            np.abs(duration_prediction[duration_observed] - duration[duration_observed]),
+            duration_epistemic_std[duration_observed],
+            error_kind="absolute_observed_duration_error_seconds",
+            uncertainty_kind=(
+                "five_member_raw_time_distribution_mean_population_std_seconds"
+            ),
         ),
         "object": _risk_coverage(
             object_error_rows,
@@ -1023,6 +1071,15 @@ def evaluate_deployed_ensemble_predictions(
         "duration_mixture_censored_nll_log1p": _mean_or_none(
             censored_nll_rows[duration_mask & ~duration_observed]
         ),
+        "duration_epistemic_std_mean_seconds": _mean_or_none(
+            duration_epistemic_std[duration_mask]
+        ),
+        "duration_mean_member_aleatoric_variance_mean_seconds2": _mean_or_none(
+            duration_mean_aleatoric_variance[duration_mask]
+        ),
+        "duration_total_std_mean_seconds": _mean_or_none(
+            duration_total_std[duration_mask]
+        ),
         "object_mixture_rmse": (
             float(math.sqrt(float(object_error_rows.mean())))
             if len(object_error_rows)
@@ -1081,6 +1138,8 @@ def evaluate_deployed_ensemble_predictions(
         "next_event_error_aurc": risk["next_event"]["aurc"],
         "terminal_event_error_aurc": risk["terminal_event"]["aurc"],
         "duration_error_aurc": risk["duration"]["aurc"],
+        "duration_epistemic_error_aurc": risk["duration_epistemic"]["aurc"],
+        "duration_total_error_aurc": risk["duration"]["aurc"],
         "object_error_aurc": risk["object"]["aurc"],
         "terminal_goal_progress_error_aurc": risk[
             "terminal_goal_progress"
@@ -1147,6 +1206,21 @@ def evaluate_deployed_ensemble_predictions(
         "success_calibration_bins": success_ece_bins,
         "recovery_precision_recall": recovery_precision_recall,
         "uncertainty_risk_coverage": risk,
+        "duration_uncertainty_decomposition": {
+            "epistemic_variance": (
+                "population_variance_of_five_member_raw_time_distribution_means"
+            ),
+            "aleatoric_variance": (
+                "mean_of_five_member_next_event_mixture_raw_time_variances"
+            ),
+            "total_variance": "aleatoric_variance_plus_epistemic_variance",
+            "primary_duration_aurc_uses": "total_standard_deviation",
+            "epistemic_duration_aurc_reported_separately": True,
+            "raw_time_moment_overflow_policy": (
+                "component_log_first_moment_clipped_minus30_plus50_and_"
+                "component_log_variance_clipped_minus60_plus100"
+            ),
+        },
         "statistical_units": {
             "prediction_observation_unit": "candidate_branch",
             "ranking_observation_unit": "complete_four_candidate_decision",
