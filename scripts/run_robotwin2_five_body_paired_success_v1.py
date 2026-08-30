@@ -407,6 +407,16 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         != shared_head.terminal_horizon_contract()
         or summary.get("ablation") != shared_head.ablation_contract("full")
         or summary.get("trainer_file_sha256") != current_trainer_sha
+        or summary.get("rank_supervision_available") is not True
+        or summary.get("candidate_rank_parameters_received_direct_supervision")
+        is not True
+        or summary.get("synthetic_success_labels") != 0
+        or summary.get("rank_supervision_mode")
+        not in {
+            "mixed_success_plus_informative_dense",
+            "mixed_success_only",
+            "informative_dense_only",
+        }
         or not isinstance(ensemble_selection, Mapping)
         or ensemble_selection.get("common_step_required_for_all_five_members")
         is not True
@@ -491,6 +501,18 @@ def load_ensemble(
             != shared_head.checkpoint_candidate_rank_contract("full")
             or checkpoint.get("ablation") != shared_head.ablation_contract("full")
             or checkpoint.get("heldout_rows_used_for_training_normalization_or_selection") != 0
+            or checkpoint.get("rank_supervision_available") is not True
+            or checkpoint.get(
+                "candidate_rank_parameters_received_direct_supervision"
+            )
+            is not True
+            or checkpoint.get("synthetic_success_labels") != 0
+            or checkpoint.get("rank_supervision_mode")
+            not in {
+                "mixed_success_plus_informative_dense",
+                "mixed_success_only",
+                "informative_dense_only",
+            }
             or checkpoint.get("action_stem_count") != 1
             or checkpoint.get("member") != item["member"]
             or checkpoint.get("event_spec_sha256") != EVENT_SPEC_SHA256

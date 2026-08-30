@@ -1138,6 +1138,7 @@ def summarize_fold(
     }
     current_trainer_sha = trainer.sha256_file(Path(trainer.__file__).resolve())
     ensemble_selection = summary.get("ensemble_checkpoint_selection")
+    direct_rank_expected = variant != "success_only"
     if (
         summary.get("status") != "source_only_checkpoint_selection_complete"
         or summary.get("held_out_body") != held_out_body
@@ -1153,6 +1154,11 @@ def summarize_fold(
         or len(members) != len(ENSEMBLE_SEEDS)
         or [member.get("seed") for member in members] != list(ENSEMBLE_SEEDS)
         or summary.get("trainer_file_sha256") != current_trainer_sha
+        or summary.get("rank_supervision_available")
+        is not direct_rank_expected
+        or summary.get("candidate_rank_parameters_received_direct_supervision")
+        is not direct_rank_expected
+        or summary.get("synthetic_success_labels") != 0
         or not isinstance(ensemble_selection, Mapping)
         or ensemble_selection.get("common_step_required_for_all_five_members")
         is not True
@@ -1196,6 +1202,7 @@ def _load_frozen_members(
     models = []
     current_trainer_sha = trainer.sha256_file(Path(trainer.__file__).resolve())
     selected_step = summary["ensemble_checkpoint_selection"]["selected_step"]
+    direct_rank_expected = variant != "success_only"
     for expected_member, item in enumerate(summary["members"]):
         checkpoint_path = Path(str(item.get("checkpoint", ""))).expanduser().resolve()
         if (
@@ -1218,6 +1225,13 @@ def _load_frozen_members(
             or checkpoint.get(
                 "heldout_rows_used_for_training_normalization_or_selection"
             ) != 0
+            or checkpoint.get("rank_supervision_available")
+            is not direct_rank_expected
+            or checkpoint.get(
+                "candidate_rank_parameters_received_direct_supervision"
+            )
+            is not direct_rank_expected
+            or checkpoint.get("synthetic_success_labels") != 0
             or checkpoint.get("trainer_file_sha256") != current_trainer_sha
             or checkpoint.get("ensemble_common_selection_step") != selected_step
         ):

@@ -243,6 +243,10 @@ def ablation_contract(variant: str) -> dict[str, Any]:
             0.0 if variant == "success_only" else DENSE_FAILURE_RANK_WEIGHT
         ),
         "all_failure_dense_informative_labels_only": True,
+        "candidate_rank_requires_real_comparative_supervision": (
+            variant != "success_only"
+        ),
+        "synthetic_success_labels_allowed": False,
         "dense_target_order": (
             "none"
             if variant == "success_only"
@@ -379,6 +383,10 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ),
         "all_failure_dense_informative_labels_only": True,
         "dense_rank_label_equality_tolerance": DENSE_RANK_LABEL_EQUALITY_TOLERANCE,
+        "candidate_rank_requires_real_comparative_supervision": (
+            variant != "success_only"
+        ),
+        "synthetic_success_labels_allowed": False,
         "dense_target_requires_full_continuation": True,
         "dense_goal_progress_temperature_meters": (
             None
@@ -442,6 +450,12 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ],
         "dense_rank_label_equality_tolerance": checkpoint[
             "dense_rank_label_equality_tolerance"
+        ],
+        "candidate_rank_requires_real_comparative_supervision": checkpoint[
+            "candidate_rank_requires_real_comparative_supervision"
+        ],
+        "synthetic_success_labels_allowed": checkpoint[
+            "synthetic_success_labels_allowed"
         ],
         "dense_target_requires_full_continuation": True,
         "dense_goal_progress_temperature_meters": checkpoint[
@@ -1431,16 +1445,16 @@ class CompleteDecisionBatchSampler:
 
 
 class MacroBalancedRankDecisionBatchSampler:
-    """Build rank-only batches with sparse success comparisons in every batch.
+    """Build rank-only batches without requiring a success-changing decision.
 
     Proper likelihoods use :class:`CompleteDecisionBatchSampler` and therefore
     retain the empirical source distribution.  This sampler is used only by
     the candidate-rank objective.  It alternates body/condition/current-event
-    strata, reserves half of each batch for mixed-success decisions when that
-    many distinct groups exist, and never repeats a logical decision within a
-    batch.  Sparse mixed decisions may be revisited across batches; that is the
-    intended oversampling needed to prevent dense failures from drowning the
-    success-changing supervision.
+    strata, reserves half of each batch for mixed-success decisions when they
+    exist, and otherwise trains from genuinely orderable all-failure decisions.
+    It never repeats a logical decision within a batch.  Sparse mixed decisions
+    may be revisited across batches; that is the intended oversampling needed
+    to prevent dense failures from drowning success-changing supervision.
     """
 
     def __init__(
@@ -1526,9 +1540,9 @@ class MacroBalancedRankDecisionBatchSampler:
         self.strata = strata
         self.mixed_groups = sorted(group for group, kind in kinds.items() if kind == "mixed")
         self.dense_groups = sorted(group for group, kind in kinds.items() if kind == "dense")
-        if not self.mixed_groups:
+        if not self.mixed_groups and not self.dense_groups:
             raise FiveBodyContractError(
-                "balanced rank sampler requires a positive-weight mixed-success decision"
+                "rank sampler requires mixed-success or informative dense supervision"
             )
         self.decisions_per_batch = max(1, batch_size // CANDIDATE_COUNT)
         self.batch_count = max(
@@ -1587,20 +1601,30 @@ class MacroBalancedRankDecisionBatchSampler:
     def __iter__(self) -> Iterator[list[int]]:
         generator = random.Random(self.seed + self.epoch)
         self.epoch += 1
-        mixed = self._stratified_cycler(self.mixed_groups, self.strata, generator)
+        mixed = (
+            self._stratified_cycler(self.mixed_groups, self.strata, generator)
+            if self.mixed_groups
+            else None
+        )
         dense = (
             self._stratified_cycler(self.dense_groups, self.strata, generator)
             if self.dense_groups
             else None
         )
-        mixed_target = max(1, self.decisions_per_batch // 2)
+        mixed_target = (
+            max(1, self.decisions_per_batch // 2) if mixed is not None else 0
+        )
         for _batch in range(self.batch_count):
             used: set[str] = set()
-            selected = self._draw_distinct(
-                mixed,
-                requested=mixed_target,
-                available_count=len(self.mixed_groups),
-                used=used,
+            selected = (
+                self._draw_distinct(
+                    mixed,
+                    requested=mixed_target,
+                    available_count=len(self.mixed_groups),
+                    used=used,
+                )
+                if mixed is not None
+                else []
             )
             if dense is not None:
                 selected.extend(
@@ -1611,16 +1635,22 @@ class MacroBalancedRankDecisionBatchSampler:
                         used=used,
                     )
                 )
-            selected.extend(
-                self._draw_distinct(
-                    mixed,
-                    requested=self.decisions_per_batch - len(selected),
-                    available_count=len(self.mixed_groups),
-                    used=used,
+            if mixed is not None:
+                selected.extend(
+                    self._draw_distinct(
+                        mixed,
+                        requested=self.decisions_per_batch - len(selected),
+                        available_count=len(self.mixed_groups),
+                        used=used,
+                    )
                 )
-            )
-            if not selected or not any(self.kinds[group] == "mixed" for group in selected):
-                raise FiveBodyContractError("rank batch lost mixed-success supervision")
+            if not selected or (
+                self.mixed_groups
+                and not any(self.kinds[group] == "mixed" for group in selected)
+            ):
+                raise FiveBodyContractError(
+                    "rank batch lost all comparative supervision"
+                )
             generator.shuffle(selected)
             yield [index for group in selected for index in self.decisions[group]]
 
@@ -2677,9 +2707,18 @@ def materialize_source_rows(
 
 
 def effect_preserving_group_bootstrap_weights(
-    rows: Sequence[Mapping[str, Any]], *, members: int, seed: int
-) -> tuple[np.ndarray, list[dict[str, int]]]:
-    """Use 1+Poisson for every mixed decision and Poisson for dense decisions."""
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    members: int,
+    seed: int,
+    ablation_variant: str = "full",
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Keep any available comparative rank supervision in every member."""
+
+    if ablation_variant not in ABLATION_VARIANTS:
+        raise FiveBodyContractError(
+            f"unknown ablation variant {ablation_variant!r}"
+        )
 
     group_order = [str(row["logical_group"]) for row in rows]
     weights = core.logical_group_bootstrap_weights(
@@ -2688,7 +2727,8 @@ def effect_preserving_group_bootstrap_weights(
     indices_by_group: dict[str, list[int]] = defaultdict(list)
     for index, group in enumerate(group_order):
         indices_by_group[group].append(index)
-    mixed_groups = []
+    mixed_groups: list[str] = []
+    informative_dense_groups: list[str] = []
     for group, indices in sorted(indices_by_group.items()):
         outcomes = {
             float(rows[index]["success"])
@@ -2697,22 +2737,58 @@ def effect_preserving_group_bootstrap_weights(
         }
         if outcomes == {0.0, 1.0}:
             mixed_groups.append(group)
-    if not mixed_groups:
-        raise FiveBodyContractError(
-            "effect-preserving bootstrap requires a mixed-success decision"
-        )
+        elif (
+            outcomes == {0.0}
+            and all(
+                bool(rows[index].get("terminal_event_mask", 0.0))
+                and bool(rows[index].get("terminal_goal_progress_mask", 0.0))
+                for index in indices
+            )
+            and _dense_rank_labels_are_orderable(
+                [rows[index]["terminal_max_event_id"] for index in indices],
+                [rows[index]["terminal_goal_progress"] for index in indices],
+                ablation_variant=ablation_variant,
+            )
+        ):
+            informative_dense_groups.append(group)
     # Every epistemic member sees every rare success-changing comparison.  The
-    # Poisson component still changes its relative influence across members;
-    # all-failure decisions retain the ordinary Poisson bootstrap, including
-    # genuine zero weights.
-    for group in mixed_groups:
-        weights[:, indices_by_group[group]] += 1.0
-    audit: list[dict[str, int]] = []
+    # Poisson component still changes its relative influence across members.
+    # Dense decisions retain ordinary Poisson weights unless a dense-only
+    # member would otherwise lose every real comparative group.
+    if ablation_variant != "success_only":
+        for group in mixed_groups:
+            weights[:, indices_by_group[group]] += 1.0
+    rank_groups = (
+        []
+        if ablation_variant == "success_only"
+        else mixed_groups + informative_dense_groups
+    )
+    audit: list[dict[str, Any]] = []
     for member in range(members):
+        repaired_rank_groups: list[str] = []
+
+        def active(group: str) -> bool:
+            return float(weights[member, indices_by_group[group][0]]) > 0.0
+
+        if rank_groups and not any(active(group) for group in rank_groups):
+            selector = int.from_bytes(
+                hashlib.sha256(
+                    f"{seed}|rank-support|{member}".encode()
+                ).digest()[:8],
+                "big",
+            )
+            repaired = rank_groups[selector % len(rank_groups)]
+            weights[member, indices_by_group[repaired]] = 1.0
+            repaired_rank_groups.append(repaired)
         active_mixed = [
             group
             for group in mixed_groups
-            if float(weights[member, indices_by_group[group][0]]) > 0.0
+            if active(group)
+        ]
+        active_dense = [
+            group
+            for group in informative_dense_groups
+            if active(group)
         ]
         active_indices = [
             index for index in range(len(rows)) if float(weights[member, index]) > 0.0
@@ -2729,9 +2805,17 @@ def effect_preserving_group_bootstrap_weights(
             float(weights[member, indices_by_group[group][0]]) > 0.0
             for group in mixed_groups
         )
-        if not positives or not negatives or not active_mixed_count:
+        if (
+            ablation_variant != "success_only"
+            and mixed_groups
+            and not active_mixed_count
+        ):
             raise FiveBodyContractError(
-                "effect-preserving bootstrap failed to retain outcome supervision"
+                "effect-preserving bootstrap lost mixed-success supervision"
+            )
+        if rank_groups and not (active_mixed or active_dense):
+            raise FiveBodyContractError(
+                "effect-preserving bootstrap lost all comparative supervision"
             )
         audit.append(
             {
@@ -2740,8 +2824,20 @@ def effect_preserving_group_bootstrap_weights(
                 "negative_rows_with_nonzero_weight": int(negatives),
                 "mixed_success_groups_with_nonzero_weight": int(active_mixed_count),
                 "mixed_success_groups_total": len(mixed_groups),
-                "mixed_weight_minimum": 1,
+                "informative_dense_groups_with_nonzero_weight": len(active_dense),
+                "informative_dense_groups_total": len(informative_dense_groups),
+                "rank_supervision_groups_with_nonzero_weight": (
+                    len(active_mixed) + len(active_dense)
+                    if ablation_variant != "success_only"
+                    else 0
+                ),
+                "rank_supervision_groups_total": len(rank_groups),
+                "mixed_weight_minimum": (
+                    1 if ablation_variant != "success_only" and mixed_groups else 0
+                ),
                 "deterministic_mixed_group_repairs": 0,
+                "deterministic_rank_group_repairs": len(repaired_rank_groups),
+                "repaired_rank_groups": repaired_rank_groups,
             }
         )
     return weights.astype(np.float32, copy=False), audit
@@ -2750,14 +2846,13 @@ def effect_preserving_group_bootstrap_weights(
 def proper_outcome_preserving_group_bootstrap_weights(
     rows: Sequence[Mapping[str, Any]], *, members: int, seed: int
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Keep every proper-likelihood member identifiable for task success.
+    """Retain every outcome class that really exists without synthesizing one.
 
-    The ordinary Poisson group bootstrap is retained exactly unless it drops
-    every success-positive or every success-negative logical group for one
-    member.  In that rare case one complete mixed-success decision is restored
-    with unit weight.  Restoring a whole decision preserves the same-root
-    candidate dependence and gives the coherent terminal-event/success heads
-    both outcome classes without introducing a global class weight.
+    Ordinary logical-group Poisson weights are unchanged unless a member loses
+    every group from an observed success class.  A complete real group from
+    only that observed class is then restored at unit weight.  Single-class
+    source data remain single-class: no positive label, negative label, mixed
+    decision, class weight, or pseudo-outcome is ever fabricated.
     """
 
     group_order = [str(row["logical_group"]) for row in rows]
@@ -2770,6 +2865,7 @@ def proper_outcome_preserving_group_bootstrap_weights(
     indices_by_group: dict[str, list[int]] = defaultdict(list)
     for index, group in enumerate(group_order):
         indices_by_group[group].append(index)
+    all_groups: list[str] = []
     positive_groups: list[str] = []
     negative_groups: list[str] = []
     mixed_groups: list[str] = []
@@ -2783,16 +2879,16 @@ def proper_outcome_preserving_group_bootstrap_weights(
             raise FiveBodyContractError(
                 "proper success bootstrap found a non-binary outcome"
             )
+        all_groups.append(group)
         if 1.0 in outcomes:
             positive_groups.append(group)
         if 0.0 in outcomes:
             negative_groups.append(group)
         if outcomes == {0.0, 1.0}:
             mixed_groups.append(group)
-    if not positive_groups or not negative_groups or not mixed_groups:
+    if not all_groups:
         raise FiveBodyContractError(
-            "proper outcome-preserving bootstrap requires positive, negative, "
-            "and mixed-success logical groups"
+            "proper outcome-preserving bootstrap requires a supervised group"
         )
 
     audit: list[dict[str, Any]] = []
@@ -2802,21 +2898,27 @@ def proper_outcome_preserving_group_bootstrap_weights(
         def active(group: str) -> bool:
             return float(weights[member, indices_by_group[group][0]]) > 0.0
 
-        if not any(active(group) for group in positive_groups) or not any(
-            active(group) for group in negative_groups
-        ):
+        def restore_one(candidates: Sequence[str], purpose: str) -> None:
             selector = int.from_bytes(
                 hashlib.sha256(
-                    f"{seed}|proper-outcome|{member}".encode()
+                    f"{seed}|proper-outcome|{purpose}|{member}".encode()
                 ).digest()[:8],
                 "big",
             )
-            repaired = mixed_groups[selector % len(mixed_groups)]
+            repaired = candidates[selector % len(candidates)]
             selected = indices_by_group[repaired]
             weights[member, selected] = np.maximum(
                 weights[member, selected], np.float32(1.0)
             )
-            repaired_groups.append(repaired)
+            if repaired not in repaired_groups:
+                repaired_groups.append(repaired)
+
+        if positive_groups and not any(active(group) for group in positive_groups):
+            restore_one(positive_groups, "positive")
+        if negative_groups and not any(active(group) for group in negative_groups):
+            restore_one(negative_groups, "negative")
+        if not any(active(group) for group in all_groups):
+            restore_one(all_groups, "any")
 
         active_indices = [
             index for index in range(len(rows)) if float(weights[member, index]) > 0.0
@@ -2831,10 +2933,8 @@ def proper_outcome_preserving_group_bootstrap_weights(
         active_negative_groups = sum(active(group) for group in negative_groups)
         active_mixed_groups = sum(active(group) for group in mixed_groups)
         if (
-            not positive_rows
-            or not negative_rows
-            or not active_positive_groups
-            or not active_negative_groups
+            (positive_groups and (not positive_rows or not active_positive_groups))
+            or (negative_groups and (not negative_rows or not active_negative_groups))
         ):
             raise FiveBodyContractError(
                 "proper outcome-preserving bootstrap lost identifiable success support"
@@ -2856,7 +2956,13 @@ def proper_outcome_preserving_group_bootstrap_weights(
                 "positive_groups_total": len(positive_groups),
                 "negative_groups_total": len(negative_groups),
                 "mixed_success_groups_total": len(mixed_groups),
-                "deterministic_mixed_group_repairs": len(repaired_groups),
+                "positive_class_present": bool(positive_groups),
+                "negative_class_present": bool(negative_groups),
+                "deterministic_outcome_group_repairs": len(repaired_groups),
+                "deterministic_mixed_group_repairs": sum(
+                    group in mixed_groups for group in repaired_groups
+                ),
+                "success_labels_synthesized": 0,
                 "repaired_groups": repaired_groups,
             }
         )
@@ -2886,19 +2992,18 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
     successes = np.asarray(
         [float(row["success"]) for row in train_rows if bool(row["success_mask"])]
     )
-    if not len(successes) or set(np.unique(successes).tolist()) != {0.0, 1.0}:
+    if (
+        not len(successes)
+        or not set(np.unique(successes).tolist()) <= {0.0, 1.0}
+    ):
         raise FiveBodyContractError(
-            "source training requires real positive and negative outcome supervision"
+            "source training requires real binary outcome supervision"
         )
     outcome_by_group: dict[str, set[float]] = defaultdict(set)
     for row in train_rows:
         if bool(row["success_mask"]):
             outcome_by_group[str(row["logical_group"])].add(float(row["success"]))
     mixed_outcome_decisions = sum(len(values) > 1 for values in outcome_by_group.values())
-    if mixed_outcome_decisions == 0:
-        raise FiveBodyContractError(
-            "source training has no within-root success/failure candidate comparison"
-        )
     source_normalization = core.fit_train_action_normalization(
         train_rows, required_schema_ids=(0,)
     )
@@ -2952,8 +3057,37 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         )
     )
     rank_bootstrap, bootstrap_support = effect_preserving_group_bootstrap_weights(
-        train_rows, members=5, seed=args.split_seed
+        train_rows,
+        members=5,
+        seed=args.split_seed,
+        ablation_variant=args.ablation_variant,
     )
+    rank_supervision_groups = int(
+        bootstrap_support[0]["rank_supervision_groups_total"]
+    )
+    if any(
+        int(item["rank_supervision_groups_total"]) != rank_supervision_groups
+        for item in bootstrap_support
+    ):
+        raise FiveBodyContractError("rank supervision inventory changed by member")
+    rank_supervision_available = rank_supervision_groups > 0
+    if args.ablation_variant != "success_only" and not rank_supervision_available:
+        raise FiveBodyContractError(
+            "candidate-rank utility has no real mixed-success or informative "
+            "dense comparison in this source fold"
+        )
+    mixed_rank_groups = int(bootstrap_support[0]["mixed_success_groups_total"])
+    informative_dense_groups = int(
+        bootstrap_support[0]["informative_dense_groups_total"]
+    )
+    if args.ablation_variant == "success_only":
+        rank_supervision_mode = "proper_coherent_terminal_success_only"
+    elif mixed_rank_groups and informative_dense_groups:
+        rank_supervision_mode = "mixed_success_plus_informative_dense"
+    elif mixed_rank_groups:
+        rank_supervision_mode = "mixed_success_only"
+    else:
+        rank_supervision_mode = "informative_dense_only"
     proper_group_weight = {
         group: proper_bootstrap[:, index].tolist()
         for index, group in enumerate(group_order)
@@ -2962,9 +3096,25 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         group: rank_bootstrap[:, index].tolist()
         for index, group in enumerate(group_order)
     }
-    source_negative_to_positive_ratio = float(
-        (successes <= 0.5).sum() / (successes > 0.5).sum()
+    positive_count = int((successes > 0.5).sum())
+    source_negative_to_positive_ratio = (
+        float((successes <= 0.5).sum() / positive_count)
+        if positive_count
+        else None
     )
+    observed_success_classes = sorted(
+        float(value) for value in np.unique(successes).tolist()
+    )
+    if observed_success_classes == [0.0, 1.0]:
+        success_probability_identifiability = "binary_observed"
+    elif observed_success_classes == [0.0]:
+        success_probability_identifiability = (
+            "negative_only_positive_class_unidentified"
+        )
+    else:
+        success_probability_identifiability = (
+            "positive_only_negative_class_unidentified"
+        )
     base_loss_weights = dict(core.DEFAULT_LOSS_WEIGHTS)
     base_loss_weights["object"] = 0.0
     if args.ablation_variant == "success_only":
@@ -3007,12 +3157,18 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
         }
         rank_loader = DataLoader(
             train_dataset,
-            batch_sampler=MacroBalancedRankDecisionBatchSampler(
-                train_rows,
-                batch_size=args.batch_size,
-                seed=seed,
-                positive_group_weight=rank_weight_for_member,
-                ablation_variant=args.ablation_variant,
+            batch_sampler=(
+                MacroBalancedRankDecisionBatchSampler(
+                    train_rows,
+                    batch_size=args.batch_size,
+                    seed=seed,
+                    positive_group_weight=rank_weight_for_member,
+                    ablation_variant=args.ablation_variant,
+                )
+                if rank_supervision_available
+                else CompleteDecisionBatchSampler(
+                    train_rows, batch_size=args.batch_size, seed=seed
+                )
             ),
             collate_fn=core.collate_rows,
         )
@@ -3097,10 +3253,26 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             selection_components = ablation_selection_components(
                 components, args.ablation_variant
             )
+            success_brier_used_for_selection = bool(
+                "success_brier_ratio" in selection_components
+            )
+            if (
+                success_probability_identifiability != "binary_observed"
+                and args.ablation_variant != "success_only"
+            ):
+                selection_components.pop("success_brier_ratio", None)
+                success_brier_used_for_selection = False
+            if not selection_components:
+                raise FiveBodyContractError(
+                    "checkpoint selection has no identifiable proper component"
+                )
             diagnostic_score = float(np.mean(list(selection_components.values())))
             metrics["diagnostic_multitask_score"] = diagnostic_score
             metrics["diagnostic_multitask_components"] = components
             metrics["checkpoint_selection_diagnostic_components"] = selection_components
+            metrics["success_brier_used_for_checkpoint_selection"] = (
+                success_brier_used_for_selection
+            )
             metrics["train_objective_last"] = {
                 "total": float(loss.detach()),
                 **{name: float(value.detach()) for name, value in pieces.items() if name != "total"},
@@ -3203,6 +3375,33 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             best_ensemble_diagnostic = diagnostic
     if best_ensemble_ranking is None or best_ensemble_key is None:
         raise FiveBodyContractError("deployment-homomorphic ensemble selected no checkpoint")
+    validation_has_comparative_rank_evidence = any(
+        int(record["ensemble_candidate_ranking"].get("mixed_success_decisions", 0))
+        > 0
+        or int(record["ensemble_candidate_ranking"].get("dense_progress_decisions", 0))
+        > 0
+        for record in common_step_selection_audit
+    )
+    if not validation_has_comparative_rank_evidence:
+        fixed = next(
+            record
+            for record in common_step_selection_audit
+            if int(record["step"]) == args.steps
+        )
+        best_ensemble_step = args.steps
+        best_ensemble_ranking = fixed["ensemble_candidate_ranking"]
+        best_ensemble_diagnostic = float(
+            fixed["mean_member_diagnostic_multitask_score"]
+        )
+        best_ensemble_key = candidate_checkpoint_selection_key(
+            best_ensemble_ranking, best_ensemble_diagnostic, args.steps
+        )
+    if int(best_ensemble_ranking.get("mixed_success_decisions", 0)) > 0:
+        selection_evidence_mode = "mixed_success_then_dense_progress"
+    elif int(best_ensemble_ranking.get("dense_progress_decisions", 0)) > 0:
+        selection_evidence_mode = "dense_progress_without_mixed_success"
+    else:
+        selection_evidence_mode = "fixed_final_step_no_validation_comparison"
 
     members = []
     for member, seed in enumerate(args.ensemble_seeds):
@@ -3242,6 +3441,16 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
                 "action_stem_count": 1,
                 "body_to_id_source_only": body_to_id,
                 "heldout_rows_used_for_training_normalization_or_selection": 0,
+                "rank_supervision_available": rank_supervision_available,
+                "rank_supervision_mode": rank_supervision_mode,
+                "candidate_rank_parameters_received_direct_supervision": (
+                    rank_supervision_available
+                ),
+                "synthetic_success_labels": 0,
+                "selection_evidence_mode": selection_evidence_mode,
+                "success_probability_identifiability": (
+                    success_probability_identifiability
+                ),
                 "actor_frozen": True,
                 "action_normalization": normalization,
                 "state_normalization": state_normalization,
@@ -3296,13 +3505,37 @@ def _train_fold(args: argparse.Namespace, audit: Mapping[str, Any]) -> dict[str,
             "ensemble_members": len(args.ensemble_seeds),
         },
         "mixed_outcome_source_decisions": mixed_outcome_decisions,
+        "observed_success_classes": observed_success_classes,
+        "success_probability_identifiability": (
+            success_probability_identifiability
+        ),
+        "source_success_rows": positive_count,
+        "source_failure_rows": int((successes <= 0.5).sum()),
+        "rank_supervision_available": rank_supervision_available,
+        "rank_supervision_groups": rank_supervision_groups,
+        "mixed_success_rank_groups": mixed_rank_groups,
+        "informative_dense_rank_groups": informative_dense_groups,
+        "rank_supervision_mode": rank_supervision_mode,
+        "candidate_rank_parameters_received_direct_supervision": (
+            rank_supervision_available
+        ),
+        "synthetic_success_labels": 0,
+        "selection_evidence_mode": selection_evidence_mode,
         "source_negative_to_positive_ratio": source_negative_to_positive_ratio,
         "ensemble_bootstrap_effect_support": bootstrap_support,
         "ensemble_proper_bootstrap_outcome_support": proper_bootstrap_support,
         "success_probability_training_loss": "unweighted_proper_binary_cross_entropy",
-        "checkpoint_selection_primary": (
-            "five_member_standardized_one_deviation_source_validation_surrogate"
-        ),
+        "checkpoint_selection_primary": {
+            "mixed_success_then_dense_progress": (
+                "five_member_standardized_one_deviation_success_then_dense"
+            ),
+            "dense_progress_without_mixed_success": (
+                "five_member_standardized_terminal_event_then_goal_progress"
+            ),
+            "fixed_final_step_no_validation_comparison": (
+                "fixed_final_step_without_validation_rank_comparison"
+            ),
+        }[selection_evidence_mode],
         "ensemble_checkpoint_selection": {
             "common_step_required_for_all_five_members": True,
             "rank_aggregation": standardized_rank_ensemble_contract(),

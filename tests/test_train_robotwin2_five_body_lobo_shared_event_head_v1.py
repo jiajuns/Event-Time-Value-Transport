@@ -661,6 +661,43 @@ def test_terminal_proper_loss_updates_long_horizon_predictors_and_backbone() -> 
     assert any(parameter.grad is not None for parameter in model.transition.parameters())
 
 
+def test_single_failure_class_trains_coherent_success_without_synthetic_positive() -> None:
+    torch.manual_seed(10)
+    model = EffectAlignedSharedEventHead().train()
+    batch = _model_batch(torch.full((4,), 5.0 / 15.0))
+    batch.update(
+        {
+            "post_event_id": torch.zeros(4, dtype=torch.long),
+            "post_event_mask": torch.zeros(4),
+            "next_event_id": torch.zeros(4, dtype=torch.long),
+            "next_event_mask": torch.zeros(4),
+            "duration": torch.ones(4),
+            "duration_observed": torch.ones(4),
+            "duration_mask": torch.zeros(4),
+            "success": torch.zeros(4),
+            "success_mask": torch.ones(4),
+            "recovery": torch.zeros(4),
+            "recovery_mask": torch.zeros(4),
+            "object_delta": torch.zeros(4, core.OBJECT_DELTA_DIM),
+            "object_delta_mask": torch.zeros(4),
+        }
+    )
+    original_success = batch["success"].clone()
+    output = model(batch)
+    weights = {name: 0.0 for name in core.DEFAULT_LOSS_WEIGHTS}
+    weights["success"] = 1.0
+    loss, pieces = core.compute_multitask_loss(
+        output, batch, sample_weight=torch.ones(4), loss_weights=weights
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(pieces["success"])
+    assert model.terminal_event.bias.grad is not None
+    assert model.terminal_event.bias.grad[-1] > 0
+    assert bool((model.terminal_event.bias.grad[:-1] < 0).any())
+    assert torch.equal(batch["success"], original_success)
+
+
 def test_rank_features_are_only_explicit_predicted_consequences() -> None:
     torch.manual_seed(11)
     model = EffectAlignedSharedEventHead().eval()
@@ -1032,6 +1069,88 @@ def test_proper_bootstrap_repairs_only_missing_binary_outcome_support(
     assert all(item["negative_groups_with_nonzero_weight"] > 0 for item in audit)
 
 
+def test_dense_only_bootstraps_keep_real_rank_and_single_class_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = []
+    for group_index in range(2):
+        rows.extend(
+            {
+                "logical_group": f"piper|clean|dense-only-{group_index}",
+                "success": 0.0,
+                "success_mask": 1.0,
+                "terminal_max_event_id": int(index == group_index),
+                "terminal_event_mask": 1.0,
+                "terminal_goal_progress": float(index) / 10.0,
+                "terminal_goal_progress_mask": 1.0,
+            }
+            for index in range(4)
+        )
+    original_success = [row["success"] for row in rows]
+    monkeypatch.setattr(
+        core,
+        "logical_group_bootstrap_weights",
+        lambda groups, *, members, seed: np.zeros((members, len(groups)), np.float32),
+    )
+    rank_weights, rank_audit = effect_preserving_group_bootstrap_weights(
+        rows, members=5, seed=23
+    )
+    assert np.all(np.count_nonzero(rank_weights, axis=1) == 4)
+    assert all(item["mixed_success_groups_total"] == 0 for item in rank_audit)
+    assert all(item["informative_dense_groups_total"] == 2 for item in rank_audit)
+    assert all(
+        item["rank_supervision_groups_with_nonzero_weight"] == 1
+        for item in rank_audit
+    )
+    assert all(item["deterministic_rank_group_repairs"] == 1 for item in rank_audit)
+
+    proper_weights, proper_audit = proper_outcome_preserving_group_bootstrap_weights(
+        rows, members=5, seed=23
+    )
+    assert np.all(np.count_nonzero(proper_weights, axis=1) == 4)
+    assert all(item["positive_class_present"] is False for item in proper_audit)
+    assert all(item["negative_class_present"] is True for item in proper_audit)
+    assert all(item["positive_rows_with_nonzero_weight"] == 0 for item in proper_audit)
+    assert all(item["negative_rows_with_nonzero_weight"] == 4 for item in proper_audit)
+    assert all(item["deterministic_outcome_group_repairs"] == 1 for item in proper_audit)
+    assert all(item["success_labels_synthesized"] == 0 for item in proper_audit)
+    assert [row["success"] for row in rows] == original_success
+
+
+def test_proper_bootstrap_restores_separate_real_classes_without_mixed_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = []
+    for group, success in (
+        ("piper|clean|all-failure", 0.0),
+        ("piper|clean|all-success", 1.0),
+    ):
+        rows.extend(
+            {
+                "logical_group": group,
+                "success": success,
+                "success_mask": 1.0,
+            }
+            for _candidate in range(4)
+        )
+    original_success = [row["success"] for row in rows]
+    monkeypatch.setattr(
+        core,
+        "logical_group_bootstrap_weights",
+        lambda groups, *, members, seed: np.zeros((members, len(groups)), np.float32),
+    )
+    weights, audit = proper_outcome_preserving_group_bootstrap_weights(
+        rows, members=5, seed=29
+    )
+    assert np.all(np.count_nonzero(weights, axis=1) == 8)
+    assert all(item["mixed_success_groups_total"] == 0 for item in audit)
+    assert all(item["positive_rows_with_nonzero_weight"] == 4 for item in audit)
+    assert all(item["negative_rows_with_nonzero_weight"] == 4 for item in audit)
+    assert all(item["deterministic_outcome_group_repairs"] == 2 for item in audit)
+    assert all(item["success_labels_synthesized"] == 0 for item in audit)
+    assert [row["success"] for row in rows] == original_success
+
+
 def test_dense_goal_progress_uses_frozen_soft_target_inside_max_event() -> None:
     assert DENSE_GOAL_PROGRESS_TEMPERATURE_METERS == 0.02
     scores = torch.zeros(4, requires_grad=True)
@@ -1139,6 +1258,69 @@ def test_macro_balanced_rank_batches_include_mixed_without_group_duplicates() ->
         )
 
 
+def test_macro_rank_sampler_can_train_from_informative_dense_only() -> None:
+    rows: list[dict[str, object]] = []
+    weights: dict[str, float] = {}
+    for group_index in range(3):
+        group = f"piper|clean|dense-only-{group_index}"
+        weights[group] = 1.0
+        for candidate in range(4):
+            rows.append(
+                {
+                    "logical_group": group,
+                    "body": "piper",
+                    "candidate_index": candidate,
+                    "current_event_id": 0,
+                    "success": 0.0,
+                    "success_mask": 1.0,
+                    "terminal_max_event_id": int(candidate == group_index % 4),
+                    "terminal_event_mask": 1.0,
+                    "terminal_goal_progress": candidate / 10.0,
+                    "terminal_goal_progress_mask": 1.0,
+                }
+            )
+    tie_group = "piper|clean|dense-only-tie"
+    weights[tie_group] = 1.0
+    for candidate in range(4):
+        rows.append(
+            {
+                "logical_group": tie_group,
+                "body": "piper",
+                "candidate_index": candidate,
+                "current_event_id": 0,
+                "success": 0.0,
+                "success_mask": 1.0,
+                "terminal_max_event_id": 1,
+                "terminal_event_mask": 1.0,
+                "terminal_goal_progress": 0.2,
+                "terminal_goal_progress_mask": 1.0,
+            }
+        )
+    sampler = MacroBalancedRankDecisionBatchSampler(
+        rows,
+        batch_size=8,
+        seed=31,
+        positive_group_weight=weights,
+        ablation_variant="full",
+    )
+    assert sampler.mixed_groups == []
+    assert len(sampler.dense_groups) == 3
+    assert tie_group not in sampler.decisions
+    observed = []
+    for batch in sampler:
+        groups = [str(rows[index]["logical_group"]) for index in batch[::4]]
+        assert batch
+        assert len(groups) == len(set(groups))
+        assert all(sampler.kinds[group] == "dense" for group in groups)
+        assert all(
+            [int(rows[index]["candidate_index"]) for index in batch[offset:offset + 4]]
+            == [0, 1, 2, 3]
+            for offset in range(0, len(batch), 4)
+        )
+        observed.extend(groups)
+    assert set(observed) == set(weights) - {tie_group}
+
+
 class _FixedRankModel(torch.nn.Module):
     def __init__(self, variant: str) -> None:
         super().__init__()
@@ -1237,6 +1419,24 @@ def test_checkpoint_selection_prefers_mixed_success_before_dense_diagnostics() -
     assert candidate_checkpoint_selection_key(
         stronger_mixed, 1.0, 100
     ) < candidate_checkpoint_selection_key(stronger_dense_only, 0.1, 100)
+
+
+def test_checkpoint_selection_uses_dense_evidence_when_mixed_is_absent() -> None:
+    weak_dense = {
+        "macro_one_deviation_branch_success_gain": 0.0,
+        "macro_mixed_success_selection_accuracy": None,
+        "macro_mixed_success_pairwise_accuracy": None,
+        "macro_dense_progress_selection_accuracy": 0.5,
+        "macro_dense_progress_pairwise_accuracy": 0.5,
+    }
+    strong_dense = {
+        **weak_dense,
+        "macro_dense_progress_selection_accuracy": 0.8,
+        "macro_dense_progress_pairwise_accuracy": 0.7,
+    }
+    assert candidate_checkpoint_selection_key(
+        strong_dense, 100.0, 3000
+    ) < candidate_checkpoint_selection_key(weak_dense, 0.1, 100)
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
@@ -1380,6 +1580,7 @@ def _ablation_validation_metrics(offset: float) -> dict[str, object]:
 
 def _ablation_fold_summary(body: str, variant: str, offset: float) -> dict[str, object]:
     trainer_sha = sha256_file(Path(ablation.trainer.__file__).resolve())
+    direct_rank = variant != "success_only"
     return {
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": body,
@@ -1387,6 +1588,9 @@ def _ablation_fold_summary(body: str, variant: str, offset: float) -> dict[str, 
         "ablation": ablation_contract(variant),
         "candidate_rank_contract": summary_candidate_rank_contract(variant),
         "trainer_file_sha256": trainer_sha,
+        "rank_supervision_available": direct_rank,
+        "candidate_rank_parameters_received_direct_supervision": direct_rank,
+        "synthetic_success_labels": 0,
         "ensemble_checkpoint_selection": {
             "common_step_required_for_all_five_members": True,
             "rank_aggregation": ablation.trainer.standardized_rank_ensemble_contract(),
@@ -1545,11 +1749,14 @@ def test_ablation_posthoc_heldout_uses_frozen_five_member_rank_ensemble(
                 "candidate_rank_contract": checkpoint_candidate_rank_contract(
                     variant
                 ),
-                    "heldout_rows_used_for_training_normalization_or_selection": 0,
-                    "trainer_file_sha256": sha256_file(
-                        Path(ablation.trainer.__file__).resolve()
-                    ),
-                    "ensemble_common_selection_step": 3000,
+                "heldout_rows_used_for_training_normalization_or_selection": 0,
+                "rank_supervision_available": True,
+                "candidate_rank_parameters_received_direct_supervision": True,
+                "synthetic_success_labels": 0,
+                "trainer_file_sha256": sha256_file(
+                    Path(ablation.trainer.__file__).resolve()
+                ),
+                "ensemble_common_selection_step": 3000,
             },
             checkpoint_path,
         )

@@ -147,10 +147,11 @@ distance/progress、终止原因、事件年龄和剩余预算。正常成功、
    但不会反向更新 world/terminal heads，也不会改变概率先验。
 
 五个 ensemble member 的 proper stream 仍使用 logical-group Poisson bootstrap，但新增了结果支持保持：
-若某个 member 恰好把全部成功组或全部失败组抽成零权重，只确定性恢复一个完整 mixed-success
-decision 的单位权重。修复以四候选 decision 为整体，不拆组、不使用全局 `pos_weight`，因此既保留
-同根相关性，也保证每个 member 的 terminal-event / coherent-success 头都实际见过两类结果。每个
-member 的非零正负行、正负组、mixed group 和修复次数全部写入训练摘要。
+若某个 member 恰好把数据中实际存在的某个成功类别全部抽成零权重，只确定性恢复该类别的一个
+完整 decision；若 mixed decision 存在，它可同时恢复两类，否则分别恢复真实 all-success 与
+all-failure 组。修复始终以四候选 decision 为整体，不拆组、不生成缺失类别、不使用全局
+`pos_weight`，因此保留同根相关性。每个 member 的非零正负行、正负组、mixed group、真实类别和
+修复次数全部写入训练摘要。
 
 terminal-event 和 terminal-progress 的初始 loss 权重均为 0.5。全失败 decision 的 dense rank 只占
 0.1 权重：先比较达到的最大事件，再在相同最大事件内比较终局目标进度。mixed-success decision
@@ -158,6 +159,17 @@ terminal-event 和 terminal-progress 的初始 loss 权重均为 0.5。全失败
 容差内完全相同，则该 decision 只进入 proper consequence likelihood，不进入 rank-only stream，
 也不进入 dense selection accuracy 的分母；因为它没有可辨识的候选偏好，均匀 listwise 标签只会
 压平 utility 分数并占用平衡批次。`no_object_effect` 消融只按终局事件差异判断是否可排序。
+
+训练不再把 mixed-success 当作启动共享头的必要条件。若某个 outer source fold 暂时没有候选间
+成功/失败分歧，但存在真实的全失败阶段或终局目标进度差异，rank-only stream 会进入
+`informative_dense_only` 模式，并为每个 ensemble member 保留至少一个完整、真实、同根四候选组。
+proper stream 同样允许数据中真实存在的单一成功类别：Poisson bootstrap 只恢复实际存在的完整组，
+不会合成正例、负例或 mixed decision，也不使用 `pos_weight`。若非 `success_only` 模型连一个真实
+mixed 或 informative-dense 比较都没有，则停止该折而不是部署未经监督的随机 utility MLP。
+单类 fold 只声明该类别上的 proper 学习，不声明正负两类成功概率已可识别；其 success Brier ratio
+不参与 full 模型的 checkpoint tie-break，validation 又没有任何比较组时直接采用预注册最终 step。
+训练摘要和 checkpoint 会记录 success 类别、mixed/dense 组数、rank 监督模式以及
+`synthetic_success_labels=0`；正式 paired runner 会重新验证这些字段。
 
 ## 7. 保证四候选确实来自同一个根状态
 

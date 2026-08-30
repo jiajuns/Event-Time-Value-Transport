@@ -1061,6 +1061,10 @@ def summarize_fold(
         != expected_binding_sha256
         or not isinstance(summary.get("trainer_file_sha256"), str)
         or len(summary["trainer_file_sha256"]) != 64
+        or summary.get("rank_supervision_available") is not True
+        or summary.get("candidate_rank_parameters_received_direct_supervision")
+        is not True
+        or summary.get("synthetic_success_labels") != 0
         or not isinstance(ensemble_selection, Mapping)
         or ensemble_selection.get("common_step_required_for_all_five_members")
         is not True
@@ -1094,6 +1098,17 @@ def summarize_fold(
             "event_derivation_implementation_sha256"
         ),
         "mixed_outcome_source_decisions": summary.get("mixed_outcome_source_decisions"),
+        "observed_success_classes": summary.get("observed_success_classes"),
+        "source_success_rows": summary.get("source_success_rows"),
+        "source_failure_rows": summary.get("source_failure_rows"),
+        "success_probability_identifiability": summary.get(
+            "success_probability_identifiability"
+        ),
+        "informative_dense_rank_groups": summary.get(
+            "informative_dense_rank_groups"
+        ),
+        "rank_supervision_mode": summary.get("rank_supervision_mode"),
+        "selection_evidence_mode": summary.get("selection_evidence_mode"),
         "source_negative_to_positive_ratio": summary.get(
             "source_negative_to_positive_ratio"
         ),
