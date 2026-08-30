@@ -45,6 +45,10 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         augmented_n4_root=tmp_path / "augmented-n4",
         augmented_n8_root=tmp_path / "augmented-n8",
         metrics_preregistration=tmp_path / "metrics.json",
+        lerobot_root=tmp_path / "lerobot",
+        lerobot_site=tmp_path / "lerobot-site",
+        robotwin_eval_site=tmp_path / "robotwin-eval-site",
+        etsf_site=tmp_path / "etsf-site",
         poll_seconds=30.0,
         expected_gpu_uuid=watcher.EXPECTED_GPU_UUID,
     )
@@ -90,6 +94,18 @@ def test_commands_bind_complete_supplement_and_both_full_candidate_studies(
         assert sum(value == "--lobo-fold" for value in command) == 5
     assert "--candidate-count" not in n4
     assert n8[n8.index("--candidate-count") + 1] == "8"
+
+
+def test_runtime_environment_includes_explicit_etsf_dependency_site(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    environment = watcher.runtime_environment(args)
+    python_paths = environment["PYTHONPATH"].split(":")
+    assert str(args.etsf_site) in python_paths
+    assert python_paths.index(str(args.etsf_site)) > python_paths.index(
+        str(args.robotwin_eval_site)
+    )
 
 
 def test_supplement_completion_is_exact_design_not_just_group_count(

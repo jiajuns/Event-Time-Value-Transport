@@ -189,6 +189,7 @@ ETSF_SITE = HOME_ROOT / (
     "anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages"
 )
 _STATE_WRITE_LOCK = threading.Lock()
+MAX_CONSECUTIVE_SUPPLEMENTAL_FAILURES = 8
 
 
 class ContinuationError(RuntimeError):
@@ -814,23 +815,49 @@ def complete_body(static: Mapping[str, Any], body: str) -> dict[str, Any]:
     for condition in CONDITIONS:
         for query in ROOT_QUERIES:
             key = f"{condition}|{query}"
+            consecutive_failures = 0
             while counts[(condition, query)] < TARGET_PER_CONDITION_QUERY:
                 seed = progress[key]
                 if seed >= FORMAL_EVALUATION_SEED_START:
                     raise ContinuationError("supplemental seeds reached formal evaluation range")
-                run_collector(
-                    static,
-                    body=body,
-                    conditions=(condition,),
-                    seed_start=seed,
-                    seed_count=1,
-                    queries=(query,),
-                    phase="supplement_terminal_root_gap",
-                )
+                try:
+                    run_collector(
+                        static,
+                        body=body,
+                        conditions=(condition,),
+                        seed_start=seed,
+                        seed_count=1,
+                        queries=(query,),
+                        phase="supplement_terminal_root_gap",
+                    )
+                except ContinuationError as error:
+                    progress[key] = seed + 1
+                    atomic_json(progress_path(body), progress)
+                    consecutive_failures += 1
+                    write_state(
+                        "supplemental_seed_failed_resumable",
+                        body=body,
+                        condition=condition,
+                        root_query_index=query,
+                        failed_seed=seed,
+                        consecutive_failures=consecutive_failures,
+                        maximum_consecutive_failures=(
+                            MAX_CONSECUTIVE_SUPPLEMENTAL_FAILURES
+                        ),
+                        error_type=type(error).__name__,
+                        error_message=str(error),
+                    )
+                    if consecutive_failures >= MAX_CONSECUTIVE_SUPPLEMENTAL_FAILURES:
+                        raise ContinuationError(
+                            f"{body}/{condition}/query={query} failed "
+                            f"{consecutive_failures} consecutive supplemental seeds"
+                        ) from error
+                    continue
                 progress[key] = seed + 1
                 atomic_json(progress_path(body), progress)
                 manifest = load_manifest(body, static)
                 counts = stratum_counts(manifest)
+                consecutive_failures = 0
     if len(manifest["groups"]) != EXPECTED_GROUPS_PER_BODY:
         raise ContinuationError(f"{body} did not reach exactly 400 complete decisions")
     return finalize_body_manifest(body, manifest, static)
@@ -1023,16 +1050,39 @@ def main() -> int:
             return collect_base_block(static, body, block_start)
 
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="body-collector") as pool:
-        base_futures = []
+        base_futures: dict[Any, tuple[str, int]] = {}
         for job_index, (body, block_start) in enumerate(base_collection_jobs()):
             if already_complete[body] is not None:
                 continue
-            base_futures.append(pool.submit(locked_base_block, body, block_start))
+            future = pool.submit(locked_base_block, body, block_start)
+            base_futures[future] = (body, block_start // QUERY_BLOCK_SIZE)
             if job_index < 2:
                 time.sleep(20.0)
         completed_base_blocks = 0
+        failed_base_blocks: list[dict[str, Any]] = []
         for future in as_completed(base_futures):
-            body, block_index = future.result()
+            scheduled_body, scheduled_block = base_futures[future]
+            try:
+                body, block_index = future.result()
+            except Exception as error:
+                failed_base_blocks.append(
+                    {
+                        "body": scheduled_body,
+                        "block_index": scheduled_block,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    }
+                )
+                write_state(
+                    "base_block_failed_resumable",
+                    failed_body=scheduled_body,
+                    failed_block=scheduled_block,
+                    failed_base_blocks=list(failed_base_blocks),
+                    completed_base_blocks=completed_base_blocks,
+                    expected_base_blocks=len(base_futures),
+                    max_parallel_body_collectors=3,
+                )
+                continue
             completed_base_blocks += 1
             write_state(
                 "collecting_base_blocks",
@@ -1040,6 +1090,7 @@ def main() -> int:
                 last_completed_block=block_index,
                 completed_base_blocks=completed_base_blocks,
                 expected_base_blocks=len(base_futures),
+                failed_base_blocks=list(failed_base_blocks),
                 max_parallel_body_collectors=3,
             )
 

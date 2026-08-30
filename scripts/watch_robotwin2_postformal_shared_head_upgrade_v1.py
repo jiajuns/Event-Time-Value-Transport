@@ -45,6 +45,9 @@ EXPECTED_SUPPLEMENT_DECISIONS_PER_BODY = 20
 EXPECTED_SUPPLEMENT_DECISIONS = 100
 EXPECTED_SUPPLEMENT_BRANCHES = 400
 EXPECTED_GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
+DEFAULT_ETSF_SITE = Path(
+    "/home/user/anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages"
+)
 
 
 class SharedHeadUpgradeError(RuntimeError):
@@ -197,6 +200,7 @@ def runtime_environment(args: argparse.Namespace) -> dict[str, str]:
                     str(args.lerobot_root / "src"),
                     str(args.lerobot_site),
                     str(args.robotwin_eval_site),
+                    str(args.etsf_site),
                     str(args.robotwin_root),
                     str(args.robotwin_root / "envs/curobo/src"),
                 )
@@ -432,6 +436,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "lib/python3.10/site-packages"
         ),
     )
+    parser.add_argument("--etsf-site", type=Path, default=DEFAULT_ETSF_SITE)
     parser.add_argument("--expected-gpu-uuid", default=EXPECTED_GPU_UUID)
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     return parser.parse_args(argv)
@@ -467,6 +472,7 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         "lerobot_root",
         "lerobot_site",
         "robotwin_eval_site",
+        "etsf_site",
     )
     for name in path_names:
         setattr(args, name, getattr(args, name).expanduser().resolve())
@@ -578,6 +584,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.lerobot_root,
         args.lerobot_site,
         args.robotwin_eval_site,
+        args.etsf_site,
     )
     if any(not path.exists() or path.is_symlink() for path in static_paths):
         raise SharedHeadUpgradeError("one or more immutable upgrade inputs are missing/symbolic")

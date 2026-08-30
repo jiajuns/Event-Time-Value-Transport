@@ -86,6 +86,60 @@ def test_base_collection_schedule_round_robins_all_body_query_blocks() -> None:
         )
 
 
+def test_supplemental_gap_advances_past_unstable_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = "piper"
+    manifest = {
+        "groups": [
+            {
+                "condition": condition,
+                "root_query_index": query,
+                "requested_seed": 2026082000 + index,
+            }
+            for condition in watcher.CONDITIONS
+            for query in watcher.ROOT_QUERIES
+            for index in range(watcher.TARGET_PER_CONDITION_QUERY)
+            if not (condition == "clean" and query == 0 and index == 4)
+        ]
+    }
+    attempts: list[int] = []
+    progress_writes: list[dict[str, int]] = []
+
+    monkeypatch.setattr(watcher, "OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(watcher, "load_manifest", lambda *_args: manifest)
+    monkeypatch.setattr(watcher, "finalize_body_manifest", lambda *_args: {"ok": True})
+    monkeypatch.setattr(watcher, "load_progress", lambda _body: {
+        f"{condition}|{query}": watcher.SUPPLEMENTAL_SEED_START
+        for condition in watcher.CONDITIONS
+        for query in watcher.ROOT_QUERIES
+    })
+    monkeypatch.setattr(
+        watcher,
+        "atomic_json",
+        lambda _path, value: progress_writes.append(dict(value)),
+    )
+    monkeypatch.setattr(watcher, "write_state", lambda *_args, **_kwargs: None)
+
+    def fake_run_collector(*_args, **kwargs):
+        seed = kwargs["seed_start"]
+        attempts.append(seed)
+        if len(attempts) == 1:
+            raise watcher.ContinuationError("simulated UnStableError")
+        manifest["groups"].append(
+            {
+                "condition": kwargs["conditions"][0],
+                "root_query_index": kwargs["queries"][0],
+                "requested_seed": seed,
+            }
+        )
+
+    monkeypatch.setattr(watcher, "run_collector", fake_run_collector)
+    assert watcher.complete_body({}, body) == {"ok": True}
+    assert attempts == [watcher.SUPPLEMENTAL_SEED_START, watcher.SUPPLEMENTAL_SEED_START + 1]
+    assert progress_writes[-1]["clean|0"] == watcher.SUPPLEMENTAL_SEED_START + 2
+
+
 def _pose(x: float, quaternion: np.ndarray | None = None) -> np.ndarray:
     quaternion = (
         np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
