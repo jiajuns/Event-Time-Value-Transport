@@ -39,6 +39,7 @@ BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 COLLECTION_PRIORITY = ("piper", "arx-x5", "ur5", "aloha-agilex", "franka")
 CONDITIONS = ("clean", "randomized")
 ROOT_QUERIES = tuple(range(40))
+QUERY_BLOCK_SIZE = 4
 CANDIDATE_COUNT = 4
 TARGET_PER_CONDITION_QUERY = 5
 BASE_SEED_START = 2026082000
@@ -756,24 +757,46 @@ def load_progress(body: str) -> dict[str, int]:
     return value
 
 
-def fill_body(static: Mapping[str, Any], body: str) -> dict[str, Any]:
-    # Ten blocks of five seeds × four adjacent queries give every online
-    # remaining budget exactly five development decisions per condition while
-    # retaining the original 200-decision/body-condition total.  The collector
-    # is idempotent by group identity, so replaying a block resumes safely.
-    query_block_size = 4
-    seed_count_per_block = TARGET_PER_CONDITION_QUERY
-    for block_start in range(0, len(ROOT_QUERIES), query_block_size):
-        block_index = block_start // query_block_size
-        run_collector(
-            static,
-            body=body,
-            conditions=CONDITIONS,
-            seed_start=BASE_SEED_START + block_index * seed_count_per_block,
-            seed_count=seed_count_per_block,
-            queries=ROOT_QUERIES[block_start : block_start + query_block_size],
-            phase=f"base_uniform_budget_block_{block_index:02d}",
-        )
+def base_collection_jobs() -> list[tuple[str, int]]:
+    """Round-robin immutable base blocks across all five embodiments."""
+
+    if set(COLLECTION_PRIORITY) != set(BODIES) or len(COLLECTION_PRIORITY) != len(
+        BODIES
+    ):
+        raise ContinuationError("collection priority must contain every body once")
+    return [
+        (body, block_start)
+        for block_start in range(0, len(ROOT_QUERIES), QUERY_BLOCK_SIZE)
+        for body in COLLECTION_PRIORITY
+    ]
+
+
+def collect_base_block(
+    static: Mapping[str, Any], body: str, block_start: int
+) -> tuple[str, int]:
+    if (
+        body not in BODIES
+        or block_start < 0
+        or block_start >= len(ROOT_QUERIES)
+        or block_start % QUERY_BLOCK_SIZE
+    ):
+        raise ContinuationError("invalid body/query block in collection schedule")
+    block_index = block_start // QUERY_BLOCK_SIZE
+    run_collector(
+        static,
+        body=body,
+        conditions=CONDITIONS,
+        seed_start=BASE_SEED_START + block_index * TARGET_PER_CONDITION_QUERY,
+        seed_count=TARGET_PER_CONDITION_QUERY,
+        queries=ROOT_QUERIES[block_start : block_start + QUERY_BLOCK_SIZE],
+        phase=f"base_uniform_budget_block_{block_index:02d}",
+    )
+    return body, block_index
+
+
+def complete_body(static: Mapping[str, Any], body: str) -> dict[str, Any]:
+    """Fill terminal-root gaps and freeze one already base-collected body."""
+
     manifest = load_manifest(body, static)
     counts = stratum_counts(manifest)
     gaps = {
@@ -972,25 +995,60 @@ def main() -> int:
         actor_authority_file_sha256=actor_authority_sha,
     )
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    def collect_body(body: str) -> tuple[str, dict[str, Any]]:
+    def finalize_body(body: str) -> tuple[str, dict[str, Any]]:
         completed = body_already_complete(body, static)
-        return body, completed or fill_body(static, body)
+        return body, completed or complete_body(static, body)
 
-    completed_by_body: dict[str, dict[str, Any]] = {}
     # Three collectors fit the measured 4090 memory envelope while leaving
     # enough headroom for CuRobo/Vulkan peaks.  Four would approach the 24 GiB
     # device limit and turn throughput optimization into avoidable OOM risk.
+    # Scheduling fifty resumable blocks, instead of five whole-body jobs,
+    # keeps all three slots occupied until the final block while never allowing
+    # concurrent writers for one body manifest.
+    completed_by_body: dict[str, dict[str, Any]] = {}
+    already_complete = {
+        body: body_already_complete(body, static) for body in BODIES
+    }
+    completed_by_body.update(
+        {
+            body: receipt
+            for body, receipt in already_complete.items()
+            if receipt is not None
+        }
+    )
+    body_locks = {body: threading.Lock() for body in BODIES}
+
+    def locked_base_block(body: str, block_start: int) -> tuple[str, int]:
+        with body_locks[body]:
+            return collect_base_block(static, body, block_start)
+
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="body-collector") as pool:
-        futures = []
-        if set(COLLECTION_PRIORITY) != set(BODIES) or len(COLLECTION_PRIORITY) != len(
-            BODIES
-        ):
-            raise ContinuationError("collection priority must contain every body once")
-        for index, body in enumerate(COLLECTION_PRIORITY):
-            futures.append(pool.submit(collect_body, body))
-            if index + 1 < len(COLLECTION_PRIORITY):
+        base_futures = []
+        for job_index, (body, block_start) in enumerate(base_collection_jobs()):
+            if already_complete[body] is not None:
+                continue
+            base_futures.append(pool.submit(locked_base_block, body, block_start))
+            if job_index < 2:
                 time.sleep(20.0)
-        for future in as_completed(futures):
+        completed_base_blocks = 0
+        for future in as_completed(base_futures):
+            body, block_index = future.result()
+            completed_base_blocks += 1
+            write_state(
+                "collecting_base_blocks",
+                last_completed_body=body,
+                last_completed_block=block_index,
+                completed_base_blocks=completed_base_blocks,
+                expected_base_blocks=len(base_futures),
+                max_parallel_body_collectors=3,
+            )
+
+        finalize_futures = [
+            pool.submit(finalize_body, body)
+            for body in COLLECTION_PRIORITY
+            if already_complete[body] is None
+        ]
+        for future in as_completed(finalize_futures):
             body, manifest = future.result()
             completed_by_body[body] = manifest
             write_state(

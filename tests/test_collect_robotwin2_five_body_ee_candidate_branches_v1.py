@@ -72,6 +72,20 @@ def test_single_query_resume_preserves_full_manifest_query_universe() -> None:
         collector.resolve_query_contract([40], watcher.ROOT_QUERIES)
 
 
+def test_base_collection_schedule_round_robins_all_body_query_blocks() -> None:
+    jobs = watcher.base_collection_jobs()
+    assert jobs[: len(watcher.BODIES)] == [
+        (body, 0) for body in watcher.COLLECTION_PRIORITY
+    ]
+    assert len(jobs) == len(watcher.BODIES) * (
+        len(watcher.ROOT_QUERIES) // watcher.QUERY_BLOCK_SIZE
+    )
+    for body in watcher.BODIES:
+        assert [block for scheduled_body, block in jobs if scheduled_body == body] == list(
+            range(0, len(watcher.ROOT_QUERIES), watcher.QUERY_BLOCK_SIZE)
+        )
+
+
 def _pose(x: float, quaternion: np.ndarray | None = None) -> np.ndarray:
     quaternion = (
         np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
