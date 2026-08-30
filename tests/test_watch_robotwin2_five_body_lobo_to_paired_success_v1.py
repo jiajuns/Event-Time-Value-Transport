@@ -94,6 +94,7 @@ def _complete_upstream(paths: watcher.FormalPaths) -> dict[str, object]:
                 "status": watcher.FOLD_STATUS,
                 "held_out_body": body,
                 "event_spec_sha256": watcher.EXPECTED_EVENT_SPEC_SHA256,
+                "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
                 "event_derivation_implementation_sha256": (
                     watcher.EXPECTED_EVENT_MODULE_SHA256
                 ),
@@ -120,6 +121,7 @@ def _complete_upstream(paths: watcher.FormalPaths) -> dict[str, object]:
             "members_per_fold": watcher.EXPECTED_MEMBERS_PER_FOLD,
             "heldout_task_success_measured": False,
             "cross_embodiment_task_success_claim_authorized": False,
+            "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
             "outer_folds": fold_rows,
         },
     )
@@ -169,6 +171,23 @@ def test_true_complete_requires_aggregate_all_folds_and_25_checkpoints(
     checkpoint = paths.fold_root("piper") / "member_3.pt"
     checkpoint.write_bytes(b"tampered")
     with pytest.raises(watcher.PairedWatcherError, match="checkpoint SHA mismatch"):
+        watcher.validate_upstream_complete(paths, state)
+
+
+def test_upstream_aggregate_rejects_missing_state_action_frame_contract(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    state = _complete_upstream(paths)
+    aggregate = json.loads(paths.final_summary.read_text(encoding="utf-8"))
+    aggregate.pop("state_action_frame_contract")
+    _json(paths.final_summary, aggregate)
+    state["final_summary_file_sha256"] = _sha(paths.final_summary)
+    _json(paths.upstream_state, state)
+
+    with pytest.raises(
+        watcher.PairedWatcherError, match="five-fold aggregate contract changed"
+    ):
         watcher.validate_upstream_complete(paths, state)
 
 

@@ -33,15 +33,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Sequence
 
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 
 
 FORMAT = "etsf_robotwin2_five_body_branches_to_lobo_watcher_v1"
 FINAL_FORMAT = "etsf_robotwin2_five_body_lobo_source_validation_aggregate_v1"
-BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
-ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
-COLLECTOR_FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v1"
+BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v2_endpose_frame"
+ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
+MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
+COLLECTOR_FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v2_endpose_frame"
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
@@ -53,6 +53,19 @@ ACTION_SCHEMA = "dual_ee_se3_gripper_delta_14d_v2"
 EVENTS = ("e0", "e12", "e3", "e4", "eK")
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
 CANDIDATE_COUNT = 4
+STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
+    "training_state_source": "public_hdf5_endpose_left_right_endpose",
+    "runtime_state_api": "task.get_arm_pose(left/right)",
+    "runtime_state_pose_semantics": "robot.get_*_ee_pose(is_endpose=False)",
+    "native_action_pose_semantics": (
+        "same_absolute_world_ee_frame_as_training_endpose"
+    ),
+    "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "pose_convention": "xyz_plus_quaternion_wxyz",
+    "tcp_tool_axis_offset_m_excluded": 0.12,
+    "state_and_action_same_frame": True,
+}
 SEED_START = 2026082000
 DEVELOPMENT_SEED_STOP = 2026090000
 SEEDS_PER_CONDITION_QUERY = 5
@@ -134,13 +147,21 @@ OBJECT_EFFECT_SCHEMA = {
     "rotation": "q_post_times_conjugate_q_root_shortest_axis_angle_wxyz",
     "redundant_relative_goal_delta_removed": True,
 }
-DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v1"
+DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v2_endpose_frame"
 BRANCH_DIAGNOSTIC_CONTRACT = {
     "format": DIAGNOSTIC_FORMAT,
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
     "branch_error": "all_false_execution_exception_invalidates_complete_decision",
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
+    ),
+    "candidate_first_token_translation_norm_m": (
+        "label_free_left_right_translation_norm_from_same_frame_root_state_to_"
+        "candidate_token_zero"
+    ),
+    "candidate_later_token_translation_norm_median_m": (
+        "label_free_left_right_median_translation_norm_between_subsequent_"
+        "candidate_tokens"
     ),
 }
 DECISIONS_PER_BODY_CONDITION = SEEDS_PER_CONDITION_QUERY * len(QUERY_INDICES)
@@ -256,6 +277,8 @@ DIAGNOSTIC_ARRAYS = {
     "first_executed",
     "branch_error",
     "candidate_action_pairwise_rms",
+    "candidate_first_token_translation_norm_m",
+    "candidate_later_token_translation_norm_median_m",
 }
 _FAILURE_STATE_PATH: Path | None = None
 _FAILURE_RUN_EXIT_PATH: Path | None = None
@@ -1075,6 +1098,29 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
                             squared += difference * difference
                     row.append(math.sqrt(squared / float(5 * 14)))
                 pairwise_rms.append(row)
+            first_translation_norm: list[list[float]] = []
+            later_translation_norm_median: list[list[float]] = []
+            for candidate in range(CANDIDATE_COUNT):
+                first_row = []
+                later_row = []
+                for channels in ((0, 1, 2), (7, 8, 9)):
+                    def norm_at(step: int) -> float:
+                        return math.sqrt(
+                            sum(
+                                action_values[
+                                    (candidate * horizon + step) * 14 + channel
+                                ]
+                                ** 2
+                                for channel in channels
+                            )
+                        )
+
+                    first_row.append(norm_at(0))
+                    later_row.append(
+                        statistics.median(norm_at(step) for step in range(1, 5))
+                    )
+                first_translation_norm.append(first_row)
+                later_translation_norm_median.append(later_row)
     except zipfile.BadZipFile as error:
         raise LoboWatcherError(f"decision NPZ is corrupt: {path}") from error
     return {
@@ -1082,13 +1128,17 @@ def validate_decision_npz(path: Path, expected_sha256: str) -> dict[str, Any]:
         "action_horizon": horizon,
         "remaining_action_budget": float(remaining_budget[0]),
         "candidate_action_pairwise_rms": pairwise_rms,
+        "candidate_first_token_translation_norm_m": first_translation_norm,
+        "candidate_later_token_translation_norm_median_m": (
+            later_translation_norm_median
+        ),
     }
 
 
 def validate_diagnostic_npz(
     path: Path,
     expected_sha256: str,
-    expected_pairwise_rms: Sequence[Sequence[float]],
+    expected_diagnostics: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate the bound proposal-coverage sidecar without using it as a label."""
 
@@ -1111,6 +1161,14 @@ def validate_diagnostic_npz(
                 "branch_error": ((CANDIDATE_COUNT,), {"|b1"}),
                 "candidate_action_pairwise_rms": (
                     (CANDIDATE_COUNT, CANDIDATE_COUNT),
+                    {"<f4", "=f4"},
+                ),
+                "candidate_first_token_translation_norm_m": (
+                    (CANDIDATE_COUNT, 2),
+                    {"<f4", "=f4"},
+                ),
+                "candidate_later_token_translation_norm_median_m": (
+                    (CANDIDATE_COUNT, 2),
                     {"<f4", "=f4"},
                 ),
             }
@@ -1157,7 +1215,9 @@ def validate_diagnostic_npz(
             for left in range(CANDIDATE_COUNT):
                 for right in range(CANDIDATE_COUNT):
                     observed = float(pairwise[left * CANDIDATE_COUNT + right])
-                    expected_value = float(expected_pairwise_rms[left][right])
+                    expected_value = float(
+                        expected_diagnostics["candidate_action_pairwise_rms"][left][right]
+                    )
                     reverse = float(pairwise[right * CANDIDATE_COUNT + left])
                     if (
                         not math.isfinite(observed)
@@ -1169,6 +1229,36 @@ def validate_diagnostic_npz(
                         raise LoboWatcherError(
                             f"diagnostic pairwise RMS disagrees with core actions: {path}"
                         )
+            for name in (
+                "candidate_first_token_translation_norm_m",
+                "candidate_later_token_translation_norm_median_m",
+            ):
+                with archive.open(f"{name}.npy") as stream:
+                    header = read_npy_header(stream, f"{path}:{name}")
+                    byte_order = "<" if header["descr"] == "<f4" else "="
+                    observed_values = struct.unpack(
+                        byte_order + "8f", _read_exact(stream, 32, name)
+                    )
+                    if stream.read(1):
+                        raise LoboWatcherError(
+                            f"diagnostic {name} contains trailing bytes: {path}"
+                        )
+                expected_values = [
+                    float(expected_diagnostics[name][candidate][arm])
+                    for candidate in range(CANDIDATE_COUNT)
+                    for arm in range(2)
+                ]
+                if any(
+                    not math.isfinite(observed)
+                    or observed < 0.0
+                    or abs(observed - expected_value) > 2e-6
+                    for observed, expected_value in zip(
+                        observed_values, expected_values
+                    )
+                ):
+                    raise LoboWatcherError(
+                        f"diagnostic {name} disagrees with core actions: {path}"
+                    )
     except zipfile.BadZipFile as error:
         raise LoboWatcherError(f"diagnostic NPZ is corrupt: {path}") from error
     return {"diagnostic_format": DIAGNOSTIC_FORMAT}
@@ -1184,6 +1274,15 @@ def collection_progress(branches_root: Path) -> dict[str, Any]:
             continue
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(value, Mapping)
+                or value.get("state_action_frame_contract")
+                != STATE_ACTION_FRAME_CONTRACT
+            ):
+                raise LoboWatcherError(
+                    f"{body} manifest is legacy/diagnostic-only: missing the "
+                    "endpose state/action frame contract"
+                )
             groups = value.get("groups", []) if isinstance(value, dict) else []
             counts = {
                 condition: sum(
@@ -1219,6 +1318,19 @@ def collection_progress(branches_root: Path) -> dict[str, Any]:
         "expected_decisions": TOTAL_DECISIONS,
         "expected_branches": TOTAL_BRANCHES,
     }
+
+
+def validate_supplement_frame_binding(path: Path) -> dict[str, Any]:
+    """Reject legacy supplement bindings before any manifest/payload access."""
+
+    value = read_json(path, "supplement binding")
+    verify_logical_sha(value, "supplement binding")
+    if value.get("state_action_frame_contract") != STATE_ACTION_FRAME_CONTRACT:
+        raise LoboWatcherError(
+            "supplement binding is legacy/diagnostic-only: missing the "
+            "endpose state/action frame contract"
+        )
+    return dict(value)
 
 
 def progress_is_complete(progress: Mapping[str, Any]) -> bool:
@@ -1299,6 +1411,8 @@ def validate_complete_collection(
             or manifest.get("task") != TASK
             or manifest.get("instruction") != DEFAULT_INSTRUCTION
             or manifest.get("body") != body
+            or manifest.get("state_action_frame_contract")
+            != STATE_ACTION_FRAME_CONTRACT
             or manifest.get("status")
             != "complete_400_decisions_1600_candidate_branches"
             or not isinstance(manifest.get("collector_file_sha256"), str)
@@ -1357,10 +1471,9 @@ def validate_complete_collection(
             or physical_time.get("duration_semantics")
             != "simulator_elapsed_seconds_to_event_boundary"
             or physical_time.get("zero_elapsed_duration_masked") is not True
-            or physical_time.get("stationary_window_seconds")
-            != analytic_event.THRESHOLDS["stationary_window_seconds"]
-            or physical_time.get("stationary_speed_threshold_m_per_s")
-            != analytic_event.THRESHOLDS["stationary_speed_m_per_s"]
+            or physical_time.get("event_thresholds")
+            != analytic_event.THRESHOLDS
+            or physical_time.get("event_chain_success_aligned") is not True
             or candidate_action
             != {
                 "critic_observation_time": "before_candidate_execution",
@@ -1482,7 +1595,7 @@ def validate_complete_collection(
             validate_diagnostic_npz(
                 diagnostics_payload,
                 str(item["diagnostics_sha256"]),
-                decision["candidate_action_pairwise_rms"],
+                decision,
             )
             action_horizons.add(int(decision["action_horizon"]))
             observed_ids.add(str(group_id))
@@ -1929,6 +2042,8 @@ def summarize_fold(
         )
     if (
         summary.get("status") != "source_only_checkpoint_selection_complete"
+        or summary.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or summary.get("held_out_body") != held_out_body
         or not isinstance(members, list)
         or len(members) != 5
@@ -1990,6 +2105,7 @@ def summarize_fold(
             raise LoboWatcherError(f"{held_out_body} member checkpoint is missing/tampered")
     return {
         "held_out_body": held_out_body,
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "source_bodies": summary.get("source_bodies"),
         "member_count": len(members),
         "steps_per_member": 3000,
@@ -2160,9 +2276,11 @@ def validate_existing_authorities(
         or actor_authority.get("dataset_revision") != DATASET_REVISION
         or actor_authority.get("public_expert_episode_count") != 2750
         or actor_authority.get("one_universal_actor_for_all_five_bodies") is not True
+        or actor_authority.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or not isinstance(sampling_contract, Mapping)
         or sampling_contract.get("format")
-        != "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v1"
+        != "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v2_endpose_frame"
         or sampling_contract.get("frozen_actor_checkpoint_tree_sha256")
         != checkpoint_sha
         or sampling_contract.get("collector_file_sha256")
@@ -2170,6 +2288,8 @@ def validate_existing_authorities(
         or sampling_contract.get("canonical_adapter_file_sha256")
         != collection["adapter_implementation_sha256"]
         or sampling_contract.get("candidate_count") != CANDIDATE_COUNT
+        or sampling_contract.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or sampling_contract.get("candidate_indices") != list(range(CANDIDATE_COUNT))
         or sampling_contract.get("candidate_zero_is_actor_baseline") is not True
         or sampling_contract.get("same_ordered_candidate_set_for_baseline_and_etsf")
@@ -2254,6 +2374,8 @@ def validate_existing_authorities(
         or binding.get("task") != TASK
         or binding.get("instruction") != DEFAULT_INSTRUCTION
         or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or binding.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
@@ -2375,6 +2497,8 @@ def main() -> int:
         != args.supplement_binding_sha256
     ):
         raise LoboWatcherError("supplement binding SHA-256 mismatch")
+    if args.supplement_binding is not None:
+        validate_supplement_frame_binding(args.supplement_binding)
     gpu = gpu_identity()
     if "4090" not in gpu["name"] or gpu["uuid"] != args.expected_gpu_uuid:
         raise LoboWatcherError(f"unexpected GPU authority: {gpu}")
@@ -2591,6 +2715,7 @@ def main() -> int:
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
+            "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "event_derivation_implementation_sha256": collection[
                 "event_derivation_implementation_sha256"

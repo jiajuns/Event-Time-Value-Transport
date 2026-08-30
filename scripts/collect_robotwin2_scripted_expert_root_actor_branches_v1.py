@@ -33,11 +33,13 @@ import torch
 
 import collect_robotwin2_five_body_ee_candidate_branches_v1 as base
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 
 
-FORMAT = "etsf_robotwin2_scripted_expert_root_actor_branches_v2"
-MANIFEST_FORMAT = "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
+FORMAT = "etsf_robotwin2_scripted_expert_root_actor_branches_v3_endpose_frame"
+MANIFEST_FORMAT = (
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v3_endpose_frame"
+)
 TARGET_EVENTS = ("e12", "e3", "e4")
 HORIZON_SCHEDULE = (10, 25, 50, 100, 200)
 RESERVE_SEED_START = 2026081000
@@ -282,8 +284,10 @@ def load_actor_authority(
     if (
         logical != base.canonical_sha256(unsigned)
         or value.get("format")
-        != "etsf_robotwin2_frozen_native_actor_authority_v1"
+        != "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
         or value.get("task") != base.TASK
+        or value.get("state_action_frame_contract")
+        != base.STATE_ACTION_FRAME_CONTRACT
         or not isinstance(actor, Mapping)
         or actor.get("frozen") is not True
         or actor.get("optimizer_updates_allowed") is not False
@@ -357,69 +361,20 @@ class ScriptedRootObserver:
         self.expert_dense_segment_index = -1
 
     def _current_target(self) -> str | None:
-        """Match the frozen e12/e3/e4 event at the newest sample in O(T).
+        """Match the authoritative success-aligned event at the newest sample."""
 
-        The authoritative event implementation is still called before a root
-        is accepted.  This exact incremental prefilter avoids recomputing its
-        full O(T^2) stationary history at every expert physics step.
-        """
-
-        poses = np.asarray(self.trajectory, dtype=np.float32)
+        poses = np.asarray(self.trajectory, dtype=np.float64)
         times = np.asarray(self.sim_times, dtype=np.float64)
-        step = len(poses) - 1
-        moving_index = self.names.index(str(self.calibration["moving"]))
-        position = poses[:, moving_index, :3].astype(np.float64)
-        thresholds = self.calibration["thresholds"]
-        moved = bool(
-            np.linalg.norm(position[step] - position[0])
-            >= float(thresholds["moved_displacement_m"])
+        _predicates, events = analytic_event.derive_predicates_and_events(
+            poses,
+            times,
+            self.names,
+            False,
+            self.calibration,
+            base.success_height_reference_z(self.task),
         )
-        lifted = bool(
-            position[step, 2]
-            >= position[0, 2] + float(thresholds["lifted_delta_z_m"])
-        )
-        _moving, relative = analytic_event.goal_vector(
-            poses, self.names, step, self.calibration
-        )
-        near = bool(
-            np.linalg.norm(relative)
-            <= float(thresholds["near_goal_euclidean_m"])
-        )
-        if not near:
-            return "e12" if moved or lifted else None
-
-        speed = np.r_[
-            0.0,
-            np.linalg.norm(np.diff(position, axis=0), axis=1) / np.diff(times),
-        ]
-        speed_threshold = float(thresholds["stationary_speed_m_per_s"])
-        window = float(thresholds["stationary_window_seconds"])
-        stationary = False
-        for start in range(step, -1, -1):
-            _moving_at_start, relative_at_start = analytic_event.goal_vector(
-                poses, self.names, start, self.calibration
-            )
-            if (
-                np.linalg.norm(relative_at_start)
-                > float(thresholds["near_goal_euclidean_m"])
-                or speed[start] > speed_threshold
-            ):
-                break
-            elapsed = float(times[step] - times[start])
-            tolerance = (
-                64.0
-                * np.finfo(np.float64).eps
-                * max(
-                    abs(float(times[step])),
-                    abs(float(times[start])),
-                    window,
-                    1.0,
-                )
-            )
-            if elapsed + tolerance >= window:
-                stationary = True
-                break
-        return "e4" if stationary else "e3"
+        event_name = analytic_event.EVENT_NAMES[int(events[-1])]
+        return event_name if event_name in TARGET_EVENTS else None
 
     def record_physics_step(self) -> None:
         now = base._sim_time(self.task)
@@ -442,6 +397,7 @@ class ScriptedRootObserver:
                 self.names,
                 simulator_success,
                 self.calibration,
+                base.success_height_reference_z(self.task),
             )
         except (analytic_event.AnalyticEventSpecError, ValueError) as error:
             raise ScriptedRootCollectionError(str(error)) from error
@@ -482,6 +438,9 @@ class ScriptedRootObserver:
                 base.branch_root_restorable_snapshot_sha256(normalized_snapshot)
             ),
             "remaining_action_budget": self.horizon,
+            "success_height_reference_z": base.success_height_reference_z(
+                self.task
+            ),
         }
         if set(self.roots) == set(TARGET_EVENTS):
             raise _AllRequestedRootsCaptured()
@@ -697,7 +656,7 @@ def canonicalize_actor_root(
             )
         trajectory = np.concatenate(
             (
-                np.asarray(captured["detector_trajectory"], dtype=np.float32),
+                np.asarray(captured["detector_trajectory"], dtype=np.float64),
                 base.read_poses(objects)[None],
             ),
             axis=0,
@@ -708,7 +667,12 @@ def canonicalize_actor_root(
         ]
         success = bool(reference.check_success())
         _predicates, events = base.derive_predicates_and_events(
-            trajectory, sim_times, names, success, calibration
+            trajectory,
+            sim_times,
+            names,
+            success,
+            calibration,
+            base.success_height_reference_z(reference),
         )
         canonical_event = str(analytic_event.EVENT_NAMES[int(events[-1])])
         if canonical_event != target or success:
@@ -741,6 +705,15 @@ def canonicalize_actor_root(
                 device=device,
             )
         root = dict(captured)
+        if not np.isclose(
+            base.success_height_reference_z(reference),
+            float(captured["success_height_reference_z"]),
+            atol=0.0,
+            rtol=0.0,
+        ):
+            raise ScriptedRootCollectionError(
+                "fresh scripted scene changed task.orig_z success height reference"
+            )
         root.update(
             {
                 "object_names": list(names),
@@ -751,6 +724,9 @@ def canonicalize_actor_root(
                 "root_sim_steps": int(reference.scene.step_count),
                 "sim_timestep_seconds": float(reference.scene.timestep_seconds),
                 "remaining_action_budget": horizon,
+                "success_height_reference_z": base.success_height_reference_z(
+                    reference
+                ),
                 "canonical_root_snapshot_sha256": canonical_snapshot_sha256,
                 "candidate_noise_query_index": root_query,
             }
@@ -1279,6 +1255,7 @@ def main() -> None:
         "dataset_revision": base.DATASET_REVISION,
         "task": base.TASK,
         "body": args.body,
+        "state_action_frame_contract": base.STATE_ACTION_FRAME_CONTRACT,
         "conditions": list(args.conditions),
         "pre_registered_seeds": flattened_roster_seeds,
         "pre_registered_horizon_by_seed": {
@@ -1352,12 +1329,8 @@ def main() -> None:
             ),
             "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
             "zero_elapsed_duration_masked": True,
-            "stationary_window_seconds": float(
-                calibration["thresholds"]["stationary_window_seconds"]
-            ),
-            "stationary_speed_threshold_m_per_s": float(
-                calibration["thresholds"]["stationary_speed_m_per_s"]
-            ),
+            "event_thresholds": dict(calibration["thresholds"]),
+            "event_chain_success_aligned": True,
         },
         "candidate_action_contract": {
             "critic_observation_time": "before_candidate_execution",

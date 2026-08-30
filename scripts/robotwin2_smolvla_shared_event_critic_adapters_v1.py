@@ -31,7 +31,7 @@ import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
 import shared_event_critic_plugin_protocol_v1 as plugin
 
 
-FORMAT = "etsf_robotwin2_smolvla_shared_event_critic_adapters_v1"
+FORMAT = "etsf_robotwin2_smolvla_shared_event_critic_adapters_v2_endpose_frame"
 POLICY_FAMILY = "smolvla_universal_dual_ee16_five_body_actor"
 NATIVE_ACTION_SCHEMA = "dual_arm_absolute_ee_xyz_quaternion_wxyz_gripper_16d_v1"
 SUPPORTED_CANDIDATE_COUNTS = tuple(plugin.SUPPORTED_CANDIDATE_COUNTS)
@@ -40,8 +40,22 @@ EXECUTED_PREFIX_STEPS = 5
 PLANNED_DT_SECONDS = EXECUTED_PREFIX_STEPS / collector.SOURCE_EVENT_SAMPLING_HZ
 FORMAL_MAX_ACTION_CALLS = collector.FORMAL_MAX_STEPS
 
+STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
+    "training_state_source": "public_hdf5_endpose_left_right_endpose",
+    "runtime_state_api": "task.get_arm_pose(left/right)",
+    "runtime_state_pose_semantics": "robot.get_*_ee_pose(is_endpose=False)",
+    "native_action_pose_semantics": (
+        "same_absolute_world_ee_frame_as_training_endpose"
+    ),
+    "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "pose_convention": "xyz_plus_quaternion_wxyz",
+    "tcp_tool_axis_offset_m_excluded": 0.12,
+    "state_and_action_same_frame": True,
+}
+
 NATIVE_ACTION_SEMANTIC_CONTRACT = {
-    "format": "etsf_robotwin2_dual_arm_absolute_ee16_native_action_v1",
+    "format": "etsf_robotwin2_dual_arm_absolute_ee16_native_action_v2_endpose_frame",
     "shape": ["horizon", 16],
     "channels": [
         "left_x",
@@ -61,7 +75,8 @@ NATIVE_ACTION_SEMANTIC_CONTRACT = {
         "right_quaternion_z",
         "right_gripper",
     ],
-    "pose_semantics": "absolute_world_frame_tcp_xyz_quaternion_wxyz",
+    "pose_semantics": "absolute_world_ee_endpose_xyz_quaternion_wxyz",
+    "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
     "gripper_domain": [0.0, 1.0],
     "environment_call": "task.take_action(native_ee16, action_type=ee)",
     "not_the_canonical_effect_schema": True,
@@ -80,10 +95,11 @@ QUERY_SEED_BINDING_CONTRACT = {
 }
 
 EFFECT_SEMANTIC_CONTRACT = {
-    "format": "etsf_robotwin2_ee16_to_canonical_effect14_semantics_v1",
+    "format": "etsf_robotwin2_ee16_to_canonical_effect14_semantics_v2_endpose_frame",
     "source_action_schema": NATIVE_ACTION_SCHEMA,
     "target_action_schema": plugin.CANONICAL_ACTION_SCHEMA,
-    "source_root": "pre_candidate_current_dual_tcp_and_gripper_ee16",
+    "source_root": "pre_candidate_current_dual_ee_endpose_and_gripper_ee16",
+    "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
     "conversion": "consecutive_absolute_ee16_to_world_delta_xyz_relative_axis_angle_and_gripper_delta",
     "canonical_adapter_contract": canonical_adapter.contract(),
     "candidate_order_preserved_bit_exact": True,
@@ -95,9 +111,12 @@ EFFECT_SEMANTIC_CONTRACT_SHA256 = plugin.canonical_sha256(
 )
 
 PRIVILEGED_OBSERVER_CONTRACT = {
-    "format": "etsf_robotwin2_privileged_move_can_pot_state27_observer_v1",
+    "format": "etsf_robotwin2_privileged_move_can_pot_state27_observer_v2_endpose_frame",
     "target_state_schema": plugin.CANONICAL_STATE_SCHEMA,
-    "observation_authority": "privileged_robotwin_simulator_object_poses_and_tcp",
+    "observation_authority": (
+        "privileged_robotwin_simulator_object_poses_and_ee_endpose"
+    ),
+    "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
     "actor_visible": False,
     "real_robot_deployable": False,
     "event_spec_sha256": collector.EVENT_SPEC_SHA256,
@@ -107,11 +126,12 @@ PRIVILEGED_OBSERVER_CONTRACT = {
 }
 
 EXECUTION_BASE_CONTRACT = {
-    "format": "etsf_robotwin2_native_ee16_environment_execution_v1",
+    "format": "etsf_robotwin2_native_ee16_environment_execution_v2_endpose_frame",
     "native_action_schema": NATIVE_ACTION_SCHEMA,
     "executed_prefix_steps": EXECUTED_PREFIX_STEPS,
     "max_policy_action_calls": FORMAL_MAX_ACTION_CALLS,
     "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
     "canonical_effect_execution_forbidden": True,
     "ordinary_planner_failure": "native_task_semantics",
     "python_exception": "propagate_as_protocol_failure",
@@ -235,6 +255,19 @@ def component_implementation_evidence(role: str) -> dict[str, Any]:
     }
 
 
+def validate_state_action_frame_authority() -> dict[str, Any]:
+    """Fail closed if the runtime collector still exposes legacy TCP state."""
+
+    if (
+        getattr(collector, "STATE_ACTION_FRAME_CONTRACT", None)
+        != STATE_ACTION_FRAME_CONTRACT
+    ):
+        raise Robotwin2SmolVLAAdapterError(
+            "collector lacks the frozen endpose state/action frame contract"
+        )
+    return dict(STATE_ACTION_FRAME_CONTRACT)
+
+
 def component_implementation_sha256(role: str) -> str:
     return plugin.canonical_sha256(component_implementation_evidence(role))
 
@@ -296,6 +329,12 @@ def _ordered_native_sha256(actions: np.ndarray, candidate_ids: Sequence[str]) ->
 
 def _immutable_float32(value: Any) -> np.ndarray:
     result = np.ascontiguousarray(np.asarray(value, dtype=np.float32)).copy()
+    result.setflags(write=False)
+    return result
+
+
+def _immutable_float64(value: Any) -> np.ndarray:
+    result = np.ascontiguousarray(np.asarray(value, dtype=np.float64)).copy()
     result.setflags(write=False)
     return result
 
@@ -723,7 +762,9 @@ class PrivilegedRoboTwin2StateHistory:
     query_index: int
 
     def __post_init__(self) -> None:
-        trajectory = _immutable_float32(self.trajectory)
+        # Event v2 intentionally keeps the simulator quaternion in float64 so
+        # its strict orientation boundary is identical to check_success().
+        trajectory = _immutable_float64(self.trajectory)
         sim_times = np.asarray(self.sim_times, dtype=np.float64).copy()
         sim_times.setflags(write=False)
         if (
@@ -858,6 +899,7 @@ class PrivilegedRoboTwin2State27Observer:
             names,
             False,
             task_context.calibration,
+            collector.success_height_reference_z(observation.task),
         )
         current_event = int(events[-1])
         moving_index = names.index(moving_name)
@@ -1068,6 +1110,7 @@ def materialize_authority(
 ) -> plugin.AuthorityProvenance:
     """Create and validate the exact runtime authority for these four adapters."""
 
+    validate_state_action_frame_authority()
     members = tuple(
         _require_sha256(value, f"critic_member_checkpoint_sha256[{index}]")
         for index, value in enumerate(critic_member_checkpoint_sha256)
@@ -1139,6 +1182,7 @@ __all__ = [
     "SmolVLAEE16CanonicalEffectAdapter",
     "SmolVLAEE16QueryObservation",
     "SUPPORTED_CANDIDATE_COUNTS",
+    "STATE_ACTION_FRAME_CONTRACT",
     "bind_query_seed",
     "candidate_ids",
     "candidate_noise_contract",
@@ -1146,4 +1190,5 @@ __all__ = [
     "component_implementation_sha256",
     "file_sha256",
     "materialize_authority",
+    "validate_state_action_frame_authority",
 ]

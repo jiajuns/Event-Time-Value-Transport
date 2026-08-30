@@ -1218,13 +1218,16 @@ def execute_rollout(
                 selected = 0
                 score_record = None
             else:
-                trajectory_array = np.stack(trajectory).astype(np.float32)
+                trajectory_array = np.stack(trajectory).astype(np.float64)
                 state, current_event, current_event_age = formal.canonical_state_at(
                     trajectory=trajectory_array,
                     sim_times=np.asarray(sim_times, dtype=np.float64),
                     names=names,
                     ee_action=current_ee,
                     calibration=calibration,
+                    success_height_reference_z=collector.success_height_reference_z(
+                        task
+                    ),
                 )
                 score_record = score_candidates(
                     ensemble,
@@ -1274,13 +1277,14 @@ def execute_rollout(
         success = bool(getattr(task, "eval_success", False))
         if not success:
             success = bool(task.check_success())
-        trajectory_array = np.stack(trajectory).astype(np.float32)
+        trajectory_array = np.stack(trajectory).astype(np.float64)
         _predicates, events = collector.derive_predicates_and_events(
             trajectory_array,
             np.asarray(sim_times, dtype=np.float64),
             names,
             success,
             calibration,
+            collector.success_height_reference_z(task),
         )
         return {
             "method": method,

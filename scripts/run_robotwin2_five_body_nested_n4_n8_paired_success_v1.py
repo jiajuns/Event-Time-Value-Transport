@@ -42,6 +42,7 @@ import run_robotwin2_five_body_postformal_candidate_pool_v1 as pool_runner
 collector = formal.collector
 shared_head = formal.shared_head
 analytic_event = formal.analytic_event
+STATE_ACTION_FRAME_CONTRACT = formal.STATE_ACTION_FRAME_CONTRACT
 FORMAT = "etsf_robotwin2_five_body_nested_n4_n8_execution_v2"
 PAIR_FORMAT = "etsf_robotwin2_actor_nested_n4_n8_paired_execution_v2"
 CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v1"
@@ -424,6 +425,7 @@ def existing_separate_n4_n8_comparability_audit() -> dict[str, Any]:
 def nested_pool_contract() -> dict[str, Any]:
     return {
         "format": NESTED_POOL_AUDIT_FORMAT,
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "raw_proposal_count": RAW_PROPOSAL_COUNT,
         "retained_candidate_counts": [N4_CANDIDATE_COUNT, N8_CANDIDATE_COUNT],
         "single_actor_generation_per_policy_query": True,
@@ -678,6 +680,8 @@ def validate_nested_pool_audit(value: Mapping[str, Any]) -> None:
     validate_source_action_normalizer(normalizer)
     if (
         value.get("format") != NESTED_POOL_AUDIT_FORMAT
+        or value.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or value.get("raw_proposal_count") != RAW_PROPOSAL_COUNT
         or value.get("retained_candidate_counts")
         != [N4_CANDIDATE_COUNT, N8_CANDIDATE_COUNT]
@@ -1093,13 +1097,16 @@ def execute_rollout(
                 selected = 0
                 score_record = None
             else:
-                trajectory_array = np.stack(trajectory).astype(np.float32)
+                trajectory_array = np.stack(trajectory).astype(np.float64)
                 state, current_event, current_event_age = formal.canonical_state_at(
                     trajectory=trajectory_array,
                     sim_times=np.asarray(sim_times, dtype=np.float64),
                     names=names,
                     ee_action=current_ee,
                     calibration=calibration,
+                    success_height_reference_z=collector.success_height_reference_z(
+                        task
+                    ),
                 )
                 score_record = _score_candidates(
                     method=method,
@@ -1155,13 +1162,14 @@ def execute_rollout(
         success = bool(getattr(task, "eval_success", False))
         if not success:
             success = bool(task.check_success())
-        trajectory_array = np.stack(trajectory).astype(np.float32)
+        trajectory_array = np.stack(trajectory).astype(np.float64)
         _predicates, events = collector.derive_predicates_and_events(
             trajectory_array,
             np.asarray(sim_times, dtype=np.float64),
             names,
             success,
             calibration,
+            collector.success_height_reference_z(task),
         )
         return {
             "method": method,
@@ -2177,6 +2185,7 @@ def implementation_binding(robotwin_root: Path) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    formal.validate_state_action_frame_authority()
     if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
         raise NestedCandidatePoolError("nested execution requires remote RTX 4090")
     if args.action_exec_steps != ACTION_EXEC_STEPS or args.max_steps != 200:
@@ -2271,6 +2280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "rollout_count": len(schedule) * len(METHODS),
         "methods": list(METHODS),
         "nested_pool_contract": nested_pool_contract(),
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "same_requested_seed_and_complete_reset_tripled": True,
         "method_order_rotated_before_outcomes": True,
         "method_result_persistence": {

@@ -34,7 +34,7 @@ import torch
 import collect_robotwin2_five_body_ee_candidate_branches_v1 as collector
 import evaluate_robotwin2_cross_embodiment_paired_success_v1 as evaluator
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as preregister
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as shared_head
 
 
@@ -97,6 +97,7 @@ STRICT_PROPER_SELECTION_RULE = (
     "minimize_source_body_condition_macro_proper_score_then_"
     "maximize_rank_within_one_standard_error"
 )
+STATE_ACTION_FRAME_CONTRACT = shared_head.state_action_frame_contract()
 
 
 class PairedExecutionError(RuntimeError):
@@ -115,6 +116,22 @@ def canonical_bytes(value: Any) -> bytes:
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def validate_state_action_frame_authority() -> dict[str, Any]:
+    """Require the corrected endpose-frame runtime before live execution."""
+
+    if (
+        getattr(collector, "STATE_ACTION_FRAME_CONTRACT", None)
+        != STATE_ACTION_FRAME_CONTRACT
+        or shared_head.state_action_frame_contract()
+        != STATE_ACTION_FRAME_CONTRACT
+    ):
+        raise PairedExecutionError(
+            "runtime is legacy/diagnostic-only: endpose state/action frame "
+            "contract is missing or inconsistent"
+        )
+    return dict(STATE_ACTION_FRAME_CONTRACT)
 
 
 def sha256_file(path: Path) -> str:
@@ -174,6 +191,7 @@ def implementation_binding(robotwin_root: Path) -> dict[str, Any]:
         "gpu_name": torch.cuda.get_device_name(0),
         "canonical_state_schema": collector.STATE_SCHEMA,
         "canonical_action_schema": collector.ACTION_SCHEMA,
+        "state_action_frame_contract": validate_state_action_frame_authority(),
     }
 
 
@@ -438,6 +456,8 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         or summary.get("heldout_labels_used_for_normalization_training_or_selection") is not False
         or summary.get("heldout_specific_trainable_parameters") != 0
         or summary.get("actor_frozen") is not True
+        or summary.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or summary.get("event_spec_sha256") != EVENT_SPEC_SHA256
         or summary.get("event_derivation_implementation_sha256")
         != current_event_implementation_sha
@@ -517,6 +537,7 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         raise PairedExecutionError("fold member seeds must be exactly five unique integers")
     return {
         "heldout_body": body,
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "source_bodies": expected_source_bodies,
         "body_adapter": "single_shared_row_zero_heldout_parameters",
         "fold_root": str(fold_root),
@@ -926,6 +947,8 @@ def load_ensemble(
             != shared_head.CANONICAL_STATE_SCHEMA
             or checkpoint.get("canonical_action_schema")
             != shared_head.CANONICAL_ACTION_SCHEMA
+            or checkpoint.get("state_action_frame_contract")
+            != STATE_ACTION_FRAME_CONTRACT
             or checkpoint.get("event_age_contract")
             != shared_head.event_age_contract()
             or checkpoint.get("terminal_horizon_contract")
@@ -1170,9 +1193,15 @@ def canonical_state_at(
     names: Sequence[str],
     ee_action: np.ndarray,
     calibration: Mapping[str, Any],
+    success_height_reference_z: float,
 ) -> tuple[np.ndarray, int, float]:
     predicates, events = collector.derive_predicates_and_events(
-        trajectory, sim_times, names, False, calibration
+        trajectory,
+        sim_times,
+        names,
+        False,
+        calibration,
+        success_height_reference_z,
     )
     moving_index = list(names).index(str(calibration["moving"]))
     state = collector._state27(
@@ -1382,13 +1411,16 @@ def execute_rollout(
                 selected = 0
                 score_record = None
             elif method == "etsf_best_of_4":
-                trajectory_array = np.stack(trajectory).astype(np.float32)
+                trajectory_array = np.stack(trajectory).astype(np.float64)
                 state, current_event, current_event_age = canonical_state_at(
                     trajectory=trajectory_array,
                     sim_times=np.asarray(sim_times, dtype=np.float64),
                     names=names,
                     ee_action=current_ee,
                     calibration=calibration,
+                    success_height_reference_z=collector.success_height_reference_z(
+                        task
+                    ),
                 )
                 score_record = score_candidates(
                     ensemble,
@@ -1445,13 +1477,14 @@ def execute_rollout(
             # A checker exception is a protocol/runtime failure, not evidence
             # of task failure.  Let it reach the immutable no-retry receipt.
             success = bool(task.check_success())
-        trajectory_array = np.stack(trajectory).astype(np.float32)
+        trajectory_array = np.stack(trajectory).astype(np.float64)
         _predicates, events = collector.derive_predicates_and_events(
             trajectory_array,
             np.asarray(sim_times, dtype=np.float64),
             names,
             success,
             calibration,
+            collector.success_height_reference_z(task),
         )
         progress = stage_progress(events, success)
         return {
@@ -1782,6 +1815,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    validate_state_action_frame_authority()
     if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
         raise PairedExecutionError("formal paired execution requires remote RTX 4090 CUDA")
     if args.action_exec_steps != ACTION_EXEC_STEPS:
@@ -1886,6 +1920,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "same_analytic_initial_side_pot_relative_goal_vector_used_for_"
             "event_labels_and_online_state27_channels_0_2"
         ),
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "preregistration": str(args.preregistration.resolve()),
         "preregistration_sha256": preregistration_receipt["preregistration_sha256"],
         "action_exec_steps": ACTION_EXEC_STEPS,

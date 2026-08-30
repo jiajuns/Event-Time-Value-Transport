@@ -20,7 +20,9 @@ import collect_robotwin2_scripted_expert_root_actor_branches_v1 as collector
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer
 
 
-FORMAT = "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v2"
+FORMAT = (
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v3_endpose_frame"
+)
 
 
 class SupplementBindingError(RuntimeError):
@@ -141,6 +143,8 @@ def build_binding(
         or primary.get("dataset_revision") != trainer.DATASET_REVISION
         or primary.get("task") != trainer.TASK
         or primary.get("instruction") != trainer.DEFAULT_INSTRUCTION
+        or primary.get("state_action_frame_contract")
+        != trainer.STATE_ACTION_FRAME_CONTRACT
     ):
         raise SupplementBindingError("primary binding identity changed")
     try:
@@ -156,6 +160,8 @@ def build_binding(
     if (
         actor_authority.get("format") != trainer.ACTOR_FORMAT
         or actor_authority.get("task") != trainer.TASK
+        or actor_authority.get("state_action_frame_contract")
+        != trainer.STATE_ACTION_FRAME_CONTRACT
         or not isinstance(declared_actor, Mapping)
         or declared_actor.get("sha256") != actor_authority_sha
     ):
@@ -231,6 +237,7 @@ def build_binding(
         "dataset_revision": trainer.DATASET_REVISION,
         "task": trainer.TASK,
         "instruction": trainer.DEFAULT_INSTRUCTION,
+        "state_action_frame_contract": trainer.STATE_ACTION_FRAME_CONTRACT,
         "event_spec_sha256": trainer.EVENT_SPEC_SHA256,
         "candidate_noise_contract": trainer.CANDIDATE_NOISE_CONTRACT,
         "terminal_supervision_contract": trainer.TERMINAL_SUPERVISION_CONTRACT,

@@ -32,27 +32,27 @@ from torch.utils.data import DataLoader
 
 import train_multibody_canonical_event_world_model as core
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materialization
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
 MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v11"
-BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
+BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v2_endpose_frame"
+MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
 SUPPLEMENT_BINDING_FORMAT = (
-    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v2"
+    "etsf_robotwin2_five_body_proper_world_utility_rank_supplement_binding_v3_endpose_frame"
 )
 SUPPLEMENT_MANIFEST_FORMAT = (
-    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v2"
+    "etsf_robotwin2_proper_world_utility_rank_supplement_manifest_v3_endpose_frame"
 )
 SUPPLEMENT_COLLECTOR_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_actor_branches_v2"
+    "etsf_robotwin2_scripted_expert_root_actor_branches_v3_endpose_frame"
 )
 SUPPLEMENT_MATERIALIZER_FORMAT = (
-    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v2"
+    "etsf_robotwin2_scripted_expert_root_supplement_binding_materializer_v3_endpose_frame"
 )
-ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
+ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
 MATERIALIZATION_FORMAT = public_materialization.FORMAT
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
@@ -66,6 +66,19 @@ SOURCE_EVENT_SAMPLING_HZ = 15.0
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 CANDIDATE_COUNT = 4
+STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
+    "training_state_source": "public_hdf5_endpose_left_right_endpose",
+    "runtime_state_api": "task.get_arm_pose(left/right)",
+    "runtime_state_pose_semantics": "robot.get_*_ee_pose(is_endpose=False)",
+    "native_action_pose_semantics": (
+        "same_absolute_world_ee_frame_as_training_endpose"
+    ),
+    "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "pose_convention": "xyz_plus_quaternion_wxyz",
+    "tcp_tool_axis_offset_m_excluded": 0.12,
+    "state_and_action_same_frame": True,
+}
 CANDIDATE_RANK_FEATURE_SCHEMA = {
     "post_expected_stage_progress": (0, 1),
     "next_event_advance_rate": (1, 2),
@@ -302,11 +315,19 @@ BRANCH_ROOT_SNAPSHOT_CONTRACT = {
     "reset_and_action_prefix_replay_used_for_candidates": False,
 }
 BRANCH_DIAGNOSTIC_CONTRACT = {
-    "format": "etsf_robotwin2_candidate_branch_diagnostics_v1",
+    "format": "etsf_robotwin2_candidate_branch_diagnostics_v2_endpose_frame",
     "first_executed": "successful_or_physics_advancing_actions_in_planned_first_chunk",
     "branch_error": "all_false_execution_exception_invalidates_complete_decision",
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
+    ),
+    "candidate_first_token_translation_norm_m": (
+        "label_free_left_right_translation_norm_from_same_frame_root_state_to_"
+        "candidate_token_zero"
+    ),
+    "candidate_later_token_translation_norm_median_m": (
+        "label_free_left_right_median_translation_norm_between_subsequent_"
+        "candidate_tokens"
     ),
 }
 SUPPLEMENT_ACTOR_BRANCH_CONTRACT = {
@@ -947,6 +968,7 @@ REQUIRED_ARRAYS = {
     "candidate_index",
     "event_age_seconds",
     "remaining_action_budget",
+    "success_height_reference_z",
     "dt",
 }
 
@@ -1080,6 +1102,12 @@ def event_age_contract() -> dict[str, Any]:
     """Return the frozen physical event-age input contract."""
 
     return dict(EVENT_AGE_CONTRACT)
+
+
+def state_action_frame_contract() -> dict[str, Any]:
+    """Return the frozen endpose-frame ABI used by actor state and actions."""
+
+    return dict(STATE_ACTION_FRAME_CONTRACT)
 
 
 def terminal_horizon_contract() -> dict[str, Any]:
@@ -1261,7 +1289,12 @@ def validate_actor_authority(
     value: Mapping[str, Any], *, authority_dir: Path
 ) -> dict[str, Any]:
     _verify_signed(value, "actor authority")
-    if value.get("format") != ACTOR_FORMAT or value.get("task") != TASK:
+    if (
+        value.get("format") != ACTOR_FORMAT
+        or value.get("task") != TASK
+        or value.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
+    ):
         raise FiveBodyContractError("actor authority format/task mismatch")
     actors = value.get("actors")
     if not isinstance(actors, Mapping) or set(actors) != set(BODIES):
@@ -1315,6 +1348,8 @@ def validate_body_manifest(
         or value.get("task") != TASK
         or value.get("instruction") != DEFAULT_INSTRUCTION
         or value.get("body") != expected_body
+        or value.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
     ):
         raise FiveBodyContractError(f"canonical manifest identity mismatch for {expected_body}")
     adapter = value.get("schema_adapter")
@@ -1363,10 +1398,9 @@ def validate_body_manifest(
         or physical_time.get("duration_semantics")
         != "simulator_elapsed_seconds_to_event_boundary"
         or physical_time.get("zero_elapsed_duration_masked") is not True
-        or physical_time.get("stationary_window_seconds")
-        != analytic_event.THRESHOLDS["stationary_window_seconds"]
-        or physical_time.get("stationary_speed_threshold_m_per_s")
-        != analytic_event.THRESHOLDS["stationary_speed_m_per_s"]
+        or physical_time.get("event_thresholds")
+        != analytic_event.THRESHOLDS
+        or physical_time.get("event_chain_success_aligned") is not True
     ):
         raise FiveBodyContractError(
             f"{expected_body} lacks the physical simulator time/event contract"
@@ -1833,6 +1867,8 @@ def load_binding(path: Path, expected_sha256: str) -> dict[str, Any]:
         or binding.get("task") != TASK
         or binding.get("instruction") != DEFAULT_INSTRUCTION
         or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or binding.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
@@ -1940,6 +1976,8 @@ def load_supplement_binding(
         or binding.get("task") != TASK
         or binding.get("instruction") != DEFAULT_INSTRUCTION
         or binding.get("event_spec_sha256") != EVENT_SPEC_SHA256
+        or binding.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or binding.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
         or binding.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
@@ -2415,6 +2453,7 @@ def build_preflight_receipt(
         "format": FORMAT,
         "status": "preflight_passed_payloads_still_unopened",
         "dataset_revision": DATASET_REVISION,
+        "state_action_frame_contract": state_action_frame_contract(),
         "event_spec_sha256": audit["event_spec_sha256"],
         "event_derivation_implementation_sha256": audit[
             "event_derivation_implementation_sha256"
@@ -2637,6 +2676,18 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
     )):
         raise FiveBodyContractError(
             f"{path} remaining action budget is outside the formal query grid"
+        )
+    height_reference = np.asarray(
+        arrays["success_height_reference_z"], dtype=np.float64
+    )
+    if not np.isfinite(height_reference).all() or not np.allclose(
+        height_reference,
+        height_reference[:1],
+        atol=0.0,
+        rtol=0.0,
+    ):
+        raise FiveBodyContractError(
+            f"{path} candidates do not share one finite task.orig_z authority"
         )
     stop_reason = arrays["terminal_stop_reason_id"]
     if not np.array_equal(stop_reason, stop_reason.astype(np.int64)) or np.any(
@@ -7257,6 +7308,7 @@ def _train_fold(
                 ),
                 "canonical_state_schema": CANONICAL_STATE_SCHEMA,
                 "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
+                "state_action_frame_contract": state_action_frame_contract(),
                 "event_age_contract": event_age_contract(),
                 "terminal_horizon_contract": terminal_horizon_contract(),
                 "event_spec_sha256": EVENT_SPEC_SHA256,
@@ -7334,6 +7386,7 @@ def _train_fold(
         "body_adapter": "single_shared_row_zero_heldout_parameters",
         "canonical_state_schema": CANONICAL_STATE_SCHEMA,
         "canonical_action_schema": CANONICAL_ACTION_SCHEMA,
+        "state_action_frame_contract": state_action_frame_contract(),
         "event_age_contract": event_age_contract(),
         "terminal_horizon_contract": terminal_horizon_contract(),
         "event_spec_sha256": EVENT_SPEC_SHA256,
@@ -7585,6 +7638,7 @@ __all__ = [
     "MONOTONE_BENEFIT_FEATURES", "MONOTONE_RISK_FEATURES",
     "EVENT_SPEC_SHA256", "MATERIALIZATION_FORMAT", "MODEL_FAMILY",
     "OBJECT_EFFECT_SCHEMA", "EVENT_AGE_CONTRACT", "event_age_contract",
+    "STATE_ACTION_FRAME_CONTRACT", "state_action_frame_contract",
     "REQUIRED_ARRAYS",
     "RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT",
     "RiskAdjustedRankEnsemble", "SEMANTIC_COMPARATIVE_GRADIENT_BUDGET",

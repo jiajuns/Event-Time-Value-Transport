@@ -13,13 +13,88 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import collect_robotwin2_five_body_ee_candidate_branches_v1 as collector  # noqa: E402
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event  # noqa: E402
 import watch_robotwin2_ee16_actor_to_five_body_branches_v1 as watcher  # noqa: E402
 
 
 class _NoiseConfig:
     chunk_size = 3
     max_action_dim = 4
+
+
+class _EndPoseRobot:
+    def get_left_gripper_val(self) -> float:
+        return 0.25
+
+    def get_right_gripper_val(self) -> float:
+        return 0.75
+
+    def get_left_tcp_pose(self) -> np.ndarray:
+        raise AssertionError("TCP frame must never be read for the actor state")
+
+    def get_right_tcp_pose(self) -> np.ndarray:
+        raise AssertionError("TCP frame must never be read for the actor state")
+
+
+class _EndPoseTask:
+    def __init__(self) -> None:
+        self.robot = _EndPoseRobot()
+        self.calls: list[str] = []
+
+    def get_arm_pose(self, arm: str) -> np.ndarray:
+        self.calls.append(arm)
+        if arm == "left":
+            return np.asarray([1, 2, 3, 1, 0, 0, 0], dtype=np.float64)
+        if arm == "right":
+            return np.asarray([4, 5, 6, 0, 1, 0, 0], dtype=np.float64)
+        raise AssertionError(f"unexpected arm: {arm}")
+
+
+def test_current_ee_action16_uses_training_endpose_api_and_exact_layout() -> None:
+    task = _EndPoseTask()
+    value = collector.current_ee_action16(task)
+    assert task.calls == ["left", "right"]
+    assert value.dtype == np.float32
+    np.testing.assert_array_equal(
+        value,
+        np.asarray(
+            [1, 2, 3, 1, 0, 0, 0, 0.25, 4, 5, 6, 0, 1, 0, 0, 0.75],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_state_action_frame_contract_is_explicit_and_rejects_old_tcp_artifacts() -> None:
+    assert collector.STATE_ACTION_FRAME_CONTRACT == watcher.STATE_ACTION_FRAME_CONTRACT
+    assert watcher.STATE_ACTION_FRAME_CONTRACT["runtime_state_api"] == (
+        "task.get_arm_pose(left/right)"
+    )
+    assert watcher.STATE_ACTION_FRAME_CONTRACT["tcp_tool_axis_offset_m_excluded"] == 0.12
+    assert watcher.STATE_ACTION_FRAME_CONTRACT["state_and_action_same_frame"] is True
+    assert collector.FORMAT == watcher.COLLECTOR_FORMAT
+    assert collector.MANIFEST_FORMAT == watcher.MANIFEST_FORMAT
+    assert collector.DIAGNOSTIC_FORMAT == watcher.DIAGNOSTIC_FORMAT
+
+    old_tcp_artifact = {
+        "format": "etsf_robotwin2_five_body_lobo_training_binding_v1",
+        "state_action_frame_contract": {
+            "runtime_state_api": "robot.get_left_tcp_pose/get_right_tcp_pose"
+        },
+    }
+    for artifact in ("manifest", "actor authority", "training binding"):
+        with pytest.raises(watcher.ContinuationError, match="exact training-aligned"):
+            watcher.require_state_action_frame_contract(
+                old_tcp_artifact, artifact=artifact
+            )
+    with pytest.raises(watcher.ContinuationError, match="format"):
+        watcher.validate_training_binding_contract(old_tcp_artifact)
+
+    watcher.validate_training_binding_contract(
+        {
+            "format": watcher.BINDING_FORMAT,
+            "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
+        }
+    )
 
 
 def test_antithetic_noise_preserves_candidate_zero_and_normal_marginals() -> None:
@@ -187,16 +262,23 @@ def _root_and_outcomes() -> tuple[dict, list[dict]]:
         "prefix_trajectory": prefix,
         "prefix_sim_times": np.asarray([0.0], dtype=np.float64),
         "remaining_action_budget": 200,
+        "success_height_reference_z": 0.75,
         "candidates": np.stack([_candidate(index) for index in range(4)]),
     }
-    quarter_turn_z = np.asarray(
-        [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)], dtype=np.float32
+    quarter_turn_roll = np.asarray(
+        [np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32
     )
     specifications = (
         (_trajectory([0.30, 0.28]), [0.0, 0.10], False, 5, None),
-        (_trajectory([0.30, 0.18], quarter_turn_z), [0.0, 0.10], True, 5, None),
+        (_trajectory([0.30, 0.18], quarter_turn_roll), [0.0, 0.10], True, 5, None),
         (_trajectory([0.30]), [0.0], False, 0, None),
-        (_trajectory([0.30, 0.18, 0.18, 0.18]), [0.0, 0.05, 0.10, 0.35], False, 5, None),
+        (
+            _trajectory([0.30, 0.18, 0.18, 0.18], quarter_turn_roll),
+            [0.0, 0.05, 0.10, 0.35],
+            False,
+            5,
+            None,
+        ),
     )
     outcomes = []
     for trajectory, times, success, executed, error in specifications:
@@ -221,8 +303,13 @@ def _calibration() -> dict:
     return {
         "moving": "can",
         "anchor": "pot",
+        "required_objects": list(analytic_event.REQUIRED_OBJECTS),
         "goal_rule": analytic_event.GOAL_RULE,
+        "success_height_reference_rule": (
+            analytic_event.SUCCESS_HEIGHT_REFERENCE_RULE
+        ),
         "thresholds": analytic_event.THRESHOLDS,
+        "event_rules": analytic_event.EVENT_RULES,
     }
 
 
@@ -246,7 +333,7 @@ def test_materialization_keeps_terminal_endpoints_and_se3_object_effect() -> Non
     )
     np.testing.assert_allclose(arrays["object_delta"][1, :3], [-0.12, 0.0, 0.0])
     np.testing.assert_allclose(
-        arrays["object_delta"][1, 3:], [0.0, 0.0, np.pi / 2.0], atol=1e-5
+        arrays["object_delta"][1, 3:], [np.pi / 2.0, 0.0, 0.0], atol=1e-5
     )
     np.testing.assert_array_equal(arrays["event_age_seconds"], np.zeros(4))
     np.testing.assert_array_equal(
@@ -407,5 +494,16 @@ def test_branch_diagnostics_capture_action_coverage_without_runtime_failures() -
     np.testing.assert_allclose(distances, distances.T)
     np.testing.assert_allclose(np.diag(distances), 0.0)
     assert np.all(distances[np.triu_indices(4, 1)] > 0.0)
+    np.testing.assert_allclose(
+        arrays["candidate_first_token_translation_norm_m"],
+        [[0.002, 0.001], [0.004, 0.002], [0.006, 0.003], [0.008, 0.004]],
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(
+        arrays["candidate_later_token_translation_norm_median_m"],
+        [[0.002, 0.001], [0.004, 0.002], [0.006, 0.003], [0.008, 0.004]],
+        atol=1e-7,
+    )
+    assert np.all(arrays["candidate_first_token_translation_norm_m"] < 0.01)
     assert collector.BRANCH_DIAGNOSTIC_CONTRACT == watcher.BRANCH_DIAGNOSTIC_CONTRACT
     assert watcher.ROOT_QUERIES == tuple(range(40))

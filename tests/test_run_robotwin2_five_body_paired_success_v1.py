@@ -334,9 +334,17 @@ def test_prepare_and_execute_signatures_bind_the_same_initial_commitment(
             self.robot = Robot()
             self.can = Object()
             self.pot = Object()
+            self.orig_z = 0.0
             self.scene = runner.collector.SimulationClockScene(RawScene())
             self.take_action_cnt = 0
             self.eval_success = False
+
+        def get_arm_pose(self, arm):
+            if arm == "left":
+                return self.robot.get_left_tcp_pose()
+            if arm == "right":
+                return self.robot.get_right_tcp_pose()
+            raise ValueError(arm)
 
         def take_action(self, _action, action_type):
             assert action_type == "ee"
@@ -356,7 +364,7 @@ def test_prepare_and_execute_signatures_bind_the_same_initial_commitment(
     monkeypatch.setattr(
         runner.collector,
         "derive_predicates_and_events",
-        lambda poses, sim_times, names, success, calibration: (
+        lambda poses, sim_times, names, success, calibration, orig_z: (
             np.zeros((len(poses), 5), dtype=np.float32),
             np.zeros(len(poses), dtype=np.int64),
         ),
@@ -366,6 +374,9 @@ def test_prepare_and_execute_signatures_bind_the_same_initial_commitment(
         "anchor": "pot",
         "required_objects": list(runner.analytic_event.REQUIRED_OBJECTS),
         "goal_rule": dict(runner.analytic_event.GOAL_RULE),
+        "success_height_reference_rule": dict(
+            runner.analytic_event.SUCCESS_HEIGHT_REFERENCE_RULE
+        ),
         "thresholds": dict(runner.analytic_event.THRESHOLDS),
         "event_rules": dict(runner.analytic_event.EVENT_RULES),
     }
@@ -452,6 +463,7 @@ def _write_fold_summary(tmp_path: Path, seeds: list[int]) -> Path:
         "held_out_body": "franka",
         "source_bodies": [body for body in runner.BODIES if body != "franka"],
         "body_adapter": "single_shared_row_zero_heldout_parameters",
+        "state_action_frame_contract": runner.STATE_ACTION_FRAME_CONTRACT,
         "heldout_labels_used_for_normalization_training_or_selection": False,
         "heldout_specific_trainable_parameters": 0,
         "actor_frozen": True,
@@ -510,6 +522,7 @@ def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
         },
         "canonical_state_schema": runner.shared_head.CANONICAL_STATE_SCHEMA,
         "canonical_action_schema": runner.shared_head.CANONICAL_ACTION_SCHEMA,
+        "state_action_frame_contract": runner.STATE_ACTION_FRAME_CONTRACT,
         "event_age_contract": runner.shared_head.event_age_contract(),
         "terminal_horizon_contract": runner.shared_head.terminal_horizon_contract(),
         "model_family": runner.shared_head.MODEL_FAMILY,
@@ -533,6 +546,16 @@ def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
     monkeypatch.setattr(runner.torch, "load", lambda *_args, **_kwargs: checkpoint)
     with pytest.raises(runner.PairedExecutionError, match="checkpoint contract"):
         runner.load_ensemble(fold, torch.device("cpu"))
+
+
+def test_runtime_rejects_legacy_tcp_frame_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(
+        runner.collector, "STATE_ACTION_FRAME_CONTRACT", raising=False
+    )
+    with pytest.raises(runner.PairedExecutionError, match="diagnostic-only"):
+        runner.validate_state_action_frame_authority()
 
 
 def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None:
@@ -774,28 +797,29 @@ def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None
 
 def test_analytic_events_and_state27_goal_are_identical_offline_and_online() -> None:
     spec_path = (
-        ROOT / "configs/robotwin2_move_can_pot_five_body_analytic_event_spec_v1.json"
+        ROOT / "configs/robotwin2_move_can_pot_five_body_analytic_event_spec_v2.json"
     )
     _spec, calibration = runner.analytic_event.load_event_spec(spec_path)
     poses = np.zeros((6, 2, 7), dtype=np.float32)
     poses[:, 0, 0] = [-0.30, -0.28, -0.18, -0.18, -0.18, -0.18]
     poses[:, :, 2] = 0.74
     poses[:, :, 3] = 1.0
+    poses[-1, 0, 3:7] = [np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0]
     times = np.asarray([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float64)
     predicates, events = runner.collector.derive_predicates_and_events(
-        poses, times, ["can", "pot"], False, calibration
+        poses, times, ["can", "pot"], False, calibration, 0.74
     )
-    # The high arrival speed at t=0.2 is part of that closed stationary window,
-    # so e4 begins only after a full low-speed [0.3, 0.5] interval.
+    # v2 e3 is the native success position region; e4 additionally requires
+    # the public 90-degree roll, pitch and low-height conditions.
     assert events.tolist() == [0, 1, 2, 2, 2, 3]
     _shifted_predicates, shifted_events = (
         runner.collector.derive_predicates_and_events(
-            poses, times + 1.0, ["can", "pot"], False, calibration
+            poses, times + 1.0, ["can", "pot"], False, calibration, 0.74
         )
     )
     assert shifted_events.tolist() == events.tolist()
     _predicates, terminal = runner.collector.derive_predicates_and_events(
-        poses, times, ["can", "pot"], True, calibration
+        poses, times, ["can", "pot"], True, calibration, 0.74
     )
     assert terminal.tolist() == [0, 1, 2, 2, 2, 4]
     ee = np.zeros(16, dtype=np.float32)
@@ -807,7 +831,7 @@ def test_analytic_events_and_state27_goal_are_identical_offline_and_online() -> 
     )
     online, online_event, online_event_age = runner.canonical_state_at(
         trajectory=poses, sim_times=times, names=["can", "pot"],
-        ee_action=ee, calibration=calibration,
+        ee_action=ee, calibration=calibration, success_height_reference_z=0.74,
     )
     assert online_event_age == pytest.approx(0.0)
     assert online_event == 3

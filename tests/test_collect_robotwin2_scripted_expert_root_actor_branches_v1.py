@@ -18,7 +18,7 @@ if str(SCRIPTS) not in sys.path:
 import collect_robotwin2_five_body_ee_candidate_branches_v1 as base  # noqa: E402
 import collect_robotwin2_scripted_expert_root_actor_branches_v1 as collector  # noqa: E402
 import materialize_robotwin2_scripted_expert_root_supplement_binding_v1 as materializer  # noqa: E402
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event  # noqa: E402
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer  # noqa: E402
 
 
@@ -70,17 +70,19 @@ def test_expert_scene_proxy_advances_exactly_one_native_step() -> None:
 class _PoseObject:
     def __init__(self, x: float) -> None:
         self.x = float(x)
+        self.q = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     def get_pose(self) -> SimpleNamespace:
         return SimpleNamespace(
             p=np.asarray([self.x, 0.0, 0.75], dtype=np.float32),
-            q=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            q=self.q.copy(),
         )
 
 
 class _ObserverTask:
     def __init__(self) -> None:
         self.scene = base.SimulationClockScene(_NativeScene(timestep=0.1))
+        self.orig_z = 0.75
 
     def check_success(self) -> bool:
         return False
@@ -92,6 +94,9 @@ def _calibration() -> dict:
         "anchor": "pot",
         "required_objects": list(analytic_event.REQUIRED_OBJECTS),
         "goal_rule": dict(analytic_event.GOAL_RULE),
+        "success_height_reference_rule": dict(
+            analytic_event.SUCCESS_HEIGHT_REFERENCE_RULE
+        ),
         "thresholds": dict(analytic_event.THRESHOLDS),
         "event_rules": dict(analytic_event.EVENT_RULES),
     }
@@ -147,13 +152,16 @@ def test_observer_freezes_first_e12_e3_e4_and_resets_actor_horizon(
 
     task.scene.step_count = 5
     can.x = 0.18
+    can.q = np.asarray(
+        [np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32
+    )
     with pytest.raises(collector._AllRequestedRootsCaptured):
         observer.record_physics_step()
     assert set(observer.roots) == {"e12", "e3", "e4"}
     assert observer.roots["e4"]["detector_sim_step"] == 5
-    # The full-history authority runs only for the three accepted targets, not
-    # for every physics step in a potentially long scripted expert rollout.
-    assert authoritative_prefix_lengths == [2, 3, 5]
+    # v2 uses its authoritative success-aligned derivation for every observed
+    # physical step and repeats it when accepting a previously unseen target.
+    assert authoritative_prefix_lengths == [2, 2, 3, 3, 4, 5, 5]
     for root in observer.roots.values():
         fields = root["branch_root_snapshot"]["task_fields"]
         assert fields == {
@@ -166,6 +174,7 @@ def test_observer_freezes_first_e12_e3_e4_and_resets_actor_horizon(
             "untouched": [1.0, 2.0]
         }
         assert root["remaining_action_budget"] == 50
+        assert root["success_height_reference_z"] == 0.75
 
 
 def test_reserve_roster_is_body_local_fixed_and_label_blind() -> None:
@@ -575,6 +584,7 @@ def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Pa
         {
             "format": trainer.ACTOR_FORMAT,
             "task": trainer.TASK,
+            "state_action_frame_contract": trainer.STATE_ACTION_FRAME_CONTRACT,
             "actors": {
                 body: {"checkpoint_sha256": checkpoint_sha}
                 for body in trainer.BODIES
@@ -588,6 +598,8 @@ def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Pa
     for body in trainer.BODIES:
         primary_manifest = _signed(
             {
+                "format": trainer.MANIFEST_FORMAT,
+                "state_action_frame_contract": trainer.STATE_ACTION_FRAME_CONTRACT,
                 "groups": [
                     {
                         "condition": condition,
@@ -613,6 +625,7 @@ def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Pa
             "dataset_revision": trainer.DATASET_REVISION,
             "task": trainer.TASK,
             "instruction": trainer.DEFAULT_INSTRUCTION,
+            "state_action_frame_contract": trainer.STATE_ACTION_FRAME_CONTRACT,
             "actor_authority": {"path": actor_path.name, "sha256": actor_sha},
             "body_manifests": primary_body_bindings,
         }

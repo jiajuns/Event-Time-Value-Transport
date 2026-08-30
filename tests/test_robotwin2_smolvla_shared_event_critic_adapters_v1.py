@@ -79,6 +79,7 @@ class FakeTask:
     def __init__(self) -> None:
         self.robot = FakeRobot()
         self.scene = FakeScene()
+        self.orig_z = 0.1
         self.take_action_cnt = 0
         self.eval_success = False
         self.actions: list[np.ndarray] = []
@@ -106,6 +107,13 @@ class FakeTask:
             }
         }
 
+    def get_arm_pose(self, arm: str) -> np.ndarray:
+        if arm == "left":
+            return self.robot.get_left_tcp_pose()
+        if arm == "right":
+            return self.robot.get_right_tcp_pose()
+        raise ValueError(arm)
+
     def take_action(self, action: np.ndarray, *, action_type: str) -> None:
         self.actions.append(np.asarray(action, dtype=np.float32).copy())
         self.action_types.append(action_type)
@@ -124,6 +132,9 @@ def calibration() -> dict[str, Any]:
         "anchor": "pot",
         "required_objects": list(event.REQUIRED_OBJECTS),
         "goal_rule": dict(event.GOAL_RULE),
+        "success_height_reference_rule": dict(
+            event.SUCCESS_HEIGHT_REFERENCE_RULE
+        ),
         "thresholds": dict(event.THRESHOLDS),
         "event_rules": dict(event.EVENT_RULES),
     }
@@ -246,9 +257,12 @@ def test_native_candidates_become_canonical_batch_but_only_native_selection_exec
         assert candidates.candidate_ids[0] == "actor_baseline"
         assert not candidates.actions.flags.writeable
 
+        privileged_history = history(root)
+        assert privileged_history.trajectory.dtype == np.float64
+        assert not privileged_history.trajectory.flags.writeable
         state = observer.observe_state(
             root,
-            history(root),
+            privileged_history,
             adapters.PrivilegedRoboTwin2TaskContext(
                 calibration=calibration(),
                 remaining_action_budget=200,

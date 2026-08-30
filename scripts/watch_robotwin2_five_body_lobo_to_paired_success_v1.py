@@ -87,6 +87,19 @@ RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT = {
     "aggregation": "member_mean_minus_weight_times_member_population_std",
     "within_member_candidate_standardization": False,
 }
+STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
+    "training_state_source": "public_hdf5_endpose_left_right_endpose",
+    "runtime_state_api": "task.get_arm_pose(left/right)",
+    "runtime_state_pose_semantics": "robot.get_*_ee_pose(is_endpose=False)",
+    "native_action_pose_semantics": (
+        "same_absolute_world_ee_frame_as_training_endpose"
+    ),
+    "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "pose_convention": "xyz_plus_quaternion_wxyz",
+    "tcp_tool_axis_offset_m_excluded": 0.12,
+    "state_and_action_same_frame": True,
+}
 
 
 class PairedWatcherError(RuntimeError):
@@ -129,7 +142,7 @@ class FormalPaths:
 
     @property
     def event_module(self) -> Path:
-        return self.code_root / "robotwin2_move_can_pot_analytic_event_spec_v1.py"
+        return self.code_root / "robotwin2_move_can_pot_analytic_event_spec_v2.py"
 
     @property
     def final_summary(self) -> Path:
@@ -194,7 +207,7 @@ def formal_paths(code_root: Path | None = None) -> FormalPaths:
         vlm_metadata=home / "etsf_stage0/offline_assets/smolvlm2_500m_metadata",
         robotwin_root=home / "etsf_stage0/RoboTwin",
         event_spec=home
-        / "etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v1.json",
+        / "etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v2.json",
         materialization_receipt=home
         / (
             "public_benchmark_receipts/"
@@ -379,6 +392,8 @@ def inspect_fold(paths: FormalPaths, body: str) -> dict[str, Any]:
         summary.get("format") != FOLD_FORMAT
         or summary.get("status") != FOLD_STATUS
         or summary.get("held_out_body") != body
+        or summary.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or summary.get("event_spec_sha256") != EXPECTED_EVENT_SPEC_SHA256
         or summary.get("event_derivation_implementation_sha256")
         != EXPECTED_EVENT_MODULE_SHA256
@@ -420,6 +435,7 @@ def inspect_fold(paths: FormalPaths, body: str) -> dict[str, Any]:
         raise PairedWatcherError(f"{body} fold members must be exactly 0..4")
     return {
         "heldout_body": body,
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "fold_root": str(root.resolve()),
         "training_summary": str(summary_path.resolve()),
         "training_summary_sha256": sha256_file(summary_path),
@@ -453,6 +469,8 @@ def validate_upstream_complete(paths: FormalPaths, state: Mapping[str, Any]) -> 
         or final.get("members_per_fold") != EXPECTED_MEMBERS_PER_FOLD
         or final.get("heldout_task_success_measured") is not False
         or final.get("cross_embodiment_task_success_claim_authorized") is not False
+        or final.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
     ):
         raise PairedWatcherError("five-fold aggregate contract changed")
     folds = {body: inspect_fold(paths, body) for body in BODIES}
@@ -476,6 +494,7 @@ def validate_upstream_complete(paths: FormalPaths, state: Mapping[str, Any]) -> 
         ):
             raise PairedWatcherError(f"aggregate/fold binding changed for {body}")
     return {
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "upstream_state_file_sha256": sha256_file(paths.upstream_state),
         "upstream_run_exit_file_sha256": sha256_file(paths.upstream_run_exit),
         "final_summary": str(paths.final_summary),
@@ -521,7 +540,7 @@ def code_binding(paths: FormalPaths) -> list[dict[str, Any]]:
         "robotwin2_cross_body_canonical_adapter_v1.py",
         "train_multibody_canonical_event_world_model.py",
         "verify_robotwin2_move_can_pot_public_materialization_v1.py",
-        "robotwin2_move_can_pot_analytic_event_spec_v1.py",
+        "robotwin2_move_can_pot_analytic_event_spec_v2.py",
     )
     if paths.code_root.is_symlink() or not paths.code_root.is_dir():
         raise PairedWatcherError("deployed code root is missing or symbolic")

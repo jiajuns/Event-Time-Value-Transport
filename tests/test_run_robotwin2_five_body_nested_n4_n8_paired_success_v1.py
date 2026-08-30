@@ -117,6 +117,14 @@ def test_raw16_blind_fps_produces_exact_nested_prefix_and_candidate_zero() -> No
     ]
     runner.validate_nested_pool_audit(audit)
 
+    legacy = copy.deepcopy(audit)
+    legacy.pop("state_action_frame_contract")
+    legacy["audit_sha256"] = runner.canonical_sha256(
+        {key: value for key, value in legacy.items() if key != "audit_sha256"}
+    )
+    with pytest.raises(runner.NestedCandidatePoolError):
+        runner.validate_nested_pool_audit(legacy)
+
     tampered = copy.deepcopy(audit)
     tampered["ordered_fps_raw_indices_n4"] = list(reversed(
         tampered["ordered_fps_raw_indices_n4"]

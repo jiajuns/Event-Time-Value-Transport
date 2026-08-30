@@ -42,6 +42,7 @@ def _write_real_v10_fold(root: Path) -> Path:
                 "canonical_action_schema": trainer.CANONICAL_ACTION_SCHEMA,
                 "event_age_contract": trainer.event_age_contract(),
                 "terminal_horizon_contract": trainer.terminal_horizon_contract(),
+                "state_action_frame_contract": trainer.state_action_frame_contract(),
                 "model_family": trainer.MODEL_FAMILY,
                 "candidate_rank_contract": trainer.checkpoint_candidate_rank_contract(
                     "full"
@@ -82,6 +83,7 @@ def _write_real_v10_fold(root: Path) -> Path:
         "heldout_labels_used_for_normalization_training_or_selection": False,
         "heldout_specific_trainable_parameters": 0,
         "actor_frozen": True,
+        "state_action_frame_contract": trainer.state_action_frame_contract(),
         "event_spec_sha256": paired.EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": event_sha,
         "candidate_rank_contract": trainer.summary_candidate_rank_contract("full"),

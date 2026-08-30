@@ -94,7 +94,7 @@ CRITICAL_CODE_FILES = (
     "train_multibody_canonical_event_world_model.py",
     "collect_robotwin2_five_body_ee_candidate_branches_v1.py",
     "robotwin2_cross_body_canonical_adapter_v1.py",
-    "robotwin2_move_can_pot_analytic_event_spec_v1.py",
+    "robotwin2_move_can_pot_analytic_event_spec_v2.py",
     "verify_robotwin2_move_can_pot_public_materialization_v1.py",
     "preregister_robotwin2_move_can_pot_five_body_lobo_v1.py",
     "run_robotwin2_five_body_paired_success_v1.py",

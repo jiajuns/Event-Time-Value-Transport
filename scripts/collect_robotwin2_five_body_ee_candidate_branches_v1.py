@@ -34,12 +34,12 @@ import torch
 import yaml
 
 import robotwin2_cross_body_canonical_adapter_v1 as canonical_adapter
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 
 
-FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v1"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
-DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v1"
+FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v2_endpose_frame"
+MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
+DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v2_endpose_frame"
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
@@ -72,6 +72,19 @@ OBJECT_EFFECT_SCHEMA = {
     ],
     "rotation": "q_post_times_conjugate_q_root_shortest_axis_angle_wxyz",
     "redundant_relative_goal_delta_removed": True,
+}
+STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
+    "training_state_source": "public_hdf5_endpose_left_right_endpose",
+    "runtime_state_api": "task.get_arm_pose(left/right)",
+    "runtime_state_pose_semantics": "robot.get_*_ee_pose(is_endpose=False)",
+    "native_action_pose_semantics": (
+        "same_absolute_world_ee_frame_as_training_endpose"
+    ),
+    "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "pose_convention": "xyz_plus_quaternion_wxyz",
+    "tcp_tool_axis_offset_m_excluded": 0.12,
+    "state_and_action_same_frame": True,
 }
 CANDIDATE_NOISE_CONTRACT = {
     "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
@@ -142,6 +155,14 @@ BRANCH_DIAGNOSTIC_CONTRACT = {
     "branch_error": "all_false_execution_exception_invalidates_complete_decision",
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
+    ),
+    "candidate_first_token_translation_norm_m": (
+        "label_free_left_right_translation_norm_from_same_frame_root_state_to_"
+        "candidate_token_zero"
+    ),
+    "candidate_later_token_translation_norm_median_m": (
+        "label_free_left_right_median_translation_norm_between_subsequent_"
+        "candidate_tokens"
     ),
 }
 BODY_EMBODIMENT = {
@@ -801,7 +822,10 @@ def read_poses(objects: Sequence[Any]) -> np.ndarray:
     values = [_pose_vector(value) for value in objects]
     if any(value is None for value in values):
         raise BranchCollectionError("a tracked object stopped exposing a pose")
-    return np.stack(values).astype(np.float32)
+    # Keep the simulator's float64 quaternion until the official strict Euler
+    # checks have been evaluated.  Casting to float32 can flip a strict 15°
+    # boundary relative to RoboTwin ``check_success``.
+    return np.stack(values).astype(np.float64)
 
 
 def _goal_vector(
@@ -822,10 +846,16 @@ def derive_predicates_and_events(
     names: Sequence[str],
     success: bool,
     calibration: Mapping[str, Any],
+    success_height_reference_z: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     try:
         return analytic_event.derive_predicates_and_events(
-            poses, sim_times, names, success, calibration
+            poses,
+            sim_times,
+            names,
+            success,
+            calibration,
+            success_height_reference_z,
         )
     except (analytic_event.AnalyticEventSpecError, ValueError) as error:
         raise BranchCollectionError(str(error)) from error
@@ -866,8 +896,19 @@ def _image_chw(value: Any) -> torch.Tensor:
 
 
 def current_ee_action16(task: Any) -> np.ndarray:
-    left_pose = np.asarray(task.robot.get_left_tcp_pose(), dtype=np.float32)
-    right_pose = np.asarray(task.robot.get_right_tcp_pose(), dtype=np.float32)
+    """Read the actor state in the exact end-pose frame used by its HDF5 data."""
+
+    get_arm_pose = getattr(task, "get_arm_pose", None)
+    if not callable(get_arm_pose):
+        raise BranchCollectionError(
+            "RoboTwin task lacks get_arm_pose(left/right) required by the end-pose frame"
+        )
+    left_pose = np.asarray(get_arm_pose("left"), dtype=np.float32)
+    right_pose = np.asarray(get_arm_pose("right"), dtype=np.float32)
+    if left_pose.shape != (7,) or right_pose.shape != (7,):
+        raise BranchCollectionError(
+            "RoboTwin task.get_arm_pose(left/right) must return xyz+quaternion_wxyz"
+        )
     value = np.concatenate(
         (
             left_pose,
@@ -1047,6 +1088,19 @@ def _sim_time(task: Any) -> float:
     return scene.sim_seconds
 
 
+def success_height_reference_z(task: Any) -> float:
+    """Return the exact per-episode height authority used by check_success."""
+
+    value = getattr(task, "orig_z", None)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float, np.number))
+        or not np.isfinite(float(value))
+    ):
+        raise BranchCollectionError("task.orig_z success height reference is invalid")
+    return float(value)
+
+
 def _append_physical_observation(
     task: Any,
     objects: Sequence[Any],
@@ -1122,6 +1176,7 @@ def _root_prefix(
         snapshot = capture_branch_root_snapshot(task)
         snapshot_sha = branch_root_snapshot_sha256(snapshot)
         restorable_snapshot_sha = branch_root_restorable_snapshot_sha256(snapshot)
+        height_reference_z = success_height_reference_z(task)
     finally:
         task.close_env(clear_cache=False)
 
@@ -1160,6 +1215,15 @@ def _root_prefix(
                 + json.dumps(details, sort_keys=True)
             )
         reference.scene.step()
+        if not np.isclose(
+            success_height_reference_z(reference),
+            height_reference_z,
+            atol=0.0,
+            rtol=0.0,
+        ):
+            raise BranchCollectionError(
+                "fresh scene changed task.orig_z success height reference"
+            )
         reference_names, reference_objects = discover_pose_objects(
             reference, required_pose_names
         )
@@ -1200,6 +1264,7 @@ def _root_prefix(
         "root_sim_steps": root_sim_steps,
         "sim_timestep_seconds": sim_timestep_seconds,
         "remaining_action_budget": int(remaining_action_budget),
+        "success_height_reference_z": height_reference_z,
         "candidates": candidates,
     }
 
@@ -1221,7 +1286,10 @@ def _execute_candidate_from_restored_root(
     device: torch.device,
 ) -> dict[str, Any]:
     trajectory = [
-        np.asarray(value, dtype=np.float32).copy()
+        # Preserve simulator float64 quaternions until the official strict
+        # roll/pitch success checks have been evaluated.  Quantizing a saved
+        # prefix to float32 can flip a sample exactly at the 15-degree bound.
+        np.asarray(value, dtype=np.float64).copy()
         for value in np.asarray(root["prefix_trajectory"])
     ]
     sim_times = [float(value) for value in np.asarray(root["prefix_sim_times"])]
@@ -1363,6 +1431,12 @@ def _evaluate_candidate(
                 atol=2e-5,
                 rtol=0.0,
             )
+            or not np.isclose(
+                success_height_reference_z(task),
+                float(root["success_height_reference_z"]),
+                atol=0.0,
+                rtol=0.0,
+            )
         ):
             raise BranchCollectionError(
                 "fresh candidate canonical root differs from candidate-generation root"
@@ -1432,11 +1506,16 @@ def materialize_group(
         )
     names = list(root["object_names"])
     moving_index = names.index(str(calibration["moving"]))
-    prefix = np.asarray(root["prefix_trajectory"], dtype=np.float32)
+    prefix = np.asarray(root["prefix_trajectory"], dtype=np.float64)
     initial_moving = prefix[0, moving_index, :3]
     prefix_times = np.asarray(root["prefix_sim_times"], dtype=np.float64)
     prefix_predicates, prefix_events = derive_predicates_and_events(
-        prefix, prefix_times, names, False, calibration
+        prefix,
+        prefix_times,
+        names,
+        False,
+        calibration,
+        float(root["success_height_reference_z"]),
     )
     current_event = int(prefix_events[-1])
     root_event_age = event_age_seconds(prefix_events, prefix_times)
@@ -1478,10 +1557,15 @@ def materialize_group(
         # fails.  Executed action count is used only for physical timing and
         # must never censor the action that caused a negative outcome.
         mask = np.arange(horizon) < min(int(action_exec_steps), horizon)
-        trajectory = np.asarray(outcome["trajectory"], dtype=np.float32)
+        trajectory = np.asarray(outcome["trajectory"], dtype=np.float64)
         sim_times = np.asarray(outcome["sim_times"], dtype=np.float64)
         predicates, events = derive_predicates_and_events(
-            trajectory, sim_times, names, bool(outcome["success"]), calibration
+            trajectory,
+            sim_times,
+            names,
+            bool(outcome["success"]),
+            calibration,
+            float(root["success_height_reference_z"]),
         )
         root_step = int(outcome["root_step"])
         post_step = int(outcome["post_step"])
@@ -1580,6 +1664,9 @@ def materialize_group(
         "remaining_action_budget": np.full(
             count, int(root["remaining_action_budget"]), dtype=np.float32
         ),
+        "success_height_reference_z": np.full(
+            count, float(root["success_height_reference_z"]), dtype=np.float64
+        ),
         # ``dt`` is an execution-time critic input, not an outcome.  Keep it
         # equal across the four candidates and known before execution; only
         # event ``duration`` above uses counted simulator seconds.
@@ -1638,13 +1725,22 @@ def materialize_branch_diagnostics(
         [canonical_action_chunk(current, candidate) for candidate in candidates]
     ).astype(np.float32)
     planned = min(int(action_exec_steps), int(effects.shape[1]))
-    if planned <= 0:
-        raise BranchCollectionError("branch diagnostics require a positive planned horizon")
+    if planned < 2:
+        raise BranchCollectionError(
+            "branch diagnostics require first and subsequent planned action tokens"
+        )
     first = effects[:, None, :planned, :]
     second = effects[None, :, :planned, :]
     pairwise_rms = np.sqrt(np.mean(np.square(first - second), axis=(2, 3))).astype(
         np.float32
     )
+    translation_norm = np.stack(
+        (
+            np.linalg.norm(effects[:, :planned, 0:3], axis=2),
+            np.linalg.norm(effects[:, :planned, 7:10], axis=2),
+        ),
+        axis=2,
+    ).astype(np.float32)
     arrays = {
         "first_executed": np.asarray(
             [int(outcome["first_executed"]) for outcome in outcomes], dtype=np.int64
@@ -1653,6 +1749,10 @@ def materialize_branch_diagnostics(
             [outcome.get("branch_error") is not None for outcome in outcomes], dtype=bool
         ),
         "candidate_action_pairwise_rms": pairwise_rms,
+        "candidate_first_token_translation_norm_m": translation_norm[:, 0, :],
+        "candidate_later_token_translation_norm_median_m": np.median(
+            translation_norm[:, 1:, :], axis=1
+        ).astype(np.float32),
     }
     if arrays["first_executed"].shape != (CANDIDATE_COUNT,) or np.any(
         (arrays["first_executed"] < 0) | (arrays["first_executed"] > planned)
@@ -1660,6 +1760,14 @@ def materialize_branch_diagnostics(
         raise BranchCollectionError("first-executed diagnostic is outside planned horizon")
     if arrays["branch_error"].shape != (CANDIDATE_COUNT,):
         raise BranchCollectionError("branch-error diagnostic shape changed")
+    if any(
+        arrays[name].shape != (CANDIDATE_COUNT, 2)
+        for name in (
+            "candidate_first_token_translation_norm_m",
+            "candidate_later_token_translation_norm_median_m",
+        )
+    ):
+        raise BranchCollectionError("first-token continuity diagnostic shape changed")
     if pairwise_rms.shape != (CANDIDATE_COUNT, CANDIDATE_COUNT) or not np.allclose(
         pairwise_rms, pairwise_rms.T, atol=1e-7, rtol=0.0
     ) or not np.allclose(np.diag(pairwise_rms), 0.0, atol=1e-7, rtol=0.0):
@@ -1824,6 +1932,7 @@ def main() -> None:
         if (
             logical != canonical_sha256(unsigned)
             or manifest.get("format") != MANIFEST_FORMAT
+            or manifest.get("collector_format") != FORMAT
             or manifest.get("body") != args.body
             or manifest.get("collector_file_sha256") != collector_sha
             or manifest.get("actor_checkpoint") != str(args.actor_checkpoint.resolve())
@@ -1833,6 +1942,8 @@ def main() -> None:
             or manifest.get("action_exec_steps") != args.action_exec_steps
             or manifest.get("max_episode_action_steps") != args.max_steps
             or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+            or manifest.get("state_action_frame_contract")
+            != STATE_ACTION_FRAME_CONTRACT
             or manifest.get("terminal_supervision_contract")
             != TERMINAL_SUPERVISION_CONTRACT
             or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
@@ -1863,6 +1974,7 @@ def main() -> None:
             "candidate_zero_is_actor_baseline": True,
             "same_ordered_candidate_set_for_baseline_and_etsf": True,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "root_query_indices": manifest_queries,
             "schema_adapter": {
                 "kind": "analytic_label_free_canonical_v1",
@@ -1900,12 +2012,8 @@ def main() -> None:
                 / SOURCE_EVENT_SAMPLING_HZ,
                 "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
                 "zero_elapsed_duration_masked": True,
-                "stationary_window_seconds": float(
-                    calibration["thresholds"]["stationary_window_seconds"]
-                ),
-                "stationary_speed_threshold_m_per_s": float(
-                    calibration["thresholds"]["stationary_speed_m_per_s"]
-                ),
+                "event_thresholds": dict(calibration["thresholds"]),
+                "event_chain_success_aligned": True,
             },
             "candidate_action_contract": {
                 "critic_observation_time": "before_candidate_execution",

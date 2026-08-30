@@ -17,7 +17,7 @@ if str(SCRIPTS) not in sys.path:
 
 import train_multibody_canonical_event_world_model as core  # noqa: E402
 import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer_entry  # noqa: E402
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event  # noqa: E402
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E402
 import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
 import verify_robotwin2_move_can_pot_public_materialization_v1 as verifier  # noqa: E402
@@ -74,6 +74,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     TERMINAL_EVENT_ORDINAL_RPS_LOSS_WEIGHT,
     TERMINAL_SUPERVISION_CONTRACT,
     SOURCE_EVENT_SAMPLING_HZ,
+    STATE_ACTION_FRAME_CONTRACT,
     SUPPLEMENT_ACTOR_BRANCH_CONTRACT,
     SUPPLEMENT_BINDING_FORMAT,
     SUPPLEMENT_COLLECTOR_FORMAT,
@@ -224,6 +225,7 @@ def _group(
         remaining_action_budget=np.full(
             count, float(remaining_action_budget), dtype=np.float32
         ),
+        success_height_reference_z=np.full(count, 0.75, dtype=np.float64),
         dt=np.full(count, 5.0 / SOURCE_EVENT_SAMPLING_HZ, dtype=np.float32),
     )
 
@@ -320,6 +322,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
         {
             "format": ACTOR_FORMAT,
             "task": TASK,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "actors": actors,
         }
     )
@@ -357,6 +360,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                 "task": TASK,
                 "instruction": DEFAULT_INSTRUCTION,
                 "body": body,
+                "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
                 "schema_adapter": {
                     "kind": "analytic_label_free_canonical_v1",
                     "trainable": False,
@@ -378,6 +382,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                         "anchor": "pot",
                         "required_objects": list(analytic_event.REQUIRED_OBJECTS),
                         "goal_rule": dict(analytic_event.GOAL_RULE),
+                        "success_height_reference_rule": dict(
+                            analytic_event.SUCCESS_HEIGHT_REFERENCE_RULE
+                        ),
                         "thresholds": dict(analytic_event.THRESHOLDS),
                         "event_rules": dict(analytic_event.EVENT_RULES),
                     }
@@ -398,13 +405,8 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
                     "planned_dt_seconds": 5.0 / SOURCE_EVENT_SAMPLING_HZ,
                     "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
                     "zero_elapsed_duration_masked": True,
-                    "stationary_source_sampling_hz": SOURCE_EVENT_SAMPLING_HZ,
-                    "stationary_window_seconds": analytic_event.THRESHOLDS[
-                        "stationary_window_seconds"
-                    ],
-                    "stationary_speed_threshold_m_per_s": analytic_event.THRESHOLDS[
-                        "stationary_speed_m_per_s"
-                    ],
+                    "event_thresholds": dict(analytic_event.THRESHOLDS),
+                    "event_chain_success_aligned": True,
                 },
                 "candidate_action_contract": {
                     "critic_observation_time": "before_candidate_execution",
@@ -439,6 +441,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, str]:
             "task": TASK,
             "instruction": DEFAULT_INSTRUCTION,
             "event_spec_sha256": EVENT_SPEC_SHA256,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
@@ -586,6 +589,7 @@ def _supplement_fixture(
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
             "body": body,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "conditions": ["clean", "randomized"],
             "collection_status": "complete",
             "reserve_roster_contract": dict(
@@ -669,6 +673,7 @@ def _supplement_fixture(
             "task": TASK,
             "instruction": DEFAULT_INSTRUCTION,
             "event_spec_sha256": EVENT_SPEC_SHA256,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
@@ -728,6 +733,56 @@ def test_preflight_is_five_fold_source_only_and_payload_blind(
         "informative_dense_groups": 0,
         "rank_supervision_groups": 0,
     }
+
+
+def test_primary_binding_rejects_legacy_frame_before_bound_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding, _digest = _fixture(tmp_path)
+    value = json.loads(binding.read_text(encoding="utf-8"))
+    value.pop("state_action_frame_contract")
+    value.pop("logical_sha256")
+    value = _signed(value)
+    digest = _write_json(binding, value)
+    monkeypatch.setattr(
+        trainer_entry,
+        "validate_materialization_receipt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy binding reached a bound artifact")
+        ),
+    )
+    with pytest.raises(FiveBodyContractError, match="strict LOBO"):
+        load_binding(binding, digest)
+
+
+def test_supplement_binding_rejects_legacy_frame_before_manifest_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, primary_digest = _fixture(tmp_path)
+    primary_audit = load_binding(primary, primary_digest)
+    supplement, _supplement_digest = _supplement_fixture(
+        tmp_path, primary, primary_digest
+    )
+    value = json.loads(supplement.read_text(encoding="utf-8"))
+    value.pop("state_action_frame_contract")
+    value.pop("logical_sha256")
+    value = _signed(value)
+    digest = _write_json(supplement, value)
+    original = trainer_entry._read_bound_json
+
+    def binding_only(path: Path, expected_sha256: str, label: str):
+        if label != "supplement binding":
+            raise AssertionError("legacy supplement reached a source manifest")
+        return original(path, expected_sha256, label)
+
+    monkeypatch.setattr(trainer_entry, "_read_bound_json", binding_only)
+    with pytest.raises(FiveBodyContractError, match="supplement binding"):
+        load_supplement_binding(
+            supplement,
+            digest,
+            primary_audit=primary_audit,
+            held_out_body=BODIES[0],
+        )
 
 
 def test_source_split_keeps_all_queries_from_one_seed_in_one_lane() -> None:

@@ -49,6 +49,7 @@ def valid_fold_summary(
     summary = {
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": held_out_body,
+        "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
         "source_bodies": [body for body in watcher.BODIES if body != held_out_body],
         "heldout_group_npz_opened": 0,
         "heldout_labels_used_for_normalization_training_or_selection": False,
@@ -104,6 +105,8 @@ def _core(path: Path) -> np.ndarray:
             arrays[name] = np.full(count, 5.0 / 15.0, dtype=np.float32)
         elif name == "remaining_action_budget":
             arrays[name] = np.full(count, 150, dtype=np.float32)
+        elif name == "success_height_reference_z":
+            arrays[name] = np.full(count, 0.75, dtype=np.float64)
         elif name in watcher.INTEGER_ARRAYS:
             arrays[name] = np.zeros(count, dtype=np.int64)
         else:
@@ -118,6 +121,26 @@ def _pairwise(actions: np.ndarray) -> np.ndarray:
     return np.sqrt(np.mean(np.square(first - second), axis=(2, 3))).astype(np.float32)
 
 
+def test_progress_rejects_legacy_manifest_before_waiting_for_completion(
+    tmp_path: Path,
+) -> None:
+    body = watcher.BODIES[0]
+    body_root = tmp_path / body
+    body_root.mkdir()
+    (body_root / "manifest.json").write_text(
+        json.dumps({"groups": []}), encoding="utf-8"
+    )
+    with pytest.raises(watcher.LoboWatcherError, match="diagnostic-only"):
+        watcher.collection_progress(tmp_path)
+
+
+def test_supplement_binding_rejects_legacy_frame_contract(tmp_path: Path) -> None:
+    path = tmp_path / "supplement-binding.json"
+    path.write_text(json.dumps(watcher.signed({"format": "legacy"})), encoding="utf-8")
+    with pytest.raises(watcher.LoboWatcherError, match="diagnostic-only"):
+        watcher.validate_supplement_frame_binding(path)
+
+
 def test_diagnostic_values_and_action_rms_are_fully_replayed(tmp_path: Path) -> None:
     core_path = tmp_path / "group.npz"
     actions = _core(core_path)
@@ -130,11 +153,19 @@ def test_diagnostic_values_and_action_rms_are_fully_replayed(tmp_path: Path) -> 
         first_executed=np.asarray([5, 4, 3, 0], dtype=np.int64),
         branch_error=np.asarray([False, False, False, False], dtype=bool),
         candidate_action_pairwise_rms=_pairwise(actions),
+        candidate_first_token_translation_norm_m=np.asarray(
+            decision["candidate_first_token_translation_norm_m"],
+            dtype=np.float32,
+        ),
+        candidate_later_token_translation_norm_median_m=np.asarray(
+            decision["candidate_later_token_translation_norm_median_m"],
+            dtype=np.float32,
+        ),
     )
     watcher.validate_diagnostic_npz(
         diagnostic_path,
         watcher.sha256_file(diagnostic_path),
-        decision["candidate_action_pairwise_rms"],
+        decision,
     )
 
     invalid = _pairwise(actions)
@@ -144,12 +175,20 @@ def test_diagnostic_values_and_action_rms_are_fully_replayed(tmp_path: Path) -> 
         first_executed=np.asarray([-1, 6, 3, 0], dtype=np.int64),
         branch_error=np.asarray([False, False, True, False], dtype=bool),
         candidate_action_pairwise_rms=invalid,
+        candidate_first_token_translation_norm_m=np.asarray(
+            decision["candidate_first_token_translation_norm_m"],
+            dtype=np.float32,
+        ),
+        candidate_later_token_translation_norm_median_m=np.asarray(
+            decision["candidate_later_token_translation_norm_median_m"],
+            dtype=np.float32,
+        ),
     )
     with pytest.raises(watcher.LoboWatcherError):
         watcher.validate_diagnostic_npz(
             diagnostic_path,
             watcher.sha256_file(diagnostic_path),
-            decision["candidate_action_pairwise_rms"],
+            decision,
         )
 
 

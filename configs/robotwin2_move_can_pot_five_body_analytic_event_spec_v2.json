@@ -1,0 +1,135 @@
+{
+  "calibration": {
+    "move_can_pot": {
+      "anchor": "pot",
+      "event_rules": {
+        "e0": "not_moved_and_not_lifted_and_not_in_official_success_position_region_and_not_release_ready_and_not_terminal_success",
+        "e12": "moved_or_lifted",
+        "e3": "inside_official_success_position_region",
+        "e4": "inside_official_success_position_orientation_and_height_region_before_gripper_release_requirement",
+        "eK": "terminal_simulator_success",
+        "precedence_low_to_high": [
+          "e0",
+          "e12",
+          "e3",
+          "e4",
+          "eK"
+        ]
+      },
+      "goal_rule": {
+        "anchor_pose_source": "episode_initial_pot_xyz",
+        "kind": "initial_moving_relative_anchor_x_sign",
+        "lateral_offset_m": 0.18,
+        "negative_initial_relative_x_offset_m": -0.18,
+        "positive_initial_relative_x_offset_m": 0.18,
+        "side_sign_source": "sign(initial_can_x_minus_initial_pot_x)",
+        "y_offset_m": 0.0,
+        "z_offset_m": 0.0,
+        "zero_sign_policy": "error_unreachable_under_public_task_initialization"
+      },
+      "success_height_reference_rule": {
+        "captured_per_episode": true,
+        "source": "task.orig_z",
+        "source_assignment": "self.orig_z = self.pot.get_pose().p[2] in move_can_pot.load_actors",
+        "trajectory_initial_pot_z_substitution_forbidden": true
+      },
+      "moving": "can",
+      "required_objects": [
+        "can",
+        "pot"
+      ],
+      "thresholds": {
+        "lifted_delta_z_m": 0.01,
+        "moved_displacement_m": 0.01,
+        "success_abs_pitch_deg_max": 15.0,
+        "success_abs_roll_error_deg_max": 15.0,
+        "success_abs_y_max_m": 0.035,
+        "success_can_z_above_initial_pot_max_m": 0.001,
+        "success_roll_target_deg": 90.0,
+        "success_signed_x_max_m": 0.2
+      }
+    }
+  },
+  "construction": {
+    "data_or_label_files_opened": 0,
+    "labels_or_outcomes_used_to_fit": false,
+    "method": "analytic_public_task_check_success_code_and_explicit_physical_priors_only",
+    "protected_hdf_or_labels_read": false,
+    "trainable": false
+  },
+  "event_names": [
+    "e0",
+    "e12",
+    "e3",
+    "e4",
+    "eK"
+  ],
+  "format": "etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v2_success_aligned",
+  "provenance": {
+    "public_task_code": {
+      "commit": "30954692d06ba7e89f7a6b76064f4062c488fa81",
+      "path": "envs/move_can_pot.py",
+      "repository": "https://github.com/RoboTwin-Platform/RoboTwin",
+      "semantic_facts": [
+        "task attributes are pot and can",
+        "arm side is selected from the initial can x side while the public task fixes pot x to zero",
+        "target x is initial pot x minus or plus 0.18 m and target y is initial pot y",
+        "initialization rejects abs(can_x) below 0.2 m so zero side is unreachable",
+        "success requires signed can-pot x in the open interval zero to 0.2 m and absolute y distance below 0.035 m",
+        "success requires can roll within 15 degrees of 90 degrees and pitch within 15 degrees of zero",
+        "success requires can height no more than task.orig_z plus 0.001 m and both grippers open"
+      ],
+      "url": "https://github.com/RoboTwin-Platform/RoboTwin/blob/30954692d06ba7e89f7a6b76064f4062c488fa81/envs/move_can_pot.py"
+    },
+    "thresholds": {
+      "lifted_delta_z_m": {
+        "kind": "explicit_physical_prior_not_fitted",
+        "rationale": "one centimetre vertical displacement marks a material lift independently of trajectory labels",
+        "value": 0.01
+      },
+      "moved_displacement_m": {
+        "kind": "explicit_physical_prior_not_fitted",
+        "rationale": "one centimetre 3D displacement marks material object motion independently of trajectory labels",
+        "value": 0.01
+      },
+      "success_abs_pitch_deg_max": {
+        "kind": "analytic_from_public_task_code",
+        "rationale": "exact strict pitch tolerance used by move_can_pot.check_success",
+        "value": 15.0
+      },
+      "success_abs_roll_error_deg_max": {
+        "kind": "analytic_from_public_task_code",
+        "rationale": "exact strict roll-error tolerance used by move_can_pot.check_success",
+        "value": 15.0
+      },
+      "success_abs_y_max_m": {
+        "kind": "analytic_from_public_task_code",
+        "rationale": "exact strict lateral tolerance used by move_can_pot.check_success",
+        "value": 0.035
+      },
+      "success_can_z_above_initial_pot_max_m": {
+        "kind": "analytic_from_public_task_code",
+        "rationale": "exact non-strict can-height allowance used by move_can_pot.check_success",
+        "value": 0.001
+      },
+      "success_roll_target_deg": {
+        "kind": "analytic_from_public_task_code",
+        "rationale": "exact target can roll used by move_can_pot.check_success",
+        "value": 90.0
+      },
+      "success_signed_x_max_m": {
+        "kind": "analytic_from_public_task_code",
+        "rationale": "exact strict signed longitudinal upper bound used by move_can_pot.check_success",
+        "value": 0.2
+      }
+    },
+    "orientation_conversion": {
+      "function": "transforms3d.euler.quat2euler",
+      "quaternion_order": "wxyz",
+      "reason": "bitwise algorithm parity with move_can_pot.check_success",
+      "version": "0.4.2"
+    }
+  },
+  "status": "frozen_data_and_label_free_analytic_spec",
+  "task": "move_can_pot"
+}

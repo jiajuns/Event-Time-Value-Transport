@@ -24,13 +24,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
+import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
 
-FORMAT = "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v4_root_pose_roundtrip"
-ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
-BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
-MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
-RECEIPT_FORMAT = "etsf_robotwin2_five_body_complete_branch_collection_receipt_v1"
+FORMAT = "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v5_endpose_frame"
+COLLECTOR_FORMAT = "etsf_robotwin2_five_body_ee_candidate_branches_v2_endpose_frame"
+ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v2_endpose_frame"
+BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v2_endpose_frame"
+MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v2_endpose_frame"
+RECEIPT_FORMAT = (
+    "etsf_robotwin2_five_body_complete_branch_collection_receipt_v2_endpose_frame"
+)
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
@@ -55,7 +58,7 @@ EXPECTED_GROUPS_PER_BODY = (
 EXPECTED_BRANCHES_PER_BODY = EXPECTED_GROUPS_PER_BODY * CANDIDATE_COUNT
 EXPECTED_TOTAL_BRANCHES = EXPECTED_BRANCHES_PER_BODY * len(BODIES)
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
-DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v1"
+DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v2_endpose_frame"
 OBJECT_EFFECT_SCHEMA = {
     "format": "etsf_robotwin2_moving_object_se3_effect_6d_v1",
     "channels": [
@@ -68,6 +71,19 @@ OBJECT_EFFECT_SCHEMA = {
     ],
     "rotation": "q_post_times_conjugate_q_root_shortest_axis_angle_wxyz",
     "redundant_relative_goal_delta_removed": True,
+}
+STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_native_ee16_state_action_frame_v2",
+    "training_state_source": "public_hdf5_endpose_left_right_endpose",
+    "runtime_state_api": "task.get_arm_pose(left/right)",
+    "runtime_state_pose_semantics": "robot.get_*_ee_pose(is_endpose=False)",
+    "native_action_pose_semantics": (
+        "same_absolute_world_ee_frame_as_training_endpose"
+    ),
+    "environment_call": "task.take_action(native_ee16, action_type=ee)",
+    "pose_convention": "xyz_plus_quaternion_wxyz",
+    "tcp_tool_axis_offset_m_excluded": 0.12,
+    "state_and_action_same_frame": True,
 }
 CANDIDATE_NOISE_CONTRACT = {
     "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
@@ -139,6 +155,14 @@ BRANCH_DIAGNOSTIC_CONTRACT = {
     "candidate_action_pairwise_rms": (
         "symmetric_raw_canonical_effect_rms_over_planned_first_five_actions"
     ),
+    "candidate_first_token_translation_norm_m": (
+        "label_free_left_right_translation_norm_from_same_frame_root_state_to_"
+        "candidate_token_zero"
+    ),
+    "candidate_later_token_translation_norm_median_m": (
+        "label_free_left_right_median_translation_norm_between_subsequent_"
+        "candidate_tokens"
+    ),
 }
 
 HOME_ROOT = Path("/home/user")
@@ -152,25 +176,25 @@ ACTOR_CHECKPOINT = HOME_ROOT / (
     "checkpoints/020000/pretrained_model"
 )
 OUTPUT_ROOT = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip"
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260831_v5_endpose_frame"
 )
 WATCHER_STATE = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260831_v5_endpose_frame."
     "watcher_state.json"
 )
 WATCHER_PID = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260831_v5_endpose_frame."
     "watcher.pid"
 )
 WATCHER_LOG = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260831_v5_endpose_frame."
     "watcher.log"
 )
 ACTOR_AUTHORITY = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee16_actor_authority_full8000_20260830_v4_root_pose_roundtrip.json"
+    "etsf_robotwin2_fivebody_ee16_actor_authority_full8000_20260831_v5_endpose_frame.json"
 )
 TRAINING_BINDING = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260831_v5_endpose_frame."
     "binding.json"
 )
 MATERIALIZATION_RECEIPT = HOME_ROOT / (
@@ -179,7 +203,9 @@ MATERIALIZATION_RECEIPT = HOME_ROOT / (
 )
 ROBOTWIN_ROOT = HOME_ROOT / "etsf_stage0/RoboTwin"
 VLM_METADATA = HOME_ROOT / "etsf_stage0/offline_assets/smolvlm2_500m_metadata"
-EVENT_SPEC = HOME_ROOT / "etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v1.json"
+EVENT_SPEC = HOME_ROOT / (
+    "etsf_robotwin2_move_can_pot_five_body_analytic_event_spec_v2.json"
+)
 REMOTE_PYTHON = HOME_ROOT / "anaconda3/envs/RoboTwin2/bin/python"
 LEROBOT_ROOT = HOME_ROOT / "etsf_stage0/lerobot"
 LEROBOT_SITE = HOME_ROOT / (
@@ -269,6 +295,23 @@ def signed(value: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(value)
     result["logical_sha256"] = canonical_sha256(result)
     return result
+
+
+def require_state_action_frame_contract(
+    value: Mapping[str, Any], *, artifact: str
+) -> None:
+    """Fail closed on pre-fix TCP-frame authorities, manifests and bindings."""
+
+    if value.get("state_action_frame_contract") != STATE_ACTION_FRAME_CONTRACT:
+        raise ContinuationError(
+            f"{artifact} lacks the exact training-aligned EE16 state/action frame contract"
+        )
+
+
+def validate_training_binding_contract(value: Mapping[str, Any]) -> None:
+    if value.get("format") != BINDING_FORMAT:
+        raise ContinuationError("training binding format is not the end-pose-frame version")
+    require_state_action_frame_contract(value, artifact="training binding")
 
 
 def write_static(path: Path, value: Mapping[str, Any]) -> str:
@@ -384,7 +427,7 @@ def freeze_actor_authority(
         )
     checkpoint_sha, checkpoint_files, checkpoint_bytes = sha256_tree(ACTOR_CHECKPOINT)
     sampling_contract = {
-        "format": "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v1",
+        "format": "etsf_robotwin2_five_body_fixed_flow_candidate_sampling_v2_endpose_frame",
         "frozen_actor_checkpoint_tree_sha256": checkpoint_sha,
         "collector_file_sha256": static["collector_sha256"],
         "canonical_adapter_file_sha256": static["adapter_sha256"],
@@ -401,6 +444,7 @@ def freeze_actor_authority(
             "base_index*101) mod (2**63-1); odd candidates negate the draw"
         ),
         "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+        "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
         "instruction": DEFAULT_INSTRUCTION,
         "conditions": list(CONDITIONS),
         "root_query_indices": list(ROOT_QUERIES),
@@ -446,7 +490,10 @@ def freeze_actor_authority(
         "state_shape": state_shape,
         "action_feature": "action",
         "action_shape": action_shape,
-        "native_action_semantics": "dual_arm_absolute_ee_xyz_quaternion_wxyz_gripper",
+        "native_action_semantics": (
+            "left_xyz_quaternion_wxyz_gripper_then_right_xyz_quaternion_wxyz_gripper"
+        ),
+        "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
         "sampling_contract_sha256": sampling_sha,
         "candidate_count": CANDIDATE_COUNT,
         "candidate_zero_is_actor_baseline": True,
@@ -470,10 +517,12 @@ def freeze_actor_authority(
                 "state_shape": state_shape,
                 "action_shape": action_shape,
             },
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "sampling_contract": sampling_contract,
             "actors": actors,
         }
     )
+    require_state_action_frame_contract(authority, artifact="actor authority")
     authority_sha = write_static(ACTOR_AUTHORITY, authority)
     return authority, authority_sha
 
@@ -624,8 +673,10 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
     logical = unsigned.pop("logical_sha256", None)
     if logical != canonical_sha256(unsigned):
         raise ContinuationError(f"manifest logical SHA mismatch for {body}")
+    require_state_action_frame_contract(value, artifact=f"manifest for {body}")
     if (
         value.get("format") != MANIFEST_FORMAT
+        or value.get("collector_format") != COLLECTOR_FORMAT
         or value.get("dataset_repo") != DATASET_REPO
         or value.get("dataset_revision") != DATASET_REVISION
         or value.get("task") != TASK
@@ -638,6 +689,8 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("max_episode_action_steps") != MAX_STEPS
         or value.get("root_query_indices") != list(ROOT_QUERIES)
         or value.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
+        or value.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
         or value.get("terminal_supervision_contract")
         != TERMINAL_SUPERVISION_CONTRACT
         or value.get("event_age_contract") != EVENT_AGE_CONTRACT
@@ -671,12 +724,8 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
             "planned_dt_seconds": ACTION_EXEC_STEPS / 15.0,
             "duration_semantics": "simulator_elapsed_seconds_to_event_boundary",
             "zero_elapsed_duration_masked": True,
-            "stationary_window_seconds": analytic_event.THRESHOLDS[
-                "stationary_window_seconds"
-            ],
-            "stationary_speed_threshold_m_per_s": analytic_event.THRESHOLDS[
-                "stationary_speed_m_per_s"
-            ],
+            "event_thresholds": dict(analytic_event.THRESHOLDS),
+            "event_chain_success_aligned": True,
         }
         or value.get("candidate_action_contract")
         != {
@@ -898,6 +947,7 @@ def finalize_body_manifest(
             "complete_per_condition_query": TARGET_PER_CONDITION_QUERY,
             "collector_file_sha256": static["collector_sha256"],
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
             "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
@@ -968,6 +1018,7 @@ def freeze_training_binding(
             "instruction": DEFAULT_INSTRUCTION,
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
             "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
@@ -999,6 +1050,7 @@ def freeze_training_binding(
             },
         }
     )
+    validate_training_binding_contract(binding)
     return binding, write_static(TRAINING_BINDING, binding)
 
 
@@ -1127,6 +1179,7 @@ def main() -> int:
                 "event_derivation_implementation_sha256"
             ],
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
+            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
             "terminal_horizon_contract": TERMINAL_HORIZON_CONTRACT,
