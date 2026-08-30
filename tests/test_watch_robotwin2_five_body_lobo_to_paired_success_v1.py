@@ -262,7 +262,7 @@ def test_analytic_and_execution_code_identities_are_frozen() -> None:
         "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
     )
     assert watcher.EXPECTED_RUNNER_SHA256 == (
-        "b1a9a23e068d7b277c674bf2a759893655d5183ef023113860c303424f2a3c8d"
+        "5999cd50cbd4785d5d5cec3e9cdc77dba54228fc9c87f131c68ea82be51c2803"
     )
     assert watcher.EXPECTED_EVALUATOR_SHA256 == (
         "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"
