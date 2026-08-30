@@ -353,6 +353,25 @@ def aggregate_risk_adjusted_rank_scores(member_scores: torch.Tensor) -> torch.Te
     )
 
 
+def runtime_rank_ensemble_contract(candidate_count: int) -> dict[str, Any]:
+    """Declare the frozen N=4 training axis and postformal runtime axis once."""
+
+    candidate_count = validate_candidate_count(candidate_count)
+    frozen = shared_head.risk_adjusted_rank_ensemble_contract()
+    training_candidate_count = frozen.pop("candidate_count", None)
+    if training_candidate_count != formal.CANDIDATE_COUNT:
+        raise PostformalCandidatePoolError(
+            "shared-head training candidate count changed"
+        )
+    return {
+        **frozen,
+        "training_candidate_count": int(training_candidate_count),
+        "runtime_candidate_count": candidate_count,
+        "formula_and_five_member_axis_unchanged": True,
+        "candidate_axis_extension_only": True,
+    }
+
+
 def select_candidate(scores: Sequence[float], *, candidate_count: int) -> int:
     candidate_count = validate_candidate_count(candidate_count)
     values = np.asarray(scores, dtype=np.float64)
@@ -1353,11 +1372,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vlm_metadata_size_bytes": vlm_size,
         "folds": folds,
         "fold_training_regime": fold_training_regime,
-        "candidate_rank_ensemble_contract": {
-            **shared_head.risk_adjusted_rank_ensemble_contract(),
-            "candidate_axis_extension_from_4_to": candidate_count,
-            "formula_and_five_member_axis_unchanged": True,
-        },
+        "candidate_rank_ensemble_contract": runtime_rank_ensemble_contract(
+            candidate_count
+        ),
         "event_spec": str(event_spec_path),
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": sha256_file(
@@ -1663,6 +1680,7 @@ __all__ = [
     "method_name",
     "pool_selection_audit",
     "proposal_count",
+    "runtime_rank_ensemble_contract",
     "score_candidates",
     "select_candidate",
 ]

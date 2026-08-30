@@ -132,6 +132,16 @@ def test_dynamic_candidate_axis_keeps_frozen_five_member_lcb_formula() -> None:
         runner.shared_head.aggregate_risk_adjusted_rank_scores(values)
 
 
+def test_runtime_ensemble_contract_separates_training_and_runtime_axes() -> None:
+    contract = runner.runtime_rank_ensemble_contract(8)
+    assert "candidate_count" not in contract
+    assert contract["training_candidate_count"] == 4
+    assert contract["runtime_candidate_count"] == 8
+    assert contract["member_count"] == 5
+    assert contract["epistemic_risk_weight"] == 0.25
+    assert contract["candidate_axis_extension_only"] is True
+
+
 def test_score_candidates_accepts_eight_without_any_selection_gate() -> None:
     class FixedModel:
         def __init__(self, member: int):

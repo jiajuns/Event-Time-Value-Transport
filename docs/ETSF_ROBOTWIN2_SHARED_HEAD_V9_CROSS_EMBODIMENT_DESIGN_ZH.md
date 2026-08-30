@@ -10,12 +10,12 @@
 持续时间、对象变化、回退/恢复、有限时域终局事件、成功概率、目标进展与不确定性，再用受约束 utility
 重排序。它不更新 OpenVLA/SmolVLA 权重，不生成动作，也不为 held-out 本体增加可训练参数。
 
-截至 2026-08-31 00:54 CST，正式 C 数据已有 614/2000 decisions、2456/8000 branches：
+截至 2026-08-31 01:35 CST，正式 C 数据已有 634/2000 decisions、2536/8000 branches：
 
-- candidate-0 成功 1/614，N=4 success oracle 也为 1/614，mixed-success decision 为 0；
-- 21/614 个 decision 的候选可改善分阶段进度，oracle 平均阶段增益为 `+0.00855`；
-- 277/614 个全失败 decision 仍存在事件或目标进展差异，可用于 dense comparative 监督；
-- `e0/e12/eK` 根终局计数为 260/353/1，recovery 有效样本为 0，说明中后期边界监督明显不足。
+- candidate-0 成功 1/634，N=4 success oracle 也为 1/634，mixed-success decision 为 0；
+- 21/634 个 decision 的候选可改善分阶段进度，oracle 平均阶段增益为 `+0.00828`；
+- 247/634 个全失败 decision 仍存在事件或目标进展差异，可用于 dense comparative 监督；
+- candidate action 退化率为 0；当前仍没有可用于证明二值成功提升的 N=4 oracle 头部空间。
 
 因此，当前已证明的是“候选动作会造成可学习的局部后果差异”，尚未证明共享头能提高二值成功率。v9
 的结构和补采协议正是针对时域交互、e3/e4、恢复样本与候选覆盖不足，而不是继续加 gate 或用小测试代替
@@ -133,7 +133,7 @@ world heads：不进入 normalization、rank utility、source validation、check
 
 `shared_event_critic_plugin_protocol_v1.py` 把运行时拆为四个结构化 adapter：
 
-1. `PolicyCandidateProvider`：冻结策略产生四个有序 native candidates，candidate 0 是 actor baseline；
+1. `PolicyCandidateProvider`：冻结策略产生 authority-bound N=4/8/16 个有序 native candidates，candidate 0 是 actor baseline；
 2. `CanonicalEffectAdapter`：把 native action 的真实控制语义变为 14-D canonical physical effect；
 3. `CanonicalStateObserver`：产生 state27、事件、事件年龄、剩余预算和物理 dt；
 4. `EnvironmentExecutor`：按原策略动作语义 reset/执行，不把 canonical tensor 当控制命令。
@@ -142,6 +142,13 @@ world heads：不进入 normalization、rank utility、source validation、check
 authority，再执行 `mean-0.25*population_std` 后 argmax。
 它不 import SmolVLA、OpenVLA 或 RoboTwin，也不调用策略/环境。OpenVLA 的 native action 即使也是 14-D，
 也不能靠维数相同冒充 canonical effect；必须有坐标系、控制器和语义可审计的 effect adapter。
+
+`robotwin2_smolvla_shared_event_critic_adapters_v1.py` 已经给出第一个真实生产实现：复用正式 SmolVLA
+EE16 flow-noise provider、EE16→effect14 物理转换、RoboTwin native EE executor，并用
+`scene_seed+query_index` 绑定每次 query。它只允许 typed native EE16 selection 进入环境，14-D canonical
+effect 无法被误执行；N4/N8 各自生成不同 authority。其 state27 observer 显式是 simulator privileged
+upper bound（`actor_visible=False`、`real_robot_deployable=False`），不能冒充真机可见状态。真实 v9 五成员
+已通过该 N8 adapter batch、纯 scorer 和 native executor 的 CPU 端到端测试。
 
 因此 v9 的 head/scorer 层对多种候选策略可插拔，但“直接迁移”有两个必要条件：策略能提供多个候选，且
 native action 能无标签地映射到同一 canonical 物理效果。换事件本体或任务后还需要新的解析式 event/state
@@ -191,9 +198,11 @@ C 2000/8000 完整采集
 - B binding：`scripts/materialize_robotwin2_scripted_expert_root_supplement_binding_v1.py`
 - v9 trainer：`scripts/train_robotwin2_five_body_lobo_shared_event_head_v1.py`
 - 纯插件协议：`scripts/shared_event_critic_plugin_protocol_v1.py`
+- SmolVLA EE16 + RoboTwin 生产适配器：`scripts/robotwin2_smolvla_shared_event_critic_adapters_v1.py`
 - N4 paired runner：`scripts/run_robotwin2_five_body_paired_success_v1.py`
 - N8 runner：`scripts/run_robotwin2_five_body_postformal_candidate_pool_v1.py`
 - 完整增强 watcher：`scripts/watch_robotwin2_postformal_shared_head_upgrade_v1.py`
+- 增强 watcher guardian：`scripts/guard_robotwin2_postformal_shared_head_upgrade_v1.py`
 
 当前最重要的结果不是再加更多控制逻辑，而是先让 B 提供真实 e3/e4/恢复/多时域监督，再通过 N=8 扩大
 可选动作覆盖，最后用 held-out 配对 ΔSR 判断共享头是否真正改善任务成功率。

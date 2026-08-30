@@ -7,7 +7,7 @@
 
 运行时组件由四个 `@runtime_checkable Protocol` 明确分开：
 
-- `PolicyCandidateProvider`：从冻结 actor 产生四个有序原生候选；候选 0 必须是该 actor
+- `PolicyCandidateProvider`：从冻结 actor 产生 authority 指定的 4/8/16 个有序原生候选；候选 0 必须是该 actor
   自己的默认动作。
 - `CanonicalEffectAdapter`：把原生候选的真实物理语义转换为
   `dual_ee_se3_gripper_delta_14d_v2`，输出共享头所需的 canonical batch。
@@ -31,17 +31,17 @@ token 或未声明坐标系的动作，必须实现实际 FK/控制器/物理效
 
 ## Canonical batch 与纯 scorer
 
-`CanonicalCandidateBatch` 是一个完整决策，固定验证：
+`CanonicalCandidateBatch` 是一个完整决策，候选轴由 authority 逐实验绑定，固定验证：
 
-- state 为 bit-exact 同根的 `[4,27]`；
-- action effect 为 `[4,H>=5,14]`，mask 恰好只开放前五步；
-- 四候选共享 event、event age、physical `dt` 和剩余预算；
+- state 为 bit-exact 同根的 `[N,27]`，`N` 只能是 4、8 或 16；
+- action effect 为 `[N,H>=5,14]`，mask 恰好只开放前五步；
+- 所有候选共享 event、event age、physical `dt` 和剩余预算；
 - `body_id=0`、`action_schema_id=0`，与当前共享单行 checkpoint 一致；
 - 不含 success、event target、rank label 或环境 outcome。
 
 `SharedEventCriticScorer` 只接受该 batch 和五个处于 eval 模式的 member。每个 member 的运行时
 `checkpoint_sha256` 必须按顺序与 authority 绑定的五个 digest 精确相等，并返回有限的
-`candidate_rank_logit: [4]`，随后严格计算：
+`candidate_rank_logit: [N]`，随后严格计算：
 
 ```text
 member_mean = mean(member_scores, axis=member)
@@ -70,7 +70,10 @@ validate_plugin_components(
 )
 
 native = provider.propose_candidates(
-    observation, instruction, query_seed=query_seed, candidate_count=4
+    observation,
+    instruction,
+    query_seed=query_seed,
+    candidate_count=authority.candidate_count,
 )
 state = observer.observe_state(observation, history, task_context)
 batch = effect_adapter.adapt_candidates(
@@ -80,6 +83,26 @@ scores = SharedEventCriticScorer(five_members, authority=authority).score(batch)
 selected_native_index = scores.selected_candidate_index
 ```
 
+实际加载的 v9 `torch.nn.Module` 不应靠临时写入属性伪造 provenance。先对精确 checkpoint
+文件计算 SHA-256，再使用 `BoundCriticMember(model, checkpoint_sha256)` 包装；包装器会保持
+模型为 eval 模式，scorer 会把五个 digest 与 authority 的有序 checkpoint 列表逐项比较。
+
+候选轴扩展只改变同一决策中的候选数，不改变五成员轴、风险公式或 checkpoint 权重。N4 与
+N8 必须各自生成不同的 authority logical SHA，禁止拿 N4 batch 在 N8 authority 下评分。
+
+## 当前真实适配实现
+
+`scripts/robotwin2_smolvla_shared_event_critic_adapters_v1.py` 已实现 SmolVLA EE16 + RoboTwin 的四个
+生产 adapter 与 authority materializer。它直接复用正式 collector 的候选采样和 EE16→effect14 转换，
+支持 authority-bound N=4/8/16，并保证只有原生 EE16 typed selection 能进入环境 executor。
+其中 state27 observer 读取仿真器对象位姿和解析事件，是明确标注的 privileged simulator upper bound，
+不是 actor-visible 或真机可部署 observer。
+
+OpenVLA 目前仍不能直接使用该 v9 checkpoint：仓库已有 OpenVLA native 候选生成和原生 executor，但缺少
+经 `unnorm_key`、关节控制语义、FK/controller 及 EE roundtrip 验证的 native action14→双臂物理
+effect14 转换。完成该转换前，必须拒绝“14维等于14维”的直接别名迁移。
+
 定向测试为 `tests/test_shared_event_critic_plugin_protocol_v1.py`，覆盖 runtime protocol、
-provenance 绑定、OpenVLA 14-D 语义冒充拒绝、canonical shape/root/prefix 合同、五成员精确
-`mean-0.25*population_std`、无 fallback 行为，以及禁止策略/环境模块 import。
+provenance 绑定、OpenVLA 14-D 语义冒充拒绝、N4/N8 候选轴 authority 绑定、canonical
+shape/root/prefix 合同、五成员精确 `mean-0.25*population_std`、真实 v9 N4/N8 forward、
+无 fallback 行为，以及禁止策略/环境模块 import。

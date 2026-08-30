@@ -748,6 +748,21 @@ class FiveBodyContractError(RuntimeError):
     """A five-body training authority or payload failed closed."""
 
 
+def validate_ensemble_seeds(seeds: Sequence[int]) -> tuple[int, ...]:
+    """Freeze five distinct ensemble initializations before any fold work."""
+
+    values = tuple(seeds)
+    if (
+        len(values) != 5
+        or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in values)
+        or len(set(values)) != 5
+    ):
+        raise FiveBodyContractError(
+            "ensemble seeds must be exactly five distinct integers"
+        )
+    return values
+
+
 def supplement_horizon_slot_key(condition: str, horizon_slot: int) -> str:
     """Return one immutable body-local supplement slot identity."""
 
@@ -5659,6 +5674,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    validate_ensemble_seeds(args.ensemble_seeds)
     audit = load_binding(args.binding, args.binding_sha256)
     if (args.supplement_binding is None) != (
         args.supplement_binding_sha256 is None
@@ -5746,4 +5762,5 @@ __all__ = [
     "validate_actor_authority", "validate_body_manifest",
     "validate_supplement_body_manifest",
     "validate_materialization_receipt",
+    "validate_ensemble_seeds",
 ]

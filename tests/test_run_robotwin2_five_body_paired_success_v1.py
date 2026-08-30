@@ -426,6 +426,105 @@ def test_fold_specs_require_exactly_five_unique_bodies(tmp_path: Path) -> None:
         runner.parse_fold_specs(specs[:-1])
 
 
+def _write_fold_summary(tmp_path: Path, seeds: list[int]) -> Path:
+    fold_root = tmp_path / "fold"
+    fold_root.mkdir()
+    trainer_sha = runner.sha256_file(Path(runner.shared_head.__file__).resolve())
+    event_sha = runner.sha256_file(Path(runner.analytic_event.__file__).resolve())
+    members = []
+    for member, seed in enumerate(seeds):
+        checkpoint = fold_root / f"member-{member}.pt"
+        checkpoint.write_bytes(f"checkpoint-{member}".encode("ascii"))
+        members.append(
+            {
+                "member": member,
+                "seed": seed,
+                "best_step": 100,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": runner.sha256_file(checkpoint),
+                "trainer_file_sha256": trainer_sha,
+            }
+        )
+    summary = {
+        "format": runner.shared_head.FORMAT,
+        "status": "source_only_checkpoint_selection_complete",
+        "held_out_body": "franka",
+        "heldout_labels_used_for_normalization_training_or_selection": False,
+        "heldout_specific_trainable_parameters": 0,
+        "actor_frozen": True,
+        "event_spec_sha256": runner.EVENT_SPEC_SHA256,
+        "event_derivation_implementation_sha256": event_sha,
+        "candidate_rank_contract": runner.shared_head.summary_candidate_rank_contract(
+            "full"
+        ),
+        "event_age_contract": runner.shared_head.event_age_contract(),
+        "terminal_horizon_contract": runner.shared_head.terminal_horizon_contract(),
+        "ablation": runner.shared_head.ablation_contract("full"),
+        "trainer_file_sha256": trainer_sha,
+        "rank_supervision_available": True,
+        "candidate_rank_parameters_received_direct_supervision": True,
+        "synthetic_success_labels": 0,
+        "rank_supervision_mode": "informative_dense_only",
+        "ensemble_checkpoint_selection": {
+            "common_step_required_for_all_five_members": True,
+            "rank_aggregation": runner.shared_head.risk_adjusted_rank_ensemble_contract(),
+            "selected_step": 100,
+            "heldout_rows_used": 0,
+        },
+        "members": members,
+    }
+    (fold_root / "training_summary.json").write_text(
+        json.dumps(summary), encoding="utf-8"
+    )
+    return fold_root
+
+
+def test_inspect_fold_rejects_duplicate_summary_member_seeds(tmp_path: Path) -> None:
+    fold_root = _write_fold_summary(tmp_path, [101, 102, 103, 104, 104])
+    with pytest.raises(runner.PairedExecutionError, match="seeds.*five unique"):
+        runner.inspect_fold("franka", fold_root)
+
+
+def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fold = {
+        "heldout_body": "franka",
+        "event_derivation_implementation_sha256": "a" * 64,
+        "trainer_file_sha256": "b" * 64,
+        "ensemble_common_selection_step": 100,
+        "members": [{"member": 0, "seed": 101, "checkpoint": "/opaque/member.pt"}],
+    }
+    checkpoint = {
+        "format": runner.shared_head.FORMAT,
+        "held_out_body": "franka",
+        "canonical_state_schema": runner.shared_head.CANONICAL_STATE_SCHEMA,
+        "canonical_action_schema": runner.shared_head.CANONICAL_ACTION_SCHEMA,
+        "event_age_contract": runner.shared_head.event_age_contract(),
+        "terminal_horizon_contract": runner.shared_head.terminal_horizon_contract(),
+        "model_family": runner.shared_head.MODEL_FAMILY,
+        "candidate_rank_contract": runner.shared_head.checkpoint_candidate_rank_contract(
+            "full"
+        ),
+        "ablation": runner.shared_head.ablation_contract("full"),
+        "heldout_rows_used_for_training_normalization_or_selection": 0,
+        "rank_supervision_available": True,
+        "candidate_rank_parameters_received_direct_supervision": True,
+        "synthetic_success_labels": 0,
+        "rank_supervision_mode": "informative_dense_only",
+        "action_stem_count": 1,
+        "member": 0,
+        "seed": 999,
+        "event_spec_sha256": runner.EVENT_SPEC_SHA256,
+        "event_derivation_implementation_sha256": "a" * 64,
+        "trainer_file_sha256": "b" * 64,
+        "ensemble_common_selection_step": 100,
+    }
+    monkeypatch.setattr(runner.torch, "load", lambda *_args, **_kwargs: checkpoint)
+    with pytest.raises(runner.PairedExecutionError, match="checkpoint contract"):
+        runner.load_ensemble(fold, torch.device("cpu"))
+
+
 def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None:
     supplement_sha = "a" * 64
 

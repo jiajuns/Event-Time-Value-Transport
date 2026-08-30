@@ -24,6 +24,7 @@ CANONICAL_ACTION_SCHEMA = "dual_ee_se3_gripper_delta_14d_v2"
 STATE_DIM = 27
 ACTION_DIM = 14
 CANDIDATE_COUNT = 4
+SUPPORTED_CANDIDATE_COUNTS = (4, 8, 16)
 EXECUTED_PREFIX_STEPS = 5
 ENSEMBLE_MEMBER_COUNT = 5
 EPISTEMIC_RISK_WEIGHT = 0.25
@@ -143,9 +144,19 @@ class AuthorityProvenance:
             )
         for index, digest in enumerate(members):
             _require_sha256(digest, f"critic_member_checkpoint_sha256[{index}]")
-        if self.candidate_count != CANDIDATE_COUNT:
-            raise SharedEventCriticProtocolError("candidate count is frozen to four")
-        if self.executed_prefix_steps != EXECUTED_PREFIX_STEPS:
+        if (
+            isinstance(self.candidate_count, bool)
+            or not isinstance(self.candidate_count, int)
+            or self.candidate_count not in SUPPORTED_CANDIDATE_COUNTS
+        ):
+            raise SharedEventCriticProtocolError(
+                "candidate count must be authority-bound to 4, 8 or 16"
+            )
+        if (
+            isinstance(self.executed_prefix_steps, bool)
+            or not isinstance(self.executed_prefix_steps, int)
+            or self.executed_prefix_steps != EXECUTED_PREFIX_STEPS
+        ):
             raise SharedEventCriticProtocolError("executed prefix is frozen to five steps")
         if self.candidate_zero_is_actor_baseline is not True:
             raise SharedEventCriticProtocolError("candidate zero must be the actor baseline")
@@ -260,7 +271,7 @@ class CanonicalStateObservation:
 
 @dataclass(frozen=True)
 class CanonicalCandidateBatch:
-    """Exactly one ordered four-candidate decision for the shared event head."""
+    """One authority-bound ordered candidate decision for the shared event head."""
 
     state: torch.Tensor
     actions: torch.Tensor
@@ -300,17 +311,22 @@ class CanonicalCandidateBatch:
         devices = {value.device for value in tensors.values()}
         if len(devices) != 1:
             raise SharedEventCriticProtocolError("canonical batch tensors must share one device")
-        if self.state.shape != (CANDIDATE_COUNT, STATE_DIM):
-            raise SharedEventCriticProtocolError("canonical state must be [4,27]")
+        if self.state.ndim != 2 or self.state.shape[1] != STATE_DIM:
+            raise SharedEventCriticProtocolError("canonical state must be [N,27]")
+        candidate_count = int(self.state.shape[0])
+        if candidate_count not in SUPPORTED_CANDIDATE_COUNTS:
+            raise SharedEventCriticProtocolError(
+                "canonical candidate axis must contain 4, 8 or 16 entries"
+            )
         if (
             self.actions.ndim != 3
-            or self.actions.shape[0] != CANDIDATE_COUNT
+            or self.actions.shape[0] != candidate_count
             or self.actions.shape[1] < EXECUTED_PREFIX_STEPS
             or self.actions.shape[2] != ACTION_DIM
         ):
-            raise SharedEventCriticProtocolError("canonical actions must be [4,H>=5,14]")
+            raise SharedEventCriticProtocolError("canonical actions must be [N,H>=5,14]")
         horizon = self.actions.shape[1]
-        if self.action_mask.shape != (CANDIDATE_COUNT, horizon):
+        if self.action_mask.shape != (candidate_count, horizon):
             raise SharedEventCriticProtocolError("action mask shape changed")
         vector_fields = (
             self.action_available,
@@ -321,19 +337,19 @@ class CanonicalCandidateBatch:
             self.event_age_seconds,
             self.remaining_action_budget,
         )
-        if any(value.shape != (CANDIDATE_COUNT,) for value in vector_fields):
-            raise SharedEventCriticProtocolError("canonical context fields must be [4]")
+        if any(value.shape != (candidate_count,) for value in vector_fields):
+            raise SharedEventCriticProtocolError("canonical context fields must be [N]")
         for name, value in (("state", self.state), ("actions", self.actions)):
             if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
                 raise SharedEventCriticProtocolError(f"{name} must be finite floating point")
         if self.action_mask.dtype != torch.bool or self.action_available.dtype != torch.bool:
             raise SharedEventCriticProtocolError("action masks/availability must use bool dtype")
         expected_mask = torch.arange(horizon, device=self.actions.device) < EXECUTED_PREFIX_STEPS
-        expected_mask = expected_mask[None].expand(CANDIDATE_COUNT, -1)
+        expected_mask = expected_mask[None].expand(candidate_count, -1)
         if not torch.equal(self.action_mask, expected_mask):
             raise SharedEventCriticProtocolError("action mask must expose exactly the first five steps")
         if not bool(self.action_available.all()):
-            raise SharedEventCriticProtocolError("all four planned candidates must be available")
+            raise SharedEventCriticProtocolError("all planned candidates must be available")
         integer_fields = (
             (self.action_schema_id, "action_schema_id"),
             (self.body_id, "body_id"),
@@ -359,7 +375,7 @@ class CanonicalCandidateBatch:
             if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
                 raise SharedEventCriticProtocolError(f"{name} must be finite floating point")
             if not torch.equal(value, value[:1].expand_as(value)):
-                raise SharedEventCriticProtocolError(f"four candidates must share one {name}")
+                raise SharedEventCriticProtocolError(f"all candidates must share one {name}")
         if bool((self.dt <= 0).any()) or bool((self.event_age_seconds < 0).any()) or bool(
             (self.remaining_action_budget <= 0).any()
         ):
@@ -369,11 +385,13 @@ class CanonicalCandidateBatch:
         if not torch.equal(
             self.current_event_id, self.current_event_id[:1].expand_as(self.current_event_id)
         ):
-            raise SharedEventCriticProtocolError("four candidates must share one current event")
+            raise SharedEventCriticProtocolError("all candidates must share one current event")
         if not torch.equal(self.state, self.state[:1].expand_as(self.state)):
-            raise SharedEventCriticProtocolError("four candidates must share one bit-exact root state")
+            raise SharedEventCriticProtocolError(
+                "all candidates must share one bit-exact root state"
+            )
         expected_event = torch.zeros(
-            (CANDIDATE_COUNT, 5), dtype=self.state.dtype, device=self.state.device
+            (candidate_count, 5), dtype=self.state.dtype, device=self.state.device
         )
         expected_event.scatter_(1, self.current_event_id[:, None].long(), 1.0)
         if not torch.equal(self.state[:, 18:23], expected_event):
@@ -382,8 +400,12 @@ class CanonicalCandidateBatch:
             )
         if bool(((self.state[:, 23:27] < 0.0) | (self.state[:, 23:27] > 1.0)).any()):
             raise SharedEventCriticProtocolError("state27 predicates must lie in [0,1]")
-        if len(self.candidate_ids) != CANDIDATE_COUNT or len(set(self.candidate_ids)) != CANDIDATE_COUNT:
-            raise SharedEventCriticProtocolError("candidate ids must contain four unique entries")
+        if len(self.candidate_ids) != candidate_count or (
+            len(set(self.candidate_ids)) != candidate_count
+        ):
+            raise SharedEventCriticProtocolError(
+                "candidate ids must contain N unique entries"
+            )
         for candidate_id in self.candidate_ids:
             _require_name(candidate_id, "candidate_id")
         if self.baseline_candidate_index != 0:
@@ -397,6 +419,12 @@ class CanonicalCandidateBatch:
             self.ordered_native_candidate_set_sha256,
             "ordered_native_candidate_set_sha256",
         )
+
+    @property
+    def candidate_count(self) -> int:
+        """Return the validated runtime candidate-axis length."""
+
+        return int(self.state.shape[0])
 
     def to_model_batch(self) -> Mapping[str, torch.Tensor]:
         return {
@@ -515,6 +543,40 @@ class CriticMember(Protocol):
     ) -> Mapping[str, torch.Tensor]: ...
 
 
+class BoundCriticMember(torch.nn.Module):
+    """Bind one loaded eval-mode module to its independently verified file SHA.
+
+    This wrapper avoids mutating the model with an ad-hoc provenance attribute.
+    The caller must compute the digest from the exact checkpoint file before
+    construction; the scorer then compares it with the ordered authority.
+    """
+
+    def __init__(self, member: torch.nn.Module, checkpoint_sha256: str) -> None:
+        super().__init__()
+        if not isinstance(member, torch.nn.Module):
+            raise SharedEventCriticProtocolError(
+                "bound critic member must wrap a torch.nn.Module"
+            )
+        self.member = member
+        self._checkpoint_sha256 = _require_sha256(
+            checkpoint_sha256, "checkpoint_sha256"
+        )
+        self.eval()
+
+    @property
+    def checkpoint_sha256(self) -> str:
+        return self._checkpoint_sha256
+
+    def forward(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> Mapping[str, torch.Tensor]:
+        if self.training or self.member.training:
+            raise SharedEventCriticProtocolError(
+                "bound critic member must remain in eval mode"
+            )
+        return self.member(batch)
+
+
 def validate_plugin_components(
     authority: AuthorityProvenance,
     *,
@@ -628,6 +690,10 @@ class SharedEventCriticScorer:
         batch.validate()
         if batch.authority_logical_sha256 != self.authority.logical_sha256:
             raise SharedEventCriticProtocolError("canonical batch authority does not match scorer")
+        if batch.candidate_count != self.authority.candidate_count:
+            raise SharedEventCriticProtocolError(
+                "canonical batch candidate count does not match authority"
+            )
         if batch.canonical_state_schema != self.authority.canonical_state_schema or (
             batch.canonical_action_schema != self.authority.canonical_action_schema
         ):
@@ -648,13 +714,14 @@ class SharedEventCriticScorer:
                 score = output[MEMBER_SCORE_KEY]
                 if (
                     not isinstance(score, torch.Tensor)
-                    or score.shape != (CANDIDATE_COUNT,)
+                    or score.shape != (batch.candidate_count,)
                     or not score.is_floating_point()
                     or score.device != batch.actions.device
                     or not bool(torch.isfinite(score).all())
                 ):
                     raise SharedEventCriticProtocolError(
-                        f"critic member {index} score must be finite floating [4] on batch device"
+                        f"critic member {index} score must be finite floating "
+                        f"[{batch.candidate_count}] on batch device"
                     )
                 rows.append(score)
             member_scores = torch.stack(rows, dim=0)
@@ -680,6 +747,7 @@ __all__ = [
     "ACTION_DIM",
     "AUTHORITY_FORMAT",
     "AuthorityProvenance",
+    "BoundCriticMember",
     "CANONICAL_ACTION_SCHEMA",
     "CANONICAL_STATE_SCHEMA",
     "CANDIDATE_COUNT",
@@ -695,6 +763,7 @@ __all__ = [
     "FORMAT",
     "PolicyCandidateProvider",
     "STATE_DIM",
+    "SUPPORTED_CANDIDATE_COUNTS",
     "SharedEventCriticProtocolError",
     "SharedEventCriticScorer",
     "SharedEventCriticScores",

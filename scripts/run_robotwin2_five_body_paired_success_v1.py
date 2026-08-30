@@ -432,16 +432,23 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         raise PairedExecutionError(f"LOBO fold must contain five members for {body}")
     normalized = []
     identities = set()
+    seeds = set()
     for item in members:
         if not isinstance(item, Mapping):
             raise PairedExecutionError("fold member must be an object")
         member = int(item.get("member", -1))
+        seed = item.get("seed")
         checkpoint = Path(str(item.get("checkpoint", ""))).expanduser().resolve()
         try:
             checkpoint.relative_to(fold_root)
         except ValueError as error:
             raise PairedExecutionError("fold checkpoint escapes the fold directory") from error
-        if member in identities or not checkpoint.is_file():
+        if (
+            member in identities
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or not checkpoint.is_file()
+        ):
             raise PairedExecutionError("fold member identity/checkpoint is invalid")
         observed = sha256_file(checkpoint)
         if observed != item.get("checkpoint_sha256"):
@@ -454,16 +461,19 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
                 "fold member was not selected by the common deployment ensemble"
             )
         identities.add(member)
+        seeds.add(seed)
         normalized.append(
             {
                 "member": member,
-                "seed": int(item["seed"]),
+                "seed": seed,
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": observed,
             }
         )
     if identities != set(range(5)):
         raise PairedExecutionError("fold members must be exactly 0..4")
+    if len(seeds) != 5:
+        raise PairedExecutionError("fold member seeds must be exactly five unique integers")
     return {
         "heldout_body": body,
         "fold_root": str(fold_root),
@@ -621,6 +631,7 @@ def load_ensemble(
             }
             or checkpoint.get("action_stem_count") != 1
             or checkpoint.get("member") != item["member"]
+            or checkpoint.get("seed") != item["seed"]
             or checkpoint.get("event_spec_sha256") != EVENT_SPEC_SHA256
             or checkpoint.get("event_derivation_implementation_sha256")
             != fold["event_derivation_implementation_sha256"]

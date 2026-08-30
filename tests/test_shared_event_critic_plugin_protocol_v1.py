@@ -22,7 +22,9 @@ def digest(index: int) -> str:
     return f"{index:064x}"
 
 
-def authority(*, native_schema: str = "test_native_action_v1") -> plugin.AuthorityProvenance:
+def authority(
+    *, native_schema: str = "test_native_action_v1", candidate_count: int = 4
+) -> plugin.AuthorityProvenance:
     return plugin.AuthorityProvenance(
         policy_family="test_policy",
         native_action_schema=native_schema,
@@ -40,6 +42,7 @@ def authority(*, native_schema: str = "test_native_action_v1") -> plugin.Authori
         environment_execution_contract_sha256=digest(8),
         task_event_contract_sha256=digest(9),
         critic_member_checkpoint_sha256=tuple(digest(10 + index) for index in range(5)),
+        candidate_count=candidate_count,
     )
 
 
@@ -50,23 +53,26 @@ def canonical_batch(
     state[18:23] = 0.0
     state[19] = 1.0
     state[23:27] = torch.tensor([0.0, 1.0, 0.0, 1.0])
-    state = state[None].repeat(plugin.CANDIDATE_COUNT, 1)
+    candidate_count = bound.candidate_count
+    state = state[None].repeat(candidate_count, 1)
     actions = torch.arange(
-        plugin.CANDIDATE_COUNT * 7 * plugin.ACTION_DIM, dtype=torch.float32
-    ).reshape(plugin.CANDIDATE_COUNT, 7, plugin.ACTION_DIM)
+        candidate_count * 7 * plugin.ACTION_DIM, dtype=torch.float32
+    ).reshape(candidate_count, 7, plugin.ACTION_DIM)
     mask = torch.arange(7)[None] < plugin.EXECUTED_PREFIX_STEPS
     return plugin.CanonicalCandidateBatch(
         state=state,
         actions=actions,
-        action_mask=mask.expand(plugin.CANDIDATE_COUNT, -1).clone(),
-        action_available=torch.ones(plugin.CANDIDATE_COUNT, dtype=torch.bool),
-        action_schema_id=torch.zeros(plugin.CANDIDATE_COUNT, dtype=torch.long),
-        body_id=torch.zeros(plugin.CANDIDATE_COUNT, dtype=torch.long),
-        dt=torch.full((plugin.CANDIDATE_COUNT,), 1.0 / 3.0),
-        current_event_id=torch.ones(plugin.CANDIDATE_COUNT, dtype=torch.long),
-        event_age_seconds=torch.full((plugin.CANDIDATE_COUNT,), 0.5),
-        remaining_action_budget=torch.full((plugin.CANDIDATE_COUNT,), 80.0),
-        candidate_ids=("actor_baseline", "candidate_1", "candidate_2", "candidate_3"),
+        action_mask=mask.expand(candidate_count, -1).clone(),
+        action_available=torch.ones(candidate_count, dtype=torch.bool),
+        action_schema_id=torch.zeros(candidate_count, dtype=torch.long),
+        body_id=torch.zeros(candidate_count, dtype=torch.long),
+        dt=torch.full((candidate_count,), 1.0 / 3.0),
+        current_event_id=torch.ones(candidate_count, dtype=torch.long),
+        event_age_seconds=torch.full((candidate_count,), 0.5),
+        remaining_action_budget=torch.full((candidate_count,), 80.0),
+        candidate_ids=("actor_baseline",) + tuple(
+            f"candidate_{index}" for index in range(1, candidate_count)
+        ),
         baseline_candidate_index=0,
         canonical_state_schema=plugin.CANONICAL_STATE_SCHEMA,
         canonical_action_schema=plugin.CANONICAL_ACTION_SCHEMA,
@@ -157,7 +163,7 @@ class FixedMember(torch.nn.Module):
         self.checkpoint_sha256 = checkpoint_sha256
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        assert batch["actions"].shape[:1] == (plugin.CANDIDATE_COUNT,)
+        assert batch["actions"].shape[:1] == (self.scores.numel(),)
         return {plugin.MEMBER_SCORE_KEY: self.scores.to(batch["actions"])}
 
 
@@ -179,6 +185,18 @@ def test_runtime_protocols_and_authority_binding_are_structural() -> None:
         environment_executor=executor,
     )
     assert bound.to_dict()["logical_sha256"] == bound.logical_sha256
+
+
+@pytest.mark.parametrize("candidate_count", plugin.SUPPORTED_CANDIDATE_COUNTS)
+def test_authority_binds_supported_candidate_axes(candidate_count: int) -> None:
+    bound = authority(candidate_count=candidate_count)
+    batch = canonical_batch(bound)
+    assert batch.candidate_count == candidate_count
+    assert batch.state.shape == (candidate_count, plugin.STATE_DIM)
+    with pytest.raises(plugin.SharedEventCriticProtocolError, match="candidate count"):
+        dataclasses.replace(bound, candidate_count=6)
+    with pytest.raises(plugin.SharedEventCriticProtocolError, match="candidate count"):
+        dataclasses.replace(bound, candidate_count=4.0)
 
 
 def test_openvla_sized_native_action_cannot_alias_canonical_semantics() -> None:
@@ -295,6 +313,44 @@ def test_scorer_rejects_wrong_ensemble_authority_and_nonfinite_member() -> None:
         plugin.SharedEventCriticScorer(wrong_checkpoint, authority=bound)
 
 
+def test_scorer_rejects_candidate_axis_not_bound_by_authority() -> None:
+    bound4 = authority(candidate_count=4)
+    bound8 = authority(candidate_count=8)
+    members = [
+        FixedMember(torch.arange(8, dtype=torch.float32), digest(10 + index)).eval()
+        for index in range(5)
+    ]
+    scorer = plugin.SharedEventCriticScorer(members, authority=bound4)
+    foreign_batch = dataclasses.replace(
+        canonical_batch(bound8), authority_logical_sha256=bound4.logical_sha256
+    )
+    with pytest.raises(plugin.SharedEventCriticProtocolError, match="candidate count"):
+        scorer.score(foreign_batch)
+
+
+def test_bound_member_carries_verified_checkpoint_sha_without_model_mutation() -> None:
+    bound = authority(candidate_count=8)
+    wrapped = []
+    for index, checkpoint_sha256 in enumerate(
+        bound.critic_member_checkpoint_sha256
+    ):
+        model = FixedMember(torch.arange(8, dtype=torch.float32), checkpoint_sha256)
+        del model.checkpoint_sha256
+        member = plugin.BoundCriticMember(model, checkpoint_sha256)
+        assert member.checkpoint_sha256 == checkpoint_sha256
+        assert not member.training and not model.training
+        wrapped.append(member)
+    result = plugin.SharedEventCriticScorer(wrapped, authority=bound).score(
+        canonical_batch(bound)
+    )
+    assert result.member_scores.shape == (5, 8)
+    wrapped[0].train()
+    with pytest.raises(plugin.SharedEventCriticProtocolError, match="eval mode"):
+        plugin.SharedEventCriticScorer(wrapped, authority=bound).score(
+            canonical_batch(bound)
+        )
+
+
 def test_protocol_module_has_no_policy_or_environment_imports() -> None:
     path = SCRIPTS / "shared_event_critic_plugin_protocol_v1.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -307,24 +363,26 @@ def test_protocol_module_has_no_policy_or_environment_imports() -> None:
     assert imported <= {"__future__", "hashlib", "json", "math", "dataclasses", "typing", "torch"}
 
 
-def test_current_v9_members_run_through_the_policy_independent_scorer() -> None:
+@pytest.mark.parametrize("candidate_count", (4, 8))
+def test_current_v9_members_run_through_the_policy_independent_scorer(
+    candidate_count: int,
+) -> None:
     torch.manual_seed(20260831)
-    bound = authority()
+    bound = authority(candidate_count=candidate_count)
     members = []
     for index, checkpoint_sha256 in enumerate(
         bound.critic_member_checkpoint_sha256
     ):
         torch.manual_seed(20260831 + index)
         member = trainer.EffectAlignedSharedEventHead().eval()
-        member.checkpoint_sha256 = checkpoint_sha256
-        members.append(member)
+        members.append(plugin.BoundCriticMember(member, checkpoint_sha256))
     result = plugin.SharedEventCriticScorer(members, authority=bound).score(
         canonical_batch(bound)
     )
     assert trainer.MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v9"
     assert result.member_scores.shape == (
         plugin.ENSEMBLE_MEMBER_COUNT,
-        plugin.CANDIDATE_COUNT,
+        candidate_count,
     )
     assert torch.isfinite(result.risk_adjusted_scores).all()
-    assert 0 <= result.selected_candidate_index < plugin.CANDIDATE_COUNT
+    assert 0 <= result.selected_candidate_index < candidate_count

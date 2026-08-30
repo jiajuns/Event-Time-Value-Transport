@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import train_multibody_canonical_event_world_model as core  # noqa: E402
+import train_robotwin2_five_body_lobo_shared_event_head_v1 as trainer_entry  # noqa: E402
 import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E402
 import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
@@ -104,6 +106,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     supplement_reserve_roster,
     supplement_source_train_split,
     summary_candidate_rank_contract,
+    validate_ensemble_seeds,
     validate_supplement_body_manifest,
 )
 
@@ -2649,6 +2652,38 @@ def test_calibration_guard_rejects_comparative_support_drift(
     second["ensemble_candidate_ranking"][support_name] += 1
     with pytest.raises(FiveBodyContractError, match="support changed across steps"):
         select_calibration_guarded_checkpoint([first, second])
+
+
+def test_ensemble_seeds_must_be_five_distinct_integers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert validate_ensemble_seeds([11, 12, 13, 14, 15]) == (
+        11,
+        12,
+        13,
+        14,
+        15,
+    )
+    with pytest.raises(FiveBodyContractError, match="five distinct integers"):
+        validate_ensemble_seeds([11, 12, 13, 14, 14])
+    with pytest.raises(FiveBodyContractError, match="five distinct integers"):
+        validate_ensemble_seeds([11, 12, 13, 14])
+    with pytest.raises(FiveBodyContractError, match="five distinct integers"):
+        validate_ensemble_seeds([11, 12, 13, 14, True])
+    monkeypatch.setattr(
+        trainer_entry,
+        "parse_args",
+        lambda: argparse.Namespace(ensemble_seeds=[11, 12, 13, 14, 14]),
+    )
+    monkeypatch.setattr(
+        trainer_entry,
+        "load_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("binding was opened before ensemble seed validation")
+        ),
+    )
+    with pytest.raises(FiveBodyContractError, match="five distinct integers"):
+        trainer_entry.main()
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
