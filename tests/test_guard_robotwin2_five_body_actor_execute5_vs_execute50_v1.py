@@ -36,6 +36,10 @@ def _args(tmp_path: Path) -> SimpleNamespace:
     runner.write_text("# frozen runner\n", encoding="utf-8")
     event = tmp_path / "event.json"
     event.write_text("{}\n", encoding="utf-8")
+    stable_roster = tmp_path / "stable-roster.json"
+    stable_roster.write_text("{}\n", encoding="utf-8")
+    materializer = code / "scripts" / "materialize_robotwin2_stable_seed_roster_v1.py"
+    materializer.write_text("# frozen roster materializer\n", encoding="utf-8")
     return SimpleNamespace(
         runner_pid=123,
         python_bin=Path(sys.executable),
@@ -44,6 +48,8 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         vlm_metadata_path=vlm,
         robotwin_root=robotwin,
         event_spec=event,
+        stable_seed_roster=stable_roster,
+        stable_seed_roster_sha256=guardian.sha256_file(stable_roster),
         output=output,
         state_root=tmp_path / "guardian",
         gpu_uuid="GPU-test",
@@ -76,6 +82,27 @@ def _write_static_binding(args: SimpleNamespace) -> tuple[str, str]:
         "robotwin_root": str(args.robotwin_root.resolve()),
         "event_spec": str(args.event_spec.resolve()),
         "event_spec_sha256": guardian.sha256_file(args.event_spec),
+        "stable_seed_roster_binding": {
+            "path": str(args.stable_seed_roster.resolve()),
+            "file_sha256": guardian.sha256_file(args.stable_seed_roster),
+            "logical_sha256": "a" * 64,
+            "preregistration_file_sha256": "b" * 64,
+            "preregistration_logical_sha256": "c" * 64,
+            "materializer_path": str(
+                (
+                    args.code_root
+                    / "scripts"
+                    / "materialize_robotwin2_stable_seed_roster_v1.py"
+                ).resolve()
+            ),
+            "materializer_file_sha256": guardian.sha256_file(
+                args.code_root
+                / "scripts"
+                / "materialize_robotwin2_stable_seed_roster_v1.py"
+            ),
+            "selection_uses_labels_or_outcomes": False,
+            "actor_inference_calls_during_selection": 0,
+        },
         "runtime_binding": {
             "critical_files": [
                 {
@@ -119,6 +146,10 @@ def test_build_runner_command_is_the_exact_frozen_command(tmp_path: Path) -> Non
         str(args.robotwin_root.absolute()),
         "--event-spec",
         str(args.event_spec.absolute()),
+        "--stable-seed-roster",
+        str(args.stable_seed_roster.absolute()),
+        "--stable-seed-roster-sha256",
+        args.stable_seed_roster_sha256,
         "--output",
         str(args.output.absolute()),
     ]
@@ -340,6 +371,10 @@ def test_main_rejects_state_nested_in_experiment_before_any_write(
         str(args.robotwin_root),
         "--event-spec",
         str(args.event_spec),
+        "--stable-seed-roster",
+        str(args.stable_seed_roster),
+        "--stable-seed-roster-sha256",
+        args.stable_seed_roster_sha256,
         "--output",
         str(args.output),
         "--state-root",

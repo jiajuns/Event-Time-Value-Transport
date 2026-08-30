@@ -35,8 +35,8 @@ STATE_FORMAT = "etsf_robotwin2_actor_execute5_vs_execute50_guardian_state_v1"
 LOG_FORMAT = "etsf_robotwin2_actor_execute5_vs_execute50_guardian_log_v1"
 EXIT_FORMAT = "etsf_robotwin2_actor_execute5_vs_execute50_guardian_exit_v1"
 RUNNER_FILENAME = "run_robotwin2_five_body_actor_execute5_vs_execute50_v1.py"
-RUNNER_FORMAT = "etsf_robotwin2_five_body_actor_execute5_vs_execute50_v1"
-BINDING_FORMAT = "etsf_robotwin2_actor_deployment_protocol_binding_v1"
+RUNNER_FORMAT = "etsf_robotwin2_five_body_actor_execute5_vs_execute50_v2_stable_roster"
+BINDING_FORMAT = "etsf_robotwin2_actor_deployment_protocol_binding_v2_stable_roster"
 COMPLETION_FORMAT = "etsf_robotwin2_actor_execute5_vs_execute50_completion_v1"
 COMPLETION_STATUS = "complete_200_pairs_400_rollouts_frozen"
 PAIR_COUNT = 200
@@ -240,6 +240,10 @@ def build_runner_command(args: argparse.Namespace) -> list[str]:
         str(_absolute(args.robotwin_root, role="RoboTwin root")),
         "--event-spec",
         str(_absolute(args.event_spec, role="event spec")),
+        "--stable-seed-roster",
+        str(_absolute(args.stable_seed_roster, role="stable seed roster")),
+        "--stable-seed-roster-sha256",
+        args.stable_seed_roster_sha256,
         "--output",
         str(_absolute(args.output, role="experiment output")),
     ]
@@ -281,6 +285,9 @@ def validate_binding_and_static_paths(args: argparse.Namespace) -> dict[str, Any
     )
     event_invocation, event_resolved = _existing(
         args.event_spec, role="event spec", directory=False
+    )
+    roster_invocation, roster_resolved = _existing(
+        args.stable_seed_roster, role="stable seed roster", directory=False
     )
     _output_invocation, output_resolved = _existing(
         args.output, role="experiment output", directory=True
@@ -329,10 +336,34 @@ def validate_binding_and_static_paths(args: argparse.Namespace) -> dict[str, Any
 
     runner_sha = sha256_file(runner_resolved)
     event_sha = sha256_file(event_resolved)
+    roster_sha = sha256_file(roster_resolved)
     if runner_sha != binding.get("runner_sha256"):
         raise GuardianContractError("actor protocol runner SHA changed")
     if event_sha != binding.get("event_spec_sha256"):
         raise GuardianContractError("event specification SHA changed")
+    roster_binding = binding.get("stable_seed_roster_binding")
+    if (
+        not isinstance(roster_binding, Mapping)
+        or roster_binding.get("path") != str(roster_resolved)
+        or roster_binding.get("file_sha256") != roster_sha
+        or args.stable_seed_roster_sha256 != roster_sha
+        or not _is_sha256(roster_binding.get("logical_sha256"))
+        or not _is_sha256(roster_binding.get("preregistration_file_sha256"))
+        or not _is_sha256(roster_binding.get("preregistration_logical_sha256"))
+        or roster_binding.get("selection_uses_labels_or_outcomes") is not False
+        or roster_binding.get("actor_inference_calls_during_selection") != 0
+    ):
+        raise GuardianContractError("stable seed roster binding changed")
+    materializer = Path(str(roster_binding.get("materializer_path", ""))).resolve(
+        strict=True
+    )
+    if (
+        not materializer.is_file()
+        or materializer.is_symlink()
+        or code_resolved not in materializer.parents
+        or sha256_file(materializer) != roster_binding.get("materializer_file_sha256")
+    ):
+        raise GuardianContractError("stable seed roster materializer changed")
 
     actor_tree = sha256_tree(actor_resolved)
     vlm_tree = sha256_tree(vlm_resolved)
@@ -384,6 +415,8 @@ def validate_binding_and_static_paths(args: argparse.Namespace) -> dict[str, Any
         "robotwin_root": str(robotwin_resolved),
         "event_spec_path": str(event_resolved),
         "event_spec_sha256": event_sha,
+        "stable_seed_roster_path": str(roster_resolved),
+        "stable_seed_roster_file_sha256": roster_sha,
         "output_path": str(output_resolved),
         "binding_path": str(binding_path),
         "binding_logical_sha256": str(logical),
@@ -1030,6 +1063,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vlm-metadata-path", type=Path, required=True)
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--event-spec", type=Path, required=True)
+    parser.add_argument("--stable-seed-roster", type=Path, required=True)
+    parser.add_argument("--stable-seed-roster-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--state-root", type=Path, required=True)
     parser.add_argument("--gpu-uuid", required=True)

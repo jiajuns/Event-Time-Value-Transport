@@ -35,13 +35,14 @@ import torch
 
 import run_robotwin2_five_body_paired_success_v1 as formal
 import robotwin2_move_can_pot_analytic_event_spec_v2 as analytic_event
+import materialize_robotwin2_stable_seed_roster_v1 as stable_roster
 
 
 collector = formal.collector
 shared_head = formal.shared_head
 
-FORMAT = "etsf_robotwin2_five_body_actor_execute5_vs_execute50_v1"
-BINDING_FORMAT = "etsf_robotwin2_actor_deployment_protocol_binding_v1"
+FORMAT = "etsf_robotwin2_five_body_actor_execute5_vs_execute50_v2_stable_roster"
+BINDING_FORMAT = "etsf_robotwin2_actor_deployment_protocol_binding_v2_stable_roster"
 ATTEMPT_FORMAT = "etsf_robotwin2_actor_deployment_pair_attempt_v1"
 COMMITMENT_FORMAT = "etsf_robotwin2_actor_deployment_initial_commitment_v1"
 METHOD_START_FORMAT = "etsf_robotwin2_actor_deployment_method_start_v1"
@@ -69,9 +70,15 @@ QUERY_CANONICALIZATION_STEPS = formal.QUERY_CANONICALIZATION_STEPS
 STAGE_DENOMINATOR = formal.STAGE_DENOMINATOR
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
 
-# Fresh prospective roster, disjoint from the inspected formal and nested runs.
-SEED_BASE = 2026101000
+# Runtime values are replaced by the validated create-once stable-roster file
+# before any actor/simulator setup.  The initial values only keep pure helper
+# imports deterministic; they do not authorize a production run.
+SEED_BASE = stable_roster.CANDIDATE_SEED_START
 SEED_COUNT = 20
+SEED_ROSTER = tuple(range(SEED_BASE, SEED_BASE + SEED_COUNT))
+STABLE_SEED_ROSTER: dict[str, Any] | None = None
+STABLE_SEED_ROSTER_PATH: Path | None = None
+STABLE_SEED_ROSTER_FILE_SHA256: str | None = None
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20261019
 METHOD_RESUME_LIMIT = 1
@@ -84,6 +91,38 @@ array_sha256 = formal.array_sha256
 
 class ActorDeploymentProtocolError(RuntimeError):
     """The frozen actor, paired reset, recovery chain, or report changed."""
+
+
+def configure_stable_seed_roster(
+    value: Mapping[str, Any], *, path: Path, file_sha256: str
+) -> dict[str, Any]:
+    try:
+        validated = stable_roster.validate_stable_seed_roster(value)
+    except stable_roster.StableSeedRosterError as error:
+        raise ActorDeploymentProtocolError(str(error)) from error
+    selected = tuple(int(seed) for seed in validated["selected_seeds"])
+    if len(selected) != SEED_COUNT or len(set(selected)) != SEED_COUNT:
+        raise ActorDeploymentProtocolError("stable roster does not contain 20 unique seeds")
+    global SEED_ROSTER, SEED_BASE, STABLE_SEED_ROSTER
+    global STABLE_SEED_ROSTER_PATH, STABLE_SEED_ROSTER_FILE_SHA256
+    SEED_ROSTER = selected
+    SEED_BASE = min(selected)
+    STABLE_SEED_ROSTER = dict(validated)
+    STABLE_SEED_ROSTER_PATH = path.expanduser().resolve()
+    STABLE_SEED_ROSTER_FILE_SHA256 = file_sha256
+    return dict(validated)
+
+
+def require_stable_seed_roster() -> dict[str, Any]:
+    if (
+        STABLE_SEED_ROSTER is None
+        or STABLE_SEED_ROSTER_PATH is None
+        or STABLE_SEED_ROSTER_FILE_SHA256 is None
+    ):
+        raise ActorDeploymentProtocolError(
+            "production actor-v2 requires a file-bound common-stable seed roster"
+        )
+    return stable_roster.validate_stable_seed_roster(STABLE_SEED_ROSTER)
 
 
 def _is_sha256(value: Any) -> bool:
@@ -184,18 +223,21 @@ def promote_create_once_json(
 
 
 def evaluation_protocol() -> dict[str, Any]:
+    roster = require_stable_seed_roster()
     formal_seeds = set(range(formal.SEED_BASE, formal.SEED_BASE + formal.SEED_COUNT))
     nested_seeds = set(range(2026091000, 2026091100))
-    seeds = set(range(SEED_BASE, SEED_BASE + SEED_COUNT))
+    seeds = set(SEED_ROSTER)
     if seeds & formal_seeds or seeds & nested_seeds:
         raise ActorDeploymentProtocolError("deployment protocol reuses an inspected seed")
     base = {
-        "format": "etsf_robotwin2_actor_execute5_vs_execute50_protocol_v1",
+        "format": "etsf_robotwin2_actor_execute5_vs_execute50_protocol_v2_stable_roster",
         "task": TASK,
         "bodies": list(BODIES),
         "conditions": list(CONDITIONS),
-        "seed_base": SEED_BASE,
+        "selected_seeds": list(SEED_ROSTER),
         "seed_count": SEED_COUNT,
+        "stable_seed_roster_logical_sha256": roster["logical_sha256"],
+        "stable_seed_roster_file_sha256": STABLE_SEED_ROSTER_FILE_SHA256,
         "pair_count": len(BODIES) * len(CONDITIONS) * SEED_COUNT,
         "rollout_count": len(BODIES) * len(CONDITIONS) * SEED_COUNT * 2,
         "methods": list(METHODS),
@@ -232,10 +274,12 @@ def evaluation_protocol() -> dict[str, Any]:
 def method_order(body: str, condition: str, seed: int) -> list[str]:
     if body not in BODIES or condition not in CONDITIONS:
         raise ActorDeploymentProtocolError("unknown body/condition in method order")
+    if int(seed) not in SEED_ROSTER:
+        raise ActorDeploymentProtocolError("seed is outside the frozen stable roster")
     parity = (
         BODIES.index(body)
         + CONDITIONS.index(condition)
-        + (int(seed) - SEED_BASE)
+        + SEED_ROSTER.index(int(seed))
     ) % 2
     return list(METHODS if parity == 0 else reversed(METHODS))
 
@@ -244,7 +288,7 @@ def evaluation_schedule() -> list[dict[str, Any]]:
     result = []
     for body in BODIES:
         for condition in CONDITIONS:
-            for seed in range(SEED_BASE, SEED_BASE + SEED_COUNT):
+            for seed in SEED_ROSTER:
                 result.append(
                     {
                         "heldout_body": body,
@@ -1218,7 +1262,7 @@ def _comparison_summary(
     selected_cells = sorted(
         {(str(row["heldout_body"]), str(row["condition"])) for row in rows}
     )
-    seeds = list(range(SEED_BASE, SEED_BASE + SEED_COUNT))
+    seeds = list(SEED_ROSTER)
     by_seed: dict[int, list[int]] = {seed: [] for seed in seeds}
     for index, row in enumerate(rows):
         seed = row.get("requested_seed")
@@ -1540,11 +1584,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vlm-metadata-path", type=Path, required=True)
     parser.add_argument("--robotwin-root", type=Path, required=True)
     parser.add_argument("--event-spec", type=Path, required=True)
+    parser.add_argument("--stable-seed-roster", type=Path, required=True)
+    parser.add_argument("--stable-seed-roster-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--instruction", default=collector.DEFAULT_INSTRUCTION)
     parser.add_argument("--max-steps", type=int, default=MAX_EPISODE_ACTION_STEPS)
-    parser.add_argument("--seed-base", type=int, default=SEED_BASE)
-    parser.add_argument("--seed-count", type=int, default=SEED_COUNT)
     return parser.parse_args(argv)
 
 
@@ -1560,12 +1604,31 @@ def _binding(
     calibration: Mapping[str, Any],
 ) -> dict[str, Any]:
     runner_path = Path(__file__).resolve()
+    roster_document = require_stable_seed_roster()
+    roster_materializer_path = Path(
+        inspect.getsourcefile(stable_roster) or ""
+    ).resolve()
     base = {
         "format": BINDING_FORMAT,
         "runner_format": FORMAT,
         "runner_path": str(runner_path),
         "runner_sha256": sha256_file(runner_path),
         "evaluation_protocol": evaluation_protocol(),
+        "stable_seed_roster_binding": {
+            "path": str(STABLE_SEED_ROSTER_PATH),
+            "file_sha256": STABLE_SEED_ROSTER_FILE_SHA256,
+            "logical_sha256": roster_document["logical_sha256"],
+            "preregistration_file_sha256": roster_document[
+                "preregistration_file_sha256"
+            ],
+            "preregistration_logical_sha256": roster_document[
+                "preregistration_logical_sha256"
+            ],
+            "materializer_path": str(roster_materializer_path),
+            "materializer_file_sha256": sha256_file(roster_materializer_path),
+            "selection_uses_labels_or_outcomes": False,
+            "actor_inference_calls_during_selection": 0,
+        },
         "actor_checkpoint": str(actor_checkpoint),
         "actor_checkpoint_tree_sha256": actor_tree[0],
         "actor_checkpoint_file_count": actor_tree[1],
@@ -1604,11 +1667,19 @@ def _binding(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if (
-        args.seed_base != SEED_BASE
-        or args.seed_count != SEED_COUNT
-        or args.max_steps != MAX_EPISODE_ACTION_STEPS
-    ):
+    try:
+        roster_value = stable_roster.load_stable_seed_roster_file(
+            args.stable_seed_roster,
+            args.stable_seed_roster_sha256,
+        )
+    except stable_roster.StableSeedRosterError as error:
+        raise ActorDeploymentProtocolError(str(error)) from error
+    configure_stable_seed_roster(
+        roster_value,
+        path=args.stable_seed_roster,
+        file_sha256=args.stable_seed_roster_sha256,
+    )
+    if args.max_steps != MAX_EPISODE_ACTION_STEPS:
         raise ActorDeploymentProtocolError("formal deployment roster/horizon is frozen")
     if args.instruction != collector.DEFAULT_INSTRUCTION:
         raise ActorDeploymentProtocolError("primary comparison holds generic prompt fixed")
@@ -1617,6 +1688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.vlm_metadata_path,
         args.robotwin_root,
         args.event_spec,
+        args.stable_seed_roster,
     )
     if any(not path.expanduser().resolve().exists() for path in required):
         raise FileNotFoundError("one or more static deployment inputs are missing")

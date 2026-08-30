@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -104,6 +105,33 @@ def test_preregistration_uses_fresh_2026104000_interval() -> None:
         "prior_nonformal_probe_2026103000_block_reused": False,
         "fresh_candidate_interval_starts_at": 2026104000,
     }
+
+
+def test_task_args_replace_stale_yaml_robot_files(tmp_path: Path) -> None:
+    config_root = tmp_path / "env_cfg" / "task_config"
+    robot_root = tmp_path / "robots" / "piper"
+    config_root.mkdir(parents=True)
+    robot_root.mkdir(parents=True)
+    (config_root / "demo_clean.yml").write_text(
+        yaml.safe_dump(
+            {
+                "left_robot_file": "/stale/left",
+                "right_robot_file": "/stale/right",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (config_root / "_embodiment_config.yml").write_text(
+        yaml.safe_dump({"piper": {"file_path": "robots/piper"}}),
+        encoding="utf-8",
+    )
+    (robot_root / "config.yml").write_text("robot: piper\n", encoding="utf-8")
+
+    arguments = roster._task_args(tmp_path, "piper", "clean")
+
+    assert arguments["left_robot_file"] == str(robot_root.resolve())
+    assert arguments["right_robot_file"] == str(robot_root.resolve())
+    assert "/stale/" not in json.dumps(arguments)
 
 
 def test_probe_short_circuits_after_first_setup_failure() -> None:

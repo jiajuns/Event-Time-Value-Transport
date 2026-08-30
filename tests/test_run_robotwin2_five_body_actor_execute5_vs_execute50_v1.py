@@ -27,6 +27,70 @@ runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
 
 
+def _configure_test_stable_roster() -> dict[str, object]:
+    attempts = []
+    selected = list(
+        range(
+            runner.stable_roster.CANDIDATE_SEED_START,
+            runner.stable_roster.CANDIDATE_SEED_START + runner.SEED_COUNT,
+        )
+    )
+    for seed in selected:
+        attempts.append(
+            {
+                "candidate_seed": seed,
+                "cells": [
+                    {
+                        "cell_index": index,
+                        "body": body,
+                        "condition": condition,
+                        "status": "setup_succeeded_and_closed",
+                    }
+                    for index, (body, condition) in enumerate(
+                        runner.stable_roster.CELL_ORDER
+                    )
+                ],
+                "all_ten_setup_cells_stable": True,
+                "actor_inference_calls": 0,
+                "task_action_calls": 0,
+                "label_or_outcome_reads": 0,
+            }
+        )
+    prereg = runner.stable_roster.preregistration_document()
+    unsigned = {
+        "format": runner.stable_roster.ROSTER_FORMAT,
+        "status": "complete_first_twenty_common_stable_seeds",
+        "task": runner.TASK,
+        "preregistration": "/test/preregistration.json",
+        "preregistration_file_sha256": "a" * 64,
+        "preregistration_logical_sha256": prereg["logical_sha256"],
+        "body_order": list(runner.BODIES),
+        "condition_order": list(runner.CONDITIONS),
+        "candidate_attempt_count": len(attempts),
+        "stable_candidate_count_observed": len(selected),
+        "selected_seeds": selected,
+        "pair_count": 200,
+        "rollout_count_for_two_methods": 400,
+        "attempts": attempts,
+        "actor_inference_calls": 0,
+        "task_action_calls": 0,
+        "label_or_outcome_reads": 0,
+    }
+    value = {
+        **unsigned,
+        "logical_sha256": runner.stable_roster.canonical_sha256(unsigned),
+    }
+    runner.configure_stable_seed_roster(
+        value,
+        path=Path("/test/stable-roster.json"),
+        file_sha256="b" * 64,
+    )
+    return value
+
+
+TEST_STABLE_ROSTER = _configure_test_stable_roster()
+
+
 def _ee16() -> np.ndarray:
     value = np.zeros(16, dtype=np.float32)
     value[3] = 1.0
@@ -172,6 +236,11 @@ def test_frozen_roster_is_200_pairs_400_rollouts_and_counterbalanced() -> None:
     assert protocol["candidate_index"] == 0
     assert protocol["critic_loaded_or_called"] is False
     assert protocol["training_performed"] is False
+    assert protocol["selected_seeds"] == TEST_STABLE_ROSTER["selected_seeds"]
+    assert protocol["stable_seed_roster_logical_sha256"] == (
+        TEST_STABLE_ROSTER["logical_sha256"]
+    )
+    assert protocol["stable_seed_roster_file_sha256"] == "b" * 64
     canonicalization = protocol["query_canonicalization"]
     assert canonicalization["raw_scene_steps_before_every_actor_query"] == 1
     assert canonicalization["formal_actor_action_count_advanced"] is False
