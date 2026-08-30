@@ -21,6 +21,7 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as verifier  # no
 from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     _candidate_rank_loss,
     _dense_soft_listwise_loss,
+    _relative_gradient_budget_scale,
     _robust_object_effect_loss,
     _semantic_comparative_loss,
     _terminal_consequence_loss,
@@ -42,6 +43,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     CANDIDATE_RANK_FEATURE_DIM,
     CANDIDATE_RANK_FEATURE_SCHEMA,
     DENSE_FAILURE_RANK_WEIGHT,
+    DENSE_ONLY_RANK_WEIGHT,
     DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
     EPISTEMIC_RANK_RISK_WEIGHT,
     BRANCH_DIAGNOSTIC_CONTRACT,
@@ -56,7 +58,8 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT,
     MONOTONE_BENEFIT_FEATURES,
     MONOTONE_RISK_FEATURES,
-    SEMANTIC_COMPARATIVE_LOSS_WEIGHT,
+    SEMANTIC_COMPARATIVE_GRADIENT_BUDGET,
+    SEMANTIC_GRADIENT_SCALE_CAP,
     TERMINAL_SUPERVISION_CONTRACT,
     SOURCE_EVENT_SAMPLING_HZ,
     TASK,
@@ -71,8 +74,10 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     effect_preserving_group_bootstrap_weights,
     proper_outcome_preserving_group_bootstrap_weights,
     evaluate_candidate_ranking,
+    evaluate_terminal_consequences,
     load_binding,
     materialize_source_rows,
+    select_calibration_guarded_checkpoint,
     sha256_file,
     sha256_tree,
     source_group_split,
@@ -688,10 +693,10 @@ def test_semantic_comparative_loss_updates_terminal_locations_not_utility_or_sca
     )
     original_success = batch["success"].clone()
     output = model(batch)
-    loss, pieces = _semantic_comparative_loss(
+    raw_loss, pieces = _semantic_comparative_loss(
         output, batch, torch.ones(8), ablation_variant="full"
     )
-    loss.backward()
+    raw_loss.backward()
 
     def has_nonzero_gradient(module: torch.nn.Module) -> bool:
         return any(
@@ -699,17 +704,24 @@ def test_semantic_comparative_loss_updates_terminal_locations_not_utility_or_sca
             for parameter in module.parameters()
         )
 
-    assert torch.isfinite(loss)
+    assert torch.isfinite(raw_loss)
     assert pieces["semantic_mixed_groups_in_batch"] == 1
     assert pieces["semantic_dense_groups_in_batch"] == 1
     torch.testing.assert_close(
-        loss,
-        SEMANTIC_COMPARATIVE_LOSS_WEIGHT
-        * (
-            pieces["semantic_comparative_mixed_success"]
-            + pieces["semantic_comparative_dense_event_goal"]
-        ),
+        pieces["semantic_comparative_event_raw"],
+        pieces["semantic_comparative_mixed_success"]
+        + pieces["semantic_comparative_dense_event"],
     )
+    torch.testing.assert_close(
+        pieces["semantic_comparative_goal_raw"],
+        pieces["semantic_comparative_dense_goal"],
+    )
+    torch.testing.assert_close(
+        raw_loss,
+        pieces["semantic_comparative_event_raw"]
+        + pieces["semantic_comparative_goal_raw"],
+    )
+    torch.testing.assert_close(raw_loss, pieces["semantic_comparative_raw"])
     assert has_nonzero_gradient(model.terminal_event)
     assert has_nonzero_gradient(model.terminal_goal_progress_mean)
     assert has_nonzero_gradient(model.terminal_context_encoder)
@@ -723,6 +735,284 @@ def test_semantic_comparative_loss_updates_terminal_locations_not_utility_or_sca
     assert not has_nonzero_gradient(model.duration_mean)
     assert not has_nonzero_gradient(model.duration_scale)
     assert torch.equal(batch["success"], original_success)
+
+
+def test_relative_gradient_budget_caps_comparative_head_gradient() -> None:
+    head = torch.nn.Linear(2, 1)
+    inputs = torch.tensor([[1.0, -2.0], [0.5, 3.0]])
+    prediction = head(inputs).squeeze(-1)
+    proper_loss = prediction.square().mean()
+    comparative_loss = 100.0 * prediction.mean()
+    parameters = tuple(head.parameters())
+
+    scale = _relative_gradient_budget_scale(
+        proper_loss,
+        comparative_loss,
+        parameters,
+    )
+    proper_gradients = torch.autograd.grad(
+        proper_loss, parameters, retain_graph=True
+    )
+    scaled_comparative_gradients = torch.autograd.grad(
+        scale * comparative_loss, parameters
+    )
+
+    def gradient_norm(gradients: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return torch.sqrt(
+            torch.stack([gradient.square().sum() for gradient in gradients]).sum()
+        )
+
+    proper_norm = gradient_norm(proper_gradients)
+    scaled_comparative_norm = gradient_norm(scaled_comparative_gradients)
+    assert not scale.requires_grad
+    assert 0.0 <= float(scale) <= SEMANTIC_GRADIENT_SCALE_CAP
+    assert float(scale) < SEMANTIC_GRADIENT_SCALE_CAP
+    assert scaled_comparative_norm <= (
+        SEMANTIC_COMPARATIVE_GRADIENT_BUDGET * proper_norm + 1e-6
+    )
+
+
+def test_shared_world_budget_uses_only_comparative_active_parameters() -> None:
+    output_head = torch.nn.Parameter(torch.tensor(1.0))
+    shared_upstream = torch.nn.Parameter(torch.tensor(1.0))
+    proper_only_zero_comparative = torch.nn.Parameter(torch.tensor(2.0))
+    proper_loss = (
+        output_head.square()
+        + proper_only_zero_comparative.square()
+        + 0.0 * shared_upstream
+    )
+    comparative_loss = (
+        10.0 * output_head
+        + 10.0 * shared_upstream
+        + 0.0 * proper_only_zero_comparative
+    )
+
+    local_scale = _relative_gradient_budget_scale(
+        proper_loss, comparative_loss, (output_head,)
+    )
+    local_proper_gradient = torch.autograd.grad(
+        proper_loss, output_head, retain_graph=True
+    )[0]
+    local_comparative_gradient = torch.autograd.grad(
+        local_scale * comparative_loss, output_head, retain_graph=True
+    )[0]
+    assert 0.0 < float(local_scale) <= SEMANTIC_GRADIENT_SCALE_CAP
+    assert abs(float(local_comparative_gradient)) <= (
+        SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
+        * abs(float(local_proper_gradient))
+        + 1e-6
+    )
+
+    pre_shared_world_budget = local_scale * comparative_loss
+    zero_comparative_gradient = torch.autograd.grad(
+        pre_shared_world_budget,
+        proper_only_zero_comparative,
+        retain_graph=True,
+    )[0]
+    assert zero_comparative_gradient is not None
+    assert zero_comparative_gradient == 0.0
+    shared_world_scale = _relative_gradient_budget_scale(
+        proper_loss,
+        pre_shared_world_budget,
+        (shared_upstream, proper_only_zero_comparative),
+    )
+    assert shared_world_scale == 0.0
+
+    final_semantic_loss = shared_world_scale * pre_shared_world_budget
+    final_shared_gradient = torch.autograd.grad(
+        final_semantic_loss, shared_upstream, retain_graph=True
+    )[0]
+    active_proper_gradient = torch.autograd.grad(
+        proper_loss, shared_upstream
+    )[0]
+    assert abs(float(final_shared_gradient)) <= (
+        SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
+        * abs(float(active_proper_gradient))
+        + 1e-6
+    )
+
+
+def _fixed_terminal_metrics(
+    group_specs: list[tuple[str, int, float]],
+    *,
+    variant: str,
+    event_supervised: bool = True,
+    goal_supervised: bool = True,
+) -> dict[str, object]:
+    row_probabilities = torch.tensor(
+        [probability for _group, _seed, probability in group_specs]
+    ).repeat_interleave(4)
+
+    class FixedTerminalModel(torch.nn.Module):
+        def __init__(self, success_probability: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("success_probability", success_probability)
+            self.ablation_variant = variant
+
+        def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            count = len(batch["success"])
+            probability = self.success_probability[:count]
+            nonterminal = ((1.0 - probability) / 4.0).unsqueeze(-1).expand(-1, 4)
+            terminal_probability = torch.cat(
+                (nonterminal, probability.unsqueeze(-1)), dim=-1
+            )
+            zero = probability.new_zeros(count)
+            return {
+                "terminal_event_logits": terminal_probability.log(),
+                "terminal_goal_progress_mean": zero,
+                "terminal_goal_progress_log_scale": zero,
+                "success_logit": torch.logit(probability),
+                "regression_probability": zero,
+                "joint_recovery_probability": zero,
+            }
+
+    count = len(row_probabilities)
+    batch = {
+        "success": torch.ones(count),
+        "success_mask": torch.ones(count),
+        "terminal_max_event_id": torch.full((count,), 4, dtype=torch.long),
+        "terminal_event_mask": torch.full((count,), float(event_supervised)),
+        "terminal_goal_progress": torch.zeros(count),
+        "terminal_goal_progress_mask": torch.full(
+            (count,), float(goal_supervised)
+        ),
+        "post_event_id": torch.zeros(count, dtype=torch.long),
+        "post_event_mask": torch.ones(count),
+        "current_event_id": torch.zeros(count, dtype=torch.long),
+        "recovery": torch.zeros(count),
+        "requested_seed": torch.tensor(
+            [seed for _group, seed, _probability in group_specs]
+        ).repeat_interleave(4),
+        "logical_group": [
+            group for group, _seed, _probability in group_specs for _ in range(4)
+        ],
+    }
+    return evaluate_terminal_consequences(
+        FixedTerminalModel(row_probabilities),
+        [batch],
+        torch.device("cpu"),
+        ablation_variant=variant,
+    )
+
+
+def test_terminal_consequence_metrics_report_strict_proper_macro_se_and_success_nll(
+) -> None:
+    group_specs = [
+        (f"{BODIES[0]}|clean|a", 10, 0.8),
+        (f"{BODIES[0]}|clean|b", 11, 0.4),
+        (f"{BODIES[1]}|randomized|a", 20, 0.6),
+        (f"{BODIES[1]}|randomized|b", 21, 0.2),
+    ]
+    metrics = _fixed_terminal_metrics(group_specs, variant="success_only")
+    group_nll = -np.log(np.asarray([0.8, 0.4, 0.6, 0.2]))
+    expected_macro = float(
+        np.mean([np.mean(group_nll[:2]), np.mean(group_nll[2:])])
+    )
+    expected_se = float(
+        np.sqrt(
+            np.var(group_nll[:2], ddof=1) / 2
+            + np.var(group_nll[2:], ddof=1) / 2
+        )
+        / 2
+    )
+    strict = metrics["strict_proper"]
+    assert strict["logical_decisions"] == 4
+    assert strict["body_condition_units"] == 2
+    assert strict["independent_requested_seed_clusters"] == 4
+    assert strict["selection_rule"] == (
+        "source_body_condition_macro_seed_clustered_proper_loss_"
+        "one_standard_error"
+    )
+    assert strict["macro_score"] == pytest.approx(expected_macro)
+    assert strict["macro_standard_error"] == pytest.approx(expected_se)
+    assert strict["components"] == {
+        "success_nll": pytest.approx(expected_macro)
+    }
+    expected_support = 4 * len(group_specs)
+    assert metrics["terminal_success"]["support"] == expected_support
+    assert metrics["terminal_success"]["positive"] == expected_support
+    assert metrics["terminal_success"]["nll"] == pytest.approx(expected_macro)
+
+
+def test_success_only_strict_evaluation_does_not_require_event_or_goal_labels(
+) -> None:
+    metrics = _fixed_terminal_metrics(
+        [
+            (f"{BODIES[0]}|clean|a", 10, 0.8),
+            (f"{BODIES[0]}|clean|b", 11, 0.4),
+        ],
+        variant="success_only",
+        event_supervised=False,
+        goal_supervised=False,
+    )
+    strict = metrics["strict_proper"]
+    assert np.isfinite(strict["macro_score"])
+    assert set(strict["components"]) == {"success_nll"}
+    assert metrics["terminal_event"]["support"] == 0
+    assert metrics["terminal_event"]["nll"] is None
+    assert metrics["terminal_goal_progress"]["support"] == 0
+    assert metrics["terminal_goal_progress"]["student_t3_nll"] is None
+
+
+def test_no_object_effect_strict_evaluation_does_not_require_goal_labels() -> None:
+    metrics = _fixed_terminal_metrics(
+        [
+            (f"{BODIES[0]}|clean|a", 10, 0.8),
+            (f"{BODIES[0]}|clean|b", 11, 0.4),
+        ],
+        variant="no_object_effect",
+        goal_supervised=False,
+    )
+    strict = metrics["strict_proper"]
+    assert np.isfinite(strict["macro_score"])
+    assert set(strict["components"]) == {
+        "success_nll",
+        "terminal_event_nll",
+    }
+    assert metrics["terminal_event"]["support"] == 8
+    assert metrics["terminal_goal_progress"]["support"] == 0
+    assert metrics["terminal_goal_progress"]["student_t3_nll"] is None
+
+
+def test_strict_proper_se_clusters_queries_by_requested_seed() -> None:
+    one_query_per_seed = _fixed_terminal_metrics(
+        [
+            (f"{BODIES[0]}|clean|seed10-query0", 10, 0.8),
+            (f"{BODIES[0]}|clean|seed20-query0", 20, 0.2),
+        ],
+        variant="success_only",
+    )["strict_proper"]
+    two_queries_per_seed = _fixed_terminal_metrics(
+        [
+            (f"{BODIES[0]}|clean|seed10-query0", 10, 0.8),
+            (f"{BODIES[0]}|clean|seed10-query1", 10, 0.8),
+            (f"{BODIES[0]}|clean|seed20-query0", 20, 0.2),
+            (f"{BODIES[0]}|clean|seed20-query1", 20, 0.2),
+        ],
+        variant="success_only",
+    )["strict_proper"]
+    assert one_query_per_seed["independent_requested_seed_clusters"] == 2
+    assert two_queries_per_seed["independent_requested_seed_clusters"] == 2
+    assert two_queries_per_seed["macro_score"] == pytest.approx(
+        one_query_per_seed["macro_score"]
+    )
+    assert two_queries_per_seed["macro_standard_error"] == pytest.approx(
+        one_query_per_seed["macro_standard_error"]
+    )
+
+
+def test_strict_proper_se_fails_closed_with_fewer_than_two_requested_seeds() -> None:
+    with pytest.raises(
+        FiveBodyContractError,
+        match="requires at least two independent requested seeds",
+    ):
+        _fixed_terminal_metrics(
+            [
+                (f"{BODIES[0]}|clean|query0", 10, 0.8),
+                (f"{BODIES[0]}|clean|query1", 10, 0.4),
+            ],
+            variant="success_only",
+        )
 
 
 def test_single_failure_class_trains_coherent_success_without_synthetic_positive() -> None:
@@ -1062,6 +1352,7 @@ def test_mixed_success_uses_group_listwise_success_probability_mass() -> None:
         "group_listwise_success_mass_balanced_rank"
     ]
     assert good["all_failure_dense_soft_listwise_balanced_rank"] == 0.0
+    assert good["dense_rank_effective_weight"] == DENSE_FAILURE_RANK_WEIGHT
 
 
 def test_all_failure_dense_target_is_true_lexicographic_terminal_value() -> None:
@@ -1084,9 +1375,10 @@ def test_all_failure_dense_target_is_true_lexicographic_terminal_value() -> None
     ]
     assert torch.allclose(
         good["candidate_ranking_balanced_rank"],
-        DENSE_FAILURE_RANK_WEIGHT
+        DENSE_ONLY_RANK_WEIGHT
         * good["all_failure_dense_soft_listwise_balanced_rank"],
     )
+    assert good["dense_rank_effective_weight"] == DENSE_ONLY_RANK_WEIGHT
     no_object = _effect_loss(
         success=[0, 0, 0, 0],
         terminal_event=[1, 1, 1, 1],
@@ -1572,8 +1864,139 @@ def test_checkpoint_selection_uses_dense_evidence_when_mixed_is_absent() -> None
     ) < candidate_checkpoint_selection_key(weak_dense, 0.1, 100)
 
 
+def test_calibration_guard_selects_rank_only_inside_proper_one_se_set() -> None:
+    records = [
+        {
+            "step": 100,
+            "mean_member_strict_proper_score": 1.0,
+            "conservative_strict_proper_standard_error": 0.1,
+            "selection_key": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100),
+            "ensemble_candidate_ranking": {
+                "mixed_success_decisions": 1,
+                "dense_progress_decisions": 0,
+            },
+        },
+        {
+            "step": 200,
+            "mean_member_strict_proper_score": 1.08,
+            "conservative_strict_proper_standard_error": 0.9,
+            "selection_key": (-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 200),
+            "ensemble_candidate_ranking": {
+                "mixed_success_decisions": 1,
+                "dense_progress_decisions": 0,
+            },
+        },
+        {
+            "step": 300,
+            "mean_member_strict_proper_score": 1.2,
+            "conservative_strict_proper_standard_error": 0.9,
+            "selection_key": (-10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 300),
+            "ensemble_candidate_ranking": {
+                "mixed_success_decisions": 1,
+                "dense_progress_decisions": 0,
+            },
+        },
+    ]
+    selected, audit = select_calibration_guarded_checkpoint(records)
+    assert selected["step"] == 200
+    assert audit["comparative_validation_evidence"] is True
+    assert audit["eligible_steps"] == [100, 200]
+    assert audit["eligible_threshold"] == pytest.approx(1.1)
+    assert audit["heldout_rows_used"] == 0
+
+
+def test_calibration_guard_without_comparative_evidence_uses_strict_proper_step(
+) -> None:
+    records = [
+        {
+            "step": step,
+            "mean_member_strict_proper_score": score,
+            "conservative_strict_proper_standard_error": 0.1,
+            "selection_key": rank_key,
+            "ensemble_candidate_ranking": {
+                "mixed_success_decisions": 0,
+                "dense_progress_decisions": 0,
+            },
+        }
+        for step, score, rank_key in (
+            (100, 1.0, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100)),
+            (200, 1.0, (-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 200)),
+            (300, 1.1, (-10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 300)),
+        )
+    ]
+    selected, audit = select_calibration_guarded_checkpoint(records)
+    assert selected["step"] == 100
+    assert audit["comparative_validation_evidence"] is False
+    assert audit["eligible_steps"] == [100]
+    assert audit["selected_score"] == pytest.approx(1.0)
+
+
+def _checkpoint_selection_record(
+    step: int,
+    *,
+    mixed_support: int = 1,
+    dense_support: int = 2,
+) -> dict[str, object]:
+    return {
+        "step": step,
+        "mean_member_strict_proper_score": 1.0,
+        "conservative_strict_proper_standard_error": 0.1,
+        "selection_key": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, step],
+        "ensemble_candidate_ranking": {
+            "mixed_success_decisions": mixed_support,
+            "dense_progress_decisions": dense_support,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("mean_member_strict_proper_score", "standard_error", "selection_key"),
+)
+def test_calibration_guard_rejects_nonfinite_selection_values(field: str) -> None:
+    record = _checkpoint_selection_record(100)
+    if field == "standard_error":
+        record["conservative_strict_proper_standard_error"] = float("inf")
+    elif field == "selection_key":
+        record["selection_key"][5] = float("nan")
+    else:
+        record[field] = float("nan")
+    with pytest.raises(FiveBodyContractError, match="violates the proper/rank contract"):
+        select_calibration_guarded_checkpoint([record])
+
+
+def test_calibration_guard_rejects_selection_key_step_mismatch() -> None:
+    record = _checkpoint_selection_record(100)
+    record["selection_key"][-1] = 200
+    with pytest.raises(FiveBodyContractError, match="violates the proper/rank contract"):
+        select_calibration_guarded_checkpoint([record])
+
+
+def test_calibration_guard_rejects_duplicate_steps() -> None:
+    with pytest.raises(FiveBodyContractError, match="steps are not unique"):
+        select_calibration_guarded_checkpoint(
+            [
+                _checkpoint_selection_record(100),
+                _checkpoint_selection_record(100),
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "support_name", ("mixed_success_decisions", "dense_progress_decisions")
+)
+def test_calibration_guard_rejects_comparative_support_drift(
+    support_name: str,
+) -> None:
+    first = _checkpoint_selection_record(100)
+    second = _checkpoint_selection_record(200)
+    second["ensemble_candidate_ranking"][support_name] += 1
+    with pytest.raises(FiveBodyContractError, match="support changed across steps"):
+        select_calibration_guarded_checkpoint([first, second])
+
+
 def test_ablation_variants_change_only_declared_score_features() -> None:
-    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v7"
+    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v8"
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
     torch.testing.assert_close(
@@ -1670,6 +2093,27 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert full_contract["utility_rank_loss_updates_semantic_action_transition"] is False
     assert full_contract["utility_rank_loss_updates_consequence_predictors"] is False
     assert full_contract["semantic_comparative_loss_updates_terminal_predictors"] is True
+    assert full_contract[
+        "semantic_comparative_gradient_budget_relative_to_proper_head"
+    ] == SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
+    assert full_contract["semantic_gradient_scale_cap"] == SEMANTIC_GRADIENT_SCALE_CAP
+    assert full_contract[
+        "semantic_comparative_gradient_budget_relative_to_shared_world"
+    ] == SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
+    assert full_contract["semantic_comparative_gradient_budget_scope"] == (
+        "per_terminal_head_then_shared_world_on_comparative_active_parameters"
+    )
+    assert full_contract["dense_only_listwise_weight"] == DENSE_ONLY_RANK_WEIGHT
+    assert full_contract["world_and_utility_gradient_clipping_are_separate"] is True
+    assert full_contract["checkpoint_selection_calibration_guard"] == (
+        "source_body_condition_macro_seed_clustered_strict_proper_score_"
+        "one_standard_error"
+    )
+    assert full_contract["strict_proper_components"] == [
+        "success_binary_nll",
+        "terminal_event_categorical_nll_weight_0.5",
+        "terminal_goal_student_t3_nll_weight_0.5",
+    ]
     assert full_contract["raw_world_frame_object_axes_in_rank_input"] is False
     assert full_contract["cross_feature_layer_normalization"] is False
     assert full_contract["feature_schema"] == {

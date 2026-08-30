@@ -1080,6 +1080,22 @@ def summarize_fold(
             ensemble_selection.get("selected_ensemble_candidate_ranking"),
             Mapping,
         )
+        or not isinstance(
+            ensemble_selection.get("strict_proper_selection"), Mapping
+        )
+        or ensemble_selection["strict_proper_selection"].get("rule")
+        != (
+            "minimize_source_body_condition_macro_proper_score_then_"
+            "maximize_rank_within_one_standard_error"
+        )
+        or ensemble_selection["strict_proper_selection"].get(
+            "selected_step"
+        )
+        != ensemble_selection.get("selected_step")
+        or ensemble_selection["strict_proper_selection"].get(
+            "heldout_rows_used"
+        )
+        != 0
         or any(
             member.get("best_step") != ensemble_selection.get("selected_step")
             or member.get("trainer_file_sha256")
@@ -1119,6 +1135,25 @@ def summarize_fold(
             "source_negative_to_positive_ratio"
         ),
         "source_validation": {
+            "strict_proper": {
+                "macro_score": numeric_summary(
+                    nested_values(
+                        members,
+                        "terminal_consequences",
+                        "strict_proper",
+                        "macro_score",
+                    )
+                ),
+                "macro_standard_error": numeric_summary(
+                    nested_values(
+                        members,
+                        "terminal_consequences",
+                        "strict_proper",
+                        "macro_standard_error",
+                    )
+                ),
+                "selection": ensemble_selection["strict_proper_selection"],
+            },
             "macro_one_deviation_branch_success_gain": numeric_summary(
                 nested_values(
                     members,
