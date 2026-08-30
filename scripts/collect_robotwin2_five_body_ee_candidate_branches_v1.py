@@ -118,7 +118,7 @@ TERMINAL_HORIZON_CONTRACT = {
     ),
 }
 BRANCH_ROOT_SNAPSHOT_CONTRACT = {
-    "format": "etsf_sapien_explicit_fresh_scene_branch_root_v1",
+    "format": "etsf_sapien_explicit_fresh_scene_branch_root_v2_float32_roundtrip",
     "physics_state": "keyed_rigid_articulation_drive_task_render_rng_snapshot",
     "candidate_scene_isolation": "one_fresh_scene_per_candidate",
     "contact_cache_reconstruction": "one_counted_raw_scene_step",
