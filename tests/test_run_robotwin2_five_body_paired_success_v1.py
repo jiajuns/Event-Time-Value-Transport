@@ -69,12 +69,12 @@ def _commitment() -> dict:
 def _rollout(method: str, success: int, progress: float) -> dict:
     commitment = _commitment()
     raw_rank = np.asarray([[0.0, 0.0, 1.0, 0.0]] * 5, dtype=np.float64)
-    standardized = runner.shared_head.aggregate_standardized_rank_scores(
+    risk_adjusted = runner.shared_head.aggregate_risk_adjusted_rank_scores(
         torch.as_tensor(raw_rank)
     ).numpy()
     critic_scores = {
         "selected_candidate_index": 2,
-        "candidate_rank_score_standardized_ensemble": standardized.tolist(),
+        "candidate_rank_score_epistemic_lcb_ensemble": risk_adjusted.tolist(),
         "candidate_rank_score_mean": raw_rank.mean(axis=0).tolist(),
         "candidate_rank_score_raw_candidate_population_std": raw_rank.std(
             axis=0, ddof=0
@@ -144,7 +144,7 @@ def test_tie_break_is_lowest_candidate_index() -> None:
         runner.select_candidate([1.0, float("nan"), 0.0, 0.0])
 
 
-def test_scoring_uses_equal_member_scale_not_raw_logit_magnitude() -> None:
+def test_scoring_uses_epistemic_lcb_on_comparable_bounded_utilities() -> None:
     class FixedModel:
         def __init__(self, rank: list[float]):
             self.rank = torch.tensor(rank, dtype=torch.float32)
@@ -166,17 +166,19 @@ def test_scoring_uses_equal_member_scale_not_raw_logit_magnitude() -> None:
                 "joint_recovery_probability": zeros,
             }
 
-    # One large-scale member prefers candidate 0; four equal-weight members
-    # prefer candidate 1. Raw averaging would incorrectly choose candidate 0.
-    models = [FixedModel([100.0, 0.0, 0.0, 0.0])] + [
-        FixedModel([0.0, 1.0, 0.0, 0.0]) for _ in range(4)
+    # Candidate 0 has the larger mean only because one member assigns utility
+    # one while the other four assign zero.  Candidate 1 has a smaller but
+    # unanimous bounded utility, so the frozen epistemic LCB prefers it.
+    models = [FixedModel([1.0, 0.15, 0.0, 0.0])] + [
+        FixedModel([0.0, 0.15, 0.0, 0.0]) for _ in range(4)
     ]
     scored = runner.score_candidates(models, {})
     assert int(np.argmax(scored["candidate_rank_score_mean"])) == 0
     assert scored["selected_candidate_index"] == 1
     assert int(
-        np.argmax(scored["candidate_rank_score_standardized_ensemble"])
+        np.argmax(scored["candidate_rank_score_epistemic_lcb_ensemble"])
     ) == 1
+    assert "candidate_rank_score_standardized_ensemble" not in scored
     assert len(scored["candidate_rank_score_raw_member_candidate_population_std"]) == 5
 
 
@@ -246,7 +248,7 @@ def test_pair_records_discordance_and_requires_same_initial_candidates() -> None
     runner.validate_pair_record(pair, expected)
     corrupted = copy.deepcopy(pair)
     corrupted["rollouts"]["etsf_best_of_4"]["decisions"][0]["critic_scores"][
-        "candidate_rank_score_standardized_ensemble"
+        "candidate_rank_score_epistemic_lcb_ensemble"
     ][0] += 0.25
     corrupted["pair_sha256"] = runner.canonical_sha256(
         {key: value for key, value in corrupted.items() if key != "pair_sha256"}

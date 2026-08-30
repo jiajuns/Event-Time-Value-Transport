@@ -46,7 +46,7 @@ EXPECTED_EVENT_MODULE_SHA256 = (
     "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
 )
 EXPECTED_RUNNER_SHA256 = (
-    "5999cd50cbd4785d5d5cec3e9cdc77dba54228fc9c87f131c68ea82be51c2803"
+    "049017f53c0f9a3e462ea29db7d351075cc6f3d427f5c63a851fd1a154db9093"
 )
 EXPECTED_EVALUATOR_SHA256 = (
     "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"
@@ -77,16 +77,15 @@ EXPECTED_MEMBERS_PER_FOLD = 5
 ACTION_EXEC_STEPS = 5
 MAX_STEPS = 200
 FPS = 15
-STANDARDIZED_RANK_ENSEMBLE_CONTRACT = {
-    "format": "etsf_within_decision_standardized_rank_ensemble_v1",
+RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT = {
+    "format": "etsf_bounded_utility_epistemic_lcb_ensemble_v1",
     "member_count": 5,
     "candidate_count": 4,
-    "member_transform": "subtract_candidate_mean_divide_population_std",
+    "member_score_contract": "same_bounded_monotone_physical_utility",
     "population_std_correction": 0,
-    "std_floor": 1e-6,
-    "member_with_std_at_or_below_floor": "all_zero_contribution",
-    "aggregation": "equal_mean_over_exactly_five_member_contributions",
-    "normalization_scope": "one_four_candidate_decision_per_member",
+    "epistemic_risk_weight": 0.25,
+    "aggregation": "member_mean_minus_weight_times_member_population_std",
+    "within_member_candidate_standardization": False,
 }
 
 
@@ -862,7 +861,7 @@ def validate_runner_contract(paths: FormalPaths, binding: Mapping[str, Any]) -> 
         or contract.get("max_steps") != MAX_STEPS
         or contract.get("fps") != float(FPS)
         or contract.get("candidate_rank_ensemble_contract")
-        != STANDARDIZED_RANK_ENSEMBLE_CONTRACT
+        != RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT
         or contract.get("no_training") is not True
     ):
         raise PairedWatcherError("runner execution contract differs from watcher binding")

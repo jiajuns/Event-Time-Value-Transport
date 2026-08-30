@@ -1075,7 +1075,7 @@ def summarize_fold(
         or ensemble_selection.get("common_step_required_for_all_five_members")
         is not True
         or ensemble_selection.get("rank_aggregation", {}).get("format")
-        != "etsf_within_decision_standardized_rank_ensemble_v1"
+        != "etsf_bounded_utility_epistemic_lcb_ensemble_v1"
         or not isinstance(
             ensemble_selection.get("selected_ensemble_candidate_ranking"),
             Mapping,

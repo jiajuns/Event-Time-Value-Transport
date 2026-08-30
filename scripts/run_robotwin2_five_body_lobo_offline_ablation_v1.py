@@ -545,8 +545,8 @@ def evaluate_deployed_ensemble_predictions(
 ) -> dict[str, Any]:
     """Score heldout branches with the exact five-member deployed ensemble.
 
-    Proper probabilities are mixed in probability/density space.  Rank logits
-    use the trainer-exported within-decision standardized aggregation contract.
+    Proper probabilities are mixed in probability/density space.  Rank utilities
+    use the trainer-exported epistemic lower-confidence aggregation contract.
     No target is used to fit, calibrate, threshold or select any member/variant.
     """
 
@@ -837,7 +837,7 @@ def evaluate_deployed_ensemble_predictions(
         ] != list(range(trainer.CANDIDATE_COUNT)):
             raise AblationError(f"heldout decision is incomplete: {group}")
         raw_member_scores = torch.as_tensor(members["rank"][:, ordered])
-        aggregate_score = trainer.aggregate_standardized_rank_scores(
+        aggregate_score = trainer.aggregate_risk_adjusted_rank_scores(
             raw_member_scores
         ).detach().cpu().numpy()
         success_score = members["success_probability"][:, ordered].mean(axis=0)
@@ -845,14 +845,10 @@ def evaluate_deployed_ensemble_predictions(
         success_selected = int(np.argmax(success_score))
         labels = values["success"][ordered].astype(np.float64)
         decision_member_scores = members["rank"][:, ordered]
-        member_std = decision_member_scores.std(axis=1)
-        active_members = member_std > float(trainer.RANK_ENSEMBLE_STD_FLOOR)
-        member_choices = np.argmax(decision_member_scores[active_members], axis=1)
+        member_choices = np.argmax(decision_member_scores, axis=1)
         rank_success_disagreement.append(float(selected != success_selected))
         rank_member_disagreement.append(
             1.0
-            if not len(member_choices)
-            else 1.0
             - float(np.bincount(member_choices, minlength=4).max())
             / len(member_choices)
         )
@@ -871,8 +867,7 @@ def evaluate_deployed_ensemble_predictions(
         np.asarray(rank_member_disagreement),
         error_kind="selected_candidate_binary_failure",
         uncertainty_kind=(
-            "one_minus_modal_fraction_of_active_standardizable_member_rank_argmax_"
-            "all_constant_is_one"
+            "one_minus_modal_fraction_of_five_bounded_utility_member_argmax"
         ),
     )
     rank_oracle_regret_curve = _risk_coverage(
@@ -880,8 +875,7 @@ def evaluate_deployed_ensemble_predictions(
         np.asarray(rank_member_disagreement),
         error_kind="oracle_success_minus_selected_success",
         uncertainty_kind=(
-            "one_minus_modal_fraction_of_active_standardizable_member_rank_argmax_"
-            "all_constant_is_one"
+            "one_minus_modal_fraction_of_five_bounded_utility_member_argmax"
         ),
     )
     risk = {
@@ -1163,7 +1157,7 @@ def summarize_fold(
         or ensemble_selection.get("common_step_required_for_all_five_members")
         is not True
         or ensemble_selection.get("rank_aggregation")
-        != trainer.standardized_rank_ensemble_contract()
+        != trainer.risk_adjusted_rank_ensemble_contract()
         or ensemble_selection.get("heldout_rows_used") != 0
         or any(
             member.get("best_step") != ensemble_selection.get("selected_step")
@@ -1185,7 +1179,7 @@ def summarize_fold(
     }
 
 
-class _FrozenRankEnsemble(trainer.StandardizedRankEnsemble):
+class _FrozenRankEnsemble(trainer.RiskAdjustedRankEnsemble):
     """Match formal inference with the frozen within-decision rank contract."""
 
     def __init__(
@@ -1303,7 +1297,7 @@ def evaluate_posthoc_heldout_fold(
         "candidate_ranking_estimand": ranking["estimand"],
         "heldout_decisions": len(groups),
         "heldout_branches": len(rows),
-        "candidate_metric_aggregation": trainer.STANDARDIZED_RANK_ENSEMBLE_CONTRACT,
+        "candidate_metric_aggregation": trainer.RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT,
         "prediction_metric_aggregation": (
             "five_frozen_members_mixed_in_probability_or_density_space_then_scored"
         ),
@@ -1546,7 +1540,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "heldout_results_reporting_only": True,
         },
         "posthoc_prediction_evaluation_contract": {
-            "candidate_rank_ensemble": trainer.STANDARDIZED_RANK_ENSEMBLE_CONTRACT,
+            "candidate_rank_ensemble": trainer.RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT,
             "proper_prediction_aggregation": (
                 "five_frozen_members_mixed_in_probability_or_density_space_before_scoring"
             ),

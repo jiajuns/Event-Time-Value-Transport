@@ -22,6 +22,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     _candidate_rank_loss,
     _dense_soft_listwise_loss,
     _robust_object_effect_loss,
+    _semantic_comparative_loss,
     _terminal_consequence_loss,
     ABLATION_VARIANTS,
     ACTOR_FORMAT,
@@ -35,28 +36,34 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     DEFAULT_INSTRUCTION,
     EVENT_SPEC_SHA256,
     EVENT_AGE_CONTRACT,
+    GOAL_PROGRESS_NORMALIZATION_METERS,
     TERMINAL_HORIZON_CONTRACT,
     BRANCH_ROOT_SNAPSHOT_CONTRACT,
     CANDIDATE_RANK_FEATURE_DIM,
     CANDIDATE_RANK_FEATURE_SCHEMA,
     DENSE_FAILURE_RANK_WEIGHT,
     DENSE_GOAL_PROGRESS_TEMPERATURE_METERS,
+    EPISTEMIC_RANK_RISK_WEIGHT,
     BRANCH_DIAGNOSTIC_CONTRACT,
     EffectAlignedSharedEventHead,
+    InvariantMonotoneConsequenceUtility,
     MANIFEST_FORMAT,
     MATERIALIZATION_FORMAT,
     MacroBalancedRankDecisionBatchSampler,
     MODEL_FAMILY,
     OBJECT_EFFECT_SCHEMA,
     PREREGISTRATION_SHA256,
-    STANDARDIZED_RANK_ENSEMBLE_CONTRACT,
+    RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT,
+    MONOTONE_BENEFIT_FEATURES,
+    MONOTONE_RISK_FEATURES,
+    SEMANTIC_COMPARATIVE_LOSS_WEIGHT,
     TERMINAL_SUPERVISION_CONTRACT,
     SOURCE_EVENT_SAMPLING_HZ,
     TASK,
     FiveBodyContractError,
     ablation_contract,
     ablation_selection_components,
-    aggregate_standardized_rank_scores,
+    aggregate_risk_adjusted_rank_scores,
     build_preflight_receipt,
     canonical_sha256,
     checkpoint_candidate_rank_contract,
@@ -661,6 +668,63 @@ def test_terminal_proper_loss_updates_long_horizon_predictors_and_backbone() -> 
     assert any(parameter.grad is not None for parameter in model.transition.parameters())
 
 
+def test_semantic_comparative_loss_updates_terminal_locations_not_utility_or_scales(
+) -> None:
+    torch.manual_seed(12)
+    model = EffectAlignedSharedEventHead().eval()
+    batch = _model_batch(torch.full((8,), 5.0 / 15.0))
+    batch.update(
+        {
+            "success": torch.tensor([0, 1, 0, 0, 0, 0, 0, 0]).float(),
+            "success_mask": torch.ones(8),
+            "terminal_max_event_id": torch.tensor([1, 4, 2, 3, 1, 2, 2, 1]),
+            "terminal_event_mask": torch.ones(8),
+            "terminal_goal_progress": torch.tensor(
+                [0.00, 0.20, 0.05, 0.10, -0.05, 0.02, 0.12, -0.02]
+            ),
+            "terminal_goal_progress_mask": torch.ones(8),
+            "logical_group": ["mixed"] * 4 + ["dense"] * 4,
+        }
+    )
+    original_success = batch["success"].clone()
+    output = model(batch)
+    loss, pieces = _semantic_comparative_loss(
+        output, batch, torch.ones(8), ablation_variant="full"
+    )
+    loss.backward()
+
+    def has_nonzero_gradient(module: torch.nn.Module) -> bool:
+        return any(
+            parameter.grad is not None and bool(torch.count_nonzero(parameter.grad))
+            for parameter in module.parameters()
+        )
+
+    assert torch.isfinite(loss)
+    assert pieces["semantic_mixed_groups_in_batch"] == 1
+    assert pieces["semantic_dense_groups_in_batch"] == 1
+    torch.testing.assert_close(
+        loss,
+        SEMANTIC_COMPARATIVE_LOSS_WEIGHT
+        * (
+            pieces["semantic_comparative_mixed_success"]
+            + pieces["semantic_comparative_dense_event_goal"]
+        ),
+    )
+    assert has_nonzero_gradient(model.terminal_event)
+    assert has_nonzero_gradient(model.terminal_goal_progress_mean)
+    assert has_nonzero_gradient(model.terminal_context_encoder)
+    assert has_nonzero_gradient(model.transition)
+    assert has_nonzero_gradient(model.action)
+    assert has_nonzero_gradient(model.semantic)
+    assert not has_nonzero_gradient(model.candidate_rank)
+    assert not has_nonzero_gradient(model.terminal_goal_progress_scale)
+    assert not has_nonzero_gradient(model.object_scale)
+    assert not has_nonzero_gradient(model.clock)
+    assert not has_nonzero_gradient(model.duration_mean)
+    assert not has_nonzero_gradient(model.duration_scale)
+    assert torch.equal(batch["success"], original_success)
+
+
 def test_single_failure_class_trains_coherent_success_without_synthetic_positive() -> None:
     torch.manual_seed(10)
     model = EffectAlignedSharedEventHead().train()
@@ -714,62 +778,127 @@ def test_rank_features_are_only_explicit_predicted_consequences() -> None:
         start, stop = CANDIDATE_RANK_FEATURE_SCHEMA[name]
         return features[:, start:stop]
 
+    event_level = torch.arange(5, dtype=features.dtype)[None] / 4.0
+    current = batch["current_event_id"][:, None]
+    post_probability = torch.softmax(output["post_event_logits"], dim=-1)
+    next_probability = torch.softmax(output["next_event_logits"], dim=-1)
+    terminal_probability = torch.softmax(output["terminal_event_logits"], dim=-1)
     assert torch.allclose(
-        block("post_event_probability"),
-        torch.softmax(output["post_event_logits"], -1),
+        block("post_expected_stage_progress")[:, 0],
+        (post_probability * event_level).sum(dim=-1),
     )
+    positive_next_delta = (
+        torch.arange(5)[None] - current
+    ).clamp_min(0).to(features) / 4.0
     assert torch.allclose(
-        block("next_event_probability"),
-        torch.softmax(output["next_event_logits"], -1),
+        block("next_event_advance_rate")[:, 0],
+        (next_probability * positive_next_delta).sum(dim=-1)
+        / (1.0 + output["expected_duration_seconds"]),
     )
     assert torch.allclose(
         block("success_probability")[:, 0], torch.sigmoid(output["success_logit"])
     )
     assert torch.allclose(
-        block("regression_probability")[:, 0], output["regression_probability"]
-    )
-    assert torch.allclose(
-        block("joint_recovery_probability")[:, 0],
-        output["joint_recovery_probability"],
-    )
-    assert torch.count_nonzero(block("regression_probability")) == 0
-    assert torch.count_nonzero(block("joint_recovery_probability")) == 0
-    assert torch.allclose(
-        block("duration_log1p_mean")[:, 0], output["duration_selected_log_mean"]
-    )
-    assert torch.allclose(
-        block("duration_log1p_scale")[:, 0],
-        torch.exp(output["duration_selected_log_scale"]),
-    )
-    assert torch.allclose(block("object_delta_mean"), output["object_delta_mean"])
-    assert torch.allclose(
-        block("object_delta_scale"), torch.exp(output["object_delta_log_scale"])
+        block("no_unrecovered_regression_probability")[:, 0],
+        1.0
+        - (
+            output["regression_probability"]
+            - output["joint_recovery_probability"]
+        ).clamp(0.0, 1.0),
     )
     expected_progress = torch.linalg.vector_norm(batch["state"][:, :3], dim=-1) - (
         torch.linalg.vector_norm(
             batch["state"][:, :3] - output["object_delta_mean"][:, :3], dim=-1
         )
     )
-    assert torch.allclose(block("predicted_goal_progress")[:, 0], expected_progress)
     assert torch.allclose(
-        block("predicted_goal_progress_uncertainty")[:, 0],
-        output["predicted_goal_progress_uncertainty"],
-    )
-    assert torch.all(
-        block("predicted_goal_progress_uncertainty")[:, 0] > 0.0
-    )
-    assert torch.allclose(
-        block("terminal_event_probability"),
-        torch.softmax(output["terminal_event_logits"], dim=-1),
+        block("short_goal_progress_benefit")[:, 0],
+        0.5
+        * (
+            torch.tanh(expected_progress / GOAL_PROGRESS_NORMALIZATION_METERS) + 1.0
+        ),
     )
     assert torch.allclose(
-        block("terminal_goal_progress_mean")[:, 0],
-        output["terminal_goal_progress_mean"],
+        block("short_goal_progress_uncertainty_risk")[:, 0],
+        torch.tanh(
+            output["predicted_goal_progress_uncertainty"]
+            / GOAL_PROGRESS_NORMALIZATION_METERS
+        ).clamp(0.0, 1.0),
     )
     assert torch.allclose(
-        block("terminal_goal_progress_scale")[:, 0],
-        torch.exp(output["terminal_goal_progress_log_scale"]),
+        block("terminal_expected_stage_progress")[:, 0],
+        (terminal_probability * event_level).sum(dim=-1),
     )
+    assert torch.allclose(
+        block("terminal_goal_progress_benefit")[:, 0],
+        0.5
+        * (
+            torch.tanh(
+                output["terminal_goal_progress_mean"]
+                / GOAL_PROGRESS_NORMALIZATION_METERS
+            )
+            + 1.0
+        ),
+    )
+    assert torch.allclose(
+        block("terminal_goal_progress_uncertainty_risk")[:, 0],
+        torch.tanh(
+            output["terminal_goal_progress_std"]
+            / GOAL_PROGRESS_NORMALIZATION_METERS
+        ).clamp(0.0, 1.0),
+    )
+    assert bool(((features >= 0.0) & (features <= 1.0)).all())
+
+
+def test_bounded_utility_is_monotone_and_has_no_raw_world_axis() -> None:
+    assert CANDIDATE_RANK_FEATURE_DIM == 9
+    assert set(CANDIDATE_RANK_FEATURE_SCHEMA) == set(MONOTONE_BENEFIT_FEATURES) | set(
+        MONOTONE_RISK_FEATURES
+    )
+    assert set(MONOTONE_BENEFIT_FEATURES).isdisjoint(MONOTONE_RISK_FEATURES)
+    assert all(
+        stop - start == 1 for start, stop in CANDIDATE_RANK_FEATURE_SCHEMA.values()
+    )
+    assert not any(
+        token in name
+        for name in CANDIDATE_RANK_FEATURE_SCHEMA
+        for token in ("object_delta", "world_axis", "axis_angle")
+    )
+
+    utility = InvariantMonotoneConsequenceUtility().eval()
+    assert not any(
+        isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm))
+        for module in utility.modules()
+    )
+    baseline_features = torch.full((1, CANDIDATE_RANK_FEATURE_DIM), 0.4)
+    baseline_score = utility(baseline_features)[0]
+    for name in MONOTONE_BENEFIT_FEATURES:
+        improved = baseline_features.clone()
+        improved[:, CANDIDATE_RANK_FEATURE_SCHEMA[name][0]] += 0.1
+        assert utility(improved)[0] > baseline_score
+    for name in MONOTONE_RISK_FEATURES:
+        riskier = baseline_features.clone()
+        riskier[:, CANDIDATE_RANK_FEATURE_SCHEMA[name][0]] += 0.1
+        assert utility(riskier)[0] < baseline_score
+
+    # Moving 0.1 terminal probability mass from e4 (level .75) to eK (1.0)
+    # raises both expected stage by .025 and coherent success by .1.  Even a
+    # utility dominated by stage progress must therefore prefer the shift.
+    with torch.no_grad():
+        utility.benefit_logits.fill_(-10.0)
+        terminal_stage_index = MONOTONE_BENEFIT_FEATURES.index(
+            "terminal_expected_stage_progress"
+        )
+        utility.benefit_logits[terminal_stage_index] = 10.0
+    before_success_shift = baseline_features.clone()
+    after_success_shift = baseline_features.clone()
+    after_success_shift[
+        :, CANDIDATE_RANK_FEATURE_SCHEMA["terminal_expected_stage_progress"][0]
+    ] += 0.025
+    after_success_shift[
+        :, CANDIDATE_RANK_FEATURE_SCHEMA["success_probability"][0]
+    ] += 0.1
+    assert utility(after_success_shift)[0] > utility(before_success_shift)[0]
 
 
 def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
@@ -777,10 +906,10 @@ def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
     linear = torch.nn.Linear(CANDIDATE_RANK_FEATURE_DIM, 1, bias=False)
     with torch.no_grad():
         linear.weight.zero_()
-        duration_start, _duration_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
-            "duration_log1p_mean"
+        advance_start, _advance_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
+            "next_event_advance_rate"
         ]
-        linear.weight[0, duration_start] = 1.0
+        linear.weight[0, advance_start] = 1.0
         model.clock.body_beta.weight.zero_()
         model.clock.base_tau.weight.zero_()
         model.clock.base_tau.bias.zero_()
@@ -851,26 +980,30 @@ def test_terminal_prediction_conditions_on_remaining_action_budget() -> None:
     )
 
 
-def test_rank_ensemble_standardizes_each_member_within_one_decision() -> None:
+def test_rank_ensemble_uses_mean_minus_quarter_population_std() -> None:
     scores = torch.tensor(
         [
-            [1.0, 0.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0, 0.0],
-            [4.0, 0.0, 0.0, 0.0],
-            [7.0, 7.0, 7.0, 7.0],
-            [0.0, 100.0, 0.0, 0.0],
+            [0.6, 1.0, 0.4, 0.0],
+            [0.6, 1.0, 0.4, 0.0],
+            [0.6, 1.0, 0.4, 0.0],
+            [0.6, 0.0, 0.4, 0.0],
+            [0.6, 0.0, 0.4, 0.0],
         ]
     )
-    assert int(scores.mean(0).argmax()) == 1
-    aggregate = aggregate_standardized_rank_scores(scores)
+    assert scores.mean(0)[0] == scores.mean(0)[1]
+    aggregate = aggregate_risk_adjusted_rank_scores(scores)
+    expected = scores.mean(dim=0) - 0.25 * scores.std(dim=0, correction=0)
     assert aggregate.shape == (4,)
+    torch.testing.assert_close(aggregate, expected)
     assert int(aggregate.argmax()) == 0
-    assert STANDARDIZED_RANK_ENSEMBLE_CONTRACT["population_std_correction"] == 0
-    assert STANDARDIZED_RANK_ENSEMBLE_CONTRACT[
-        "member_with_std_at_or_below_floor"
-    ] == "all_zero_contribution"
-    constant_only = aggregate_standardized_rank_scores(torch.ones(5, 4))
-    assert torch.equal(constant_only, torch.zeros(4))
+    assert aggregate[0] > aggregate[1]
+    assert EPISTEMIC_RANK_RISK_WEIGHT == 0.25
+    assert RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT["population_std_correction"] == 0
+    assert RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT[
+        "within_member_candidate_standardization"
+    ] is False
+    constant_only = aggregate_risk_adjusted_rank_scores(torch.ones(5, 4))
+    assert torch.equal(constant_only, torch.ones(4))
 
 
 def _effect_loss(
@@ -1440,15 +1573,17 @@ def test_checkpoint_selection_uses_dense_evidence_when_mixed_is_absent() -> None
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
-    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v6"
+    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v7"
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
-    assert torch.equal(
-        success_only["candidate_rank_logit"], success_only["success_logit"]
+    torch.testing.assert_close(
+        success_only["candidate_rank_logit"],
+        torch.sigmoid(success_only["success_logit"]),
     )
     no_time = EffectAlignedSharedEventHead("no_time_duration").eval()(batch)
-    duration_start = CANDIDATE_RANK_FEATURE_SCHEMA["duration_log1p_mean"][0]
-    duration_stop = CANDIDATE_RANK_FEATURE_SCHEMA["duration_log1p_scale"][1]
+    duration_start, duration_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
+        "next_event_advance_rate"
+    ]
     assert torch.count_nonzero(
         no_time["candidate_rank_features"][:, duration_start:duration_stop]
     ) == 0
@@ -1461,39 +1596,37 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
         "no_time_duration"
     ).eval()(no_time_pair)
     terminal_start = CANDIDATE_RANK_FEATURE_SCHEMA[
-        "terminal_event_probability"
+        "terminal_expected_stage_progress"
     ][0]
     terminal_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
-        "terminal_goal_progress_scale"
+        "terminal_goal_progress_uncertainty_risk"
     ][1]
     torch.testing.assert_close(
         no_time_pair_output["candidate_rank_features"][0, terminal_start:terminal_stop],
         no_time_pair_output["candidate_rank_features"][1, terminal_start:terminal_stop],
     )
-    object_start = CANDIDATE_RANK_FEATURE_SCHEMA["object_delta_mean"][0]
-    object_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
-        "predicted_goal_progress_uncertainty"
-    ][1]
     no_object = EffectAlignedSharedEventHead("no_object_effect").eval()(batch)
-    assert torch.count_nonzero(
-        no_object["candidate_rank_features"][:, object_start:object_stop]
-    ) == 0
-    terminal_goal_start = CANDIDATE_RANK_FEATURE_SCHEMA[
-        "terminal_goal_progress_mean"
-    ][0]
-    terminal_goal_stop = CANDIDATE_RANK_FEATURE_SCHEMA[
-        "terminal_goal_progress_scale"
-    ][1]
-    assert torch.count_nonzero(
-        no_object["candidate_rank_features"][:, terminal_goal_start:terminal_goal_stop]
-    ) == 0
+    object_feature_names = (
+        "short_goal_progress_benefit",
+        "short_goal_progress_uncertainty_risk",
+        "terminal_goal_progress_benefit",
+        "terminal_goal_progress_uncertainty_risk",
+    )
+    for name in object_feature_names:
+        start, stop = CANDIDATE_RANK_FEATURE_SCHEMA[name]
+        assert torch.count_nonzero(
+            no_object["candidate_rank_features"][:, start:stop]
+        ) == 0
     full = EffectAlignedSharedEventHead("full").eval()(batch)
     assert torch.count_nonzero(
         full["candidate_rank_features"][:, duration_start:duration_stop]
     ) > 0
-    assert torch.count_nonzero(
-        full["candidate_rank_features"][:, object_start:object_stop]
-    ) > 0
+    for name in object_feature_names:
+        start, stop = CANDIDATE_RANK_FEATURE_SCHEMA[name]
+        values = full["candidate_rank_features"][:, start:stop]
+        assert bool(((values >= 0.0) & (values <= 1.0)).all())
+        if name.endswith("uncertainty_risk"):
+            assert torch.count_nonzero(values) > 0
     assert set(ABLATION_VARIANTS) == {
         "success_only", "no_time_duration", "no_object_effect", "full"
     }
@@ -1534,8 +1667,11 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     full_contract = checkpoint_candidate_rank_contract("full")
     assert full_contract["direct_transitioned_or_clock_hidden_rank_path"] is False
     assert full_contract["rank_inputs_are_detached_consequence_predictions"] is True
-    assert full_contract["rank_loss_updates_semantic_action_transition"] is False
-    assert full_contract["rank_loss_updates_consequence_predictors"] is False
+    assert full_contract["utility_rank_loss_updates_semantic_action_transition"] is False
+    assert full_contract["utility_rank_loss_updates_consequence_predictors"] is False
+    assert full_contract["semantic_comparative_loss_updates_terminal_predictors"] is True
+    assert full_contract["raw_world_frame_object_axes_in_rank_input"] is False
+    assert full_contract["cross_feature_layer_normalization"] is False
     assert full_contract["feature_schema"] == {
         name: list(bounds) for name, bounds in CANDIDATE_RANK_FEATURE_SCHEMA.items()
     }
@@ -1593,7 +1729,7 @@ def _ablation_fold_summary(body: str, variant: str, offset: float) -> dict[str, 
         "synthetic_success_labels": 0,
         "ensemble_checkpoint_selection": {
             "common_step_required_for_all_five_members": True,
-            "rank_aggregation": ablation.trainer.standardized_rank_ensemble_contract(),
+            "rank_aggregation": ablation.trainer.risk_adjusted_rank_ensemble_contract(),
             "selected_step": 3000,
             "heldout_rows_used": 0,
         },
@@ -1775,7 +1911,7 @@ def test_ablation_posthoc_heldout_uses_frozen_five_member_rank_ensemble(
     assert result["heldout_labels_used_for_training_checkpoint_or_variant_selection"] is False
     assert set(result["metrics"]) == set(ablation.POSTHOC_ENSEMBLE_METRICS)
     assert result["candidate_metric_aggregation"] == (
-        ablation.trainer.STANDARDIZED_RANK_ENSEMBLE_CONTRACT
+        ablation.trainer.RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT
     )
     assert result["prediction_metric_aggregation"] == (
         "five_frozen_members_mixed_in_probability_or_density_space_then_scored"

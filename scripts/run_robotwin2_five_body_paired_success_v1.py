@@ -421,7 +421,7 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
         or ensemble_selection.get("common_step_required_for_all_five_members")
         is not True
         or ensemble_selection.get("rank_aggregation")
-        != shared_head.standardized_rank_ensemble_contract()
+        != shared_head.risk_adjusted_rank_ensemble_contract()
         or not isinstance(ensemble_selection.get("selected_step"), int)
         or ensemble_selection.get("selected_step", 0) <= 0
         or ensemble_selection.get("heldout_rows_used") != 0
@@ -674,17 +674,17 @@ def score_candidates(
         )
     ):
         raise PairedExecutionError("LOBO ensemble produced a non-finite score")
-    standardized = shared_head.aggregate_standardized_rank_scores(
+    risk_adjusted = shared_head.aggregate_risk_adjusted_rank_scores(
         torch.as_tensor(ranks)
     ).cpu().numpy()
     raw_candidate_mean = ranks.mean(axis=0)
     raw_candidate_std = ranks.std(axis=0, ddof=0)
     raw_member_candidate_mean = ranks.mean(axis=1)
     raw_member_candidate_std = ranks.std(axis=1, ddof=0)
-    selected = select_candidate(standardized.tolist())
+    selected = select_candidate(risk_adjusted.tolist())
     return {
         "selected_candidate_index": selected,
-        "candidate_rank_score_standardized_ensemble": standardized.astype(float).tolist(),
+        "candidate_rank_score_epistemic_lcb_ensemble": risk_adjusted.astype(float).tolist(),
         "candidate_rank_score_mean": raw_candidate_mean.astype(float).tolist(),
         "candidate_rank_score_raw_candidate_population_std": (
             raw_candidate_std.astype(float).tolist()
@@ -1110,14 +1110,14 @@ def _validate_rollout_decisions(
             raise PairedExecutionError("ETSF decision lacks a valid pre-action event age")
         raw = np.asarray(scores.get("candidate_rank_score_members"), dtype=np.float64)
         recorded = np.asarray(
-            scores.get("candidate_rank_score_standardized_ensemble"),
+            scores.get("candidate_rank_score_epistemic_lcb_ensemble"),
             dtype=np.float64,
         )
         if raw.shape != (5, CANDIDATE_COUNT) or recorded.shape != (CANDIDATE_COUNT,):
             raise PairedExecutionError("ETSF critic score shape changed")
         if not np.isfinite(raw).all() or not np.isfinite(recorded).all():
             raise PairedExecutionError("ETSF critic score is non-finite")
-        recomputed = shared_head.aggregate_standardized_rank_scores(
+        recomputed = shared_head.aggregate_risk_adjusted_rank_scores(
             torch.as_tensor(raw)
         ).cpu().numpy()
         raw_mean = raw.mean(axis=0)
@@ -1137,7 +1137,7 @@ def _validate_rollout_decisions(
             ),
         )
         if not np.allclose(recorded, recomputed, atol=1e-6, rtol=0.0):
-            raise PairedExecutionError("ETSF standardized ensemble score cannot be replayed")
+            raise PairedExecutionError("ETSF epistemic LCB score cannot be replayed")
         for observed, expected_values in recorded_arrays:
             observed_array = np.asarray(observed, dtype=np.float64)
             if observed_array.shape != expected_values.shape or not np.allclose(
@@ -1424,7 +1424,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vlm_metadata_size_bytes": vlm_size,
         "folds": folds,
         "candidate_rank_ensemble_contract": (
-            shared_head.standardized_rank_ensemble_contract()
+            shared_head.risk_adjusted_rank_ensemble_contract()
         ),
         "event_spec": str(event_spec_path),
         "event_spec_sha256": EVENT_SPEC_SHA256,
@@ -1662,7 +1662,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "execution_contract_logical_sha256": contract["logical_sha256"],
         "execution_contract_file_sha256": contract_file_sha256,
         "candidate_rank_ensemble_contract": (
-            shared_head.standardized_rank_ensemble_contract()
+            shared_head.risk_adjusted_rank_ensemble_contract()
         ),
         "pair_count": len(rows),
         "rollout_count": len(rows) * 2,

@@ -50,7 +50,7 @@ def test_inventory_is_full_and_uses_late_episode_queries() -> None:
         ablation.validate_complete_inventory(audit)
 
 
-def test_standardized_frozen_rank_ensemble_prevents_raw_scale_domination() -> None:
+def test_risk_adjusted_frozen_rank_ensemble_uses_bounded_member_consensus() -> None:
     class FixedRank(torch.nn.Module):
         def __init__(self, scores: list[float]) -> None:
             super().__init__()
@@ -59,9 +59,9 @@ def test_standardized_frozen_rank_ensemble_prevents_raw_scale_domination() -> No
         def forward(self, _batch: dict[str, object]) -> dict[str, torch.Tensor]:
             return {"candidate_rank_logit": self.scores}
 
-    # One member has a huge raw scale and selects candidate 1.  The other four
-    # equally weighted standardized members select candidate 2.
-    models = [FixedRank([0.0, 1_000.0, 0.0, 0.0])] + [
+    # Every deployed member emits the same bounded physical utility.  One
+    # member prefers candidate 1, while four members agree on candidate 2.
+    models = [FixedRank([0.0, 1.0, 0.0, 0.0])] + [
         FixedRank([0.0, 0.0, 1.0, 0.0]) for _ in range(4)
     ]
     ensemble = ablation._FrozenRankEnsemble(models)
@@ -72,9 +72,15 @@ def test_standardized_frozen_rank_ensemble_prevents_raw_scale_domination() -> No
         }
     )["candidate_rank_logit"]
     assert int(output.argmax()) == 2
-    assert ablation.trainer.STANDARDIZED_RANK_ENSEMBLE_CONTRACT[
-        "normalization_scope"
-    ] == "one_four_candidate_decision_per_member"
+    assert ablation.trainer.RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT[
+        "epistemic_risk_weight"
+    ] == 0.25
+    assert (
+        ablation.trainer.RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT[
+            "within_member_candidate_standardization"
+        ]
+        is False
+    )
 
 
 class _PerfectPredictionModel(torch.nn.Module):

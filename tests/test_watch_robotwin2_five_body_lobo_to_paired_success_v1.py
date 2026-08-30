@@ -262,7 +262,7 @@ def test_analytic_and_execution_code_identities_are_frozen() -> None:
         "d236036e4121232391808743a957e8ae94722ea89df223d123f8a77296f9e6d9"
     )
     assert watcher.EXPECTED_RUNNER_SHA256 == (
-        "5999cd50cbd4785d5d5cec3e9cdc77dba54228fc9c87f131c68ea82be51c2803"
+        "049017f53c0f9a3e462ea29db7d351075cc6f3d427f5c63a851fd1a154db9093"
     )
     assert watcher.EXPECTED_EVALUATOR_SHA256 == (
         "6e0f2a9b370f6c8fb66caf8c01e55747f4b882ced3657a1a2b32346d9bda9984"
@@ -293,7 +293,7 @@ def test_completion_receipt_closes_contract_pair_and_outcome_chain(
     paths.output_root.mkdir(parents=True)
     contract_base = {
         "candidate_rank_ensemble_contract": (
-            watcher.STANDARDIZED_RANK_ENSEMBLE_CONTRACT
+            watcher.RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT
         )
     }
     contract = {
@@ -318,7 +318,7 @@ def test_completion_receipt_closes_contract_pair_and_outcome_chain(
         "execution_contract_logical_sha256": contract["logical_sha256"],
         "execution_contract_file_sha256": _sha(paths.execution_contract),
         "candidate_rank_ensemble_contract": (
-            watcher.STANDARDIZED_RANK_ENSEMBLE_CONTRACT
+            watcher.RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT
         ),
         "pair_count": watcher.EXPECTED_PAIRS,
         "rollout_count": watcher.EXPECTED_ROLLOUTS,
