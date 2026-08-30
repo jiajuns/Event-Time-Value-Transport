@@ -41,6 +41,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     CANONICAL_ACTION_SCHEMA,
     CANONICAL_STATE_SCHEMA,
     CANDIDATE_NOISE_CONTRACT,
+    DEFAULT_PROPER_BALANCE_MODE,
     DATASET_REPO,
     DATASET_REVISION,
     DEFAULT_INSTRUCTION,
@@ -64,6 +65,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     MATERIALIZATION_FORMAT,
     MacroBalancedRankDecisionBatchSampler,
     MODEL_FAMILY,
+    PROPER_BALANCE_MODES,
     OBJECT_EFFECT_SCHEMA,
     PREREGISTRATION_SHA256,
     RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT,
@@ -100,6 +102,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     candidate_checkpoint_selection_key,
     effect_preserving_group_bootstrap_weights,
     proper_outcome_preserving_group_bootstrap_weights,
+    proper_balance_contract,
     evaluate_candidate_ranking,
     evaluate_terminal_consequences,
     load_binding,
@@ -110,6 +113,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     sha256_file,
     sha256_tree,
     source_group_split,
+    source_causal_stratum_proper_weights,
     standardized_input_clip_diagnostics,
     supplement_group_bootstrap_weights,
     supplement_inner_validation_body,
@@ -165,6 +169,131 @@ def test_standardized_input_clip_diagnostics_reports_tail_collisions() -> None:
 def _write_json(path: Path, value: dict[str, object]) -> str:
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
     return sha256_file(path)
+
+
+def _proper_balance_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    strata = (
+        *((BODIES[0], "clean", 0, f"common-{index}") for index in range(4)),
+        (BODIES[0], "clean", 1, "rare-event"),
+        (BODIES[1], "randomized", 0, "rare-body-condition"),
+    )
+    for body, condition, event, suffix in strata:
+        group = f"{body}|{condition}|{suffix}"
+        for candidate in range(4):
+            rows.append(
+                {
+                    "logical_group": group,
+                    "candidate_index": np.int64(candidate),
+                    "body": body,
+                    "condition": condition,
+                    "current_event_id": np.int64(event),
+                    # Deliberately present every outcome family.  The balance
+                    # computation must remain invariant when these change.
+                    "success": float(candidate == 0),
+                    "post_event_id": candidate,
+                    "next_event_id": candidate,
+                    "duration_seconds": float(candidate + 1),
+                    "recovery": float(candidate == 2),
+                    "terminal_goal_progress": float(candidate) / 3.0,
+                    "object_effect": np.full(7, candidate, dtype=np.float32),
+                }
+            )
+    return rows
+
+
+def test_source_causal_proper_balance_is_tempered_label_blind_and_group_constant() -> None:
+    rows = _proper_balance_rows()
+    weights, audit = source_causal_stratum_proper_weights(
+        rows,
+        source_bodies=BODIES[:2],
+    )
+    common = f"{BODIES[0]}|clean|common-0"
+    rare_event = f"{BODIES[0]}|clean|rare-event"
+    rare_body = f"{BODIES[1]}|randomized|rare-body-condition"
+    assert weights[rare_event] / weights[common] == pytest.approx(2.0)
+    assert weights[rare_body] == pytest.approx(weights[rare_event])
+    assert sum(weights.values()) / len(weights) == pytest.approx(1.0)
+    assert audit["empirical_max_to_min_stratum_mass_ratio"] == pytest.approx(4.0)
+    assert audit["weighted_max_to_min_stratum_mass_ratio"] == pytest.approx(2.0)
+    assert audit["candidate_set_preserved"] is True
+    assert audit["outcome_label_fields_read"] == []
+    assert audit["heldout_rows_used"] == 0
+
+    changed = [dict(row) for row in rows]
+    for row in changed:
+        row["success"] = object()
+        row["post_event_id"] = object()
+        row["next_event_id"] = object()
+        row["duration_seconds"] = object()
+        row["recovery"] = object()
+        row["terminal_goal_progress"] = object()
+        row["object_effect"] = object()
+    changed_weights, changed_audit = source_causal_stratum_proper_weights(
+        changed,
+        source_bodies=BODIES[:2],
+    )
+    assert changed_weights == weights
+    assert changed_audit["causal_identity_and_weight_sha256"] == audit[
+        "causal_identity_and_weight_sha256"
+    ]
+
+
+def test_source_causal_proper_balance_empirical_ablation_exactly_recovers_v12() -> None:
+    weights, audit = source_causal_stratum_proper_weights(
+        _proper_balance_rows(),
+        source_bodies=BODIES[:2],
+        mode="empirical",
+    )
+    assert set(weights.values()) == {1.0}
+    assert audit["weighted_max_to_min_stratum_mass_ratio"] == pytest.approx(4.0)
+    assert proper_balance_contract("empirical")["enabled"] is False
+    assert DEFAULT_PROPER_BALANCE_MODE == "causal_body_condition_event_sqrt"
+    assert PROPER_BALANCE_MODES == (
+        "causal_body_condition_event_sqrt",
+        "empirical",
+    )
+
+
+def test_proper_balance_cli_defaults_to_v13_and_exposes_empirical_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = [
+        "trainer",
+        "--mode",
+        "preflight",
+        "--binding",
+        "binding.json",
+        "--binding-sha256",
+        "0" * 64,
+        "--held-out-body",
+        BODIES[0],
+    ]
+    monkeypatch.setattr(sys, "argv", required)
+    assert (
+        trainer_entry.parse_args().proper_balance_mode
+        == "causal_body_condition_event_sqrt"
+    )
+    monkeypatch.setattr(
+        sys, "argv", [*required, "--proper-balance-mode", "empirical"]
+    )
+    assert trainer_entry.parse_args().proper_balance_mode == "empirical"
+
+
+def test_source_causal_proper_balance_fails_closed_on_heldout_or_broken_decision() -> None:
+    rows = _proper_balance_rows()
+    with pytest.raises(FiveBodyContractError, match="invalid causal identity"):
+        source_causal_stratum_proper_weights(rows, source_bodies=BODIES[:1])
+    with pytest.raises(FiveBodyContractError, match="complete causal decision"):
+        source_causal_stratum_proper_weights(rows[:-1], source_bodies=BODIES[:2])
+    inconsistent = [dict(row) for row in rows]
+    inconsistent[1]["current_event_id"] = np.int64(1)
+    with pytest.raises(FiveBodyContractError, match="complete causal decision"):
+        source_causal_stratum_proper_weights(
+            inconsistent, source_bodies=BODIES[:2]
+        )
+    with pytest.raises(FiveBodyContractError, match="unknown proper balance mode"):
+        proper_balance_contract("label_balanced")
 
 
 def _group(
@@ -3879,7 +4008,17 @@ def test_ensemble_seeds_must_be_five_distinct_integers(
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
-    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v12"
+    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v13"
+    balance_ablation = ablation_contract("full")["proper_balance_ablation"]
+    assert balance_ablation == {
+        "axis": "--proper-balance-mode",
+        "default": "causal_body_condition_event_sqrt",
+        "control": "empirical",
+        "orthogonal_to_model_head_ablation": True,
+    }
+    assert proper_balance_contract(DEFAULT_PROPER_BALANCE_MODE)[
+        "checkpoint_or_inference_parameter_schema_changed"
+    ] is False
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
     torch.testing.assert_close(

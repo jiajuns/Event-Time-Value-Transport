@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Continue the complete v12 cross-body pipeline after actor protocol selection.
+"""Continue the complete v13 cross-body pipeline after actor protocol selection.
 
 This remote, standard-library watcher waits for the authenticated 200-pair
 execute-5/execute-50 comparison, freezes its prospectively defined winner as
 one immutable actor-execution protocol, runs the complete 8,000-branch primary
 collection, then invokes the protocol-bound supplement/LOBO/N1-N4-N8 watcher.
-It never selects a protocol from critic metrics and never changes the selected
-stride downstream.
+v13 keeps the v12 competing-risks model and adds source-only causal-stratum
+proper-loss balancing.  It never selects a protocol from critic metrics and
+never changes the selected stride downstream.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Any, Mapping, Sequence
 import robotwin2_actor_execution_protocol_v1 as actor_execution
 
 
-FORMAT = "etsf_robotwin2_actor_protocol_to_v12_crossbody_watcher_v1"
+FORMAT = "etsf_robotwin2_actor_protocol_to_v13_crossbody_watcher_v1"
 SELECTION_FORMAT = "etsf_robotwin2_actor_execution_protocol_selection_receipt_v1"
 ACTOR_REPORT_FORMAT = "etsf_robotwin2_actor_execute5_vs_execute50_report_v1"
 ACTOR_OUTCOME_FORMAT = "etsf_robotwin2_actor_execute5_vs_execute50_outcomes_v1"
@@ -417,21 +418,21 @@ def downstream_command(
         "--supplement-binding",
         str(root / "supplement_binding.json"),
         "--augmented-lobo-root",
-        str(root / "lobo_v12"),
+        str(root / "lobo_v13"),
         "--augmented-lobo-state",
-        str(root / "lobo_v12.watcher_state.json"),
+        str(root / "lobo_v13.watcher_state.json"),
         "--augmented-lobo-run-exit",
-        str(root / "lobo_v12.run.exit"),
+        str(root / "lobo_v13.run.exit"),
         "--augmented-n4-root",
         str(root / "formal_n4"),
         "--augmented-n8-root",
         str(root / "nested_n1_n4_n8"),
         "--state",
-        str(root / "v12_crossbody.watcher_state.json"),
+        str(root / "v13_crossbody.watcher_state.json"),
         "--run-exit",
-        str(root / "v12_crossbody.run.exit"),
+        str(root / "v13_crossbody.run.exit"),
         "--lock",
-        str(root / "v12_crossbody.lock"),
+        str(root / "v13_crossbody.lock"),
         "--log-root",
         str(root / "logs"),
     ]
@@ -582,10 +583,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     downstream = downstream_command(args, protocol_path, protocol_sha256)
-    downstream_log = args.run_root / "v12_crossbody_pipeline.log"
+    downstream_log = args.run_root / "v13_crossbody_pipeline.log"
     with downstream_log.open("a", encoding="utf-8") as stream:
         write_state(
-            "running_supplement_v12_lobo_and_nested_n1_n4_n8",
+            "running_supplement_v13_lobo_and_nested_n1_n4_n8",
             command=downstream,
         )
         result = subprocess.run(
@@ -597,22 +598,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if result.returncode != 0:
         raise CrossbodyContinuationError(
-            f"v12 cross-body watcher exited {result.returncode}"
+            f"v13 cross-body watcher exited {result.returncode}"
         )
     final_state = read_json(
-        args.run_root / "v12_crossbody.watcher_state.json",
-        "v12 cross-body final state",
+        args.run_root / "v13_crossbody.watcher_state.json",
+        "v13 cross-body final state",
     )
     if final_state.get("status") != "complete":
-        raise CrossbodyContinuationError("v12 cross-body watcher returned without completion")
+        raise CrossbodyContinuationError("v13 cross-body watcher returned without completion")
     write_state(
         "complete",
         actor_execution_protocol_binding=receipt[
             "actor_execution_protocol_binding"
         ],
-        downstream_state=str(args.run_root / "v12_crossbody.watcher_state.json"),
+        downstream_state=str(args.run_root / "v13_crossbody.watcher_state.json"),
         downstream_state_file_sha256=sha256_file(
-            args.run_root / "v12_crossbody.watcher_state.json"
+            args.run_root / "v13_crossbody.watcher_state.json"
         ),
         nested_report=final_state.get("nested_actor_n4_n8_report"),
     )

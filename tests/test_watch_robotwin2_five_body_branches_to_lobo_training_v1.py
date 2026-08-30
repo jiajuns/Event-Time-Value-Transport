@@ -69,6 +69,12 @@ def valid_fold_summary(
         )
     summary = {
         "status": "source_only_checkpoint_selection_complete",
+        "model_family": watcher.EXPECTED_MODEL_FAMILY,
+        "proper_source_balance": {
+            "mode": watcher.PROPER_BALANCE_MODE,
+            "enabled": True,
+            "heldout_rows_used": 0,
+        },
         "held_out_body": held_out_body,
         "state_action_frame_contract": watcher.STATE_ACTION_FRAME_CONTRACT,
         "actor_execution_protocol": protocol,
@@ -441,9 +447,36 @@ def test_fold_summary_accepts_strict_proper_selection_contract(
     fold_path, held_out_body, binding_sha256, _summary_path = valid_fold_summary
 
     result = watcher.summarize_fold(fold_path, held_out_body, binding_sha256)
-
+    assert result["model_family"] == watcher.EXPECTED_MODEL_FAMILY
+    assert result["proper_source_balance"]["mode"] == watcher.PROPER_BALANCE_MODE
     assert result["ensemble_common_selection_step"] == 3000
     assert result["heldout_labels_used_for_training_normalization_or_selection"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("model_family", "terminal_consequence_utility_shared_event_head_v12"),
+        ("proper_balance_mode", "empirical"),
+        ("proper_balance_heldout_rows", 1),
+    ],
+)
+def test_fold_summary_rejects_non_v13_or_nonzero_open_balance(
+    valid_fold_summary: tuple[Path, str, str, Path],
+    field: str,
+    replacement: object,
+) -> None:
+    fold_path, held_out_body, binding_sha256, summary_path = valid_fold_summary
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if field == "model_family":
+        summary[field] = replacement
+    elif field == "proper_balance_mode":
+        summary["proper_source_balance"]["mode"] = replacement
+    else:
+        summary["proper_source_balance"]["heldout_rows_used"] = replacement
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(watcher.LoboWatcherError, match="violates outer-LOBO"):
+        watcher.summarize_fold(fold_path, held_out_body, binding_sha256)
 
 
 def _valid_supplement_receipt(supplement_sha: str) -> dict[str, object]:

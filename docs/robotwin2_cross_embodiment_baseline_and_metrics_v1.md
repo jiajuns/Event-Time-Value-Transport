@@ -245,6 +245,59 @@ LAP 应作为跨本体 policy 级外部参考；若将来适配 LAP actor，仍�
 所以可行路径是迁移数据生成思想并新写 RoboTwin adapter，再让所有生成轨迹经过 native checker；
 不能把 MimicGen 数据量当作 `ΔSR`，也不能把未成功生成的轨迹自动标失败。
 
+### 6.5 VLA-ATTC / Relative Action Critic
+
+[VLA-ATTC][vla-attc-paper]在测试时从同一 VLA 采样多个候选动作块，以轻量 Relative Action
+Critic（RAC）做成对偏好比较，再通过 tournament 选出一个候选。它与当前 ETSF 的部署形态最接近：
+都不要求候选 critic 自己生成动作，最终效果都必须由冻结 actor 的闭环成功率验证。
+
+可以迁移的部分：
+
+- 以相对候选偏好替代不稳定的绝对 value 标度；
+- 固定同一候选池，以 `N=1/4/8` 比较测试时计算量与成功率；
+- 使用候选动作、候选差分、当前 proprio/state 和共享视觉语境作为公平输入；
+- 把 pairwise preference accuracy 与闭环 `ΔSR` 分开报告。
+
+不能直接迁移的部分：
+
+- RAC 没有显式下一事件、竞争风险持续时间、失败/恢复和对象状态变化监督；
+- 论文在 LIBERO-LONG 上验证 PI0.5，不能把其失败率降幅横向搬到 RoboTwin 五本体；
+- tournament 的非传递偏好可能依赖 bracket 顺序，必须冻结 pairing/bracket 或改用全 pair 聚合；
+- 若更换 actor、候选采样温度或视觉 backbone，结果就不能归因于 critic 结构。
+
+因此 VLA-ATTC 应落实为 B4 的强版本：用与 ETSF 完全相同的 branch 监督、容量上限和候选集合，
+训练一个 action-pair RAC：分别编码 `a_i`、`a_j`、`a_i-a_j` 与当前 canonical state，以 focal
+loss 学习真实 branch 偏好，并冻结 tournament bracket；正式 nested runner 同时报
+`RAC@4/RAC@8` 与 `ETSF@4/ETSF@8`。这能直接
+检验事件结构化多任务监督是否优于纯相对排序，而不是只和弱标量 MLP 比较。
+
+### 6.6 WCM / World Value Model
+
+[WCM][wcm-paper]指出单帧 value 回归在部分可观测控制中缺少时序状态，并以轻量未来 latent
+预测目标辅助 critic；[World Value Model][wvm-paper]同样把世界模型的时序表征用于通用机器人
+value estimation。两者支持“价值预测需要世界建模监督”这一大方向，但并不等于当前事件模型。
+
+可以迁移的部分：
+
+- 在同一历史窗口上增加 future-latent predictive loss，作为 B5 的强实现；
+- 共享 encoder 后同时优化 proper value/ranking 与未来状态预测；
+- 对比 single-frame scalar、future-latent critic 和事件结构化 critic；
+- 同时报离线 value-order/prediction 指标和冻结 actor 闭环成功率。
+
+不能直接迁移的部分：
+
+- WCM 主要服务 VLA RL post-training，当前实验是 critic-only、actor 不更新；
+- latent prediction 正确不保证候选动作改变了任务事件，也不自动产生跨本体规范语义；
+- 其视觉 latent、backbone 和训练数据合同与 RoboTwin EE16 branch 数据不同；
+- 直接加载权重会同时改变表征、数据规模与容量，无法成为结构消融。
+
+公平比较应在相同 root branch 上训练 matched-capacity future-latent baseline：用 action-conditioned
+residual predictor 预测下一状态 latent，联合 value loss、latent MSE 与防坍塌正则，并保持 actor、候选、
+rollout 数和 LOBO split 不变。ETSF 的可主张创新不应写成“首次给 critic 加世界模型”，而应写成：
+**把候选动作后果分解为跨本体规范事件、竞争风险持续时间、恢复与对象效果，并证明这种可解释的
+事件因子化在严格 held-out-body、critic-only best-of-N 中比标量 RAC 和非结构化 future-latent
+critic 得到更好的校准、oracle regret 与配对任务成功率。**
+
 ## 7. 正式 100 seeds/cell 配对协议
 
 ### 7.1 配对单位
@@ -550,6 +603,9 @@ body 等权、task 等权。全局 bootstrap 仍按 requested seed 聚类，一�
 - [MimicGen 项目页][mimicgen-project]、[论文][mimicgen-paper]与[官方代码][mimicgen-code]
 - [VLAC 论文][vlac-paper]与[官方代码][vlac-code]
 - [ProgressVLA 论文][progressvla-paper]
+- [VLA-ATTC 论文][vla-attc-paper]
+- [WCM 论文][wcm-paper]
+- [World Value Model 论文][wvm-paper]
 
 [robotwin-doc]: https://robotwin-platform.github.io/doc/
 [robotwin-tasks]: https://robotwin-platform.github.io/doc/tasks/
@@ -574,3 +630,6 @@ body 等权、task 等权。全局 bootstrap 仍按 requested seed 聚类，一�
 [vlac-paper]: https://arxiv.org/abs/2509.15937
 [vlac-code]: https://github.com/InternRobotics/VLAC
 [progressvla-paper]: https://arxiv.org/abs/2603.27670
+[vla-attc-paper]: https://arxiv.org/abs/2605.01194
+[wcm-paper]: https://arxiv.org/abs/2607.29613
+[wvm-paper]: https://arxiv.org/abs/2606.24742

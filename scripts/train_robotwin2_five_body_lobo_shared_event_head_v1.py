@@ -38,7 +38,7 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materia
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
-MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v12"
+MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v13"
 BINDING_FORMAT = (
     "etsf_robotwin2_five_body_lobo_training_binding_v3_actor_execution_protocol"
 )
@@ -373,6 +373,11 @@ ABLATION_VARIANTS = (
     "no_object_effect",
     "full",
 )
+PROPER_BALANCE_MODES = (
+    "causal_body_condition_event_sqrt",
+    "empirical",
+)
+DEFAULT_PROPER_BALANCE_MODE = "causal_body_condition_event_sqrt"
 
 
 def _dense_rank_labels_are_orderable(
@@ -458,11 +463,47 @@ def ablation_contract(variant: str) -> dict[str, Any]:
             else "strict_terminal_max_event_then_soft_goal_progress_temperature_0.02m"
         ),
         "training_streams": (
-            "uniform_proper_likelihood_plus_macro_balanced_rank_only"
+            "configurable_source_proper_likelihood_plus_"
+            "macro_balanced_rank_only"
         ),
+        "proper_balance_ablation": {
+            "axis": "--proper-balance-mode",
+            "default": DEFAULT_PROPER_BALANCE_MODE,
+            "control": "empirical",
+            "orthogonal_to_model_head_ablation": True,
+        },
         "rank_ensemble_aggregation": risk_adjusted_rank_ensemble_contract(),
         "same_seed_disjoint_split": True,
         "heldout_labels_used_for_training_or_selection": False,
+    }
+
+
+def proper_balance_contract(mode: str) -> dict[str, Any]:
+    """Describe the source-only proper-likelihood covariate balance."""
+
+    if mode not in PROPER_BALANCE_MODES:
+        raise FiveBodyContractError(f"unknown proper balance mode {mode!r}")
+    enabled = mode == "causal_body_condition_event_sqrt"
+    return {
+        "mode": mode,
+        "enabled": enabled,
+        "scope": "primary_source_train_proper_likelihood_only",
+        "stratum": (
+            "body_condition_current_canonical_event"
+            if enabled
+            else "empirical_decision_distribution"
+        ),
+        "inverse_frequency_exponent": 0.5 if enabled else 0.0,
+        "decision_group_constant": True,
+        "candidate_set_preserved": True,
+        "success_failure_recovery_duration_or_effect_labels_read": False,
+        "current_event_is_pre_action_causal_state": True,
+        "normalization": "source_train_decision_mean_weight_one",
+        "bootstrap_combination": "multiply_member_group_poisson_weight",
+        "supplement_reweighted": False,
+        "validation_reweighted": False,
+        "heldout_manifest_or_payload_access": False,
+        "checkpoint_or_inference_parameter_schema_changed": False,
     }
 
 
@@ -3224,6 +3265,151 @@ class CompleteDecisionBatchSampler:
 
     def __len__(self) -> int:
         return (len(self.decisions) + self.decisions_per_batch - 1) // self.decisions_per_batch
+
+
+def source_causal_stratum_proper_weights(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    source_bodies: Sequence[str],
+    mode: str = DEFAULT_PROPER_BALANCE_MODE,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Return group-constant, label-blind source proper-loss weights.
+
+    The primary collection is balanced in requested roots, not in the
+    canonical event actually reached at a root.  A shared finite-capacity
+    model can therefore minimize average loss by specializing in early events
+    and in bodies that reach them most often.  v13 tempers that covariate shift
+    with inverse square-root decision frequency over
+    ``body/condition/current_event``.  Square-root tempering reduces a count
+    ratio ``r`` to ``sqrt(r)`` without the variance explosion of full inverse
+    frequency.  No outcome, duration, effect, or next-event label is read.
+    """
+
+    contract = proper_balance_contract(mode)
+    expected_bodies = tuple(str(body) for body in source_bodies)
+    if (
+        not rows
+        or not expected_bodies
+        or len(set(expected_bodies)) != len(expected_bodies)
+        or any(body not in BODIES for body in expected_bodies)
+    ):
+        raise FiveBodyContractError("proper balance source body contract is invalid")
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        group = row.get("logical_group")
+        if not isinstance(group, str) or not group:
+            raise FiveBodyContractError("proper balance row lacks a logical group")
+        grouped[group].append(row)
+    strata: dict[str, tuple[str, str, int]] = {}
+    stratum_groups: dict[tuple[str, str, int], list[str]] = defaultdict(list)
+    observed_bodies: set[str] = set()
+    for group, members in sorted(grouped.items()):
+        candidate_indices = []
+        bodies: set[str] = set()
+        conditions: set[str] = set()
+        events: set[int] = set()
+        for row in members:
+            candidate = row.get("candidate_index")
+            event = row.get("current_event_id")
+            body = row.get("body")
+            condition = row.get("condition")
+            if (
+                isinstance(candidate, (bool, np.bool_))
+                or not isinstance(candidate, (int, np.integer))
+                or isinstance(event, (bool, np.bool_))
+                or not isinstance(event, (int, np.integer))
+                or body not in expected_bodies
+                or condition not in CONDITIONS
+                or not 0 <= int(event) < len(core.CANONICAL_EVENTS)
+            ):
+                raise FiveBodyContractError(
+                    "proper balance group has invalid causal identity"
+                )
+            candidate_indices.append(int(candidate))
+            bodies.add(str(body))
+            conditions.add(str(condition))
+            events.add(int(event))
+        if (
+            sorted(candidate_indices) != list(range(CANDIDATE_COUNT))
+            or len(bodies) != 1
+            or len(conditions) != 1
+            or len(events) != 1
+        ):
+            raise FiveBodyContractError(
+                "proper balance must preserve one complete causal decision"
+            )
+        stratum = (bodies.pop(), conditions.pop(), events.pop())
+        observed_bodies.add(stratum[0])
+        strata[group] = stratum
+        stratum_groups[stratum].append(group)
+    if observed_bodies != set(expected_bodies):
+        raise FiveBodyContractError(
+            "proper balance does not contain exactly the declared source bodies"
+        )
+    counts = {
+        stratum: len(groups) for stratum, groups in sorted(stratum_groups.items())
+    }
+    if not counts or any(count <= 0 for count in counts.values()):
+        raise FiveBodyContractError("proper balance has an empty causal stratum")
+    exponent = float(contract["inverse_frequency_exponent"])
+    raw = {
+        stratum: float(count) ** (-exponent)
+        for stratum, count in counts.items()
+    }
+    group_mean = sum(counts[stratum] * raw[stratum] for stratum in counts) / len(
+        grouped
+    )
+    weights = {
+        group: raw[stratum] / group_mean for group, stratum in strata.items()
+    }
+    if (
+        not weights
+        or any(not math.isfinite(value) or value <= 0.0 for value in weights.values())
+        or not math.isclose(
+            sum(weights.values()) / len(weights), 1.0, rel_tol=1e-12, abs_tol=1e-12
+        )
+    ):
+        raise FiveBodyContractError("proper balance weights are invalid")
+    effective_mass = {
+        stratum: counts[stratum] * raw[stratum] / group_mean
+        for stratum in counts
+    }
+    count_values = list(counts.values())
+    mass_values = list(effective_mass.values())
+    identity_rows = [
+        {
+            "logical_group": group,
+            "body": stratum[0],
+            "condition": stratum[1],
+            "current_event_id": stratum[2],
+            "weight": weights[group],
+        }
+        for group, stratum in sorted(strata.items())
+    ]
+    audit = {
+        "format": "etsf_source_causal_stratum_proper_balance_v1",
+        **contract,
+        "source_bodies": list(expected_bodies),
+        "source_body_count": len(expected_bodies),
+        "decision_groups": len(grouped),
+        "candidate_rows": len(rows),
+        "causal_strata": len(counts),
+        "minimum_decisions_per_stratum": min(count_values),
+        "maximum_decisions_per_stratum": max(count_values),
+        "empirical_max_to_min_stratum_mass_ratio": (
+            max(count_values) / min(count_values)
+        ),
+        "weighted_max_to_min_stratum_mass_ratio": (
+            max(mass_values) / min(mass_values)
+        ),
+        "minimum_group_weight": min(weights.values()),
+        "maximum_group_weight": max(weights.values()),
+        "mean_group_weight": sum(weights.values()) / len(weights),
+        "causal_identity_and_weight_sha256": canonical_sha256(identity_rows),
+        "outcome_label_fields_read": [],
+        "heldout_rows_used": 0,
+    }
+    return weights, audit
 
 
 class MacroBalancedRankDecisionBatchSampler:
@@ -7283,6 +7469,16 @@ def _train_fold(
     validation_rows = materialize_source_rows(
         validation_groups, held_out_body=args.held_out_body
     )
+    proper_balance_mode = str(
+        getattr(args, "proper_balance_mode", DEFAULT_PROPER_BALANCE_MODE)
+    )
+    proper_balance_weights, proper_balance_audit = (
+        source_causal_stratum_proper_weights(
+            train_rows,
+            source_bodies=preflight["source_bodies"],
+            mode=proper_balance_mode,
+        )
+    )
     successes = np.asarray(
         [float(row["success"]) for row in train_rows if bool(row["success_mask"])]
     )
@@ -7658,6 +7854,7 @@ def _train_fold(
             proper_weights = torch.tensor(
                 [
                     proper_group_weight[group][member]
+                    * proper_balance_weights[group]
                     for group in proper_raw["logical_group"]
                 ],
                 device=device,
@@ -8023,6 +8220,7 @@ def _train_fold(
                 "body_adapter": "single_shared_row_zero_heldout_parameters",
                 "model_family": MODEL_FAMILY,
                 "ablation": ablation_contract(args.ablation_variant),
+                "proper_source_balance": proper_balance_audit,
                 "candidate_rank_contract": checkpoint_candidate_rank_contract(
                     args.ablation_variant
                 ),
@@ -8111,6 +8309,7 @@ def _train_fold(
     snapshot_root.rmdir()
     summary = {
         "format": FORMAT,
+        "model_family": MODEL_FAMILY,
         "status": "source_only_checkpoint_selection_complete",
         "held_out_body": args.held_out_body,
         "source_bodies": preflight["source_bodies"],
@@ -8138,12 +8337,14 @@ def _train_fold(
             args.ablation_variant
         ),
         "ablation": ablation_contract(args.ablation_variant),
+        "proper_source_balance": proper_balance_audit,
         "training_budget": {
             "steps_per_member": args.steps,
             "eval_every_steps": args.eval_every,
             "batch_size_rows": args.batch_size,
             "learning_rate": args.learning_rate,
             "ensemble_members": len(args.ensemble_seeds),
+            "proper_balance_mode": proper_balance_mode,
         },
         "mixed_outcome_source_decisions": mixed_outcome_decisions,
         "observed_success_classes": observed_success_classes,
@@ -8224,7 +8425,10 @@ def _train_fold(
         "source_negative_to_positive_ratio": source_negative_to_positive_ratio,
         "ensemble_bootstrap_effect_support": bootstrap_support,
         "ensemble_proper_bootstrap_outcome_support": proper_bootstrap_support,
-        "success_probability_training_loss": "unweighted_proper_binary_cross_entropy",
+        "success_probability_training_loss": (
+            "source_causal_stratum_and_member_group_bootstrap_weighted_"
+            "proper_binary_cross_entropy"
+        ),
         "terminal_stage_progress_training_loss": (
             "categorical_cross_entropy_plus_weight_0.25_strictly_proper_"
             "ordinal_ranked_probability_score"
@@ -8302,6 +8506,15 @@ def parse_args() -> argparse.Namespace:
         "--ablation-variant", choices=ABLATION_VARIANTS, default="full"
     )
     parser.add_argument(
+        "--proper-balance-mode",
+        choices=PROPER_BALANCE_MODES,
+        default=DEFAULT_PROPER_BALANCE_MODE,
+        help=(
+            "source proper-likelihood decision weighting; empirical exactly "
+            "recovers the v12 training distribution"
+        ),
+    )
+    parser.add_argument(
         "--ensemble-seeds", nargs=5, type=int,
         default=[20260901, 20260902, 20260903, 20260904, 20260905],
     )
@@ -8356,6 +8569,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "ABLATION_VARIANTS",
+    "DEFAULT_PROPER_BALANCE_MODE", "PROPER_BALANCE_MODES",
     "ACTOR_FORMAT", "BINDING_FORMAT", "BODIES", "CANONICAL_ACTION_SCHEMA",
     "SUPPLEMENT_BINDING_FORMAT", "SUPPLEMENT_MANIFEST_FORMAT",
     "SUPPLEMENT_COLLECTOR_FORMAT",
@@ -8395,6 +8609,7 @@ __all__ = [
     "effect_preserving_group_bootstrap_weights", "load_binding",
     "load_supplement_binding",
     "proper_outcome_preserving_group_bootstrap_weights",
+    "proper_balance_contract", "source_causal_stratum_proper_weights",
     "evaluate_candidate_ranking", "materialize_source_rows",
     "materialize_supplement_rows", "sha256_file",
     "sha256_tree", "source_group_split", "supplement_inner_validation_body",

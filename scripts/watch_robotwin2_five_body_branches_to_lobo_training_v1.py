@@ -39,6 +39,8 @@ import robotwin2_actor_execution_protocol_v1 as actor_execution
 
 FORMAT = "etsf_robotwin2_five_body_branches_to_lobo_watcher_v1"
 FINAL_FORMAT = "etsf_robotwin2_five_body_lobo_source_validation_aggregate_v1"
+EXPECTED_MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v13"
+PROPER_BALANCE_MODE = "causal_body_condition_event_sqrt"
 BINDING_FORMAT = (
     "etsf_robotwin2_five_body_lobo_training_binding_v3_actor_execution_protocol"
 )
@@ -523,6 +525,7 @@ def fold_training_command(
         "--eval-every", "100",
         "--batch-size", "64",
         "--learning-rate", "0.0003",
+        "--proper-balance-mode", PROPER_BALANCE_MODE,
         "--ensemble-seeds", *[str(seed) for seed in ENSEMBLE_SEEDS],
     ]
     if args.supplement_binding is not None:
@@ -2278,6 +2281,11 @@ def summarize_fold(
         )
     if (
         summary.get("status") != "source_only_checkpoint_selection_complete"
+        or summary.get("model_family") != EXPECTED_MODEL_FAMILY
+        or not isinstance(summary.get("proper_source_balance"), Mapping)
+        or summary["proper_source_balance"].get("mode") != PROPER_BALANCE_MODE
+        or summary["proper_source_balance"].get("enabled") is not True
+        or summary["proper_source_balance"].get("heldout_rows_used") != 0
         or summary.get("state_action_frame_contract")
         != STATE_ACTION_FRAME_CONTRACT
         or summary.get("actor_execution_protocol") != protocol
@@ -2351,6 +2359,8 @@ def summarize_fold(
             raise LoboWatcherError(f"{held_out_body} member checkpoint is missing/tampered")
     return {
         "held_out_body": held_out_body,
+        "model_family": summary.get("model_family"),
+        "proper_source_balance": summary.get("proper_source_balance"),
         "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
         "source_bodies": summary.get("source_bodies"),
         "member_count": len(members),
@@ -3017,6 +3027,8 @@ def main() -> int:
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
+            "model_family": EXPECTED_MODEL_FAMILY,
+            "proper_balance_mode": PROPER_BALANCE_MODE,
             "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "actor_execution_protocol": _ACTIVE_EXECUTION_PROTOCOL,

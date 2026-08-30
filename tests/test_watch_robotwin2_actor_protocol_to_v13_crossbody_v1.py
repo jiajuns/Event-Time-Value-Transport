@@ -14,8 +14,8 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 SPEC = importlib.util.spec_from_file_location(
-    "actor_protocol_to_v12",
-    SCRIPTS / "watch_robotwin2_actor_protocol_to_v12_crossbody_v1.py",
+    "actor_protocol_to_v13",
+    SCRIPTS / "watch_robotwin2_actor_protocol_to_v13_crossbody_v1.py",
 )
 assert SPEC and SPEC.loader
 watcher = importlib.util.module_from_spec(SPEC)
