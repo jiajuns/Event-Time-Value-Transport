@@ -171,7 +171,7 @@ class FormalPaths:
 def formal_paths(code_root: Path | None = None) -> FormalPaths:
     home = Path("/home/user")
     paired_prefix = home / (
-        "etsf_robotwin2_fivebody_paired_success_full2000_20260830_v3_terminal_snapshot"
+        "etsf_robotwin2_fivebody_paired_success_full2000_20260830_v4_root_pose_roundtrip"
     )
     resolved_code = (code_root or Path(__file__).resolve().parent).resolve()
     return FormalPaths(
@@ -179,13 +179,13 @@ def formal_paths(code_root: Path | None = None) -> FormalPaths:
         code_root=resolved_code,
         upstream_state=home
         / (
-            "etsf_robotwin2_fivebody_lobo_full8000_20260830_v3_terminal_snapshot."
+            "etsf_robotwin2_fivebody_lobo_full8000_20260830_v4_root_pose_roundtrip."
             "watcher_state.json"
         ),
         upstream_run_exit=home
-        / "etsf_robotwin2_fivebody_lobo_full8000_20260830_v3_terminal_snapshot.run.exit",
+        / "etsf_robotwin2_fivebody_lobo_full8000_20260830_v4_root_pose_roundtrip.run.exit",
         lobo_root=home
-        / "etsf_robotwin2_fivebody_lobo_shared_head_full8000_20260830_v3_terminal_snapshot",
+        / "etsf_robotwin2_fivebody_lobo_shared_head_full8000_20260830_v4_root_pose_roundtrip",
         actor_checkpoint=home
         / (
             "etsf_smolvla_models/"

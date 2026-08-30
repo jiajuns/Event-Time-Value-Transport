@@ -237,6 +237,80 @@ def test_restore_hash_excludes_only_derived_qacc() -> None:
     )
 
 
+def _restore_snapshot(root_pose: list[float]) -> dict:
+    return {
+        "format": "test",
+        "articulations": {
+            "robot": {
+                "root_pose": root_pose,
+                "qpos": [0.1, 0.2],
+                "qvel": [0.3, 0.4],
+                "qacc": [5.0, -7.0],
+                "qf": [0.5, 0.6],
+            }
+        },
+        "simulation_step_count": 31,
+    }
+
+
+def test_restore_equivalence_only_tolerates_root_pose_float32_roundtrip() -> None:
+    base_pose = [0.0, 0.0, 0.75, 0.0, 0.0, -0.05, -0.9982587695121765]
+    base = _restore_snapshot(base_pose)
+    arx_roundtrip = _restore_snapshot(
+        [*base_pose[:6], -0.9982588887214661]
+    )
+    assert collector.branch_root_restorable_snapshot_sha256(base) != (
+        collector.branch_root_restorable_snapshot_sha256(arx_roundtrip)
+    )
+    assert collector.branch_root_restorable_snapshots_equal(base, arx_roundtrip)
+
+    piper_pose = [0.0, 0.0, 0.75, 1.0, 0.0, -2.60770320892334e-8, 0.0]
+    piper_roundtrip = _restore_snapshot(
+        [*piper_pose[:5], -3.3527612686157227e-8, piper_pose[6]]
+    )
+    assert collector.branch_root_restorable_snapshots_equal(
+        _restore_snapshot(piper_pose), piper_roundtrip
+    )
+
+    material_pose_change = _restore_snapshot(
+        [*base_pose[:6], base_pose[6] + 1e-6]
+    )
+    assert not collector.branch_root_restorable_snapshots_equal(
+        base, material_pose_change
+    )
+
+    changed_qpos = _restore_snapshot(base_pose)
+    changed_qpos["articulations"]["robot"]["qpos"][1] += 1e-12
+    assert not collector.branch_root_restorable_snapshots_equal(base, changed_qpos)
+
+
+def test_restore_equivalence_rejects_invalid_or_incomplete_root_pose() -> None:
+    base = _restore_snapshot([0.0, 0.0, 0.75, 1.0, 0.0, 0.0, 0.0])
+    missing_articulation = _restore_snapshot([0.0, 0.0, 0.75, 1.0, 0.0, 0.0, 0.0])
+    missing_articulation["articulations"] = {}
+    assert not collector.branch_root_restorable_snapshots_equal(
+        base, missing_articulation
+    )
+
+    invalid_shape = _restore_snapshot([0.0, 0.0, 0.75, 1.0, 0.0, 0.0, 0.0])
+    invalid_shape["articulations"]["robot"]["root_pose"] = [0.0] * 6
+    assert not collector.branch_root_restorable_snapshots_equal(base, invalid_shape)
+
+    non_finite = _restore_snapshot([0.0, 0.0, 0.75, 1.0, 0.0, 0.0, 0.0])
+    non_finite["articulations"]["robot"]["root_pose"][6] = float("nan")
+    assert not collector.branch_root_restorable_snapshots_equal(base, non_finite)
+
+    assert collector.BRANCH_ROOT_SNAPSHOT_CONTRACT == (
+        watcher.BRANCH_ROOT_SNAPSHOT_CONTRACT
+    )
+    assert collector.BRANCH_ROOT_SNAPSHOT_CONTRACT[
+        "all_non_root_pose_restorable_fields_bit_exact"
+    ] is True
+    assert collector.BRANCH_ROOT_SNAPSHOT_CONTRACT[
+        "post_canonicalization_full_snapshot_bit_exact"
+    ] is True
+
+
 def test_materialization_rejects_action_execution_exceptions() -> None:
     root, outcomes = _root_and_outcomes()
     outcomes[2] = {

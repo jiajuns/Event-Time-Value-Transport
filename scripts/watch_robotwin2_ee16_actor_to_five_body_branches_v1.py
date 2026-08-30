@@ -26,7 +26,7 @@ from typing import Any, Mapping, Sequence
 
 import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event
 
-FORMAT = "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v3_terminal_snapshot"
+FORMAT = "etsf_robotwin2_ee16_actor_to_five_body_branches_watcher_v4_root_pose_roundtrip"
 ACTOR_FORMAT = "etsf_robotwin2_frozen_native_actor_authority_v1"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
@@ -46,6 +46,7 @@ SUPPLEMENTAL_SEED_START = BASE_SEED_START + BASE_SEED_COUNT
 FORMAL_EVALUATION_SEED_START = 2026090000
 ACTION_EXEC_STEPS = 5
 MAX_STEPS = 200
+ROOT_POSE_RESTORE_ATOL = 2.384185791015625e-7
 EXPECTED_GROUPS_PER_BODY = (
     len(CONDITIONS) * len(ROOT_QUERIES) * TARGET_PER_CONDITION_QUERY
 )
@@ -119,6 +120,11 @@ BRANCH_ROOT_SNAPSHOT_CONTRACT = {
         "recorded_for_provenance_not_required_pre_step_then_recomputed_and_"
         "strictly_hashed_after_canonicalization_step"
     ),
+    "precanonical_restore_exact_except_articulation_root_pose_float32_roundtrip": True,
+    "articulation_root_pose_component_atol": ROOT_POSE_RESTORE_ATOL,
+    "articulation_root_pose_component_rtol": 0.0,
+    "all_non_root_pose_restorable_fields_bit_exact": True,
+    "post_canonicalization_full_snapshot_bit_exact": True,
     "simulation_clock_restored": True,
     "task_counters_restored": ["take_action_cnt", "eval_success"],
     "rng_restored": ["python", "numpy", "torch_cpu", "torch_cuda"],
@@ -144,25 +150,25 @@ ACTOR_CHECKPOINT = HOME_ROOT / (
     "checkpoints/020000/pretrained_model"
 )
 OUTPUT_ROOT = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot"
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip"
 )
 WATCHER_STATE = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
     "watcher_state.json"
 )
 WATCHER_PID = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
     "watcher.pid"
 )
 WATCHER_LOG = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
     "watcher.log"
 )
 ACTOR_AUTHORITY = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee16_actor_authority_full8000_20260830_v3_terminal_snapshot.json"
+    "etsf_robotwin2_fivebody_ee16_actor_authority_full8000_20260830_v4_root_pose_roundtrip.json"
 )
 TRAINING_BINDING = HOME_ROOT / (
-    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v3_terminal_snapshot."
+    "etsf_robotwin2_fivebody_ee_candidate_branches_full8000_20260830_v4_root_pose_roundtrip."
     "binding.json"
 )
 MATERIALIZATION_RECEIPT = HOME_ROOT / (
@@ -622,6 +628,7 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("task") != TASK
         or value.get("instruction") != DEFAULT_INSTRUCTION
         or value.get("body") != body
+        or value.get("collector_file_sha256") != static["collector_sha256"]
         or value.get("actor_checkpoint") != str(ACTOR_CHECKPOINT)
         or value.get("candidate_count") != CANDIDATE_COUNT
         or value.get("action_exec_steps") != ACTION_EXEC_STEPS
@@ -696,6 +703,7 @@ def load_manifest(body: str, static: Mapping[str, Any]) -> dict[str, Any]:
         if (
             not identity
             or identity in identities
+            or item.get("collector_file_sha256") != static["collector_sha256"]
             or item.get("diagnostic_format") != DIAGNOSTIC_FORMAT
             or not isinstance(item.get("diagnostics_path"), str)
             or not isinstance(item.get("diagnostics_sha256"), str)

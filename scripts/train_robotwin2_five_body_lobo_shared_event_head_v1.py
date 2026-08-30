@@ -143,6 +143,7 @@ TERMINAL_HORIZON_CONTRACT = {
     "formal_actor_query_stride_actions": 5,
     "development_remaining_action_budgets": list(range(200, 0, -5)),
 }
+ROOT_POSE_RESTORE_ATOL = 2.384185791015625e-7
 BRANCH_ROOT_SNAPSHOT_CONTRACT = {
     "format": "etsf_sapien_explicit_fresh_scene_branch_root_v1",
     "physics_state": "keyed_rigid_articulation_drive_task_render_rng_snapshot",
@@ -152,6 +153,11 @@ BRANCH_ROOT_SNAPSHOT_CONTRACT = {
         "recorded_for_provenance_not_required_pre_step_then_recomputed_and_"
         "strictly_hashed_after_canonicalization_step"
     ),
+    "precanonical_restore_exact_except_articulation_root_pose_float32_roundtrip": True,
+    "articulation_root_pose_component_atol": ROOT_POSE_RESTORE_ATOL,
+    "articulation_root_pose_component_rtol": 0.0,
+    "all_non_root_pose_restorable_fields_bit_exact": True,
+    "post_canonicalization_full_snapshot_bit_exact": True,
     "simulation_clock_restored": True,
     "task_counters_restored": ["take_action_cnt", "eval_success"],
     "rng_restored": ["python", "numpy", "torch_cpu", "torch_cuda"],

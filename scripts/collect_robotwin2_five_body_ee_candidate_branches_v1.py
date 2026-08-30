@@ -57,6 +57,7 @@ DEFAULT_INSTRUCTION = "Move the can to the side of the pot."
 CANONICAL_EVENTS = ("e0", "e12", "e3", "e4", "eK")
 EVENT_TO_ID = {name: index for index, name in enumerate(CANONICAL_EVENTS)}
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
+ROOT_POSE_RESTORE_ATOL = 2.0 * float(np.finfo(np.float32).eps)
 STATE_SCHEMA = canonical_adapter.STATE_SCHEMA
 ACTION_SCHEMA = canonical_adapter.ACTION_SCHEMA
 OBJECT_EFFECT_SCHEMA = {
@@ -125,6 +126,11 @@ BRANCH_ROOT_SNAPSHOT_CONTRACT = {
         "recorded_for_provenance_not_required_pre_step_then_recomputed_and_"
         "strictly_hashed_after_canonicalization_step"
     ),
+    "precanonical_restore_exact_except_articulation_root_pose_float32_roundtrip": True,
+    "articulation_root_pose_component_atol": ROOT_POSE_RESTORE_ATOL,
+    "articulation_root_pose_component_rtol": 0.0,
+    "all_non_root_pose_restorable_fields_bit_exact": True,
+    "post_canonicalization_full_snapshot_bit_exact": True,
     "simulation_clock_restored": True,
     "task_counters_restored": ["take_action_cnt", "eval_success"],
     "rng_restored": ["python", "numpy", "torch_cpu", "torch_cuda"],
@@ -312,6 +318,58 @@ def branch_root_restorable_snapshot(snapshot: Mapping[str, Any]) -> dict[str, An
 
 def branch_root_restorable_snapshot_sha256(snapshot: Mapping[str, Any]) -> str:
     return canonical_sha256(branch_root_restorable_snapshot(snapshot))
+
+
+def branch_root_restorable_snapshots_equal(
+    expected: Mapping[str, Any], observed: Mapping[str, Any]
+) -> bool:
+    """Check a fresh-scene restore while isolating SAPIEN float32 pose roundoff.
+
+    ``set_root_pose`` normalizes an articulation quaternion in float32, so a
+    subsequent getter can differ from the captured value by float32 roundoff.
+    Only the seven articulation-root-pose components receive an absolute
+    tolerance of two float32 machine epsilons.  After removing those values,
+    the complete restorable snapshot must still have the same canonical hash;
+    qpos, velocities, forces, task state, clocks and RNG therefore remain
+    bit-exact.
+    """
+
+    left = branch_root_restorable_snapshot(expected)
+    right = branch_root_restorable_snapshot(observed)
+    left_articulations = left.get("articulations")
+    right_articulations = right.get("articulations")
+    if not isinstance(left_articulations, Mapping) or not isinstance(
+        right_articulations, Mapping
+    ):
+        return False
+    if set(left_articulations) != set(right_articulations):
+        return False
+    for key in left_articulations:
+        left_value = left_articulations[key]
+        right_value = right_articulations[key]
+        if not isinstance(left_value, Mapping) or not isinstance(right_value, Mapping):
+            return False
+        try:
+            left_pose = np.asarray(left_value["root_pose"], dtype=np.float64)
+            right_pose = np.asarray(right_value["root_pose"], dtype=np.float64)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            left_pose.shape != (7,)
+            or right_pose.shape != (7,)
+            or not np.isfinite(left_pose).all()
+            or not np.isfinite(right_pose).all()
+            or not np.allclose(
+                left_pose,
+                right_pose,
+                atol=ROOT_POSE_RESTORE_ATOL,
+                rtol=0.0,
+            )
+        ):
+            return False
+        del left_value["root_pose"]
+        del right_value["root_pose"]
+    return canonical_sha256(left) == canonical_sha256(right)
 
 
 def branch_root_snapshot_section_sha256(
@@ -1074,10 +1132,7 @@ def _root_prefix(
     try:
         restore_branch_root_snapshot(reference, snapshot)
         restored_snapshot = capture_branch_root_snapshot(reference)
-        if (
-            branch_root_restorable_snapshot_sha256(restored_snapshot)
-            != restorable_snapshot_sha
-        ):
+        if not branch_root_restorable_snapshots_equal(snapshot, restored_snapshot):
             expected_restorable = branch_root_restorable_snapshot(snapshot)
             observed_restorable = branch_root_restorable_snapshot(
                 restored_snapshot
@@ -1251,9 +1306,8 @@ def _evaluate_candidate(
     try:
         restore_branch_root_snapshot(task, root["branch_root_snapshot"])
         restored_snapshot = capture_branch_root_snapshot(task)
-        if (
-            branch_root_restorable_snapshot_sha256(restored_snapshot)
-            != root["branch_root_restorable_snapshot_sha256"]
+        if not branch_root_restorable_snapshots_equal(
+            root["branch_root_snapshot"], restored_snapshot
         ):
             expected_restorable = branch_root_restorable_snapshot(
                 root["branch_root_snapshot"]
@@ -1757,6 +1811,7 @@ def main() -> None:
     adapter_sha = sha256_file(adapter_source)
     event_source = Path(inspect.getsourcefile(analytic_event) or "")
     event_implementation_sha = sha256_file(event_source)
+    collector_sha = sha256_file(Path(__file__).resolve())
     output = args.output.expanduser().resolve()
     groups_dir = output / "groups"
     groups_dir.mkdir(parents=True, exist_ok=True)
@@ -1770,6 +1825,7 @@ def main() -> None:
             logical != canonical_sha256(unsigned)
             or manifest.get("format") != MANIFEST_FORMAT
             or manifest.get("body") != args.body
+            or manifest.get("collector_file_sha256") != collector_sha
             or manifest.get("actor_checkpoint") != str(args.actor_checkpoint.resolve())
             or manifest.get("instruction") != DEFAULT_INSTRUCTION
             or manifest.get("candidate_count") != CANDIDATE_COUNT
@@ -1797,6 +1853,7 @@ def main() -> None:
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
             "body": args.body,
+            "collector_file_sha256": collector_sha,
             "actor_checkpoint": str(args.actor_checkpoint.resolve()),
             "instruction": DEFAULT_INSTRUCTION,
             "actor_checkpoint_tree_or_file_sha256_recorded_separately": True,
@@ -1943,6 +2000,7 @@ def main() -> None:
                 atomic_npz(diagnostic_path, diagnostics)
                 item = {
                     "group_id": group_id,
+                    "collector_file_sha256": collector_sha,
                     "condition": condition,
                     "requested_seed": int(seed),
                     "root_query_index": int(root_query),
