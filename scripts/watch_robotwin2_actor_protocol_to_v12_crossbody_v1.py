@@ -484,7 +484,7 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         "system_python",
     ):
         raw = getattr(args, name).expanduser()
-        if raw.is_symlink():
+        if raw.is_symlink() and name not in {"robotwin_python", "system_python"}:
             raise CrossbodyContinuationError(f"{name} may not be symbolic")
         setattr(args, name, raw.resolve())
     if (
