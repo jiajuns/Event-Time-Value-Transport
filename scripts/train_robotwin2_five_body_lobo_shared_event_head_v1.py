@@ -37,7 +37,7 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materia
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
-MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v8"
+MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v9"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
 SUPPLEMENT_BINDING_FORMAT = (
@@ -121,8 +121,23 @@ EXPERT_ROOT_PROVENANCE_CONTRACT = {
     "fresh_branch_horizon_starts_at_root": True,
     "formal_actor_prefix_distribution_claimed": False,
 }
-SUPPLEMENT_PRE_REGISTERED_SEEDS = tuple(range(2026081000, 2026081005))
+SUPPLEMENT_TARGET_EVENTS = ("e3", "e4")
 SUPPLEMENT_HORIZON_SCHEDULE = (10, 25, 50, 100, 200)
+SUPPLEMENT_RESERVE_SEED_START = 2026081000
+SUPPLEMENT_RESERVE_SEEDS_PER_SLOT = 16
+SUPPLEMENT_RESERVE_SEED_STOP_EXCLUSIVE = (
+    SUPPLEMENT_RESERVE_SEED_START
+    + len(BODIES)
+    * len(CONDITIONS)
+    * len(SUPPLEMENT_HORIZON_SCHEDULE)
+    * SUPPLEMENT_RESERVE_SEEDS_PER_SLOT
+)
+SUPPLEMENT_FORMAL_PRIMARY_SEED_START = 2026082000
+SUPPLEMENT_EXPECTED_DECISIONS_PER_BODY = (
+    len(CONDITIONS)
+    * len(SUPPLEMENT_HORIZON_SCHEDULE)
+    * len(SUPPLEMENT_TARGET_EVENTS)
+)
 SUPPLEMENT_ROOT_SELECTION_CONTRACT = {
     "controller": "public_RoboTwin_move_can_pot.play_once",
     "observation_granularity": "every_successful_sapien_scene_step",
@@ -132,12 +147,25 @@ SUPPLEMENT_ROOT_SELECTION_CONTRACT = {
     "adjacent_same_event_frames_used_as_additional_roots": False,
     "e4_must_be_nonterminal_simulator_success": True,
     "root_selection_reads_actor_branch_outcomes": False,
-    "missing_target_policy": "record_missing_and_do_not_replace_or_outcome_search",
+    "pair_acceptance": (
+        "both_e3_e4_exist_and_fresh_restore_canonicalize_before_any_actor_"
+        "candidate_outcome"
+    ),
+    "missing_target_policy": (
+        "record_reject_and_advance_same_body_condition_horizon_slot_ordered_"
+        "reserve_before_any_actor_candidate_outcome"
+    ),
+    "reserve_selection_reads_actor_candidate_outcomes": False,
+    "cross_body_common_success_seed_selection": False,
     "planner_after_root": "scripted_expert_ends_and_is_never_used_for_continuation",
 }
 SUPPLEMENT_HORIZON_CONTRACT = {
     "values": list(SUPPLEMENT_HORIZON_SCHEDULE),
-    "binding": "ordered_pre_registered_seed_zip_horizon_before_any_rollout",
+    "slot_count_per_condition": len(SUPPLEMENT_HORIZON_SCHEDULE),
+    "binding": (
+        "body_condition_horizon_slot_has_pre_registered_ordered_reserve_"
+        "seeds_before_any_rollout"
+    ),
     "same_horizon_for_e3_and_e4_of_one_seed": True,
     "new_actor_branch_take_action_count_at_root": 0,
     "remaining_action_budget_at_root_equals_bound_horizon": True,
@@ -145,10 +173,25 @@ SUPPLEMENT_HORIZON_CONTRACT = {
     "candidate_or_terminal_outcomes_used_to_choose_horizon": False,
     "actor_query_stride_actions": 5,
 }
+SUPPLEMENT_RESERVE_ROSTER_CONTRACT = {
+    "scope": "body_local_condition_local_horizon_slot_local",
+    "ordered_reserve_seeds_per_slot": SUPPLEMENT_RESERVE_SEEDS_PER_SLOT,
+    "selection": "first_complete_canonicalizable_e3_e4_pair",
+    "selection_occurs_before_actor_candidate_outcomes": True,
+    "rejected_attempts_are_audited": True,
+    "rejected_seed_candidate_outcomes_executed": False,
+    "one_selected_seed_per_slot": True,
+    "heldout_body_availability_changes_source_body_roster": False,
+    "python_rng_seeded_from_requested_scene_seed_before_each_fresh_setup": True,
+    "reserve_seed_start_inclusive": SUPPLEMENT_RESERVE_SEED_START,
+    "reserve_seed_stop_exclusive": SUPPLEMENT_RESERVE_SEED_STOP_EXCLUSIVE,
+    "formal_primary_seed_start": SUPPLEMENT_FORMAL_PRIMARY_SEED_START,
+}
 DENSE_FAILURE_RANK_WEIGHT = 0.1
 DENSE_ONLY_RANK_WEIGHT = 1.0
 SEMANTIC_COMPARATIVE_GRADIENT_BUDGET = 0.1
 SEMANTIC_GRADIENT_SCALE_CAP = 1.0
+TERMINAL_FILM_MODULATION_BOUND = 0.1
 DENSE_RANK_LABEL_EQUALITY_TOLERANCE = 1e-6
 ONE_DEVIATION_ESTIMAND = (
     "one_candidate_deviation_then_frozen_actor_continuation_not_"
@@ -442,6 +485,15 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         not in {"success_only", "no_time_duration"},
         "terminal_consequences_condition_on_remaining_action_budget": variant
         != "no_time_duration",
+        "terminal_context_fusion": (
+            "disabled_time_inputs_with_shared_residual_trunk"
+            if variant == "no_time_duration"
+            else "bounded_horizon_conditioned_film_residual_trunk"
+        ),
+        "terminal_candidate_relative_predictions_condition_on_horizon": (
+            variant != "no_time_duration"
+        ),
+        "terminal_film_modulation_bound": TERMINAL_FILM_MODULATION_BOUND,
         "remaining_action_budget_has_direct_rank_path": False,
         "event_age_has_numeric_score_path": variant != "no_time_duration",
         "direct_transitioned_or_clock_hidden_rank_path": False,
@@ -492,12 +544,7 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "semantic_comparative_loss_updates_terminal_predictors": (
             variant != "success_only"
         ),
-        "semantic_comparative_gradient_budget_relative_to_proper_head": (
-            0.0
-            if variant == "success_only"
-            else SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
-        ),
-        "semantic_comparative_gradient_budget_relative_to_shared_world": (
+        "semantic_comparative_gradient_budget_relative_to_active_union_proper": (
             0.0
             if variant == "success_only"
             else SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
@@ -505,7 +552,11 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "semantic_comparative_gradient_budget_scope": (
             "disabled"
             if variant == "success_only"
-            else "per_terminal_head_then_shared_world_on_comparative_active_parameters"
+            else "single_active_union_semantic_action_transition_terminal_trunk_and_location_heads"
+        ),
+        "semantic_comparative_scale_heads_excluded": True,
+        "semantic_comparative_gradient_cap_applications": (
+            0 if variant == "success_only" else 1
         ),
         "semantic_gradient_scale_cap": SEMANTIC_GRADIENT_SCALE_CAP,
         "world_and_utility_gradient_clipping_are_separate": True,
@@ -557,6 +608,13 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "terminal_consequences_condition_on_remaining_action_budget": checkpoint[
             "terminal_consequences_condition_on_remaining_action_budget"
         ],
+        "terminal_context_fusion": checkpoint["terminal_context_fusion"],
+        "terminal_candidate_relative_predictions_condition_on_horizon": checkpoint[
+            "terminal_candidate_relative_predictions_condition_on_horizon"
+        ],
+        "terminal_film_modulation_bound": checkpoint[
+            "terminal_film_modulation_bound"
+        ],
         "remaining_action_budget_has_direct_rank_path": checkpoint[
             "remaining_action_budget_has_direct_rank_path"
         ],
@@ -606,14 +664,17 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "semantic_comparative_loss_updates_terminal_predictors": checkpoint[
             "semantic_comparative_loss_updates_terminal_predictors"
         ],
-        "semantic_comparative_gradient_budget_relative_to_proper_head": checkpoint[
-            "semantic_comparative_gradient_budget_relative_to_proper_head"
-        ],
-        "semantic_comparative_gradient_budget_relative_to_shared_world": checkpoint[
-            "semantic_comparative_gradient_budget_relative_to_shared_world"
+        "semantic_comparative_gradient_budget_relative_to_active_union_proper": checkpoint[
+            "semantic_comparative_gradient_budget_relative_to_active_union_proper"
         ],
         "semantic_comparative_gradient_budget_scope": checkpoint[
             "semantic_comparative_gradient_budget_scope"
+        ],
+        "semantic_comparative_scale_heads_excluded": checkpoint[
+            "semantic_comparative_scale_heads_excluded"
+        ],
+        "semantic_comparative_gradient_cap_applications": checkpoint[
+            "semantic_comparative_gradient_cap_applications"
         ],
         "semantic_gradient_scale_cap": checkpoint[
             "semantic_gradient_scale_cap"
@@ -685,6 +746,106 @@ REQUIRED_ARRAYS = {
 
 class FiveBodyContractError(RuntimeError):
     """A five-body training authority or payload failed closed."""
+
+
+def supplement_horizon_slot_key(condition: str, horizon_slot: int) -> str:
+    """Return one immutable body-local supplement slot identity."""
+
+    if (
+        condition not in CONDITIONS
+        or isinstance(horizon_slot, bool)
+        or not isinstance(horizon_slot, int)
+        or horizon_slot not in range(len(SUPPLEMENT_HORIZON_SCHEDULE))
+    ):
+        raise FiveBodyContractError("invalid supplement horizon slot")
+    return f"{condition}|horizon_slot={horizon_slot}"
+
+
+def supplement_reserve_attempt_id(
+    condition: str, horizon_slot: int, seed: int
+) -> str:
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise FiveBodyContractError("invalid supplement reserve seed")
+    return (
+        f"{supplement_horizon_slot_key(condition, horizon_slot)}"
+        f"|requested_seed={seed}"
+    )
+
+
+def supplement_reserve_group_id(
+    condition: str, horizon_slot: int, seed: int, target: str
+) -> str:
+    if target not in SUPPLEMENT_TARGET_EVENTS:
+        raise FiveBodyContractError("unknown scripted root event")
+    return (
+        f"{supplement_reserve_attempt_id(condition, horizon_slot, seed)}"
+        f"|scripted_root={target}"
+    )
+
+
+def supplement_reserve_roster(body: str) -> list[dict[str, Any]]:
+    """Build the trainer-owned 10-slot/160-seed body-local reserve roster.
+
+    This intentionally duplicates the immutable public collector design.  The
+    production trainer must remain able to validate a materialized binding
+    without importing or executing collection code.
+    """
+
+    if body not in BODIES:
+        raise FiveBodyContractError(f"unknown supplement body {body!r}")
+    body_index = BODIES.index(body)
+    rows: list[dict[str, Any]] = []
+    for condition_index, condition in enumerate(CONDITIONS):
+        for horizon_slot, horizon in enumerate(SUPPLEMENT_HORIZON_SCHEDULE):
+            global_slot = (
+                (body_index * len(CONDITIONS) + condition_index)
+                * len(SUPPLEMENT_HORIZON_SCHEDULE)
+                + horizon_slot
+            )
+            first = (
+                SUPPLEMENT_RESERVE_SEED_START
+                + global_slot * SUPPLEMENT_RESERVE_SEEDS_PER_SLOT
+            )
+            rows.append(
+                {
+                    "slot_key": supplement_horizon_slot_key(
+                        condition, horizon_slot
+                    ),
+                    "condition": condition,
+                    "horizon_slot": horizon_slot,
+                    "remaining_action_budget": int(horizon),
+                    "ordered_requested_seeds": list(
+                        range(first, first + SUPPLEMENT_RESERVE_SEEDS_PER_SLOT)
+                    ),
+                }
+            )
+    flattened = [
+        int(seed)
+        for row in rows
+        for seed in row["ordered_requested_seeds"]
+    ]
+    expected_count = (
+        len(CONDITIONS)
+        * len(SUPPLEMENT_HORIZON_SCHEDULE)
+        * SUPPLEMENT_RESERVE_SEEDS_PER_SLOT
+    )
+    if (
+        len(flattened) != expected_count
+        or len(set(flattened)) != expected_count
+        or min(flattened) < SUPPLEMENT_RESERVE_SEED_START
+        or max(flattened) >= SUPPLEMENT_RESERVE_SEED_STOP_EXCLUSIVE
+        or max(flattened) >= SUPPLEMENT_FORMAL_PRIMARY_SEED_START
+    ):
+        raise FiveBodyContractError("supplement reserve roster is invalid")
+    return rows
+
+
+def supplement_reserve_horizon_by_seed(body: str) -> dict[int, int]:
+    return {
+        int(seed): int(row["remaining_action_budget"])
+        for row in supplement_reserve_roster(body)
+        for seed in row["ordered_requested_seeds"]
+    }
 
 
 def risk_adjusted_rank_ensemble_contract() -> dict[str, Any]:
@@ -1075,6 +1236,203 @@ def validate_body_manifest(
     }
 
 
+def _validate_supplement_reserve_design(
+    value: Mapping[str, Any], *, body: str
+) -> dict[str, Any]:
+    """Validate ordered reserve selection using manifest metadata only."""
+
+    roster = supplement_reserve_roster(body)
+    flattened = [
+        int(seed)
+        for row in roster
+        for seed in row["ordered_requested_seeds"]
+    ]
+    expected_horizons = supplement_reserve_horizon_by_seed(body)
+    declared_horizons = value.get("pre_registered_horizon_by_seed")
+    try:
+        normalized_horizons: dict[int, int] = {}
+        for seed, horizon in declared_horizons.items():
+            normalized_seed = int(seed)
+            if (
+                str(seed) != str(normalized_seed)
+                or isinstance(horizon, bool)
+                or not isinstance(horizon, int)
+            ):
+                raise ValueError("reserve horizon entry is not canonical integer data")
+            normalized_horizons[normalized_seed] = horizon
+    except (AttributeError, TypeError, ValueError) as error:
+        raise FiveBodyContractError(
+            f"{body} supplement reserve horizon map is invalid"
+        ) from error
+    selected = value.get("selected_seed_by_slot")
+    groups = value.get("groups")
+    attempts = value.get("attempts")
+    if (
+        value.get("collection_status") != "complete"
+        or value.get("reserve_roster_contract")
+        != SUPPLEMENT_RESERVE_ROSTER_CONTRACT
+        or value.get("reserve_roster") != roster
+        or value.get("pre_registered_seeds") != flattened
+        or normalized_horizons != expected_horizons
+        or not isinstance(selected, Mapping)
+        or set(selected) != {row["slot_key"] for row in roster}
+        or not isinstance(groups, list)
+        or len(groups) != SUPPLEMENT_EXPECTED_DECISIONS_PER_BODY
+        or not isinstance(attempts, list)
+    ):
+        raise FiveBodyContractError(
+            f"{body} supplement reserve design is incomplete"
+        )
+
+    attempt_by_id: dict[str, Mapping[str, Any]] = {}
+    declared_attempt_order: list[str] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            raise FiveBodyContractError("supplement reserve attempt is not an object")
+        attempt_id = attempt.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt_id in attempt_by_id
+            or attempt.get("actor_candidate_outcomes_executed_before_selection")
+            is not False
+        ):
+            raise FiveBodyContractError("supplement reserve attempt audit is invalid")
+        attempt_by_id[attempt_id] = attempt
+        declared_attempt_order.append(attempt_id)
+
+    groups_by_id: dict[str, Mapping[str, Any]] = {}
+    for group in groups:
+        if not isinstance(group, Mapping):
+            raise FiveBodyContractError("supplement group entry must be an object")
+        group_id = group.get("group_id")
+        if (
+            not isinstance(group_id, str)
+            or not group_id
+            or group_id in groups_by_id
+        ):
+            raise FiveBodyContractError("supplement group identity is invalid")
+        groups_by_id[group_id] = group
+
+    expected_attempt_order: list[str] = []
+    expected_group_ids: set[str] = set()
+    selected_pairs: set[tuple[str, int]] = set()
+    rejected_attempt_count = 0
+    for row in roster:
+        condition = str(row["condition"])
+        slot = int(row["horizon_slot"])
+        horizon = int(row["remaining_action_budget"])
+        seeds = [int(seed) for seed in row["ordered_requested_seeds"]]
+        selected_seed = selected.get(row["slot_key"])
+        if (
+            isinstance(selected_seed, bool)
+            or not isinstance(selected_seed, int)
+            or selected_seed not in seeds
+        ):
+            raise FiveBodyContractError("selected supplement reserve seed is invalid")
+        selected_seed = int(selected_seed)
+        selected_index = seeds.index(selected_seed)
+        slot_attempt_order: list[str] = []
+        for rejected_seed in seeds[:selected_index]:
+            attempt_id = supplement_reserve_attempt_id(
+                condition, slot, rejected_seed
+            )
+            rejected = attempt_by_id.get(attempt_id)
+            if (
+                not isinstance(rejected, Mapping)
+                or rejected.get("status") != "rejected_before_actor_outcomes"
+                or rejected.get("condition") != condition
+                or isinstance(rejected.get("horizon_slot"), bool)
+                or not isinstance(rejected.get("horizon_slot"), int)
+                or rejected.get("horizon_slot") != slot
+                or isinstance(rejected.get("requested_seed"), bool)
+                or not isinstance(rejected.get("requested_seed"), int)
+                or rejected.get("requested_seed") != rejected_seed
+                or isinstance(rejected.get("pre_registered_horizon"), bool)
+                or not isinstance(rejected.get("pre_registered_horizon"), int)
+                or rejected.get("pre_registered_horizon") != horizon
+                or not isinstance(rejected.get("reject_reason"), str)
+                or not str(rejected["reject_reason"]).strip()
+            ):
+                raise FiveBodyContractError(
+                    "ordered supplement reserve rejection history is incomplete"
+                )
+            slot_attempt_order.append(attempt_id)
+            rejected_attempt_count += 1
+
+        selected_attempt_id = supplement_reserve_attempt_id(
+            condition, slot, selected_seed
+        )
+        selected_attempt = attempt_by_id.get(selected_attempt_id)
+        if (
+            not isinstance(selected_attempt, Mapping)
+            or selected_attempt.get("status") != "complete"
+            or selected_attempt.get("condition") != condition
+            or isinstance(selected_attempt.get("horizon_slot"), bool)
+            or not isinstance(selected_attempt.get("horizon_slot"), int)
+            or selected_attempt.get("horizon_slot") != slot
+            or isinstance(selected_attempt.get("requested_seed"), bool)
+            or not isinstance(selected_attempt.get("requested_seed"), int)
+            or selected_attempt.get("requested_seed") != selected_seed
+            or isinstance(selected_attempt.get("pre_registered_horizon"), bool)
+            or not isinstance(selected_attempt.get("pre_registered_horizon"), int)
+            or selected_attempt.get("pre_registered_horizon") != horizon
+            or selected_attempt.get("selected_before_actor_candidate_outcomes")
+            is not True
+            or not _is_sha(selected_attempt.get("root_pair_bundle_sha256"))
+        ):
+            raise FiveBodyContractError(
+                "selected supplement reserve attempt is incomplete"
+            )
+        slot_attempt_order.append(selected_attempt_id)
+        actual_slot_order = [
+            attempt_id
+            for attempt_id in declared_attempt_order
+            if attempt_by_id[attempt_id].get("condition") == condition
+            and attempt_by_id[attempt_id].get("horizon_slot") == slot
+        ]
+        if actual_slot_order != slot_attempt_order:
+            raise FiveBodyContractError(
+                "supplement reserve attempts are out of order or continued after selection"
+            )
+        expected_attempt_order.extend(slot_attempt_order)
+        selected_pairs.add((condition, selected_seed))
+
+        for target in SUPPLEMENT_TARGET_EVENTS:
+            expected_group_id = supplement_reserve_group_id(
+                condition, slot, selected_seed, target
+            )
+            group = groups_by_id.get(expected_group_id)
+            event_id = {"e3": 2, "e4": 3}[target]
+            if (
+                not isinstance(group, Mapping)
+                or group.get("condition") != condition
+                or group.get("horizon_slot") != slot
+                or group.get("requested_seed") != selected_seed
+                or group.get("pre_registered_horizon") != horizon
+                or group.get("scripted_root_event") != target
+                or group.get("scripted_root_event_id") != event_id
+                or group.get("root_event_id") != event_id
+            ):
+                raise FiveBodyContractError(
+                    "selected supplement reserve group contract changed"
+                )
+            expected_group_ids.add(expected_group_id)
+
+    if declared_attempt_order != expected_attempt_order:
+        raise FiveBodyContractError(
+            "supplement reserve attempts do not follow the ten-slot roster"
+        )
+    if set(groups_by_id) != expected_group_ids:
+        raise FiveBodyContractError("supplement reserve group design is incomplete")
+    return {
+        "selected_pairs": selected_pairs,
+        "rejected_attempt_count": rejected_attempt_count,
+        "selected_seed_by_slot_sha256": canonical_sha256(dict(selected)),
+        "reserve_roster_sha256": canonical_sha256(roster),
+    }
+
+
 def validate_supplement_body_manifest(
     value: Mapping[str, Any],
     *,
@@ -1082,12 +1440,8 @@ def validate_supplement_body_manifest(
     manifest_dir: Path,
     expected_actor_checkpoint_sha256: str,
 ) -> dict[str, Any]:
-    """Validate the collector's raw manifest without opening branch payloads."""
+    """Validate a complete reserve-roster manifest without opening any NPZ."""
 
-    # The raw supplement carries the same canonical state/action/event/time and
-    # finite-horizon target contracts as formal actor-prefix groups.  Reuse the
-    # common manifest validator first, then enforce the distinct expert-root
-    # provenance and the complete scripted-root design below.
     validate_body_manifest(
         value,
         expected_body=expected_body,
@@ -1095,36 +1449,7 @@ def validate_supplement_body_manifest(
         expected_format=SUPPLEMENT_MANIFEST_FORMAT,
     )
     _verify_signed(value, f"{expected_body} supplement manifest")
-    root_selection = value.get("root_selection_contract")
-    horizon = value.get("horizon_contract")
-    actor_branch = value.get("actor_branch_contract")
-    seeds = value.get("pre_registered_seeds")
-    horizon_by_seed = value.get("pre_registered_horizon_by_seed")
     adapter = value.get("schema_adapter")
-    if (
-        not isinstance(seeds, list)
-        or seeds != list(SUPPLEMENT_PRE_REGISTERED_SEEDS)
-        or not isinstance(horizon_by_seed, Mapping)
-    ):
-        raise FiveBodyContractError(
-            f"{expected_body} supplement seed/horizon registration changed"
-        )
-    expected_horizon_by_seed = dict(
-        zip(
-            SUPPLEMENT_PRE_REGISTERED_SEEDS,
-            SUPPLEMENT_HORIZON_SCHEDULE,
-            strict=True,
-        )
-    )
-    try:
-        observed_horizon_by_seed = {
-            int(seed): int(branch_horizon)
-            for seed, branch_horizon in horizon_by_seed.items()
-        }
-    except (TypeError, ValueError) as error:
-        raise FiveBodyContractError(
-            f"{expected_body} supplement horizon binding is invalid"
-        ) from error
     if (
         value.get("format") != SUPPLEMENT_MANIFEST_FORMAT
         or value.get("collector_format") != SUPPLEMENT_COLLECTOR_FORMAT
@@ -1133,8 +1458,7 @@ def validate_supplement_body_manifest(
         or value.get("task") != TASK
         or value.get("body") != expected_body
         or value.get("conditions") != list(CONDITIONS)
-        or value.get("target_events") != ["e3", "e4"]
-        or observed_horizon_by_seed != expected_horizon_by_seed
+        or value.get("target_events") != list(SUPPLEMENT_TARGET_EVENTS)
         or value.get("instruction") != DEFAULT_INSTRUCTION
         or value.get("candidate_count") != CANDIDATE_COUNT
         or value.get("action_exec_steps") != 5
@@ -1177,50 +1501,48 @@ def validate_supplement_body_manifest(
         or adapter.get("duration_unit") != "seconds"
         or adapter.get("event_names") != list(core.CANONICAL_EVENTS)
         or not _is_sha(adapter.get("implementation_sha256"))
-        or root_selection != SUPPLEMENT_ROOT_SELECTION_CONTRACT
-        or horizon != SUPPLEMENT_HORIZON_CONTRACT
-        or actor_branch != SUPPLEMENT_ACTOR_BRANCH_CONTRACT
+        or value.get("root_selection_contract")
+        != SUPPLEMENT_ROOT_SELECTION_CONTRACT
+        or value.get("horizon_contract") != SUPPLEMENT_HORIZON_CONTRACT
+        or value.get("actor_branch_contract")
+        != SUPPLEMENT_ACTOR_BRANCH_CONTRACT
     ):
         raise FiveBodyContractError(
             f"{expected_body} raw scripted-root supplement contract changed"
         )
-    groups = value.get("groups")
-    if not isinstance(groups, list) or len(groups) != 20:
-        raise FiveBodyContractError(
-            f"{expected_body} supplement needs the complete 20-root design"
-        )
+
+    design = _validate_supplement_reserve_design(value, body=expected_body)
     identities: set[str] = set()
     conditions: set[str] = set()
     normalized: list[dict[str, Any]] = []
-    for declared in groups:
-        if not isinstance(declared, Mapping):
-            raise FiveBodyContractError("supplement group entry must be an object")
-        group_id = declared.get("group_id")
+    for declared in value["groups"]:
+        group_id = str(declared["group_id"])
         condition = declared.get("condition")
-        root_event = declared.get("scripted_root_event_id")
-        branch_horizon = declared.get("pre_registered_horizon")
+        slot = declared.get("horizon_slot")
         seed = declared.get("requested_seed")
+        root_event = declared.get("scripted_root_event_id")
         event_name = {2: "e3", 3: "e4"}.get(root_event)
+        branch_horizon = declared.get("pre_registered_horizon")
         if (
-            not isinstance(group_id, str)
-            or not group_id
-            or group_id in identities
+            group_id in identities
             or condition not in CONDITIONS
+            or isinstance(slot, bool)
+            or not isinstance(slot, int)
+            or slot not in range(len(SUPPLEMENT_HORIZON_SCHEDULE))
             or isinstance(seed, bool)
             or not isinstance(seed, int)
-            or seed not in expected_horizon_by_seed
             or isinstance(root_event, bool)
             or not isinstance(root_event, int)
-            or root_event not in {2, 3}
-            or declared.get("scripted_root_event") != event_name
-            or declared.get("root_event_id") != root_event
+            or event_name is None
             or isinstance(branch_horizon, bool)
             or not isinstance(branch_horizon, int)
-            or branch_horizon != expected_horizon_by_seed.get(seed)
+            or branch_horizon != SUPPLEMENT_HORIZON_SCHEDULE[slot]
             or declared.get("candidate_noise_query_index")
-            != {2: 2, 3: 3}.get(root_event)
+            != {2: 2, 3: 3}[root_event]
             or group_id
-            != f"{condition}|seed={seed}|scripted_root={event_name}"
+            != supplement_reserve_group_id(
+                str(condition), slot, seed, event_name
+            )
             or not _is_sha(declared.get("sha256"))
             or not _is_sha(declared.get("raw_expert_snapshot_sha256"))
             or not _is_sha(declared.get("branch_root_snapshot_sha256"))
@@ -1235,7 +1557,9 @@ def validate_supplement_body_manifest(
             raise FiveBodyContractError(
                 f"{expected_body} supplement group is invalid"
             )
-        path = _lexical_contained_payload_path(
+        # Lexical containment only: held-out validation must not stat, hash, or
+        # deserialize either the group payload or its diagnostics.
+        payload_path = _lexical_contained_payload_path(
             manifest_dir, str(declared.get("path", "")), "supplement group"
         )
         diagnostics_path = _lexical_contained_payload_path(
@@ -1250,31 +1574,13 @@ def validate_supplement_body_manifest(
                 **dict(declared),
                 "root_event_id": int(root_event),
                 "source_role": "proper_world_supplement",
-                "resolved_path": str(path),
+                "resolved_path": str(payload_path),
                 "resolved_diagnostics_path": str(diagnostics_path),
             }
         )
     if conditions != set(CONDITIONS):
         raise FiveBodyContractError(
             f"{expected_body} supplement lacks clean/randomized roots"
-        )
-    design = {
-        (
-            str(group["condition"]),
-            int(group["requested_seed"]),
-            int(group["root_event_id"]),
-        )
-        for group in normalized
-    }
-    expected_design = {
-        (condition, seed, root_event)
-        for condition in CONDITIONS
-        for seed in seeds
-        for root_event in (2, 3)
-    }
-    if design != expected_design:
-        raise FiveBodyContractError(
-            f"{expected_body} supplement design cells are incomplete"
         )
     return {
         "body": expected_body,
@@ -1289,6 +1595,7 @@ def validate_supplement_body_manifest(
             EXPERT_ROOT_PROVENANCE_CONTRACT
         ),
         "proper_loss_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        **design,
     }
 
 
@@ -1397,6 +1704,11 @@ def load_supplement_binding(
         actor_binding.get("sha256") if isinstance(actor_binding, Mapping) else None
     )
     materializer = binding.get("materializer_provenance")
+    rejected_attempt_count = (
+        materializer.get("rejected_attempt_count")
+        if isinstance(materializer, Mapping)
+        else None
+    )
     if (
         binding.get("format") != SUPPLEMENT_BINDING_FORMAT
         or binding.get("dataset_repo") != DATASET_REPO
@@ -1428,6 +1740,22 @@ def load_supplement_binding(
         or materializer.get("complete_decisions") != 100
         or materializer.get("complete_branches") != 400
         or materializer.get("seed_overlap_with_primary") != 0
+        or materializer.get("selected_seed_count") != 50
+        or isinstance(rejected_attempt_count, bool)
+        or not isinstance(rejected_attempt_count, int)
+        or rejected_attempt_count < 0
+        or rejected_attempt_count
+        > (
+            len(BODIES)
+            * len(CONDITIONS)
+            * len(SUPPLEMENT_HORIZON_SCHEDULE)
+            * (SUPPLEMENT_RESERVE_SEEDS_PER_SLOT - 1)
+        )
+        or materializer.get(
+            "selection_occurs_before_actor_candidate_outcomes"
+        )
+        is not True
+        or materializer.get("heldout_payload_npz_files_opened") != 0
     ):
         raise FiveBodyContractError(
             "supplement binding violates the source-train proper-only contract"
@@ -1440,11 +1768,14 @@ def load_supplement_binding(
     root = path.expanduser().resolve().parent
     manifests: dict[str, dict[str, Any]] = {}
     heldout_manifest_binding: dict[str, Any] | None = None
+    source_rejected_attempt_count = 0
     for body in BODIES:
         item = body_bindings[body]
         if (
             not isinstance(item, Mapping)
             or not _is_sha(item.get("sha256"))
+            or not _is_sha(item.get("selected_seed_by_slot_sha256"))
+            or not _is_sha(item.get("reserve_roster_sha256"))
             or isinstance(item.get("group_count"), bool)
             or not isinstance(item.get("group_count"), int)
             or int(item["group_count"]) != 20
@@ -1463,6 +1794,10 @@ def load_supplement_binding(
                 "opaque_path": str(opaque_path),
                 "sha256": str(item["sha256"]),
                 "declared_group_count": int(item["group_count"]),
+                "selected_seed_by_slot_sha256": str(
+                    item["selected_seed_by_slot_sha256"]
+                ),
+                "reserve_roster_sha256": str(item["reserve_roster_sha256"]),
                 "manifest_file_opened": 0,
                 "manifest_bytes_read": 0,
                 "payload_files_opened": 0,
@@ -1493,6 +1828,21 @@ def load_supplement_binding(
             raise FiveBodyContractError(
                 f"{body} supplement manifest group count differs from binding"
             )
+        if (
+            canonical_sha256(manifest.get("selected_seed_by_slot"))
+            != item["selected_seed_by_slot_sha256"]
+            or canonical_sha256(manifest.get("reserve_roster"))
+            != item["reserve_roster_sha256"]
+        ):
+            raise FiveBodyContractError(
+                f"{body} supplement reserve provenance differs from binding"
+            )
+        source_rejected_attempt_count += sum(
+            1
+            for attempt in manifest.get("attempts", [])
+            if isinstance(attempt, Mapping)
+            and attempt.get("status") == "rejected_before_actor_outcomes"
+        )
         primary_manifest = primary_audit.get("manifests", {}).get(body)
         if not isinstance(primary_manifest, Mapping):
             raise FiveBodyContractError(
@@ -1512,6 +1862,19 @@ def load_supplement_binding(
             )
     if heldout_manifest_binding is None:
         raise FiveBodyContractError("supplement held-out binding was not deferred")
+    heldout_rejection_capacity = (
+        len(CONDITIONS)
+        * len(SUPPLEMENT_HORIZON_SCHEDULE)
+        * (SUPPLEMENT_RESERVE_SEEDS_PER_SLOT - 1)
+    )
+    if not (
+        source_rejected_attempt_count
+        <= rejected_attempt_count
+        <= source_rejected_attempt_count + heldout_rejection_capacity
+    ):
+        raise FiveBodyContractError(
+            "supplement rejected-attempt provenance cannot match the deferred body"
+        )
     implementations = {
         value["event_derivation_implementation_sha256"]
         for value in manifests.values()
@@ -2353,8 +2716,22 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         self.terminal_context_encoder = torch.nn.Sequential(
             torch.nn.Linear(2, core.SEMANTIC_DIM),
             torch.nn.Tanh(),
+            torch.nn.Linear(core.SEMANTIC_DIM, 2 * core.SEMANTIC_DIM),
+        )
+        self.terminal_residual = torch.nn.Sequential(
+            torch.nn.LayerNorm(core.SEMANTIC_DIM),
+            torch.nn.Linear(core.SEMANTIC_DIM, core.SEMANTIC_DIM),
+            torch.nn.GELU(),
             torch.nn.Linear(core.SEMANTIC_DIM, core.SEMANTIC_DIM),
         )
+        # Start from the former horizon-free representation, then let proper
+        # finite-horizon supervision learn bounded FiLM and residual effects.
+        # This keeps initialization stable without removing the action-horizon
+        # interaction from the function class.
+        torch.nn.init.zeros_(self.terminal_context_encoder[-1].weight)
+        torch.nn.init.zeros_(self.terminal_context_encoder[-1].bias)
+        torch.nn.init.zeros_(self.terminal_residual[-1].weight)
+        torch.nn.init.zeros_(self.terminal_residual[-1].bias)
         self.terminal_event = torch.nn.Linear(core.SEMANTIC_DIM, 5)
         self.terminal_recovery = torch.nn.Linear(core.SEMANTIC_DIM, 1)
         self.terminal_goal_progress_mean = torch.nn.Linear(core.SEMANTIC_DIM, 1)
@@ -2429,8 +2806,8 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         )
         if self.ablation_variant == "no_time_duration":
             terminal_context = torch.zeros_like(terminal_context)
-        terminal_hidden = output["transitioned"] + self.terminal_context_encoder(
-            terminal_context
+        terminal_hidden = self._terminal_hidden(
+            output["transitioned"], terminal_context
         )
         terminal_event_logits = self.terminal_event(terminal_hidden)
         event_levels = torch.arange(
@@ -2621,6 +2998,34 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             raise FiveBodyContractError("candidate utility output shape changed")
         output["candidate_rank_logit"] = candidate_rank_logit
         return output
+
+    def _terminal_hidden(
+        self,
+        transitioned: torch.Tensor,
+        terminal_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse event age/horizon with consequences through bounded FiLM.
+
+        A purely additive context followed by a linear terminal head makes the
+        difference between two candidates invariant to their shared horizon.
+        FiLM changes the candidate representation itself, while the bounded
+        residual trunk supplies a small nonlinear interaction without exposing
+        a direct latent rank path.
+        """
+
+        if transitioned.ndim != 2 or transitioned.shape[-1] != core.SEMANTIC_DIM:
+            raise FiveBodyContractError("terminal transitioned state must be [B,96]")
+        if terminal_context.shape != (transitioned.shape[0], 2):
+            raise FiveBodyContractError("terminal context must be [B,2]")
+        film = self.terminal_context_encoder(terminal_context)
+        film_scale, film_shift = film.chunk(2, dim=-1)
+        bounded_scale = TERMINAL_FILM_MODULATION_BOUND * torch.tanh(film_scale)
+        bounded_shift = TERMINAL_FILM_MODULATION_BOUND * torch.tanh(film_shift)
+        modulated = (1.0 + bounded_scale) * transitioned + bounded_shift
+        residual = TERMINAL_FILM_MODULATION_BOUND * torch.tanh(
+            self.terminal_residual(modulated)
+        )
+        return modulated + residual
 
 
 class RiskAdjustedRankEnsemble(torch.nn.Module):
@@ -3569,6 +3974,69 @@ def _relative_gradient_budget_scale(
         float(budget) * proper_norm / comparative_norm.clamp_min(1e-12),
         max=float(scale_cap),
     ).detach()
+
+
+def _semantic_comparative_active_parameters(
+    model: EffectAlignedSharedEventHead,
+) -> tuple[torch.nn.Parameter, ...]:
+    """Return the single audited union reached by semantic comparisons.
+
+    Comparative supervision may shape canonical state/action transitions and
+    terminal location predictions, including the horizon-interaction trunk.
+    Aleatoric scale heads and the detached deployment utility are deliberately
+    absent from this union.
+    """
+
+    modules = (
+        model.semantic,
+        model.action,
+        model.transition,
+        model.terminal_context_encoder,
+        model.terminal_residual,
+        model.terminal_event,
+        model.terminal_goal_progress_mean,
+    )
+    parameters = tuple(
+        parameter
+        for module in modules
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    )
+    if not parameters or len({id(parameter) for parameter in parameters}) != len(
+        parameters
+    ):
+        raise FiveBodyContractError(
+            "semantic comparative active union is empty or contains duplicates"
+        )
+    excluded = {
+        id(parameter)
+        for module in (
+            model.object_scale,
+            model.duration_scale,
+            model.terminal_goal_progress_scale,
+        )
+        for parameter in module.parameters()
+    }
+    if any(id(parameter) in excluded for parameter in parameters):
+        raise FiveBodyContractError(
+            "semantic comparative active union contains an uncertainty scale head"
+        )
+    return parameters
+
+
+def _bounded_semantic_comparative_loss(
+    proper_loss: torch.Tensor,
+    comparative_loss: torch.Tensor,
+    model: EffectAlignedSharedEventHead,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply exactly one proper-relative cap over the audited active union."""
+
+    scale = _relative_gradient_budget_scale(
+        proper_loss,
+        comparative_loss,
+        _semantic_comparative_active_parameters(model),
+    )
+    return scale * comparative_loss, scale
 
 
 @torch.no_grad()
@@ -4755,71 +5223,24 @@ def _train_fold(
                 )
             )
             if args.ablation_variant == "success_only":
-                semantic_event_scale = multitask_loss.new_zeros(())
-                semantic_goal_scale = multitask_loss.new_zeros(())
-            else:
-                proper_event_reference = (
-                    multitask_loss
-                    + terminal_pieces[
-                        "terminal_event_weighted_uniform_proper"
-                    ]
-                )
-                semantic_event_scale = _relative_gradient_budget_scale(
-                    proper_event_reference,
-                    semantic_comparative_pieces[
-                        "semantic_comparative_event_raw"
-                    ],
-                    tuple(model.terminal_event.parameters()),
-                )
-                semantic_goal_scale = _relative_gradient_budget_scale(
-                    terminal_pieces[
-                        "terminal_goal_progress_weighted_uniform_proper"
-                    ],
-                    semantic_comparative_pieces[
-                        "semantic_comparative_goal_raw"
-                    ],
-                    tuple(model.terminal_goal_progress_mean.parameters()),
-                )
-            semantic_event_bounded = (
-                semantic_event_scale
-                * semantic_comparative_pieces[
-                    "semantic_comparative_event_raw"
-                ]
-            )
-            semantic_goal_bounded = (
-                semantic_goal_scale
-                * semantic_comparative_pieces[
-                    "semantic_comparative_goal_raw"
-                ]
-            )
-            semantic_pre_shared_world_budget = (
-                semantic_event_bounded + semantic_goal_bounded
-            )
-            if args.ablation_variant == "success_only":
-                semantic_shared_world_scale = multitask_loss.new_zeros(())
+                semantic_comparative_scale = multitask_loss.new_zeros(())
+                semantic_comparative_loss = multitask_loss.new_zeros(())
             else:
                 proper_world_reference = (
                     multitask_loss + object_effect_loss + terminal_loss
                 )
-                semantic_shared_world_scale = _relative_gradient_budget_scale(
+                (
+                    semantic_comparative_loss,
+                    semantic_comparative_scale,
+                ) = _bounded_semantic_comparative_loss(
                     proper_world_reference,
-                    semantic_pre_shared_world_budget,
-                    tuple(world_parameters),
+                    _semantic_comparative_raw,
+                    model,
                 )
-            semantic_comparative_loss = (
-                semantic_shared_world_scale * semantic_pre_shared_world_budget
-            )
             semantic_comparative_pieces = {
                 **semantic_comparative_pieces,
-                "semantic_event_gradient_scale": semantic_event_scale,
-                "semantic_goal_gradient_scale": semantic_goal_scale,
-                "semantic_event_gradient_bounded": semantic_event_bounded,
-                "semantic_goal_gradient_bounded": semantic_goal_bounded,
-                "semantic_comparative_pre_shared_world_budget": (
-                    semantic_pre_shared_world_budget
-                ),
-                "semantic_shared_world_gradient_scale": (
-                    semantic_shared_world_scale
+                "semantic_comparative_active_union_gradient_scale": (
+                    semantic_comparative_scale
                 ),
                 "semantic_comparative_gradient_bounded": (
                     semantic_comparative_loss
@@ -5306,6 +5727,7 @@ __all__ = [
     "RISK_ADJUSTED_RANK_ENSEMBLE_CONTRACT",
     "RiskAdjustedRankEnsemble", "SEMANTIC_COMPARATIVE_GRADIENT_BUDGET",
     "SEMANTIC_GRADIENT_SCALE_CAP",
+    "TERMINAL_FILM_MODULATION_BOUND",
     "TERMINAL_SUPERVISION_CONTRACT",
     "ablation_contract", "ablation_selection_components",
     "aggregate_risk_adjusted_rank_scores",

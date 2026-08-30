@@ -2,9 +2,10 @@
 """Bind five completed scripted-root collectors for strict LOBO training.
 
 The per-body raw manifests are already canonical supplement manifests.  This
-materializer validates them without opening transition NPZ payloads, requires
-the complete 5 x 2 x 2 x 5 design, rejects primary-reset seed overlap, and
-writes the single signed binding consumed by the v8 trainer.
+materializer validates the body-local ordered reserve resolution without
+opening transition NPZ payloads, requires the complete 5 x 2 x 2 x 5 selected
+design, rejects primary-reset seed overlap, and writes the single signed
+binding consumed by the trainer.
 """
 
 from __future__ import annotations
@@ -114,63 +115,12 @@ def _primary_seed_pairs(primary: Mapping[str, Any], primary_dir: Path) -> dict[s
 def _validate_complete_design(
     value: Mapping[str, Any], *, body: str
 ) -> set[tuple[str, int]]:
-    groups = value.get("groups")
-    seeds = value.get("pre_registered_seeds")
-    horizon_by_seed = value.get("pre_registered_horizon_by_seed")
-    if (
-        not isinstance(groups, list)
-        or len(groups) != collector.EXPECTED_DECISIONS_PER_BODY
-        or not isinstance(seeds, list)
-        or seeds != list(collector.PREDEFINED_SEEDS)
-        or not isinstance(horizon_by_seed, Mapping)
-    ):
-        raise SupplementBindingError(
-            f"{body} supplement is not the complete pre-registered 20-decision design"
-        )
-    expected_horizons = collector.resolve_seed_horizons(seeds)
     try:
-        declared_horizons = {
-            int(key): int(horizon) for key, horizon in horizon_by_seed.items()
-        }
-    except (TypeError, ValueError) as error:
+        return collector.validate_completed_design_metadata(value, body=body)
+    except collector.ScriptedRootCollectionError as error:
         raise SupplementBindingError(
-            f"{body} supplement horizon map is invalid"
+            f"{body} supplement is not the complete ordered-reserve 20-decision design: {error}"
         ) from error
-    if declared_horizons != expected_horizons:
-        raise SupplementBindingError(
-            f"{body} supplement horizon map is not the pre-registered schedule"
-        )
-    observed: set[tuple[str, int, int]] = set()
-    pairs: set[tuple[str, int]] = set()
-    for group in groups:
-        if not isinstance(group, Mapping):
-            raise SupplementBindingError(f"{body} supplement group is invalid")
-        condition = str(group.get("condition"))
-        seed = group.get("requested_seed")
-        root_event = group.get("root_event_id")
-        horizon = group.get("pre_registered_horizon")
-        if (
-            condition not in trainer.CONDITIONS
-            or isinstance(seed, bool)
-            or not isinstance(seed, int)
-            or root_event not in {2, 3}
-            or horizon != expected_horizons.get(int(seed))
-        ):
-            raise SupplementBindingError(f"{body} supplement group contract changed")
-        identity = (condition, int(seed), int(root_event))
-        if identity in observed:
-            raise SupplementBindingError(f"{body} supplement duplicates a decision")
-        observed.add(identity)
-        pairs.add((condition, int(seed)))
-    expected = {
-        (condition, int(seed), root_event)
-        for condition in trainer.CONDITIONS
-        for seed in seeds
-        for root_event in (2, 3)
-    }
-    if observed != expected:
-        raise SupplementBindingError(f"{body} supplement design cells are incomplete")
-    return pairs
 
 
 def build_binding(
@@ -216,6 +166,8 @@ def build_binding(
 
     body_bindings: dict[str, dict[str, Any]] = {}
     event_implementations: set[str] = set()
+    rejected_attempt_count = 0
+    selected_seed_count = 0
     for body in trainer.BODIES:
         manifest_path = body_manifest_paths.get(body)
         if manifest_path is None:
@@ -227,6 +179,7 @@ def build_binding(
             raise SupplementBindingError(
                 f"{body} raw manifest does not bind the primary actor authority"
             )
+        supplement_pairs = _validate_complete_design(manifest, body=body)
         try:
             validated = trainer.validate_supplement_body_manifest(
                 manifest,
@@ -240,7 +193,6 @@ def build_binding(
             raise SupplementBindingError(
                 f"{body} raw manifest is not trainer-compatible: {error}"
             ) from error
-        supplement_pairs = _validate_complete_design(manifest, body=body)
         overlap = primary_pairs[body].intersection(supplement_pairs)
         if overlap:
             raise SupplementBindingError(
@@ -249,12 +201,24 @@ def build_binding(
         event_implementations.add(
             str(validated["event_derivation_implementation_sha256"])
         )
+        rejected_attempt_count += sum(
+            1
+            for attempt in manifest["attempts"]
+            if attempt.get("status") == "rejected_before_actor_outcomes"
+        )
+        selected_seed_count += len(manifest["selected_seed_by_slot"])
         body_bindings[body] = {
             "path": _contained_relative(
                 output.parent, manifest_path, f"{body} supplement manifest"
             ),
             "sha256": manifest_sha,
             "group_count": len(validated["groups"]),
+            "selected_seed_by_slot_sha256": trainer.canonical_sha256(
+                manifest["selected_seed_by_slot"]
+            ),
+            "reserve_roster_sha256": trainer.canonical_sha256(
+                manifest["reserve_roster"]
+            ),
         }
     if len(event_implementations) != 1:
         raise SupplementBindingError(
@@ -287,6 +251,10 @@ def build_binding(
             "complete_decisions": collector.EXPECTED_FIVE_BODY_DECISIONS,
             "complete_branches": collector.EXPECTED_FIVE_BODY_BRANCHES,
             "seed_overlap_with_primary": 0,
+            "selected_seed_count": selected_seed_count,
+            "rejected_attempt_count": rejected_attempt_count,
+            "selection_occurs_before_actor_candidate_outcomes": True,
+            "heldout_payload_npz_files_opened": 0,
         },
     }
     binding["logical_sha256"] = trainer.canonical_sha256(binding)

@@ -40,7 +40,10 @@ SUPPLEMENT_BINDING_FORMAT = (
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
 TARGET_EVENTS = ("e3", "e4")
-SUPPLEMENT_SEEDS = tuple(range(2026081000, 2026081005))
+SUPPLEMENT_HORIZONS = (10, 25, 50, 100, 200)
+SUPPLEMENT_RESERVE_SEED_START = 2026081000
+SUPPLEMENT_RESERVE_SEEDS_PER_SLOT = 16
+SUPPLEMENT_RESERVE_SEED_STOP_EXCLUSIVE = 2026081800
 EXPECTED_SUPPLEMENT_DECISIONS_PER_BODY = 20
 EXPECTED_SUPPLEMENT_DECISIONS = 100
 EXPECTED_SUPPLEMENT_BRANCHES = 400
@@ -126,6 +129,43 @@ def validate_upstream_state(value: Mapping[str, Any]) -> None:
         raise SharedHeadUpgradeError("formal postformal-ablation summary is missing/tampered")
 
 
+def supplement_reserve_roster(body: str) -> list[dict[str, Any]]:
+    if body not in BODIES:
+        raise SharedHeadUpgradeError("unknown supplement body")
+    rows = []
+    body_index = BODIES.index(body)
+    for condition_index, condition in enumerate(CONDITIONS):
+        for slot, horizon in enumerate(SUPPLEMENT_HORIZONS):
+            global_slot = (
+                (body_index * len(CONDITIONS) + condition_index)
+                * len(SUPPLEMENT_HORIZONS)
+                + slot
+            )
+            first = (
+                SUPPLEMENT_RESERVE_SEED_START
+                + global_slot * SUPPLEMENT_RESERVE_SEEDS_PER_SLOT
+            )
+            rows.append(
+                {
+                    "slot_key": f"{condition}|horizon_slot={slot}",
+                    "condition": condition,
+                    "horizon_slot": slot,
+                    "remaining_action_budget": horizon,
+                    "ordered_requested_seeds": list(
+                        range(first, first + SUPPLEMENT_RESERVE_SEEDS_PER_SLOT)
+                    ),
+                }
+            )
+    flattened = [seed for row in rows for seed in row["ordered_requested_seeds"]]
+    if (
+        len(set(flattened)) != len(flattened)
+        or min(flattened) < SUPPLEMENT_RESERVE_SEED_START
+        or max(flattened) >= SUPPLEMENT_RESERVE_SEED_STOP_EXCLUSIVE
+    ):
+        raise SharedHeadUpgradeError("supplement reserve roster changed")
+    return rows
+
+
 def supplement_manifest_complete(path: Path, body: str) -> bool:
     """Metadata-only resumability check; the materializer performs full validation."""
 
@@ -136,34 +176,87 @@ def supplement_manifest_complete(path: Path, body: str) -> bool:
         return False
     groups = value.get("groups")
     attempts = value.get("attempts")
+    selected = value.get("selected_seed_by_slot")
+    roster = supplement_reserve_roster(body)
     if (
         value.get("format") != SUPPLEMENT_MANIFEST_FORMAT
         or value.get("body") != body
         or value.get("conditions") != list(CONDITIONS)
-        or value.get("pre_registered_seeds") != list(SUPPLEMENT_SEEDS)
+        or value.get("collection_status") != "complete"
+        or value.get("reserve_roster") != roster
+        or value.get("pre_registered_seeds")
+        != [seed for row in roster for seed in row["ordered_requested_seeds"]]
         or not isinstance(groups, list)
         or len(groups) != EXPECTED_SUPPLEMENT_DECISIONS_PER_BODY
         or not isinstance(attempts, list)
-        or len(attempts) != len(CONDITIONS) * len(SUPPLEMENT_SEEDS)
-        or any(item.get("status") != "complete" for item in attempts)
+        or not isinstance(selected, Mapping)
+        or set(selected) != {row["slot_key"] for row in roster}
     ):
+        return False
+    attempt_by_id = {
+        item.get("attempt_id"): item
+        for item in attempts
+        if isinstance(item, Mapping) and isinstance(item.get("attempt_id"), str)
+    }
+    if len(attempt_by_id) != len(attempts):
         return False
     design = {
         (
             item.get("condition"),
+            item.get("horizon_slot"),
             item.get("requested_seed"),
             item.get("scripted_root_event"),
         )
         for item in groups
         if isinstance(item, Mapping)
     }
-    expected = {
-        (condition, seed, event)
-        for condition in CONDITIONS
-        for seed in SUPPLEMENT_SEEDS
-        for event in TARGET_EVENTS
-    }
-    return design == expected
+    expected = set()
+    consumed_attempts = set()
+    for row in roster:
+        seed = selected.get(row["slot_key"])
+        seeds = row["ordered_requested_seeds"]
+        if isinstance(seed, bool) or seed not in seeds:
+            return False
+        selected_index = seeds.index(seed)
+        for rejected_seed in seeds[:selected_index]:
+            attempt_id = (
+                f"{row['slot_key']}|requested_seed={rejected_seed}"
+            )
+            attempt = attempt_by_id.get(attempt_id)
+            if (
+                not isinstance(attempt, Mapping)
+                or attempt.get("status") != "rejected_before_actor_outcomes"
+                or attempt.get(
+                    "actor_candidate_outcomes_executed_before_selection"
+                )
+                is not False
+            ):
+                return False
+            consumed_attempts.add(attempt_id)
+        selected_attempt_id = f"{row['slot_key']}|requested_seed={seed}"
+        selected_attempt = attempt_by_id.get(selected_attempt_id)
+        if (
+            not isinstance(selected_attempt, Mapping)
+            or selected_attempt.get("status") != "complete"
+            or selected_attempt.get("selected_before_actor_candidate_outcomes")
+            is not True
+            or selected_attempt.get(
+                "actor_candidate_outcomes_executed_before_selection"
+            )
+            is not False
+        ):
+            return False
+        consumed_attempts.add(selected_attempt_id)
+        expected.update(
+            (
+                row["condition"],
+                row["horizon_slot"],
+                seed,
+                event,
+            )
+            for event in TARGET_EVENTS
+        )
+    return design == expected and consumed_attempts == set(attempt_by_id)
 
 
 def gpu_compute_pids(expected_uuid: str) -> list[int]:
@@ -236,8 +329,6 @@ def supplement_collector_command(args: argparse.Namespace, body: str) -> list[st
         str(args.supplement_root / body),
         "--conditions",
         *CONDITIONS,
-        "--seeds",
-        *[str(seed) for seed in SUPPLEMENT_SEEDS],
         "--action-exec-steps",
         "5",
     ]
@@ -754,5 +845,6 @@ __all__ = [
     "paired_n8_command",
     "supplement_collector_command",
     "supplement_manifest_complete",
+    "supplement_reserve_roster",
     "validate_upstream_state",
 ]

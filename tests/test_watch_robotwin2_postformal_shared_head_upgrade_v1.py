@@ -61,11 +61,9 @@ def test_commands_bind_complete_supplement_and_both_full_candidate_studies(
     supplement_sha = "a" * 64
     collector = watcher.supplement_collector_command(args, "piper")
     assert collector[collector.index("--body") + 1] == "piper"
-    seed_start = collector.index("--seeds") + 1
-    assert collector[seed_start : seed_start + 5] == [
-        str(seed) for seed in watcher.SUPPLEMENT_SEEDS
-    ]
-    assert collector[collector.index("--conditions") + 1 : seed_start - 1] == [
+    assert "--seeds" not in collector
+    action_index = collector.index("--action-exec-steps")
+    assert collector[collector.index("--conditions") + 1 : action_index] == [
         "clean",
         "randomized",
     ]
@@ -111,26 +109,53 @@ def test_runtime_environment_includes_explicit_etsf_dependency_site(
 def test_supplement_completion_is_exact_design_not_just_group_count(
     tmp_path: Path,
 ) -> None:
+    roster = watcher.supplement_reserve_roster("franka")
+    selected = {
+        row["slot_key"]: row["ordered_requested_seeds"][1] for row in roster
+    }
     groups = [
         {
-            "condition": condition,
-            "requested_seed": seed,
+            "condition": row["condition"],
+            "horizon_slot": row["horizon_slot"],
+            "requested_seed": selected[row["slot_key"]],
             "scripted_root_event": event,
         }
-        for condition in watcher.CONDITIONS
-        for seed in watcher.SUPPLEMENT_SEEDS
+        for row in roster
         for event in watcher.TARGET_EVENTS
     ]
-    attempts = [
-        {"status": "complete"}
-        for _condition in watcher.CONDITIONS
-        for _seed in watcher.SUPPLEMENT_SEEDS
-    ]
+    attempts = []
+    for row in roster:
+        rejected_seed = row["ordered_requested_seeds"][0]
+        selected_seed = selected[row["slot_key"]]
+        attempts.extend(
+            (
+                {
+                    "attempt_id": (
+                        f"{row['slot_key']}|requested_seed={rejected_seed}"
+                    ),
+                    "status": "rejected_before_actor_outcomes",
+                    "actor_candidate_outcomes_executed_before_selection": False,
+                },
+                {
+                    "attempt_id": (
+                        f"{row['slot_key']}|requested_seed={selected_seed}"
+                    ),
+                    "status": "complete",
+                    "selected_before_actor_candidate_outcomes": True,
+                    "actor_candidate_outcomes_executed_before_selection": False,
+                },
+            )
+        )
     value = {
         "format": watcher.SUPPLEMENT_MANIFEST_FORMAT,
         "body": "franka",
         "conditions": list(watcher.CONDITIONS),
-        "pre_registered_seeds": list(watcher.SUPPLEMENT_SEEDS),
+        "collection_status": "complete",
+        "reserve_roster": roster,
+        "pre_registered_seeds": [
+            seed for row in roster for seed in row["ordered_requested_seeds"]
+        ],
+        "selected_seed_by_slot": selected,
         "groups": groups,
         "attempts": attempts,
     }
@@ -145,6 +170,21 @@ def test_supplement_completion_is_exact_design_not_just_group_count(
     value["logical_sha256"] = watcher.canonical_sha256(unsigned)
     path.write_text(json.dumps(value), encoding="utf-8")
     assert watcher.supplement_manifest_complete(path, "franka") is False
+
+
+def test_reserve_rosters_are_body_local_and_disjoint() -> None:
+    by_body = {
+        body: {
+            seed
+            for row in watcher.supplement_reserve_roster(body)
+            for seed in row["ordered_requested_seeds"]
+        }
+        for body in watcher.BODIES
+    }
+    assert all(len(seeds) == 160 for seeds in by_body.values())
+    for index, body in enumerate(watcher.BODIES):
+        for other in watcher.BODIES[index + 1 :]:
+            assert by_body[body].isdisjoint(by_body[other])
 
 
 def test_upstream_gate_requires_complete_bound_ablation(tmp_path: Path) -> None:

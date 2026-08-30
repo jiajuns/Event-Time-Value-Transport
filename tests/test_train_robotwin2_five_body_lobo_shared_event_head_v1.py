@@ -14,17 +14,18 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import train_multibody_canonical_event_world_model as core  # noqa: E402
-import collect_robotwin2_scripted_expert_root_actor_branches_v1 as expert_collector  # noqa: E402
 import robotwin2_move_can_pot_analytic_event_spec_v1 as analytic_event  # noqa: E402
 import preregister_robotwin2_move_can_pot_five_body_lobo_v1 as prereg  # noqa: E402
 import run_robotwin2_five_body_lobo_offline_ablation_v1 as ablation  # noqa: E402
 import verify_robotwin2_move_can_pot_public_materialization_v1 as verifier  # noqa: E402
 from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
+    _bounded_semantic_comparative_loss,
     _candidate_rank_loss,
     _dense_soft_listwise_loss,
     _relative_gradient_budget_scale,
     _robust_object_effect_loss,
     _semantic_comparative_loss,
+    _semantic_comparative_active_parameters,
     _supplement_proper_world_model_loss,
     _terminal_consequence_loss,
     ABLATION_VARIANTS,
@@ -62,11 +63,17 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     MONOTONE_RISK_FEATURES,
     SEMANTIC_COMPARATIVE_GRADIENT_BUDGET,
     SEMANTIC_GRADIENT_SCALE_CAP,
+    TERMINAL_FILM_MODULATION_BOUND,
     TERMINAL_SUPERVISION_CONTRACT,
     SOURCE_EVENT_SAMPLING_HZ,
+    SUPPLEMENT_ACTOR_BRANCH_CONTRACT,
     SUPPLEMENT_BINDING_FORMAT,
+    SUPPLEMENT_COLLECTOR_FORMAT,
+    SUPPLEMENT_HORIZON_CONTRACT,
     SUPPLEMENT_MANIFEST_FORMAT,
     SUPPLEMENT_PROPER_LOSS_WEIGHT,
+    SUPPLEMENT_RESERVE_ROSTER_CONTRACT,
+    SUPPLEMENT_ROOT_SELECTION_CONTRACT,
     SUPPLEMENT_USAGE_CONTRACT,
     EXPERT_ROOT_PROVENANCE_CONTRACT,
     TASK,
@@ -91,6 +98,10 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     sha256_tree,
     source_group_split,
     supplement_group_bootstrap_weights,
+    supplement_reserve_attempt_id,
+    supplement_reserve_group_id,
+    supplement_reserve_horizon_by_seed,
+    supplement_reserve_roster,
     supplement_source_train_split,
     summary_candidate_rank_contract,
     validate_supplement_body_manifest,
@@ -422,69 +433,123 @@ def _supplement_fixture(
         )
     )
     body_bindings = {}
+    rejected_attempt_count = 0
     for body_index, body in enumerate(BODIES):
         primary_manifest_path = tmp_path / primary_binding["body_manifests"][body]["path"]
         primary_manifest = json.loads(
             primary_manifest_path.read_text(encoding="utf-8")
         )
-        seeds = list(expert_collector.PREDEFINED_SEEDS)
-        horizon_by_seed = dict(
-            zip(seeds, expert_collector.HORIZON_SCHEDULE, strict=True)
-        )
+        roster = supplement_reserve_roster(body)
+        seeds = [
+            seed
+            for row in roster
+            for seed in row["ordered_requested_seeds"]
+        ]
+        horizon_by_seed = supplement_reserve_horizon_by_seed(body)
+        selected_seed_by_slot = {}
+        attempts = []
         groups = []
-        for condition_index, condition in enumerate(("clean", "randomized")):
-            for seed in seeds:
-                horizon = horizon_by_seed[seed]
-                for root_event, event_name in ((2, "e3"), (3, "e4")):
-                    name = (
-                        f"supplement-{body}-{condition}-{event_name}-seed{seed}.npz"
-                    )
-                    path = tmp_path / name
-                    _group(
-                        path,
-                        float(body_index + condition_index + root_event + 1),
-                        current_event=root_event,
-                        remaining_action_budget=horizon,
-                    )
-                    groups.append(
-                        {
-                            "group_id": (
-                                f"{condition}|seed={seed}|scripted_root={event_name}"
-                            ),
-                            "collector_file_sha256": "8" * 64,
-                            "base_collector_file_sha256": "9" * 64,
-                            "condition": condition,
-                            "requested_seed": seed,
-                            "scripted_root_event": event_name,
-                            "scripted_root_event_id": root_event,
-                            "root_event_id": root_event,
-                            "pre_registered_horizon": horizon,
-                            "candidate_noise_query_index": {2: 2, 3: 3}[root_event],
-                            "raw_expert_snapshot_sha256": "0" * 64,
-                            "branch_root_snapshot_sha256": "1" * 64,
-                            "branch_root_restorable_snapshot_sha256": "2" * 64,
-                            "canonical_root_snapshot_sha256": "3" * 64,
-                            "path": name,
-                            "sha256": sha256_file(path),
-                            "diagnostic_format": BRANCH_DIAGNOSTIC_CONTRACT["format"],
-                            "diagnostics_path": name.replace(
-                                ".npz", ".diagnostics.npz"
-                            ),
-                            "diagnostics_sha256": "4" * 64,
-                        }
-                    )
+        for row in roster:
+            condition = row["condition"]
+            condition_index = ("clean", "randomized").index(condition)
+            slot = row["horizon_slot"]
+            horizon = row["remaining_action_budget"]
+            ordered_seeds = row["ordered_requested_seeds"]
+            # Exercise one genuine ordered rejection per body in the positive
+            # fixture; every other slot selects its first reserve seed.
+            selected_index = 1 if condition == "clean" and slot == 0 else 0
+            selected_seed = ordered_seeds[selected_index]
+            selected_seed_by_slot[row["slot_key"]] = selected_seed
+            for rejected_seed in ordered_seeds[:selected_index]:
+                attempts.append(
+                    {
+                        "attempt_id": supplement_reserve_attempt_id(
+                            condition, slot, rejected_seed
+                        ),
+                        "status": "rejected_before_actor_outcomes",
+                        "condition": condition,
+                        "horizon_slot": slot,
+                        "requested_seed": rejected_seed,
+                        "pre_registered_horizon": horizon,
+                        "reject_reason": "missing_e4",
+                        "actor_candidate_outcomes_executed_before_selection": False,
+                    }
+                )
+                rejected_attempt_count += 1
+            attempts.append(
+                {
+                    "attempt_id": supplement_reserve_attempt_id(
+                        condition, slot, selected_seed
+                    ),
+                    "status": "complete",
+                    "condition": condition,
+                    "horizon_slot": slot,
+                    "requested_seed": selected_seed,
+                    "pre_registered_horizon": horizon,
+                    "selected_before_actor_candidate_outcomes": True,
+                    "actor_candidate_outcomes_executed_before_selection": False,
+                    "root_pair_bundle_sha256": "5" * 64,
+                }
+            )
+            for root_event, event_name in ((2, "e3"), (3, "e4")):
+                name = (
+                    f"supplement-{body}-{condition}-h{slot}-{event_name}-"
+                    f"seed{selected_seed}.npz"
+                )
+                path = tmp_path / name
+                _group(
+                    path,
+                    float(body_index + condition_index + root_event + 1),
+                    current_event=root_event,
+                    remaining_action_budget=horizon,
+                )
+                groups.append(
+                    {
+                        "group_id": supplement_reserve_group_id(
+                            condition, slot, selected_seed, event_name
+                        ),
+                        "collector_file_sha256": "8" * 64,
+                        "base_collector_file_sha256": "9" * 64,
+                        "condition": condition,
+                        "horizon_slot": slot,
+                        "requested_seed": selected_seed,
+                        "scripted_root_event": event_name,
+                        "scripted_root_event_id": root_event,
+                        "root_event_id": root_event,
+                        "pre_registered_horizon": horizon,
+                        "candidate_noise_query_index": {2: 2, 3: 3}[root_event],
+                        "raw_expert_snapshot_sha256": "0" * 64,
+                        "branch_root_snapshot_sha256": "1" * 64,
+                        "branch_root_restorable_snapshot_sha256": "2" * 64,
+                        "canonical_root_snapshot_sha256": "3" * 64,
+                        "path": name,
+                        "sha256": sha256_file(path),
+                        "diagnostic_format": BRANCH_DIAGNOSTIC_CONTRACT["format"],
+                        "diagnostics_path": name.replace(
+                            ".npz", ".diagnostics.npz"
+                        ),
+                        "diagnostics_sha256": "4" * 64,
+                    }
+                )
         manifest = {
             "format": SUPPLEMENT_MANIFEST_FORMAT,
-            "collector_format": expert_collector.FORMAT,
+            "collector_format": SUPPLEMENT_COLLECTOR_FORMAT,
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
             "body": body,
             "conditions": ["clean", "randomized"],
+            "collection_status": "complete",
+            "reserve_roster_contract": dict(
+                SUPPLEMENT_RESERVE_ROSTER_CONTRACT
+            ),
+            "reserve_roster": roster,
             "pre_registered_seeds": seeds,
             "pre_registered_horizon_by_seed": {
                 str(seed): horizon for seed, horizon in horizon_by_seed.items()
             },
+            "selected_seed_by_slot": selected_seed_by_slot,
+            "attempts": attempts,
             "target_events": ["e3", "e4"],
             "collector_file_sha256": "8" * 64,
             "base_collector_file_sha256": "9" * 64,
@@ -507,9 +572,9 @@ def _supplement_fixture(
             "expert_root_provenance_contract": dict(
                 EXPERT_ROOT_PROVENANCE_CONTRACT
             ),
-            "root_selection_contract": dict(expert_collector.ROOT_SELECTION_CONTRACT),
-            "horizon_contract": dict(expert_collector.HORIZON_CONTRACT),
-            "actor_branch_contract": dict(expert_collector.ACTOR_BRANCH_CONTRACT),
+            "root_selection_contract": dict(SUPPLEMENT_ROOT_SELECTION_CONTRACT),
+            "horizon_contract": dict(SUPPLEMENT_HORIZON_CONTRACT),
+            "actor_branch_contract": dict(SUPPLEMENT_ACTOR_BRANCH_CONTRACT),
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
             "terminal_supervision_contract": TERMINAL_SUPERVISION_CONTRACT,
             "event_age_contract": EVENT_AGE_CONTRACT,
@@ -542,6 +607,10 @@ def _supplement_fixture(
             "path": manifest_path.name,
             "sha256": _write_json(manifest_path, manifest),
             "group_count": len(groups),
+            "selected_seed_by_slot_sha256": canonical_sha256(
+                selected_seed_by_slot
+            ),
+            "reserve_roster_sha256": canonical_sha256(roster),
         }
     binding = _signed(
         {
@@ -575,6 +644,10 @@ def _supplement_fixture(
                 "complete_decisions": 100,
                 "complete_branches": 400,
                 "seed_overlap_with_primary": 0,
+                "selected_seed_count": 50,
+                "rejected_attempt_count": rejected_attempt_count,
+                "selection_occurs_before_actor_candidate_outcomes": True,
+                "heldout_payload_npz_files_opened": 0,
             },
         }
     )
@@ -771,6 +844,47 @@ def test_supplement_heldout_manifest_and_payload_are_zero_open(
     assert receipt["supplement"]["heldout_group_npz_opened"] == 0
 
 
+def test_supplement_binding_reserve_provenance_fails_closed(
+    tmp_path: Path,
+) -> None:
+    binding, digest = _fixture(tmp_path)
+    primary = load_binding(binding, digest)
+    supplement_binding, _supplement_digest = _supplement_fixture(
+        tmp_path, binding, digest
+    )
+    original = json.loads(supplement_binding.read_text(encoding="utf-8"))
+
+    changed_body_hash = json.loads(json.dumps(original))
+    changed_body_hash["body_manifests"]["aloha-agilex"][
+        "reserve_roster_sha256"
+    ] = "f" * 64
+    changed_body_hash.pop("logical_sha256")
+    changed_body_hash = _signed(changed_body_hash)
+    changed_body_path = tmp_path / "supplement-binding-changed-body.json"
+    changed_body_digest = _write_json(changed_body_path, changed_body_hash)
+    with pytest.raises(FiveBodyContractError, match="reserve provenance"):
+        load_supplement_binding(
+            changed_body_path,
+            changed_body_digest,
+            primary_audit=primary,
+            held_out_body="franka",
+        )
+
+    changed_count = json.loads(json.dumps(original))
+    changed_count["materializer_provenance"]["rejected_attempt_count"] = 0
+    changed_count.pop("logical_sha256")
+    changed_count = _signed(changed_count)
+    changed_count_path = tmp_path / "supplement-binding-changed-count.json"
+    changed_count_digest = _write_json(changed_count_path, changed_count)
+    with pytest.raises(FiveBodyContractError, match="rejected-attempt provenance"):
+        load_supplement_binding(
+            changed_count_path,
+            changed_count_digest,
+            primary_audit=primary,
+            held_out_body="franka",
+        )
+
+
 def test_supplement_is_source_train_only_and_never_enters_validation(
     tmp_path: Path,
 ) -> None:
@@ -838,15 +952,81 @@ def test_supplement_seed_and_expert_root_contracts_fail_closed(
     original = json.loads(manifest_path.read_text(encoding="utf-8"))
     checkpoint_sha = primary["actor"]["checkpoint_sha256_by_body"]["aloha-agilex"]
 
-    changed_seed = dict(original)
-    changed_seed["pre_registered_seeds"] = [
-        *expert_collector.PREDEFINED_SEEDS[:-1],
-        expert_collector.PREDEFINED_SEEDS[-1] + 1,
-    ]
+    changed_seed = json.loads(json.dumps(original))
+    changed_seed["pre_registered_seeds"][-1] += 1
     changed_seed.pop("logical_sha256")
-    with pytest.raises(FiveBodyContractError, match="seed/horizon"):
+    with pytest.raises(FiveBodyContractError, match="reserve design"):
         validate_supplement_body_manifest(
             _signed(changed_seed),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+    incomplete = json.loads(json.dumps(original))
+    incomplete["collection_status"] = "collecting"
+    incomplete.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="reserve design"):
+        validate_supplement_body_manifest(
+            _signed(incomplete),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+    changed_horizon = json.loads(json.dumps(original))
+    first_seed = str(changed_horizon["pre_registered_seeds"][0])
+    changed_horizon["pre_registered_horizon_by_seed"][first_seed] += 1
+    changed_horizon.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="reserve design"):
+        validate_supplement_body_manifest(
+            _signed(changed_horizon),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+    missing_slot = json.loads(json.dumps(original))
+    missing_slot["selected_seed_by_slot"].pop("clean|horizon_slot=1")
+    missing_slot.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="reserve design"):
+        validate_supplement_body_manifest(
+            _signed(missing_slot),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+    missing_rejection = json.loads(json.dumps(original))
+    missing_rejection["attempts"].pop(0)
+    missing_rejection.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="rejection history"):
+        validate_supplement_body_manifest(
+            _signed(missing_rejection),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+    late_selection = json.loads(json.dumps(original))
+    late_selection["attempts"][1][
+        "selected_before_actor_candidate_outcomes"
+    ] = False
+    late_selection.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="selected.*incomplete"):
+        validate_supplement_body_manifest(
+            _signed(late_selection),
+            expected_body="aloha-agilex",
+            manifest_dir=manifest_path.parent,
+            expected_actor_checkpoint_sha256=checkpoint_sha,
+        )
+
+    wrong_group_identity = json.loads(json.dumps(original))
+    wrong_group_identity["groups"][0]["group_id"] += "|tampered"
+    wrong_group_identity.pop("logical_sha256")
+    with pytest.raises(FiveBodyContractError, match="group"):
+        validate_supplement_body_manifest(
+            _signed(wrong_group_identity),
             expected_body="aloha-agilex",
             manifest_dir=manifest_path.parent,
             expected_actor_checkpoint_sha256=checkpoint_sha,
@@ -1059,6 +1239,9 @@ def test_rank_gradient_updates_only_consequence_utility_not_world_model() -> Non
         parameter.grad is None
         for parameter in model.terminal_context_encoder.parameters()
     )
+    assert all(
+        parameter.grad is None for parameter in model.terminal_residual.parameters()
+    )
     assert all(parameter.grad is None for parameter in model.terminal_event.parameters())
     assert all(
         parameter.grad is None for parameter in model.terminal_recovery.parameters()
@@ -1153,6 +1336,7 @@ def test_semantic_comparative_loss_updates_terminal_locations_not_utility_or_sca
     assert has_nonzero_gradient(model.terminal_event)
     assert has_nonzero_gradient(model.terminal_goal_progress_mean)
     assert has_nonzero_gradient(model.terminal_context_encoder)
+    assert has_nonzero_gradient(model.terminal_residual)
     assert has_nonzero_gradient(model.transition)
     assert has_nonzero_gradient(model.action)
     assert has_nonzero_gradient(model.semantic)
@@ -1200,63 +1384,57 @@ def test_relative_gradient_budget_caps_comparative_head_gradient() -> None:
     )
 
 
-def test_shared_world_budget_uses_only_comparative_active_parameters() -> None:
-    output_head = torch.nn.Parameter(torch.tensor(1.0))
-    shared_upstream = torch.nn.Parameter(torch.tensor(1.0))
-    proper_only_zero_comparative = torch.nn.Parameter(torch.tensor(2.0))
-    proper_loss = (
-        output_head.square()
-        + proper_only_zero_comparative.square()
-        + 0.0 * shared_upstream
+def test_single_active_union_budget_excludes_scales_and_caps_once() -> None:
+    torch.manual_seed(14)
+    model = EffectAlignedSharedEventHead().eval()
+    active = _semantic_comparative_active_parameters(model)
+    active_ids = {id(parameter) for parameter in active}
+    expected_modules = (
+        model.semantic,
+        model.action,
+        model.transition,
+        model.terminal_context_encoder,
+        model.terminal_residual,
+        model.terminal_event,
+        model.terminal_goal_progress_mean,
     )
-    comparative_loss = (
-        10.0 * output_head
-        + 10.0 * shared_upstream
-        + 0.0 * proper_only_zero_comparative
-    )
+    assert active_ids == {
+        id(parameter)
+        for module in expected_modules
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    }
+    for excluded_module in (
+        model.object_scale,
+        model.duration_scale,
+        model.terminal_goal_progress_scale,
+        model.candidate_rank,
+    ):
+        assert active_ids.isdisjoint(
+            id(parameter) for parameter in excluded_module.parameters()
+        )
 
-    local_scale = _relative_gradient_budget_scale(
-        proper_loss, comparative_loss, (output_head,)
+    proper_loss = sum(parameter.square().mean() for parameter in active)
+    comparative_loss = 100.0 * sum(parameter.mean() for parameter in active)
+    bounded, scale = _bounded_semantic_comparative_loss(
+        proper_loss, comparative_loss, model
     )
-    local_proper_gradient = torch.autograd.grad(
-        proper_loss, output_head, retain_graph=True
-    )[0]
-    local_comparative_gradient = torch.autograd.grad(
-        local_scale * comparative_loss, output_head, retain_graph=True
-    )[0]
-    assert 0.0 < float(local_scale) <= SEMANTIC_GRADIENT_SCALE_CAP
-    assert abs(float(local_comparative_gradient)) <= (
-        SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
-        * abs(float(local_proper_gradient))
-        + 1e-6
+    proper_gradients = torch.autograd.grad(
+        proper_loss, active, retain_graph=True
     )
+    bounded_gradients = torch.autograd.grad(bounded, active)
 
-    pre_shared_world_budget = local_scale * comparative_loss
-    zero_comparative_gradient = torch.autograd.grad(
-        pre_shared_world_budget,
-        proper_only_zero_comparative,
-        retain_graph=True,
-    )[0]
-    assert zero_comparative_gradient is not None
-    assert zero_comparative_gradient == 0.0
-    shared_world_scale = _relative_gradient_budget_scale(
-        proper_loss,
-        pre_shared_world_budget,
-        (shared_upstream, proper_only_zero_comparative),
-    )
-    assert shared_world_scale == 0.0
+    def gradient_norm(gradients: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return torch.sqrt(
+            torch.stack([gradient.square().sum() for gradient in gradients]).sum()
+        )
 
-    final_semantic_loss = shared_world_scale * pre_shared_world_budget
-    final_shared_gradient = torch.autograd.grad(
-        final_semantic_loss, shared_upstream, retain_graph=True
-    )[0]
-    active_proper_gradient = torch.autograd.grad(
-        proper_loss, shared_upstream
-    )[0]
-    assert abs(float(final_shared_gradient)) <= (
-        SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
-        * abs(float(active_proper_gradient))
-        + 1e-6
+    proper_norm = gradient_norm(proper_gradients)
+    bounded_norm = gradient_norm(bounded_gradients)
+    assert not scale.requires_grad
+    assert 0.0 < float(scale) < SEMANTIC_GRADIENT_SCALE_CAP
+    assert bounded_norm <= (
+        SEMANTIC_COMPARATIVE_GRADIENT_BUDGET * proper_norm + 1e-6
     )
 
 
@@ -1671,8 +1849,10 @@ def test_terminal_prediction_conditions_on_remaining_action_budget() -> None:
     with torch.no_grad():
         for parameter in model.terminal_context_encoder.parameters():
             parameter.zero_()
-        model.terminal_context_encoder[0].weight[0, 1] = 1.0
-        model.terminal_context_encoder[2].weight[0, 0] = 1.0
+        model.terminal_context_encoder[0].weight[0, 1] = 0.2
+        model.terminal_context_encoder[2].weight[
+            core.SEMANTIC_DIM, 0
+        ] = 1.0
         model.terminal_goal_progress_mean.weight.zero_()
         model.terminal_goal_progress_mean.bias.zero_()
         model.terminal_goal_progress_mean.weight[0, 0] = 1.0
@@ -1696,6 +1876,54 @@ def test_terminal_prediction_conditions_on_remaining_action_budget() -> None:
     torch.testing.assert_close(
         torch.sigmoid(output["success_logit"]), terminal_probability[:, -1]
     )
+
+
+@pytest.mark.parametrize(
+    ("context_channel", "low", "high"),
+    ((0, 0.0, 9.0), (1, 10.0, 200.0)),
+)
+def test_terminal_candidate_difference_changes_with_shared_horizon_context(
+    context_channel: int,
+    low: float,
+    high: float,
+) -> None:
+    """FiLM must break the additive head's candidate-difference invariance."""
+
+    model = EffectAlignedSharedEventHead().eval()
+    with torch.no_grad():
+        for parameter in model.terminal_context_encoder.parameters():
+            parameter.zero_()
+        for parameter in model.terminal_residual.parameters():
+            parameter.zero_()
+        model.terminal_context_encoder[0].weight[0, context_channel] = 0.2
+        # The first half of the FiLM vector modulates transitioned features.
+        model.terminal_context_encoder[2].weight[0, 0] = 1.0
+        model.terminal_goal_progress_mean.weight.zero_()
+        model.terminal_goal_progress_mean.bias.zero_()
+        model.terminal_goal_progress_mean.weight[0, 0] = 1.0
+
+    candidate_a = torch.zeros(core.SEMANTIC_DIM)
+    candidate_b = torch.zeros(core.SEMANTIC_DIM)
+    candidate_a[0] = 1.0
+    candidate_b[0] = -1.0
+    transitioned = torch.stack(
+        (candidate_a, candidate_b, candidate_a, candidate_b)
+    )
+    base_context = torch.tensor([0.4, 175.0]).log1p()
+    low_context = base_context.clone()
+    high_context = base_context.clone()
+    low_context[context_channel] = torch.tensor(low).log1p()
+    high_context[context_channel] = torch.tensor(high).log1p()
+    context = torch.stack(
+        (low_context, low_context, high_context, high_context)
+    )
+    terminal_hidden = model._terminal_hidden(transitioned, context)
+    prediction = model.terminal_goal_progress_mean(terminal_hidden).squeeze(-1)
+    low_difference = prediction[0] - prediction[1]
+    high_difference = prediction[2] - prediction[3]
+
+    assert torch.isfinite(prediction).all()
+    assert abs(float((high_difference - low_difference).detach())) > 1e-4
 
 
 def test_rank_ensemble_uses_mean_minus_quarter_population_std() -> None:
@@ -2424,7 +2652,7 @@ def test_calibration_guard_rejects_comparative_support_drift(
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
-    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v8"
+    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v9"
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
     torch.testing.assert_close(
@@ -2522,14 +2750,22 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert full_contract["utility_rank_loss_updates_consequence_predictors"] is False
     assert full_contract["semantic_comparative_loss_updates_terminal_predictors"] is True
     assert full_contract[
-        "semantic_comparative_gradient_budget_relative_to_proper_head"
+        "semantic_comparative_gradient_budget_relative_to_active_union_proper"
     ] == SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
     assert full_contract["semantic_gradient_scale_cap"] == SEMANTIC_GRADIENT_SCALE_CAP
-    assert full_contract[
-        "semantic_comparative_gradient_budget_relative_to_shared_world"
-    ] == SEMANTIC_COMPARATIVE_GRADIENT_BUDGET
     assert full_contract["semantic_comparative_gradient_budget_scope"] == (
-        "per_terminal_head_then_shared_world_on_comparative_active_parameters"
+        "single_active_union_semantic_action_transition_terminal_trunk_and_location_heads"
+    )
+    assert full_contract["semantic_comparative_scale_heads_excluded"] is True
+    assert full_contract["semantic_comparative_gradient_cap_applications"] == 1
+    assert full_contract["terminal_context_fusion"] == (
+        "bounded_horizon_conditioned_film_residual_trunk"
+    )
+    assert full_contract[
+        "terminal_candidate_relative_predictions_condition_on_horizon"
+    ] is True
+    assert full_contract["terminal_film_modulation_bound"] == (
+        TERMINAL_FILM_MODULATION_BOUND
     )
     assert full_contract["dense_only_listwise_weight"] == DENSE_ONLY_RANK_WEIGHT
     assert full_contract["world_and_utility_gradient_clipping_are_separate"] is True

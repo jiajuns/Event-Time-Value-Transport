@@ -96,3 +96,24 @@
 5. 单独提交并 push，排除用户原有 dirty 文件。
 6. 部署新的只读代码目录到远端，但等 4090 空闲后再采 100/400 supplement。
 7. 完整运行 C-only LOBO/paired 基线，再运行 C+supplement LOBO/paired；比较 held-out 五本体宏平均 `ΔSR`、阶段进度和 95% CI。
+
+## 7. 2026-08-31：scripted-root reserve roster 收口
+
+固定五个任意 reset seed 无法保证 public expert 在五本体、clean/randomized 下都产生 e3/e4。补充 collector 已改成不依赖 outcome 的有序 reserve 协议：
+
+- 每个 `(body, condition, H slot)` 冻结 16 个 seed；五本体合计使用互不重叠的 `2026081000..2026081799`，与 primary `2026082000+` 分离；
+- H 仍固定为 `10/25/50/100/200`，manifest 明确区分 `horizon_slot`、H 和真实 `requested_seed`；
+- 只选择第一个同时具有 e3/e4 且两个 root 都可 fresh-restore canonicalize 的 seed，选择发生在任何 actor candidate outcome 前；
+- 所有 rejected seed 都记录原因，reserve 耗尽非零退出，missing attempt 不再被标为 complete；
+- selected root pair 在 outcome 前保存 create-once 恢复 bundle；已有 group 必须同时通过 payload 和 diagnostics SHA 才可跳过；
+- 完成规模仍为每本体 20 decisions/80 branches、总计 100/400；materializer 和 upgrade watcher 都按 selected-slot 设计 fail closed，materializer 仍不打开 NPZ。
+
+2026-08-31 后续合并已经把 reserve 协议接入 v9 trainer，接口现状如下：
+
+1. trainer 内部独立实现与 collector 相同的 reserve 常量和 `reserve_roster(body)` 公式，生产训练不 import collector；
+2. root-selection、horizon、reserve-roster contracts 已逐项同步；
+3. `validate_supplement_body_manifest` payload-blind 校验本体局部 160-seed roster、seed→H map、10 个 selected slots、严格有序 rejection ledger 和 selection-before-outcomes；
+4. group identity 已改为 `(condition, horizon_slot, requested_seed, root_event)`；
+5. outer-heldout manifest/payload 保持 zero-open，四个 source body 的 roster/selection SHA 从实际 manifest 重算并与 binding 比对。
+
+联合 CPU 回归为 122 passed；只有把该版本提交、推送并部署为新的远程只读代码目录后，supplement 自动流水线才可切换到它。

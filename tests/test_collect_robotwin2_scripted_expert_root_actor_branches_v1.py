@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import inspect
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -148,22 +150,186 @@ def test_observer_freezes_only_first_e3_and_e4_and_resets_actor_horizon() -> Non
         assert root["remaining_action_budget"] == 50
 
 
-def test_seed_horizon_binding_is_fixed_and_label_blind() -> None:
-    expected = dict(zip(collector.PREDEFINED_SEEDS, (10, 25, 50, 100, 200)))
-    assert collector.resolve_seed_horizons(collector.PREDEFINED_SEEDS) == expected
-    with pytest.raises(collector.ScriptedRootCollectionError):
-        collector.resolve_seed_horizons(collector.PREDEFINED_SEEDS[:-1])
-    with pytest.raises(collector.ScriptedRootCollectionError):
-        collector.resolve_seed_horizons(tuple(reversed(collector.PREDEFINED_SEEDS)))
+def test_reserve_roster_is_body_local_fixed_and_label_blind() -> None:
+    all_seeds = set()
+    for body in base.BODIES:
+        roster = collector.reserve_roster(body)
+        assert len(roster) == len(base.CONDITIONS) * len(
+            collector.HORIZON_SCHEDULE
+        )
+        assert [row["remaining_action_budget"] for row in roster[:5]] == list(
+            collector.HORIZON_SCHEDULE
+        )
+        body_seeds = {
+            seed for row in roster for seed in row["ordered_requested_seeds"]
+        }
+        assert len(body_seeds) == 160
+        assert body_seeds.isdisjoint(all_seeds)
+        assert max(body_seeds) < collector.FORMAL_PRIMARY_SEED_START
+        all_seeds.update(body_seeds)
+        horizon_by_seed = collector.reserve_horizon_by_seed(body)
+        for row in roster:
+            assert all(
+                horizon_by_seed[seed] == row["remaining_action_budget"]
+                for seed in row["ordered_requested_seeds"]
+            )
     assert collector.HORIZON_CONTRACT[
         "candidate_or_terminal_outcomes_used_to_choose_horizon"
     ] is False
+    assert collector.RESERVE_ROSTER_CONTRACT[
+        "selection_occurs_before_actor_candidate_outcomes"
+    ] is True
+    assert collector.RESERVE_ROSTER_CONTRACT[
+        "heldout_body_availability_changes_source_body_roster"
+    ] is False
+
+
+def test_main_freezes_pair_selection_before_candidate_generation_and_outcomes() -> None:
+    source = inspect.getsource(collector.main)
+    pair_validation = source.index("generate_actor_candidates=False")
+    selection = source.index("selected_seed_by_slot[slot_key] = seed")
+    candidate_generation = source.index("generate_actor_candidates=True")
+    candidate_outcome = source.index("base._evaluate_candidate(")
+    assert pair_validation < selection < candidate_generation < candidate_outcome
+
+
+def test_task_setup_exception_still_closes_partial_environment() -> None:
+    class _SetupFailureTask:
+        closed = 0
+
+        def setup_demo(self, **_kwargs: object) -> None:
+            raise RuntimeError("setup failed")
+
+        def close_env(self, *, clear_cache: bool) -> None:
+            assert clear_cache is False
+            type(self).closed += 1
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        collector._new_task_with_setup_cleanup(
+            _SetupFailureTask, {}, 123, "instruction"
+        )
+    assert _SetupFailureTask.closed == 1
+
+    wrapped = collector._task_factory_with_setup_cleanup(_SetupFailureTask)()
+    with pytest.raises(RuntimeError, match="setup failed"):
+        wrapped.setup_demo(seed=123)
+    assert _SetupFailureTask.closed == 2
+
+
+def test_fresh_setup_python_rng_is_scene_seed_deterministic() -> None:
+    class _SeedTask:
+        observed: list[float] = []
+
+        def setup_demo(self, **_kwargs: object) -> None:
+            type(self).observed.append(random.random())
+
+        def set_instruction(self, *, instruction: str) -> None:
+            assert instruction == "instruction"
+
+        def close_env(self, *, clear_cache: bool) -> None:
+            assert clear_cache is False
+
+    class _Scene:
+        def get_timestep(self) -> float:
+            return 0.01
+
+    first = _SeedTask()
+    first.scene = _Scene()
+    second = _SeedTask()
+    second.scene = _Scene()
+    tasks = iter((first, second))
+    factory = lambda: next(tasks)
+    one = collector._new_task_with_setup_cleanup(
+        factory, {}, 2026081234, "instruction"
+    )
+    random.random()
+    two = collector._new_task_with_setup_cleanup(
+        factory, {}, 2026081234, "instruction"
+    )
+    collector._close_task_safely(one)
+    collector._close_task_safely(two)
+    assert _SeedTask.observed[0] == _SeedTask.observed[1]
+
+
+def _root_pair_capture_fixture(horizon: int = 50) -> dict:
+    task = _ObserverTask()
+    roots = {}
+    for index, target in enumerate(collector.TARGET_EVENTS, start=1):
+        task.scene.step_count = index
+        snapshot = _fake_snapshot(task)
+        roots[target] = {
+            "target_event": target,
+            "target_event_id": int(analytic_event.EVENT_TO_ID[target]),
+            "object_names": ["can", "pot"],
+            "branch_root_snapshot": snapshot,
+            "branch_root_snapshot_sha256": base.branch_root_snapshot_sha256(
+                snapshot
+            ),
+            "remaining_action_budget": horizon,
+        }
+    return {
+        "roots": roots,
+        "captured_targets": list(collector.TARGET_EVENTS),
+        "missing_targets": [],
+        "expert_plan_success": True,
+    }
+
+
+def test_root_pair_bundle_is_create_once_and_resumable(tmp_path: Path) -> None:
+    path = tmp_path / "root-pair.pt"
+    value = {
+        "format": collector.ROOT_PAIR_BUNDLE_FORMAT,
+        "body": "franka",
+        "condition": "clean",
+        "horizon_slot": 2,
+        "remaining_action_budget": 50,
+        "requested_seed": 2026081320,
+        "actor_candidate_outcomes_executed_before_bundle": False,
+        "capture": _root_pair_capture_fixture(),
+    }
+    persisted, sha, created = collector.persist_root_pair_bundle_create_once(
+        path, value
+    )
+    assert created is True
+    assert persisted["capture"]["captured_targets"] == ["e3", "e4"]
+    resumed, resumed_sha, created = collector.persist_root_pair_bundle_create_once(
+        path, value
+    )
+    assert created is False
+    assert resumed_sha == sha
+    assert collector._root_pair_fingerprint(resumed["capture"]) == (
+        collector._root_pair_fingerprint(value["capture"])
+    )
+
+
+def test_existing_group_is_never_skipped_without_both_sha_checks(
+    tmp_path: Path,
+) -> None:
+    group = tmp_path / "groups" / "one.npz"
+    diagnostics = tmp_path / "groups" / "one.diagnostics.npz"
+    group.parent.mkdir(parents=True)
+    group.write_bytes(b"group")
+    diagnostics.write_bytes(b"diagnostics")
+    item = {
+        "path": "groups/one.npz",
+        "sha256": base.sha256_file(group),
+        "diagnostics_path": "groups/one.diagnostics.npz",
+        "diagnostics_sha256": base.sha256_file(diagnostics),
+    }
+    collector.verify_existing_group_files(tmp_path, item)
+    diagnostics.write_bytes(b"changed")
+    with pytest.raises(
+        collector.ScriptedRootCollectionError,
+        match="diagnostics SHA-256 mismatch",
+    ):
+        collector.verify_existing_group_files(tmp_path, item)
 
 
 def _manifest_header(
     body: str, actor_authority_sha: str, actor_checkpoint_sha: str, event_sha: str
 ) -> dict:
     calibration = _calibration()
+    roster = collector.reserve_roster(body)
     return {
         "format": trainer.SUPPLEMENT_MANIFEST_FORMAT,
         "collector_format": collector.FORMAT,
@@ -192,6 +358,8 @@ def _manifest_header(
         "action_exec_steps": 5,
         "root_selection_contract": dict(collector.ROOT_SELECTION_CONTRACT),
         "horizon_contract": dict(collector.HORIZON_CONTRACT),
+        "reserve_roster_contract": dict(collector.RESERVE_ROSTER_CONTRACT),
+        "reserve_roster": roster,
         "actor_branch_contract": dict(collector.ACTOR_BRANCH_CONTRACT),
         "event_spec_sha256": trainer.EVENT_SPEC_SHA256,
         "event_derivation_implementation_sha256": event_sha,
@@ -244,12 +412,12 @@ def _manifest_header(
         "branch_root_snapshot_contract": trainer.BRANCH_ROOT_SNAPSHOT_CONTRACT,
         "object_effect_schema": trainer.OBJECT_EFFECT_SCHEMA,
         "branch_diagnostic_contract": trainer.BRANCH_DIAGNOSTIC_CONTRACT,
-        "pre_registered_seeds": list(collector.PREDEFINED_SEEDS),
+        "pre_registered_seeds": [
+            seed for row in roster for seed in row["ordered_requested_seeds"]
+        ],
         "pre_registered_horizon_by_seed": {
             str(seed): horizon
-            for seed, horizon in collector.resolve_seed_horizons(
-                collector.PREDEFINED_SEEDS
-            ).items()
+            for seed, horizon in collector.reserve_horizon_by_seed(body).items()
         },
     }
 
@@ -261,39 +429,123 @@ def _supplement_manifest(
         body, actor_authority_sha, actor_checkpoint_sha, event_sha
     )
     groups = []
-    horizons = collector.resolve_seed_horizons(collector.PREDEFINED_SEEDS)
-    for condition in trainer.CONDITIONS:
-        for seed in collector.PREDEFINED_SEEDS:
-            for event in (2, 3):
-                stem = f"{condition}-seed{seed}-e{event}"
-                event_name = {2: "e3", 3: "e4"}[event]
-                groups.append(
-                    {
-                        "group_id": (
-                            f"{condition}|seed={seed}|scripted_root={event_name}"
-                        ),
-                        "condition": condition,
-                        "requested_seed": seed,
-                        "root_event_id": event,
-                        "scripted_root_event_id": event,
-                        "scripted_root_event": event_name,
-                        "pre_registered_horizon": horizons[seed],
-                        "candidate_noise_query_index": event,
-                        "path": f"groups/{stem}.npz",
-                        "sha256": "1" * 64,
-                        "raw_expert_snapshot_sha256": "8" * 64,
-                        "branch_root_snapshot_sha256": "2" * 64,
-                        "branch_root_restorable_snapshot_sha256": "3" * 64,
-                        "canonical_root_snapshot_sha256": "4" * 64,
-                        "diagnostic_format": trainer.BRANCH_DIAGNOSTIC_CONTRACT[
-                            "format"
-                        ],
-                        "diagnostics_path": f"groups/{stem}.diagnostics.npz",
-                        "diagnostics_sha256": "5" * 64,
-                    }
-                )
+    attempts = []
+    selected = {}
+    for row in collector.reserve_roster(body):
+        condition = row["condition"]
+        slot = row["horizon_slot"]
+        horizon = row["remaining_action_budget"]
+        seed = row["ordered_requested_seeds"][0]
+        selected[row["slot_key"]] = seed
+        attempts.append(
+            {
+                "attempt_id": collector.reserve_attempt_id(
+                    condition, slot, seed
+                ),
+                "condition": condition,
+                "horizon_slot": slot,
+                "requested_seed": seed,
+                "pre_registered_horizon": horizon,
+                "status": "complete",
+                "selected_before_actor_candidate_outcomes": True,
+                "actor_candidate_outcomes_executed_before_selection": False,
+                "root_pair_bundle_sha256": "9" * 64,
+            }
+        )
+        for event in (2, 3):
+            stem = f"{condition}-slot{slot}-seed{seed}-e{event}"
+            event_name = {2: "e3", 3: "e4"}[event]
+            groups.append(
+                {
+                    "group_id": collector.reserve_group_id(
+                        condition, slot, seed, event_name
+                    ),
+                    "condition": condition,
+                    "horizon_slot": slot,
+                    "requested_seed": seed,
+                    "root_event_id": event,
+                    "scripted_root_event_id": event,
+                    "scripted_root_event": event_name,
+                    "pre_registered_horizon": horizon,
+                    "candidate_noise_query_index": event,
+                    "path": f"groups/{stem}.npz",
+                    "sha256": "1" * 64,
+                    "raw_expert_snapshot_sha256": "8" * 64,
+                    "branch_root_snapshot_sha256": "2" * 64,
+                    "branch_root_restorable_snapshot_sha256": "3" * 64,
+                    "canonical_root_snapshot_sha256": "4" * 64,
+                    "diagnostic_format": trainer.BRANCH_DIAGNOSTIC_CONTRACT[
+                        "format"
+                    ],
+                    "diagnostics_path": f"groups/{stem}.diagnostics.npz",
+                    "diagnostics_sha256": "5" * 64,
+                }
+            )
+    value["collection_status"] = "complete"
+    value["selected_seed_by_slot"] = selected
+    value["attempts"] = attempts
     value["groups"] = groups
     return _signed(value)
+
+
+def test_completed_design_requires_full_ordered_reject_history() -> None:
+    manifest = _supplement_manifest(
+        "piper", "a" * 64, "c" * 64, "e" * 64
+    )
+    manifest.pop("logical_sha256")
+    row = collector.reserve_roster("piper")[0]
+    old_seed, selected_seed = row["ordered_requested_seeds"][:2]
+    manifest["selected_seed_by_slot"][row["slot_key"]] = selected_seed
+    selected_attempt = next(
+        attempt
+        for attempt in manifest["attempts"]
+        if attempt["attempt_id"]
+        == collector.reserve_attempt_id(
+            row["condition"], row["horizon_slot"], old_seed
+        )
+    )
+    selected_attempt["attempt_id"] = collector.reserve_attempt_id(
+        row["condition"], row["horizon_slot"], selected_seed
+    )
+    selected_attempt["requested_seed"] = selected_seed
+    manifest["attempts"].append(
+        {
+            "attempt_id": collector.reserve_attempt_id(
+                row["condition"], row["horizon_slot"], old_seed
+            ),
+            "condition": row["condition"],
+            "horizon_slot": row["horizon_slot"],
+            "requested_seed": old_seed,
+            "pre_registered_horizon": row["remaining_action_budget"],
+            "status": "rejected_before_actor_outcomes",
+            "reject_reason": "missing_e4",
+            "selected_before_actor_candidate_outcomes": False,
+            "actor_candidate_outcomes_executed_before_selection": False,
+        }
+    )
+    for group in manifest["groups"]:
+        if (
+            group["condition"] == row["condition"]
+            and group["horizon_slot"] == row["horizon_slot"]
+        ):
+            group["requested_seed"] = selected_seed
+            group["group_id"] = collector.reserve_group_id(
+                row["condition"],
+                row["horizon_slot"],
+                selected_seed,
+                group["scripted_root_event"],
+            )
+    collector.validate_completed_design_metadata(manifest, body="piper")
+    manifest["attempts"] = [
+        attempt
+        for attempt in manifest["attempts"]
+        if attempt.get("requested_seed") != old_seed
+    ]
+    with pytest.raises(
+        collector.ScriptedRootCollectionError,
+        match="rejection history",
+    ):
+        collector.validate_completed_design_metadata(manifest, body="piper")
 
 
 def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Path]]:
@@ -359,6 +611,35 @@ def _binding_fixture(tmp_path: Path) -> tuple[Path, str, Path, str, dict[str, Pa
     return primary_path, primary_sha, actor_path, actor_sha, supplements
 
 
+def _reserve_aware_trainer_validator(
+    value: dict,
+    *,
+    expected_body: str,
+    manifest_dir: Path,
+    expected_actor_checkpoint_sha256: str,
+) -> dict:
+    assert value["actor_checkpoint_tree_or_file_sha256"] == (
+        expected_actor_checkpoint_sha256
+    )
+    collector.validate_completed_design_metadata(value, body=expected_body)
+    return {
+        "body": expected_body,
+        "groups": [
+            {
+                **group,
+                "resolved_path": str(manifest_dir / group["path"]),
+                "resolved_diagnostics_path": str(
+                    manifest_dir / group["diagnostics_path"]
+                ),
+            }
+            for group in value["groups"]
+        ],
+        "event_derivation_implementation_sha256": value[
+            "event_derivation_implementation_sha256"
+        ],
+    }
+
+
 def test_five_body_materializer_emits_exact_trainer_binding_without_payload_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -383,6 +664,11 @@ def test_five_body_materializer_emits_exact_trainer_binding_without_payload_open
                 }
             }
         },
+    )
+    monkeypatch.setattr(
+        materializer.trainer,
+        "validate_supplement_body_manifest",
+        _reserve_aware_trainer_validator,
     )
     binding = materializer.build_binding(
         primary_binding_path=primary_path,
@@ -425,13 +711,16 @@ def test_five_body_materializer_emits_exact_trainer_binding_without_payload_open
     assert audit["heldout_manifest_binding"]["payload_files_opened"] == 0
     assert binding["actor_authority_sha256"] == actor_sha
     assert binding["primary_binding_file_sha256"] == primary_sha
-    assert binding["materializer_provenance"] == {
-        "format": materializer.FORMAT,
-        "payload_npz_files_opened": 0,
-        "complete_decisions": 100,
-        "complete_branches": 400,
-        "seed_overlap_with_primary": 0,
-    }
+    provenance = binding["materializer_provenance"]
+    assert provenance["format"] == materializer.FORMAT
+    assert provenance["payload_npz_files_opened"] == 0
+    assert provenance["heldout_payload_npz_files_opened"] == 0
+    assert provenance["complete_decisions"] == 100
+    assert provenance["complete_branches"] == 400
+    assert provenance["selected_seed_count"] == 50
+    assert provenance["rejected_attempt_count"] == 0
+    assert provenance["seed_overlap_with_primary"] == 0
+    assert provenance["selection_occurs_before_actor_candidate_outcomes"] is True
 
 
 def test_materializer_rejects_incomplete_design(
@@ -456,7 +745,12 @@ def test_materializer_rejects_incomplete_design(
             }
         },
     )
-    with pytest.raises(materializer.SupplementBindingError, match="complete 20"):
+    monkeypatch.setattr(
+        materializer.trainer,
+        "validate_supplement_body_manifest",
+        _reserve_aware_trainer_validator,
+    )
+    with pytest.raises(materializer.SupplementBindingError, match="ordered-reserve"):
         materializer.build_binding(
             primary_binding_path=primary_path,
             actor_authority_path=actor_path,
@@ -499,7 +793,7 @@ def test_checkpoint_tree_hash_exactly_matches_trainer_authority_hash(
     assert collector.sha256_path(checkpoint) == trainer.sha256_tree(checkpoint)[0]
 
 
-def test_collector_and_trainer_supplement_constants_are_exactly_aligned() -> None:
+def test_collector_preserves_shared_proper_only_contract_and_exact_scale() -> None:
     assert collector.MANIFEST_FORMAT == trainer.SUPPLEMENT_MANIFEST_FORMAT
     assert collector.SUPPLEMENT_USAGE_CONTRACT == trainer.SUPPLEMENT_USAGE_CONTRACT
     assert (
@@ -509,16 +803,12 @@ def test_collector_and_trainer_supplement_constants_are_exactly_aligned() -> Non
     assert collector.SUPPLEMENT_PROPER_LOSS_WEIGHT == (
         trainer.SUPPLEMENT_PROPER_LOSS_WEIGHT
     )
-    assert collector.PREDEFINED_SEEDS == trainer.SUPPLEMENT_PRE_REGISTERED_SEEDS
     assert collector.HORIZON_SCHEDULE == trainer.SUPPLEMENT_HORIZON_SCHEDULE
-    assert (
-        collector.ROOT_SELECTION_CONTRACT
-        == trainer.SUPPLEMENT_ROOT_SELECTION_CONTRACT
-    )
-    assert collector.HORIZON_CONTRACT == trainer.SUPPLEMENT_HORIZON_CONTRACT
     assert (
         collector.ACTOR_BRANCH_CONTRACT
         == trainer.SUPPLEMENT_ACTOR_BRANCH_CONTRACT
     )
+    assert collector.RESERVE_SEED_STOP_EXCLUSIVE == 2026081800
+    assert collector.RESERVE_SEED_STOP_EXCLUSIVE < collector.FORMAL_PRIMARY_SEED_START
     assert collector.EXPECTED_FIVE_BODY_DECISIONS == 100
     assert collector.EXPECTED_FIVE_BODY_BRANCHES == 400
