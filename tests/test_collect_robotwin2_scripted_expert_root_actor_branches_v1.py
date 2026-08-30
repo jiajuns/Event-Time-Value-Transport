@@ -359,7 +359,7 @@ def _manifest_header(
         "conditions": list(trainer.CONDITIONS),
         "target_events": ["e12", "e3", "e4"],
         "supplement_role": (
-            "expert_event_root_proper_world_and_utility_rank_source_train_only"
+            "expert_event_root_outer_source_crossfit_proper_world_and_utility_rank"
         ),
         "root_policy": "robotwin_scripted_expert",
         "candidate_and_continuation_policy": (

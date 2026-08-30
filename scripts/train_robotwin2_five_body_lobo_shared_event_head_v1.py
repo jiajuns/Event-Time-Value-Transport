@@ -37,7 +37,7 @@ import verify_robotwin2_move_can_pot_public_materialization_v1 as public_materia
 
 
 FORMAT = "etsf_robotwin2_five_body_lobo_shared_event_head_v1"
-MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v10"
+MODEL_FAMILY = "terminal_consequence_utility_shared_event_head_v11"
 BINDING_FORMAT = "etsf_robotwin2_five_body_lobo_training_binding_v1"
 MANIFEST_FORMAT = "etsf_robotwin2_canonical_transition_manifest_v1"
 SUPPLEMENT_BINDING_FORMAT = (
@@ -103,20 +103,30 @@ TERMINAL_GOAL_PROGRESS_LOSS_WEIGHT = 0.5
 SUPPLEMENT_PROPER_LOSS_WEIGHT = 0.25
 SUPPLEMENT_RANK_LOSS_WEIGHT = 0.25
 SUPPLEMENT_USAGE_CONTRACT = {
-    "outer_lobo_source_train_only": True,
+    "outer_lobo_source_only": True,
+    "source_train_bodies_per_outer_fold": 3,
+    "label_blind_inner_cross_body_proper_validation": True,
+    "proper_validation_bodies_per_outer_fold": 1,
+    "proper_validation_body_selection": (
+        "sha256_split_seed_ordered_five_body_cycle_successor_derangement"
+    ),
     "multitask_proper_loss": True,
     "robust_object_effect_proper_loss": True,
     "terminal_event_proper_loss": True,
     "terminal_goal_progress_proper_loss": True,
     "normalization_or_baseline_fit": False,
-    "candidate_rank_or_utility_loss": True,
+    "candidate_rank_or_utility_loss": "source_train_lane_only",
     "candidate_rank_or_utility_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
     "candidate_rank_updates": (
         "bounded_monotone_utility_only_from_detached_consequence_features"
     ),
     "semantic_comparative_loss": False,
-    "source_validation_or_checkpoint_selection": False,
-    "calibration": False,
+    "source_validation_or_checkpoint_selection": (
+        "proper_only_fixed_weight_0.25_no_rank_selection"
+    ),
+    "proper_checkpoint_selection_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+    "calibration_diagnostics": True,
+    "calibration_fit": False,
     "heldout_payload_access": False,
 }
 EXPERT_ROOT_PROVENANCE_CONTRACT = {
@@ -547,15 +557,36 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "cross_body_standardized_input_clip": CROSS_BODY_STANDARDIZED_INPUT_CLIP,
         "heldout_statistics_used_for_input_normalization_or_clip": False,
         "goal_progress_definition": (
-            "norm(state_relative_goal_xyz)-norm(state_relative_goal_xyz-"
-            "predicted_object_translation_mean)"
+            "post_event_mixture_expectation_of_norm(state_relative_goal_xyz)-"
+            "norm(state_relative_goal_xyz-object_translation_component_mean)"
         ),
         "goal_progress_benefit_transform": (
-            "0.5_times_one_plus_softsign_progress_over_0.02m"
+            "categorical_event_mixture_expectation_of_0.5_times_one_plus_"
+            "softsign_conditional_location_progress_over_0.02m"
         ),
         "goal_progress_uncertainty_definition": (
-            "delta_method_radial_std_from_student_t3_object_translation_scale_"
-            "mapped_as_std_over_std_plus_0.02m"
+            "post_event_mixture_total_std_combining_student_t3_within_event_"
+            "and_between_event_goal_progress_variance_mapped_as_std_over_std_"
+            "plus_0.02m"
+        ),
+        "object_effect_joint_distribution": (
+            "p(post_event)_times_independent_student_t3_dof3_object_delta_"
+            "conditioned_on_post_event"
+        ),
+        "terminal_goal_joint_distribution": (
+            "p(terminal_event)_times_student_t3_dof3_goal_progress_conditioned_"
+            "on_terminal_event"
+        ),
+        "conditional_consequence_proper_nll": (
+            "gather_observed_event_component_on_uniform_proper_stream"
+        ),
+        "legacy_consequence_mean_semantics": "categorical_event_mixture_mean",
+        "legacy_consequence_log_scale_semantics": (
+            "log_of_total_mixture_std_divided_by_sqrt3_moment_equivalent_"
+            "student_t3_scale"
+        ),
+        "aleatoric_consequence_risk": (
+            "law_of_total_variance_within_event_student_t3_plus_between_event"
         ),
         "pairwise_rank_loss_enabled": False,
         "group_listwise_success_mass_loss_enabled": variant != "success_only",
@@ -625,10 +656,19 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "semantic_gradient_scale_cap": SEMANTIC_GRADIENT_SCALE_CAP,
         "world_and_utility_gradient_clipping_are_separate": True,
         "checkpoint_selection_calibration_guard": (
-            "source_body_condition_macro_seed_clustered_strict_proper_score_"
-            "one_standard_error_then_minimum_10_comparative_seed_clusters_"
-            "across_minimum_2_requested_seeds_4_body_condition_units_2_bodies"
+            "primary_source_body_condition_macro_seed_clustered_strict_proper_"
+            "plus_fixed_0.25_label_blind_inner_cross_body_supplement_strict_"
+            "proper_with_independent_variance_one_standard_error_then_formal_"
+            "only_minimum_10_comparative_seed_clusters_across_minimum_2_"
+            "requested_seeds_4_body_condition_units_2_bodies"
         ),
+        "supplement_proper_validation_body_selection": (
+            "sha256_split_seed_ordered_five_body_cycle_successor_derangement"
+        ),
+        "supplement_proper_validation_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+        "supplement_validation_used_for_rank_comparison": False,
+        "supplement_validation_calibration_diagnostics": True,
+        "supplement_validation_calibration_fit": False,
         "strict_proper_components": (
             ["success_binary_nll"]
             if variant == "success_only"
@@ -645,14 +685,16 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
                 *(
                     []
                     if variant == "no_object_effect"
-                    else ["object_student_t3_nll_weight_0.5"]
+                    else ["object_given_post_event_student_t3_nll_weight_0.5"]
                 ),
                 "terminal_event_categorical_nll_weight_0.5",
                 "terminal_event_ordinal_ranked_probability_score_weight_0.25",
                 *(
                     []
                     if variant == "no_object_effect"
-                    else ["terminal_goal_student_t3_nll_weight_0.5"]
+                    else [
+                        "terminal_goal_given_terminal_event_student_t3_nll_weight_0.5"
+                    ]
                 ),
             ]
         ),
@@ -663,7 +705,10 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "terminal_stage_progress_loss": (
             "terminal_event_cdf_ranked_probability_score_weight_0.25"
         ),
-        "terminal_goal_progress_loss": "proper_student_t3_nll_uniform_stream",
+        "terminal_goal_progress_loss": (
+            "proper_observed_terminal_event_conditional_student_t3_nll_"
+            "uniform_stream"
+        ),
         "success_probability_definition": (
             "exact_terminal_event_probability_of_eK_with_shared_horizon_context"
         ),
@@ -799,6 +844,21 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "checkpoint_selection_calibration_guard": checkpoint[
             "checkpoint_selection_calibration_guard"
         ],
+        "supplement_proper_validation_body_selection": checkpoint[
+            "supplement_proper_validation_body_selection"
+        ],
+        "supplement_proper_validation_weight": checkpoint[
+            "supplement_proper_validation_weight"
+        ],
+        "supplement_validation_used_for_rank_comparison": checkpoint[
+            "supplement_validation_used_for_rank_comparison"
+        ],
+        "supplement_validation_calibration_diagnostics": checkpoint[
+            "supplement_validation_calibration_diagnostics"
+        ],
+        "supplement_validation_calibration_fit": checkpoint[
+            "supplement_validation_calibration_fit"
+        ],
         "strict_proper_components": checkpoint[
             "strict_proper_components"
         ],
@@ -828,6 +888,24 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ],
         "goal_progress_uncertainty_definition": checkpoint[
             "goal_progress_uncertainty_definition"
+        ],
+        "object_effect_joint_distribution": checkpoint[
+            "object_effect_joint_distribution"
+        ],
+        "terminal_goal_joint_distribution": checkpoint[
+            "terminal_goal_joint_distribution"
+        ],
+        "conditional_consequence_proper_nll": checkpoint[
+            "conditional_consequence_proper_nll"
+        ],
+        "legacy_consequence_mean_semantics": checkpoint[
+            "legacy_consequence_mean_semantics"
+        ],
+        "legacy_consequence_log_scale_semantics": checkpoint[
+            "legacy_consequence_log_scale_semantics"
+        ],
+        "aleatoric_consequence_risk": checkpoint[
+            "aleatoric_consequence_risk"
         ],
         "cross_body_input_normalization": checkpoint[
             "cross_body_input_normalization"
@@ -1607,7 +1685,7 @@ def validate_supplement_body_manifest(
         or value.get("candidate_count") != CANDIDATE_COUNT
         or value.get("action_exec_steps") != 5
         or value.get("supplement_role")
-        != "expert_event_root_proper_world_and_utility_rank_source_train_only"
+        != "expert_event_root_outer_source_crossfit_proper_world_and_utility_rank"
         or value.get("root_policy") != "robotwin_scripted_expert"
         or value.get("candidate_and_continuation_policy")
         != "same_frozen_native_actor_as_primary_binding"
@@ -1907,7 +1985,7 @@ def load_supplement_binding(
         or materializer.get("heldout_payload_npz_files_opened") != 0
     ):
         raise FiveBodyContractError(
-            "supplement binding violates the source-train proper/rank contract"
+            "supplement binding violates the outer-source train/validation contract"
         )
     body_bindings = binding.get("body_manifests")
     if not isinstance(body_bindings, Mapping) or set(body_bindings) != set(BODIES):
@@ -2200,14 +2278,33 @@ def source_group_split(
     return training, validation, heldout
 
 
+def supplement_inner_validation_body(
+    *, held_out_body: str, split_seed: int
+) -> str:
+    """Choose one outer-source body without inspecting supplement labels."""
+
+    if held_out_body not in BODIES:
+        raise FiveBodyContractError(f"unknown held-out body {held_out_body!r}")
+    if isinstance(split_seed, bool) or not isinstance(split_seed, int):
+        raise FiveBodyContractError("supplement split seed must be an integer")
+    ordered = sorted(
+        BODIES,
+        key=lambda body: hashlib.sha256(
+            f"{split_seed}|supplement-crossfit-order|{body}".encode()
+        ).hexdigest(),
+    )
+    return ordered[(ordered.index(held_out_body) + 1) % len(ordered)]
+
+
 def supplement_source_train_split(
-    supplement_audit: Mapping[str, Any], *, held_out_body: str
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Route supplements only to outer-fold source train; there is no val lane."""
+    supplement_audit: Mapping[str, Any], *, held_out_body: str, split_seed: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Split four source bodies into three train and one proper-validation lane."""
 
     if held_out_body not in BODIES:
         raise FiveBodyContractError(f"unknown held-out body {held_out_body!r}")
     training: list[dict[str, Any]] = []
+    validation: list[dict[str, Any]] = []
     manifests = supplement_audit.get("manifests")
     expected_sources = set(BODIES) - {held_out_body}
     if (
@@ -2218,20 +2315,35 @@ def supplement_source_train_split(
         raise FiveBodyContractError(
             "supplement audit does not expose exactly four source manifests"
         )
+    validation_body = supplement_inner_validation_body(
+        held_out_body=held_out_body, split_seed=split_seed
+    )
     for body in BODIES:
         if body == held_out_body:
             continue
         groups = list(manifests[body]["groups"])
-        training.extend({**group, "body": body} for group in groups)
+        if len(groups) != SUPPLEMENT_EXPECTED_DECISIONS_PER_BODY:
+            raise FiveBodyContractError(
+                f"{body} supplement does not contain the complete 30-group design"
+            )
+        target = validation if body == validation_body else training
+        target.extend({**group, "body": body} for group in groups)
     heldout = supplement_audit.get("heldout_manifest_binding")
     if (
         not training
+        or not validation
         or not isinstance(heldout, Mapping)
         or heldout.get("body") != held_out_body
         or int(heldout.get("declared_group_count", 0)) <= 0
     ):
         raise FiveBodyContractError("supplement LOBO split contains an empty lane")
-    return training, dict(heldout)
+    if (
+        {str(row["body"]) for row in validation} != {validation_body}
+        or {str(row["body"]) for row in training}
+        != expected_sources - {validation_body}
+    ):
+        raise FiveBodyContractError("supplement inner cross-body split changed")
+    return training, validation, dict(heldout)
 
 
 def build_preflight_receipt(
@@ -2280,13 +2392,24 @@ def build_preflight_receipt(
         )
     if supplement_audit is None:
         supplement_training: list[dict[str, Any]] = []
+        supplement_validation: list[dict[str, Any]] = []
+        supplement_validation_body: str | None = None
         supplement_heldout: dict[str, Any] = {
             "declared_group_count": 0,
             "sha256": None,
         }
     else:
-        supplement_training, supplement_heldout = supplement_source_train_split(
-            supplement_audit, held_out_body=held_out_body
+        (
+            supplement_training,
+            supplement_validation,
+            supplement_heldout,
+        ) = supplement_source_train_split(
+            supplement_audit,
+            held_out_body=held_out_body,
+            split_seed=split_seed,
+        )
+        supplement_validation_body = supplement_inner_validation_body(
+            held_out_body=held_out_body, split_seed=split_seed
         )
     receipt = {
         "format": FORMAT,
@@ -2342,12 +2465,21 @@ def build_preflight_receipt(
                 else 0.0
             ),
             "source_train_groups": len(supplement_training),
-            "source_validation_groups": 0,
+            "source_validation_groups": len(supplement_validation),
+            "source_validation_body": supplement_validation_body,
+            "source_validation_body_selection": (
+                "label_blind_sha256_ordered_five_body_cycle_successor_"
+                "derangement"
+            ),
+            "source_validation_assignment_uses_labels": False,
             "heldout_groups_deferred": int(
                 supplement_heldout["declared_group_count"]
             ),
             "source_train_identity_sha256": canonical_sha256(
                 identity(supplement_training)
+            ),
+            "source_validation_identity_sha256": canonical_sha256(
+                identity(supplement_validation)
             ),
             "heldout_manifest_sha256": supplement_heldout.get("sha256"),
             "usage_contract": dict(SUPPLEMENT_USAGE_CONTRACT),
@@ -2358,7 +2490,24 @@ def build_preflight_receipt(
             ),
             "source_validation_rows_used": 0,
             "checkpoint_selection_rows_used": 0,
+            "proper_checkpoint_selection_rows_authorized": (
+                len(supplement_validation) * CANDIDATE_COUNT
+            ),
+            "proper_checkpoint_selection_weight": (
+                SUPPLEMENT_PROPER_LOSS_WEIGHT
+                if supplement_audit is not None
+                else 0.0
+            ),
+            "proper_validation_primary_reset_overlap": 0,
+            "proper_validation_standard_error_combination": (
+                "independent_primary_and_supplement_seed_variances"
+            ),
+            "rank_selection_rows_authorized": 0,
+            "calibration_diagnostic_rows_authorized": (
+                len(supplement_validation) * CANDIDATE_COUNT
+            ),
             "calibration_rows_used": 0,
+            "calibration_fit": False,
             "heldout_group_npz_opened": 0,
             "heldout_group_payload_bytes_read": 0,
             "heldout_group_payload_deserialized": 0,
@@ -2902,6 +3051,90 @@ class InvariantMonotoneConsequenceUtility(torch.nn.Module):
         )
 
 
+def _event_conditioned_student_t3_mixture_moments(
+    event_probability: torch.Tensor,
+    component_mean: torch.Tensor,
+    component_log_scale: torch.Tensor,
+    *,
+    dof: float = 3.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return exact mean/std and a moment-equivalent Student-t log scale.
+
+    ``component_mean`` may be scalar ``[B, E]`` or vector ``[B, E, D]``.
+    The returned standard deviation applies the law of total variance, so it
+    contains both Student-t variance within an observed-event mode and variance
+    between event modes.  The compatibility log scale is defined as
+    ``log(total_std / sqrt(dof / (dof - 2)))``; for dof=3, legacy consumers that
+    multiply ``exp(log_scale)`` by ``sqrt(3)`` recover the exact mixture std.
+    """
+
+    if (
+        event_probability.ndim != 2
+        or component_mean.shape != component_log_scale.shape
+        or component_mean.ndim not in {2, 3}
+        or component_mean.shape[:2] != event_probability.shape
+        or not math.isfinite(float(dof))
+        or float(dof) <= 2.0
+    ):
+        raise FiveBodyContractError("event-conditioned Student-t mixture is invalid")
+    weight = event_probability
+    while weight.ndim < component_mean.ndim:
+        weight = weight.unsqueeze(-1)
+    component_variance = (float(dof) / (float(dof) - 2.0)) * torch.exp(
+        2.0 * component_log_scale
+    )
+    mixture_mean = (weight * component_mean).sum(dim=1)
+    minimum_variance = (float(dof) / (float(dof) - 2.0)) * math.exp(
+        2.0 * CONSEQUENCE_LOG_SCALE_MIN
+    )
+    # Use the centered law of total variance directly.  The algebraically
+    # equivalent E[var + mean^2] - E[mean]^2 form loses all between-event
+    # variance in float32 when component locations share a large offset.
+    centered_component_mean = component_mean - mixture_mean.unsqueeze(1)
+    mixture_variance = (
+        weight * (component_variance + centered_component_mean.square())
+    ).sum(dim=1).clamp_min(minimum_variance)
+    mixture_std = torch.sqrt(mixture_variance)
+    moment_equivalent_log_scale = torch.log(
+        mixture_std
+        / math.sqrt(float(dof) / (float(dof) - 2.0))
+    )
+    return mixture_mean, mixture_std, moment_equivalent_log_scale
+
+
+def _gather_observed_event_component(
+    component: torch.Tensor,
+    observed_event_id: torch.Tensor,
+) -> torch.Tensor:
+    """Gather one categorical-event conditional component per batch row."""
+
+    if (
+        component.ndim not in {2, 3}
+        or observed_event_id.shape != (component.shape[0],)
+        or observed_event_id.dtype
+        not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }
+        or bool(
+            (
+                (observed_event_id < 0)
+                | (observed_event_id >= component.shape[1])
+            ).any()
+        )
+    ):
+        raise FiveBodyContractError("observed event component gather is invalid")
+    index = observed_event_id.long()
+    if component.ndim == 2:
+        return component.gather(1, index[:, None]).squeeze(1)
+    return component.gather(
+        1, index[:, None, None].expand(-1, 1, component.shape[-1])
+    ).squeeze(1)
+
+
 class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
     """Shared event model with a scalar head trained for best-of-four choice."""
 
@@ -2911,11 +3144,15 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         super().__init__(core.ModelConfig(body_count=1, action_schema_count=1))
         self.ablation_variant = ablation_variant
         self.action.normalization_clip = CROSS_BODY_STANDARDIZED_INPUT_CLIP
-        # The base class exposes horizon-free terminal outcome heads.  Branch
-        # success and recovery are finite-horizon labels here, so those heads
-        # are frozen and replaced below by horizon-coherent predictions.
+        # The base class exposes independent horizon-free outcome/effect heads.
+        # Branch success and recovery are finite-horizon labels here, while the
+        # object likelihood is categorical-post-event conditional in v11.  The
+        # legacy heads remain checkpoint-visible for base compatibility but are
+        # frozen and excluded from every prediction and loss below.
         self.success.requires_grad_(False)
         self.recovery.requires_grad_(False)
+        self.object_mean.requires_grad_(False)
+        self.object_scale.requires_grad_(False)
         self.register_buffer("state_mean", torch.zeros(core.STATE_DIM))
         self.register_buffer("state_std", torch.ones(core.STATE_DIM))
         self.event_age_encoder = torch.nn.Sequential(
@@ -2944,8 +3181,20 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         torch.nn.init.zeros_(self.terminal_residual[-1].bias)
         self.terminal_event = torch.nn.Linear(core.SEMANTIC_DIM, 5)
         self.terminal_recovery = torch.nn.Linear(core.SEMANTIC_DIM, 1)
-        self.terminal_goal_progress_mean = torch.nn.Linear(core.SEMANTIC_DIM, 1)
-        self.terminal_goal_progress_scale = torch.nn.Linear(core.SEMANTIC_DIM, 1)
+        self.object_delta_component_mean = torch.nn.Linear(
+            core.SEMANTIC_DIM,
+            len(core.CANONICAL_EVENTS) * core.OBJECT_DELTA_DIM,
+        )
+        self.object_delta_component_scale = torch.nn.Linear(
+            core.SEMANTIC_DIM,
+            len(core.CANONICAL_EVENTS) * core.OBJECT_DELTA_DIM,
+        )
+        self.terminal_goal_progress_component_mean = torch.nn.Linear(
+            core.SEMANTIC_DIM, len(core.CANONICAL_EVENTS)
+        )
+        self.terminal_goal_progress_component_scale = torch.nn.Linear(
+            core.SEMANTIC_DIM, len(core.CANONICAL_EVENTS)
+        )
         self.candidate_rank = InvariantMonotoneConsequenceUtility()
 
     @torch.no_grad()
@@ -2971,16 +3220,39 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             max=CROSS_BODY_STANDARDIZED_INPUT_CLIP,
         )
         output = super().forward(normalized_batch)
-        # The generic core uses -5 for historical Gaussian heads.  The v10
-        # Student-t consequence head needs a lower floor: at -5 its deployed
-        # 2 cm-normalized risk can never fall below 0.525, erasing the low-risk
-        # end of the candidate ordering.  Recompute from the same transitioned
-        # representation so both training likelihood and deployment use -7.
-        output["object_delta_log_scale"] = torch.clamp(
-            self.object_scale(output["transitioned"]),
+        post_probability = torch.softmax(output["post_event_logits"], dim=-1)
+        object_component_mean = self.object_delta_component_mean(
+            output["transitioned"]
+        ).reshape(
+            -1, len(core.CANONICAL_EVENTS), core.OBJECT_DELTA_DIM
+        )
+        object_component_log_scale = torch.clamp(
+            self.object_delta_component_scale(output["transitioned"]).reshape(
+                -1, len(core.CANONICAL_EVENTS), core.OBJECT_DELTA_DIM
+            ),
             CONSEQUENCE_LOG_SCALE_MIN,
             2.0,
         )
+        (
+            object_mixture_mean,
+            object_mixture_std,
+            object_moment_equivalent_log_scale,
+        ) = _event_conditioned_student_t3_mixture_moments(
+            post_probability,
+            object_component_mean,
+            object_component_log_scale,
+            dof=OBJECT_STUDENT_T_DOF,
+        )
+        output["object_delta_component_mean"] = object_component_mean
+        output["object_delta_component_log_scale"] = (
+            object_component_log_scale
+        )
+        output["object_delta_mixture_probability"] = post_probability
+        # Backward-compatible fields now describe the full post-event mixture.
+        # ``exp(log_scale)*sqrt(3) == std`` remains exact for legacy consumers.
+        output["object_delta_mean"] = object_mixture_mean
+        output["object_delta_std"] = object_mixture_std
+        output["object_delta_log_scale"] = object_moment_equivalent_log_scale
 
         event_age = batch.get("event_age_seconds")
         if (
@@ -3047,21 +3319,44 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             terminal_event_logits[:, :-1], dim=-1
         )
         terminal_recovery_logit = self.terminal_recovery(terminal_hidden).squeeze(-1)
-        terminal_goal_progress_mean = self.terminal_goal_progress_mean(
-            terminal_hidden
-        ).squeeze(-1)
-        terminal_goal_progress_log_scale = torch.clamp(
-            self.terminal_goal_progress_scale(terminal_hidden).squeeze(-1),
+        terminal_goal_progress_component_mean = (
+            self.terminal_goal_progress_component_mean(
+                terminal_hidden
+            )
+        )
+        terminal_goal_progress_component_log_scale = torch.clamp(
+            self.terminal_goal_progress_component_scale(terminal_hidden),
             CONSEQUENCE_LOG_SCALE_MIN,
             2.0,
+        )
+        terminal_event_probability = torch.softmax(terminal_event_logits, dim=-1)
+        (
+            terminal_goal_progress_mean,
+            terminal_goal_progress_std,
+            terminal_goal_progress_log_scale,
+        ) = _event_conditioned_student_t3_mixture_moments(
+            terminal_event_probability,
+            terminal_goal_progress_component_mean,
+            terminal_goal_progress_component_log_scale,
+            dof=TERMINAL_PROGRESS_STUDENT_T_DOF,
         )
         output["terminal_event_logits"] = terminal_event_logits
         output["success_logit"] = terminal_success_logit
         output["recovery_logit"] = terminal_recovery_logit
+        output["terminal_goal_progress_component_mean"] = (
+            terminal_goal_progress_component_mean
+        )
+        output["terminal_goal_progress_component_log_scale"] = (
+            terminal_goal_progress_component_log_scale
+        )
+        output["terminal_goal_progress_mixture_probability"] = (
+            terminal_event_probability
+        )
         output["terminal_goal_progress_mean"] = terminal_goal_progress_mean
         output["terminal_goal_progress_log_scale"] = (
             terminal_goal_progress_log_scale
         )
+        output["terminal_goal_progress_std"] = terminal_goal_progress_std
 
         # The deployed score is deliberately a function of predicted
         # consequences, never a free projection of ``transitioned`` or
@@ -3069,7 +3364,6 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         # proper event/outcome/effect likelihoods calibrated: listwise rank
         # supervision learns how to combine their predictions, not how to
         # rewrite them into an unconstrained latent critic.
-        post_probability = torch.softmax(output["post_event_logits"], dim=-1)
         next_probability = torch.softmax(output["next_event_logits"], dim=-1)
         success_probability = torch.sigmoid(output["success_logit"])
         # Recovery is conditional on an operational regression.  Compose the
@@ -3098,45 +3392,66 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             ).clamp(min=0.0, max=10.0)
         )
         object_mean = output["object_delta_mean"]
-        object_scale = torch.exp(output["object_delta_log_scale"])
         state = batch["state"]
         if state.ndim != 2 or state.shape[-1] != core.STATE_DIM:
             raise FiveBodyContractError(
                 "consequence rank utility requires one canonical 27-D root state"
             )
         relative_goal = state[:, :3].to(object_mean)
-        predicted_remaining = relative_goal - object_mean[:, :3]
+        predicted_remaining_component = (
+            relative_goal[:, None, :] - object_component_mean[:, :, :3]
+        )
         current_distance = torch.linalg.vector_norm(relative_goal, dim=-1)
-        predicted_distance = torch.linalg.vector_norm(predicted_remaining, dim=-1)
-        predicted_goal_progress = current_distance - predicted_distance
+        predicted_distance_component = torch.linalg.vector_norm(
+            predicted_remaining_component, dim=-1
+        )
+        predicted_goal_progress_component = (
+            current_distance[:, None] - predicted_distance_component
+        )
+        predicted_goal_progress = (
+            post_probability * predicted_goal_progress_component
+        ).sum(dim=-1)
 
         # Delta-method radial uncertainty for the Student-t(3) translation
         # effect.  At a zero predicted residual, fall back to the current goal
         # direction; if both vectors are zero, use the isotropic RMS scale.
         epsilon = torch.finfo(object_mean.dtype).eps**0.5
-        remaining_unit = predicted_remaining / predicted_distance[:, None].clamp_min(
-            epsilon
+        remaining_unit = predicted_remaining_component / (
+            predicted_distance_component[:, :, None].clamp_min(epsilon)
         )
         current_unit = relative_goal / current_distance[:, None].clamp_min(epsilon)
-        has_remaining_direction = predicted_distance > epsilon
+        has_remaining_direction = predicted_distance_component > epsilon
         direction = torch.where(
-            has_remaining_direction[:, None], remaining_unit, current_unit
+            has_remaining_direction[:, :, None],
+            remaining_unit,
+            current_unit[:, None, :],
         )
-        has_direction = has_remaining_direction | (current_distance > epsilon)
-        translation_variance = object_scale[:, :3].square()
+        has_direction = has_remaining_direction | (current_distance[:, None] > epsilon)
+        translation_variance = torch.exp(
+            2.0 * object_component_log_scale[:, :, :3]
+        )
         projected_variance = (direction.square() * translation_variance).sum(dim=-1)
         isotropic_variance = translation_variance.mean(dim=-1)
-        radial_variance = torch.where(
+        within_component_progress_variance = OBJECT_STUDENT_T_DOF * torch.where(
             has_direction, projected_variance, isotropic_variance
         )
-        predicted_goal_progress_uncertainty = torch.sqrt(
-            OBJECT_STUDENT_T_DOF * radial_variance.clamp_min(0.0)
+        centered_goal_progress_component = (
+            predicted_goal_progress_component
+            - predicted_goal_progress[:, None]
         )
-
-        terminal_event_probability = torch.softmax(terminal_event_logits, dim=-1)
-        terminal_goal_progress_std = math.sqrt(
-            TERMINAL_PROGRESS_STUDENT_T_DOF
-        ) * torch.exp(terminal_goal_progress_log_scale)
+        predicted_goal_progress_variance = (
+            post_probability
+            * (
+                within_component_progress_variance
+                + centered_goal_progress_component.square()
+            )
+        ).sum(dim=-1)
+        predicted_goal_progress_uncertainty = torch.sqrt(
+            predicted_goal_progress_variance.clamp_min(
+                OBJECT_STUDENT_T_DOF
+                * math.exp(2.0 * CONSEQUENCE_LOG_SCALE_MIN)
+            )
+        )
 
         normalized_event_level = event_index.to(post_probability) / float(
             len(core.CANONICAL_EVENTS) - 1
@@ -3157,9 +3472,10 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             regression_probability.squeeze(-1)
             - joint_recovery_probability.squeeze(-1)
         ).clamp(0.0, 1.0)
-        short_goal_benefit = _goal_progress_benefit_value(
-            predicted_goal_progress
-        )
+        short_goal_benefit = (
+            post_probability
+            * _goal_progress_benefit_value(predicted_goal_progress_component)
+        ).sum(dim=-1)
         short_goal_risk = (
             predicted_goal_progress_uncertainty
             / (
@@ -3170,9 +3486,12 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         terminal_expected_stage = (
             terminal_event_probability * normalized_event_level
         ).sum(dim=-1)
-        terminal_goal_benefit = _goal_progress_benefit_value(
-            terminal_goal_progress_mean
-        )
+        terminal_goal_benefit = (
+            terminal_event_probability
+            * _goal_progress_benefit_value(
+                terminal_goal_progress_component_mean
+            )
+        ).sum(dim=-1)
         terminal_goal_risk = (
             terminal_goal_progress_std
             / (terminal_goal_progress_std + GOAL_PROGRESS_NORMALIZATION_METERS)
@@ -3204,11 +3523,13 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
         ):
             raise FiveBodyContractError("consequence rank feature schema changed")
         output["predicted_goal_progress"] = predicted_goal_progress
+        output["predicted_goal_progress_component"] = (
+            predicted_goal_progress_component
+        )
         output["predicted_goal_progress_uncertainty"] = (
             predicted_goal_progress_uncertainty
         )
         output["expected_duration_seconds"] = expected_duration_seconds
-        output["terminal_goal_progress_std"] = terminal_goal_progress_std
         output["candidate_rank_features"] = rank_features
         if self.ablation_variant == "success_only":
             candidate_rank_logit = success_probability
@@ -3322,6 +3643,14 @@ def evaluate_terminal_consequences(
         batch = core._move_batch(raw, device)
         output = model(batch)
         logical_groups.extend(str(value) for value in raw["logical_group"])
+        observed_terminal_goal_mean = _gather_observed_event_component(
+            output["terminal_goal_progress_component_mean"],
+            batch["terminal_max_event_id"].long(),
+        )
+        observed_terminal_goal_log_scale = _gather_observed_event_component(
+            output["terminal_goal_progress_component_log_scale"],
+            batch["terminal_max_event_id"].long(),
+        )
         tensors = {
             "event_label": batch["terminal_max_event_id"],
             "event_mask": batch["terminal_event_mask"],
@@ -3329,9 +3658,14 @@ def evaluate_terminal_consequences(
                 output["terminal_event_logits"], dim=-1
             ),
             "goal_label": batch["terminal_goal_progress"],
-            "goal_mask": batch["terminal_goal_progress_mask"],
+            "goal_mask": (
+                batch["terminal_goal_progress_mask"]
+                * batch["terminal_event_mask"]
+            ),
             "goal_mean": output["terminal_goal_progress_mean"],
             "goal_log_scale": output["terminal_goal_progress_log_scale"],
+            "goal_conditional_mean": observed_terminal_goal_mean,
+            "goal_conditional_log_scale": observed_terminal_goal_log_scale,
             "success_label": batch["success"],
             "success_mask": batch["success_mask"],
             "success_probability": torch.sigmoid(output["success_logit"]),
@@ -3385,28 +3719,35 @@ def evaluate_terminal_consequences(
                     }
                 )
             if variant != "no_object_effect":
-                object_scale = torch.exp(
-                    output["object_delta_log_scale"]
-                ).clamp_min(1e-4)
+                object_mean = _gather_observed_event_component(
+                    output["object_delta_component_mean"],
+                    batch["post_event_id"].long(),
+                )
+                object_log_scale = _gather_observed_event_component(
+                    output["object_delta_component_log_scale"],
+                    batch["post_event_id"].long(),
+                )
+                object_scale = torch.exp(object_log_scale).clamp_min(1e-4)
                 object_standardized = (
-                    batch["object_delta"].to(output["object_delta_mean"])
-                    - output["object_delta_mean"]
+                    batch["object_delta"].to(object_mean)
+                    - object_mean
                 ) / object_scale
                 tensors.update(
                     {
                         "object_student_t3_nll": (
-                            output["object_delta_log_scale"]
+                            object_log_scale
                             + 2.0
                             * torch.log1p(object_standardized.square() / 3.0)
                         ).mean(dim=-1),
                         "object_proper_mask": (
                             batch["object_delta_mask"]
                             * batch["action_available"]
+                            * batch["post_event_mask"]
                         ),
                         "object_abs_student_t3_standardized": (
                             object_standardized.abs()
                         ),
-                        "object_log_scale": output["object_delta_log_scale"],
+                        "object_log_scale": object_log_scale,
                     }
                 )
         for name, tensor in tensors.items():
@@ -3430,12 +3771,21 @@ def evaluate_terminal_consequences(
         axis=-1,
     )
 
-    goal_mask = values["goal_mask"] > 0.5
+    goal_mask = (values["goal_mask"] > 0.5) & event_mask
     goal_label = values["goal_label"][goal_mask].astype(np.float64)
     goal_mean = values["goal_mean"][goal_mask].astype(np.float64)
     goal_log_scale = values["goal_log_scale"][goal_mask].astype(np.float64)
     goal_scale = np.exp(goal_log_scale).clip(min=1e-5)
-    goal_standardized = (goal_label - goal_mean) / goal_scale
+    goal_conditional_mean = values["goal_conditional_mean"][goal_mask].astype(
+        np.float64
+    )
+    goal_conditional_log_scale = values[
+        "goal_conditional_log_scale"
+    ][goal_mask].astype(np.float64)
+    goal_conditional_scale = np.exp(goal_conditional_log_scale).clip(min=1e-5)
+    goal_standardized = (
+        goal_label - goal_conditional_mean
+    ) / goal_conditional_scale
     dof = TERMINAL_PROGRESS_STUDENT_T_DOF
     goal_normalizer = (
         math.lgamma(dof / 2.0)
@@ -3443,7 +3793,7 @@ def evaluate_terminal_consequences(
         - math.lgamma((dof + 1.0) / 2.0)
     )
     goal_nll = (
-        goal_log_scale
+        goal_conditional_log_scale
         + 0.5 * (dof + 1.0) * np.log1p(np.square(goal_standardized) / dof)
         + goal_normalizer
     )
@@ -3737,6 +4087,13 @@ def evaluate_terminal_consequences(
             "central_90_coverage": float(
                 np.mean(np.abs(goal_label - goal_mean) <= central_90_t3 * goal_scale)
             ),
+            "point_prediction": "terminal_event_mixture_mean",
+            "student_t3_nll_distribution": (
+                "observed_terminal_event_conditional_component"
+            ),
+            "central_90_coverage_interpretation": (
+                "moment_matched_student_t3_approximation_to_event_mixture"
+            ),
         }
     else:
         goal_metrics = {
@@ -3745,6 +4102,13 @@ def evaluate_terminal_consequences(
             "rmse_meters": None,
             "student_t3_nll": None,
             "central_90_coverage": None,
+            "point_prediction": "terminal_event_mixture_mean",
+            "student_t3_nll_distribution": (
+                "observed_terminal_event_conditional_component"
+            ),
+            "central_90_coverage_interpretation": (
+                "moment_matched_student_t3_approximation_to_event_mixture"
+            ),
         }
     if variant not in {"success_only", "no_object_effect"}:
         object_mask = values["object_proper_mask"] > 0.5
@@ -3812,7 +4176,12 @@ def evaluate_terminal_consequences(
                 if object_scale.size
                 else None
             ),
-            "likelihood": "independent_student_t_dof_3",
+            "likelihood": (
+                "observed_post_event_conditional_independent_student_t_dof_3"
+            ),
+            "deployment_prediction": (
+                "post_event_mixture_mean_and_total_within_plus_between_std"
+            ),
             "proper_metric_aggregation": (
                 "requested_seed_cluster_then_body_condition_macro"
             ),
@@ -3827,6 +4196,7 @@ def evaluate_terminal_consequences(
             "log_scale_floor_fraction": None,
             "scale_quantiles_05_50_95": None,
             "likelihood": "disabled_by_ablation",
+            "deployment_prediction": "disabled_by_ablation",
             "proper_metric_aggregation": (
                 "requested_seed_cluster_then_body_condition_macro"
             ),
@@ -4007,22 +4377,31 @@ def _robust_object_effect_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Student-t object likelihood for the uniform proper-likelihood stream."""
 
-    # A Student-t(3) likelihood retains a calibrated scale head but prevents
-    # a few large object errors from dominating the shared consequence model.
-    object_scale = torch.exp(output["object_delta_log_scale"]).clamp_min(1e-4)
+    # Together with the post-event categorical CE, gathering the observed
+    # event component is the joint p(post_event) p(delta | post_event) proper
+    # likelihood.  No target event is fed to deployment predictions.
+    observed_event = batch["post_event_id"].long()
+    object_mean = _gather_observed_event_component(
+        output["object_delta_component_mean"], observed_event
+    )
+    object_log_scale = _gather_observed_event_component(
+        output["object_delta_component_log_scale"], observed_event
+    )
+    object_scale = torch.exp(object_log_scale).clamp_min(1e-4)
     standardized = (
-        batch["object_delta"].to(output["object_delta_mean"])
-        - output["object_delta_mean"]
+        batch["object_delta"].to(object_mean)
+        - object_mean
     ) / object_scale
     object_rows = (
-        output["object_delta_log_scale"]
+        object_log_scale
         + 2.0 * torch.log1p(standardized.square() / 3.0)
     ).mean(dim=-1)
     object_effect = core._weighted_mean(
         object_rows,
         sample_weight
         * batch["action_available"].to(sample_weight)
-        * batch["object_delta_mask"].to(sample_weight),
+        * batch["object_delta_mask"].to(sample_weight)
+        * batch["post_event_mask"].to(sample_weight),
     )
     if ablation_variant in {"success_only", "no_object_effect"}:
         object_effect = object_effect * 0.0
@@ -4101,11 +4480,15 @@ def _terminal_consequence_loss(
         ordinal_event_rows, event_weight
     )
 
-    goal_target = batch["terminal_goal_progress"].to(
-        output["terminal_goal_progress_mean"]
+    terminal_event_target = batch["terminal_max_event_id"].long()
+    goal_mean = _gather_observed_event_component(
+        output["terminal_goal_progress_component_mean"], terminal_event_target
     )
-    goal_mean = output["terminal_goal_progress_mean"]
-    goal_log_scale = output["terminal_goal_progress_log_scale"]
+    goal_log_scale = _gather_observed_event_component(
+        output["terminal_goal_progress_component_log_scale"],
+        terminal_event_target,
+    )
+    goal_target = batch["terminal_goal_progress"].to(goal_mean)
     goal_scale = torch.exp(goal_log_scale).clamp_min(1e-5)
     standardized = (goal_target - goal_mean) / goal_scale
     dof = TERMINAL_PROGRESS_STUDENT_T_DOF
@@ -4123,6 +4506,7 @@ def _terminal_consequence_loss(
         sample_weight
         * batch["action_available"].to(sample_weight)
         * batch["terminal_goal_progress_mask"].to(sample_weight)
+        * batch["terminal_event_mask"].to(sample_weight)
     )
     terminal_goal = core._weighted_mean(goal_rows, goal_weight)
 
@@ -4491,8 +4875,12 @@ def _semantic_comparative_loss(
                 _goal_progress_benefit_value(goal_label[preferred]),
                 dim=0,
             )
+            conditional_goal_mean = _gather_observed_event_component(
+                output["terminal_goal_progress_component_mean"][selected],
+                event_label,
+            )
             predicted = _goal_progress_benefit_value(
-                output["terminal_goal_progress_mean"][selected][preferred]
+                conditional_goal_mean[preferred]
             )
             goal_group_loss = -(
                 target * torch.log_softmax(predicted, dim=0)
@@ -4628,7 +5016,7 @@ def _semantic_comparative_active_parameters(
         model.terminal_context_encoder,
         model.terminal_residual,
         model.terminal_event,
-        model.terminal_goal_progress_mean,
+        model.terminal_goal_progress_component_mean,
     )
     parameters = tuple(
         parameter
@@ -4646,8 +5034,9 @@ def _semantic_comparative_active_parameters(
         id(parameter)
         for module in (
             model.object_scale,
+            model.object_delta_component_scale,
             model.duration_scale,
-            model.terminal_goal_progress_scale,
+            model.terminal_goal_progress_component_scale,
         )
         for parameter in module.parameters()
     }
@@ -5215,6 +5604,102 @@ def checkpoint_selection_evidence_mode(
     raise FiveBodyContractError(
         "comparative checkpoint selection was authorized without comparative rows"
     )
+
+
+def combine_primary_and_supplement_strict_proper(
+    primary: Sequence[Mapping[str, Any]],
+    supplement: Sequence[Mapping[str, Any] | None],
+) -> dict[str, Any]:
+    """Combine independent proper-validation lanes without fitting calibration."""
+
+    if len(primary) != 5 or len(supplement) != 5:
+        raise FiveBodyContractError(
+            "strict proper evidence requires five aligned ensemble members"
+        )
+    supplement_enabled = all(item is not None for item in supplement)
+    if any(item is not None for item in supplement) != supplement_enabled:
+        raise FiveBodyContractError(
+            "supplement strict proper evidence is only partially available"
+        )
+
+    def value(item: Mapping[str, Any], name: str) -> float:
+        result = item.get(name)
+        if (
+            isinstance(result, bool)
+            or not isinstance(result, (int, float))
+            or not math.isfinite(float(result))
+            or (name == "macro_standard_error" and float(result) < 0.0)
+        ):
+            raise FiveBodyContractError(f"strict proper evidence has invalid {name}")
+        return float(result)
+
+    primary_scores = [value(item, "macro_score") for item in primary]
+    primary_standard_errors = [
+        value(item, "macro_standard_error") for item in primary
+    ]
+    supplement_scores = (
+        [value(item, "macro_score") for item in supplement if item is not None]
+        if supplement_enabled
+        else []
+    )
+    supplement_standard_errors = (
+        [
+            value(item, "macro_standard_error")
+            for item in supplement
+            if item is not None
+        ]
+        if supplement_enabled
+        else []
+    )
+    combined_member_scores = [
+        primary_score
+        + (
+            SUPPLEMENT_PROPER_LOSS_WEIGHT * supplement_scores[index]
+            if supplement_enabled
+            else 0.0
+        )
+        for index, primary_score in enumerate(primary_scores)
+    ]
+    combined_member_standard_errors = [
+        math.sqrt(
+            primary_standard_error**2
+            + (
+                SUPPLEMENT_PROPER_LOSS_WEIGHT
+                * supplement_standard_errors[index]
+            )
+            ** 2
+        )
+        if supplement_enabled
+        else primary_standard_error
+        for index, primary_standard_error in enumerate(primary_standard_errors)
+    ]
+    return {
+        "mean_member_primary_strict_proper_score": float(np.mean(primary_scores)),
+        "mean_member_supplement_strict_proper_score": (
+            float(np.mean(supplement_scores)) if supplement_enabled else None
+        ),
+        "supplement_strict_proper_weight": (
+            SUPPLEMENT_PROPER_LOSS_WEIGHT if supplement_enabled else 0.0
+        ),
+        "mean_member_strict_proper_score": float(
+            np.mean(combined_member_scores)
+        ),
+        "primary_conservative_strict_proper_standard_error": max(
+            primary_standard_errors
+        ),
+        "supplement_conservative_strict_proper_standard_error": (
+            max(supplement_standard_errors) if supplement_enabled else None
+        ),
+        "conservative_strict_proper_standard_error": max(
+            combined_member_standard_errors
+        ),
+        "strict_proper_standard_error_combination": (
+            "per_member_sqrt_primary_variance_plus_0.25_squared_times_"
+            "supplement_variance_then_conservative_max_across_members"
+            if supplement_enabled
+            else "primary_only_conservative_max_across_members"
+        ),
+    }
 
 
 def select_calibration_guarded_checkpoint(
@@ -6081,15 +6566,26 @@ def _train_fold(
     validation_baseline = core.evaluate_train_only_baselines(baseline, validation_rows)
     if supplement_audit is None:
         supplement_groups: list[dict[str, Any]] = []
+        supplement_validation_groups: list[dict[str, Any]] = []
         supplement_rows: list[dict[str, Any]] = []
+        supplement_validation_rows: list[dict[str, Any]] = []
     else:
-        supplement_groups, _supplement_heldout_groups = (
+        (
+            supplement_groups,
+            supplement_validation_groups,
+            _supplement_heldout_groups,
+        ) = (
             supplement_source_train_split(
-                supplement_audit, held_out_body=args.held_out_body
+                supplement_audit,
+                held_out_body=args.held_out_body,
+                split_seed=args.split_seed,
             )
         )
         supplement_rows = materialize_supplement_rows(
             supplement_groups, held_out_body=args.held_out_body
+        )
+        supplement_validation_rows = materialize_supplement_rows(
+            supplement_validation_groups, held_out_body=args.held_out_body
         )
     input_clip_diagnostics = {
         "source_train": standardized_input_clip_diagnostics(
@@ -6117,6 +6613,17 @@ def _train_fold(
             if supplement_rows
             else None
         ),
+        "proper_world_supplement_source_validation": (
+            standardized_input_clip_diagnostics(
+                supplement_validation_rows,
+                state_mean=state_mean,
+                state_std=state_std,
+                action_mean=action_mean,
+                action_std=action_std,
+            )
+            if supplement_validation_rows
+            else None
+        ),
     }
     supplement_rank_inventory = candidate_rank_supervision_inventory(
         supplement_rows,
@@ -6134,6 +6641,16 @@ def _train_fold(
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=core.collate_rows,
+    )
+    supplement_validation_loader = (
+        DataLoader(
+            core.TransitionDataset(supplement_validation_rows, body_to_id),
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=core.collate_rows,
+        )
+        if supplement_validation_rows
+        else None
     )
     device = torch.device(args.device)
     group_order = [str(row["logical_group"]) for row in train_rows]
@@ -6505,6 +7022,19 @@ def _train_fold(
                 ablation_variant=args.ablation_variant,
             )
             metrics["terminal_consequences"] = terminal_consequences
+            supplement_validation_consequences = (
+                evaluate_terminal_consequences(
+                    model,
+                    supplement_validation_loader,
+                    device,
+                    ablation_variant=args.ablation_variant,
+                )
+                if supplement_validation_loader is not None
+                else None
+            )
+            metrics["supplement_proper_validation"] = (
+                supplement_validation_consequences
+            )
             if args.ablation_variant not in {"success_only", "no_object_effect"}:
                 metrics["legacy_gaussian_object_nll_not_model_distribution"] = (
                     metrics["object_nll"]
@@ -6512,7 +7042,9 @@ def _train_fold(
                 metrics["object_nll"] = terminal_consequences[
                     "object_transition"
                 ]["student_t3_nll_without_additive_normalizer"]
-                metrics["object_nll_distribution"] = "independent_student_t_dof_3"
+                metrics["object_nll_distribution"] = (
+                    "observed_post_event_conditional_independent_student_t_dof_3"
+                )
             metrics["candidate_ranking"] = evaluate_candidate_ranking(
                 model, validation_loader, device
             )
@@ -6647,17 +7179,25 @@ def _train_fold(
             ]
             for member in range(5)
         ]
-        strict_proper_score = float(
-            np.mean(
-                [float(item["macro_score"]) for item in member_strict_proper]
+        member_supplement_strict_proper = [
+            (
+                member_eval_records[member][step]["supplement_proper_validation"][
+                    "strict_proper"
+                ]
+                if member_eval_records[member][step][
+                    "supplement_proper_validation"
+                ]
+                is not None
+                else None
             )
-        )
+            for member in range(5)
+        ]
         # All members share the same validation decisions, so their sampling
-        # errors are correlated.  The maximum member SE is a conservative
-        # one-standard-error radius; dividing by sqrt(5) would be invalid.
-        strict_proper_standard_error = max(
-            float(item["macro_standard_error"])
-            for item in member_strict_proper
+        # errors are correlated across members.  Primary and supplement lanes
+        # are independent, so their per-member variances add before the
+        # conservative maximum is taken across members.
+        combined_strict_proper = combine_primary_and_supplement_strict_proper(
+            member_strict_proper, member_supplement_strict_proper
         )
         common_step_selection_audit.append(
             {
@@ -6665,10 +7205,7 @@ def _train_fold(
                 "selection_key": list(key),
                 "ensemble_candidate_ranking": ensemble_ranking,
                 "mean_member_diagnostic_multitask_score": diagnostic,
-                "mean_member_strict_proper_score": strict_proper_score,
-                "conservative_strict_proper_standard_error": (
-                    strict_proper_standard_error
-                ),
+                **combined_strict_proper,
             }
         )
     if not common_step_selection_audit:
@@ -6730,7 +7267,23 @@ def _train_fold(
                 "action_stem_count": 1,
                 "body_to_id_source_only": body_to_id,
                 "heldout_rows_used_for_training_normalization_or_selection": 0,
-                "proper_world_supplement": preflight["supplement"],
+                "proper_world_supplement": {
+                    **preflight["supplement"],
+                    "source_train_rows": len(supplement_rows),
+                    "source_validation_rows": len(supplement_validation_rows),
+                    "source_validation_rows_used": len(
+                        supplement_validation_rows
+                    ),
+                    "checkpoint_selection_rows_used": len(
+                        supplement_validation_rows
+                    ),
+                    "rank_selection_rows_used": 0,
+                    "calibration_diagnostic_rows_used": len(
+                        supplement_validation_rows
+                    ),
+                    "calibration_rows_used": 0,
+                    "calibration_fit": False,
+                },
                 "rank_supervision_available": rank_supervision_available,
                 "rank_supervision_mode": rank_supervision_mode,
                 "candidate_rank_parameters_received_direct_supervision": (
@@ -6762,6 +7315,9 @@ def _train_fold(
                 "checkpoint_sha256": sha256_file(checkpoint),
                 "trainer_file_sha256": trainer_file_sha256,
                 "source_validation": member_validation,
+                "supplement_proper_validation": member_validation[
+                    "supplement_proper_validation"
+                ],
             }
         )
     del ensemble_model, selection_models
@@ -6806,6 +7362,7 @@ def _train_fold(
         "proper_world_supplement": {
             **preflight["supplement"],
             "source_train_rows": len(supplement_rows),
+            "source_validation_rows": len(supplement_validation_rows),
             "loss": (
                 "fixed_lambda_proper_world_plus_detached_utility_candidate_rank"
                 if supplement_rows
@@ -6825,9 +7382,21 @@ def _train_fold(
             "rank_supervision_inventory": supplement_rank_inventory,
             "semantic_comparative_rows_used": 0,
             "normalization_rows_used": 0,
-            "source_validation_rows_used": 0,
-            "checkpoint_selection_rows_used": 0,
+            "source_validation_rows_used": len(supplement_validation_rows),
+            "checkpoint_selection_rows_used": len(
+                supplement_validation_rows
+            ),
+            "checkpoint_selection_use": (
+                "strict_proper_only_primary_plus_fixed_0.25_supplement"
+                if supplement_validation_rows
+                else "disabled"
+            ),
+            "rank_selection_rows_used": 0,
+            "calibration_diagnostic_rows_used": len(
+                supplement_validation_rows
+            ),
             "calibration_rows_used": 0,
+            "calibration_fit": False,
             "ensemble_logical_group_poisson_bootstrap": (
                 supplement_bootstrap_support
             ),
@@ -6875,12 +7444,25 @@ def _train_fold(
                 "five_member_epistemic_lcb_terminal_event_then_goal_progress"
             ),
             "strict_proper_no_comparative_evidence": (
-                "minimum_source_macro_strict_proper_validation_score"
+                (
+                    "minimum_primary_plus_fixed_0.25_supplement_macro_strict_"
+                    "proper_validation_score"
+                )
+                if supplement_validation_rows
+                else "minimum_primary_macro_strict_proper_validation_score"
             ),
         }[selection_evidence_mode],
         "ensemble_checkpoint_selection": {
             "common_step_required_for_all_five_members": True,
             "rank_aggregation": risk_adjusted_rank_ensemble_contract(),
+            "strict_proper_score": (
+                "primary_strict_proper_plus_fixed_0.25_times_label_blind_"
+                "inner_cross_body_supplement_strict_proper"
+                if supplement_validation_rows
+                else "primary_strict_proper_only"
+            ),
+            "supplement_validation_never_used_for_rank_comparison": True,
+            "calibration_diagnostics_only_no_parameter_fit": True,
             "selected_step": best_ensemble_step,
             "selected_key": list(best_ensemble_key),
             "selected_ensemble_candidate_ranking": best_ensemble_ranking,
@@ -7013,6 +7595,7 @@ __all__ = [
     "ablation_contract", "ablation_selection_components",
     "aggregate_risk_adjusted_rank_scores",
     "build_preflight_receipt", "canonical_sha256",
+    "combine_primary_and_supplement_strict_proper",
     "candidate_checkpoint_selection_key", "checkpoint_candidate_rank_contract",
     "candidate_rank_supervision_inventory",
     "effect_preserving_group_bootstrap_weights", "load_binding",
@@ -7020,7 +7603,8 @@ __all__ = [
     "proper_outcome_preserving_group_bootstrap_weights",
     "evaluate_candidate_ranking", "materialize_source_rows",
     "materialize_supplement_rows", "sha256_file",
-    "sha256_tree", "source_group_split", "supplement_source_train_split",
+    "sha256_tree", "source_group_split", "supplement_inner_validation_body",
+    "supplement_source_train_split",
     "supplement_group_bootstrap_weights",
     "summary_candidate_rank_contract",
     "risk_adjusted_rank_ensemble_contract",

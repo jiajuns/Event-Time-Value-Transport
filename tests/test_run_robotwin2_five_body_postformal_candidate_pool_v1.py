@@ -145,6 +145,109 @@ def test_independent_flow_draws_preserve_candidate_zero_and_remove_antithetic_pa
     )
 
 
+def test_raw8_sampling_roster_remains_bit_exact_full_iid_legacy_path() -> None:
+    config = SimpleNamespace(chunk_size=6, max_action_dim=16)
+    device = torch.device("cpu")
+    roster = runner.flow_noise_construction_roster(8)
+    assert roster == [
+        {"kind": "full_iid", "source_noise_index": index, "sign": 1}
+        for index in range(4)
+    ] * 2
+    for candidate_index, construction in enumerate(roster):
+        expected = runner.postformal_make_noise(
+            config,
+            6_200_039,
+            7,
+            candidate_index % 4,
+            device,
+        )
+        observed = runner.postformal_rostered_noise(
+            config,
+            6_200_039,
+            7,
+            construction,
+            device,
+        )
+        assert torch.equal(observed, expected)
+    contract = runner.postformal_noise_contract(8, 8)
+    assert contract["conditional_translation_resampling_enabled"] is False
+    assert contract["raw_proposal_flow_noise_indices"] == [0, 1, 2, 3] * 2
+
+
+def test_raw16_conditional_noise_is_marginal_normal_and_candidate_zero_bit_exact() -> None:
+    config = SimpleNamespace(chunk_size=6, max_action_dim=16)
+    device = torch.device("cpu")
+    roster = runner.flow_noise_construction_roster(16)
+    expected_one_language = [
+        ("full_iid", 0, 1),
+        ("full_iid", 1, 1),
+        ("full_iid", 2, 1),
+        ("full_iid", 3, 1),
+        ("conditional_first5_xyz", 4, 1),
+        ("conditional_first5_xyz", 4, -1),
+        ("conditional_fullchunk_xyz", 6, 1),
+        ("conditional_fullchunk_xyz", 6, -1),
+    ]
+    observed_one_language = [
+        (row["kind"], row["source_noise_index"], row["sign"])
+        for row in roster[:8]
+    ]
+    assert observed_one_language == expected_one_language
+    assert roster[:8] == roster[8:]
+
+    kwargs = {"scene_seed": 6_200_031, "query_index": 11, "device": device}
+    noises = [
+        runner.postformal_rostered_noise(config, construction=row, **kwargs)
+        for row in roster[:8]
+    ]
+    legacy_zero = runner.collector.make_noise(
+        config, kwargs["scene_seed"], kwargs["query_index"], 0, device
+    )
+    assert torch.equal(noises[0], legacy_zero)
+    assert runner.array_sha256(noises[0].numpy()) == runner.array_sha256(
+        legacy_zero.numpy()
+    )
+
+    xyz = list(runner.NATIVE_XYZ_NOISE_CHANNELS)
+    other = [index for index in range(config.max_action_dim) if index not in xyz]
+    source4 = runner.postformal_make_noise(config, flow_noise_index=4, **kwargs)
+    source6 = runner.postformal_make_noise(config, flow_noise_index=6, **kwargs)
+    assert torch.equal(noises[4][:, :5, xyz], source4[:, :5, xyz])
+    assert torch.equal(noises[5][:, :5, xyz], -source4[:, :5, xyz])
+    assert torch.equal(noises[4][:, 5:, :], legacy_zero[:, 5:, :])
+    assert torch.equal(noises[5][:, 5:, :], legacy_zero[:, 5:, :])
+    assert torch.equal(noises[4][:, :, other], legacy_zero[:, :, other])
+    assert torch.equal(noises[5][:, :, other], legacy_zero[:, :, other])
+    assert torch.equal(noises[6][:, :, xyz], source6[:, :, xyz])
+    assert torch.equal(noises[7][:, :, xyz], -source6[:, :, xyz])
+    assert torch.equal(noises[6][:, :, other], legacy_zero[:, :, other])
+    assert torch.equal(noises[7][:, :, other], legacy_zero[:, :, other])
+
+    # A construction-level Monte Carlo check protects the exact marginal
+    # N(0,I) claim without invoking the actor, simulator, outcomes or critic.
+    samples = []
+    for scene_seed in range(6_300_000, 6_300_256):
+        samples.append(
+            runner.postformal_rostered_noise(
+                config,
+                scene_seed,
+                0,
+                roster[4],
+                device,
+            ).numpy()
+        )
+    flattened = np.asarray(samples, dtype=np.float32).reshape(-1)
+    assert abs(float(flattened.mean())) < 0.04
+    assert 0.96 < float(flattened.std()) < 1.04
+
+    contract = runner.postformal_noise_contract(8, 16)
+    assert contract["format"] == runner.FLOW_NOISE_CONTRACT_FORMAT
+    assert contract["independent_flow_noise_draws"] == 6
+    assert contract["candidate_zero_legacy_noise_unchanged"] is True
+    assert contract["candidate_joint_distribution_claimed_iid"] is False
+    assert contract["selection_reads_outcomes_events_or_critic_scores"] is False
+
+
 def test_candidate_generation_uses_actor_path_then_ee_canonicalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -197,19 +300,19 @@ def test_candidate_generation_uses_actor_path_then_ee_canonicalization(
         instruction="move the object",
         scene_seed=6_200_043,
         query_index=3,
-        candidate_count=8,
+        candidate_count=16,
         device=torch.device("cpu"),
     )
 
     assert raw_calls == [
         (task, ["observation.images.cam_high"], "move the object")
     ]
-    assert policy.reset_count == 8
-    assert len(policy.noises) == 8
-    assert policy.processed_instructions == ["move the object"] * 4 + [
+    assert policy.reset_count == 16
+    assert len(policy.noises) == 16
+    assert policy.processed_instructions == ["move the object"] * 8 + [
         runner.TRAINING_SEEN_INSTRUCTION
-    ] * 4
-    assert candidates.shape == (8, 6, 16)
+    ] * 8
+    assert candidates.shape == (16, 6, 16)
     assert np.isfinite(candidates).all()
     assert np.allclose(np.linalg.norm(candidates[:, :, 3:7], axis=-1), 1.0)
     assert np.allclose(np.linalg.norm(candidates[:, :, 11:15], axis=-1), 1.0)
@@ -220,7 +323,10 @@ def test_candidate_generation_uses_actor_path_then_ee_canonicalization(
     )
     assert torch.equal(policy.noises[0], expected_zero)
     assert not torch.equal(policy.noises[1], -policy.noises[0])
-    assert all(torch.equal(policy.noises[index], policy.noises[index + 4]) for index in range(4))
+    assert all(
+        torch.equal(policy.noises[index], policy.noises[index + 8])
+        for index in range(8)
+    )
     assert np.any(candidates[1:] != candidates[0])
 
 

@@ -32,6 +32,7 @@ from typing import Any, Mapping, Sequence
 
 
 FORMAT = "etsf_robotwin2_postformal_shared_head_upgrade_watcher_v2"
+CODE_MANIFEST_FORMAT = "etsf_robotwin2_postformal_code_manifest_v1"
 RECOVERABLE_INTERRUPTION_STATUS = "recoverable_child_signal_interruption"
 RECOVERABLE_WATCHER_EXIT_CODE = 75
 RECOVERABLE_INTERRUPTION_SIGNALS = frozenset(
@@ -77,6 +78,29 @@ EXPECTED_NESTED_ROLLOUTS = 3000
 EXPECTED_GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
 DEFAULT_ETSF_SITE = Path(
     "/home/user/anaconda3/envs/ETSF_RoboTwin/lib/python3.10/site-packages"
+)
+
+# Freeze every repository-local implementation that can affect supplement
+# collection, C+B training, or the nested raw16 evaluation.  The watcher file
+# itself and its guardian are included so a detached wait cannot silently
+# cross an orchestrator revision either.
+CRITICAL_CODE_FILES = (
+    "watch_robotwin2_postformal_shared_head_upgrade_v1.py",
+    "guard_robotwin2_postformal_shared_head_upgrade_v1.py",
+    "collect_robotwin2_scripted_expert_root_actor_branches_v1.py",
+    "materialize_robotwin2_scripted_expert_root_supplement_binding_v1.py",
+    "watch_robotwin2_five_body_branches_to_lobo_training_v1.py",
+    "train_robotwin2_five_body_lobo_shared_event_head_v1.py",
+    "train_multibody_canonical_event_world_model.py",
+    "collect_robotwin2_five_body_ee_candidate_branches_v1.py",
+    "robotwin2_cross_body_canonical_adapter_v1.py",
+    "robotwin2_move_can_pot_analytic_event_spec_v1.py",
+    "verify_robotwin2_move_can_pot_public_materialization_v1.py",
+    "preregister_robotwin2_move_can_pot_five_body_lobo_v1.py",
+    "run_robotwin2_five_body_paired_success_v1.py",
+    "run_robotwin2_five_body_postformal_candidate_pool_v1.py",
+    "run_robotwin2_five_body_nested_n4_n8_paired_success_v1.py",
+    "evaluate_robotwin2_cross_embodiment_paired_success_v1.py",
 )
 
 
@@ -184,6 +208,119 @@ def verify_named_sha(
     declared = unsigned.pop(field, None)
     if declared != canonical_sha256(unsigned):
         raise SharedHeadUpgradeError(f"{label} {field} mismatch")
+
+
+def build_code_manifest(code_root: Path, commit_marker: str) -> dict[str, Any]:
+    """Hash the complete repository-local execution surface."""
+
+    root = code_root.expanduser().resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise SharedHeadUpgradeError("code root must be one real directory")
+    if (
+        not isinstance(commit_marker, str)
+        or len(commit_marker) != 40
+        or any(character not in "0123456789abcdef" for character in commit_marker)
+    ):
+        raise SharedHeadUpgradeError(
+            "code commit marker must be one full lowercase Git commit SHA"
+        )
+    files = []
+    for relative in CRITICAL_CODE_FILES:
+        path = root / relative
+        if not path.is_file() or path.is_symlink():
+            raise SharedHeadUpgradeError(
+                f"critical deployed code is missing/symbolic: {relative}"
+            )
+        files.append(
+            {
+                "relative_path": relative,
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    base = {
+        "format": CODE_MANIFEST_FORMAT,
+        "commit_marker": commit_marker,
+        "code_root": str(root),
+        "critical_files": files,
+        "python_bytecode_writes_allowed": False,
+    }
+    return {**base, "logical_sha256": canonical_sha256(base)}
+
+
+def freeze_code_manifest(
+    path: Path, *, code_root: Path, commit_marker: str
+) -> dict[str, Any]:
+    """Create the code manifest once, or require exact prior/current identity."""
+
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise SharedHeadUpgradeError("frozen code manifest may not be symbolic")
+    manifest_path = expanded.resolve()
+    expected = build_code_manifest(code_root, commit_marker)
+    if manifest_path.exists():
+        existing = read_json(manifest_path, "frozen code manifest")
+        verify_logical_sha(existing, "frozen code manifest")
+        if existing != expected:
+            raise SharedHeadUpgradeError(
+                "deployed code differs from the frozen startup manifest"
+            )
+        return existing
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = manifest_path.with_name(
+        manifest_path.name + f".create-{os.getpid()}"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(expected, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, manifest_path)
+        except FileExistsError:
+            existing = read_json(manifest_path, "racing frozen code manifest")
+            verify_logical_sha(existing, "racing frozen code manifest")
+            if existing != expected:
+                raise SharedHeadUpgradeError(
+                    "racing code manifest differs from startup code"
+                )
+    finally:
+        temporary.unlink(missing_ok=True)
+    return expected
+
+
+def validate_frozen_code_manifest(
+    path: Path,
+    *,
+    code_root: Path,
+    commit_marker: str,
+    expected_logical_sha256: str | None = None,
+    expected_file_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Reject any manifest tamper or deployed-byte drift since startup."""
+
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise SharedHeadUpgradeError("frozen code manifest may not be symbolic")
+    frozen = read_json(expanded.resolve(), "frozen code manifest")
+    verify_logical_sha(frozen, "frozen code manifest")
+    if (
+        expected_logical_sha256 is not None
+        and frozen.get("logical_sha256") != expected_logical_sha256
+    ):
+        raise SharedHeadUpgradeError("frozen code manifest authority changed")
+    if (
+        expected_file_sha256 is not None
+        and sha256_file(expanded.resolve()) != expected_file_sha256
+    ):
+        raise SharedHeadUpgradeError("frozen code manifest bytes changed")
+    observed = build_code_manifest(code_root, commit_marker)
+    if frozen != observed:
+        raise SharedHeadUpgradeError(
+            "deployed code bytes drifted after watcher startup"
+        )
+    return frozen
 
 
 def validate_nested_protocol(value: Mapping[str, Any]) -> str:
@@ -532,6 +669,7 @@ def runtime_environment(args: argparse.Namespace) -> dict[str, str]:
     environment.update(
         {
             "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
             "CUDA_VISIBLE_DEVICES": "0",
             "PYTHONPATH": ":".join(
@@ -761,6 +899,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream-state", type=Path, required=True)
     parser.add_argument("--code-root", type=Path, required=True)
+    parser.add_argument("--code-manifest", type=Path)
+    parser.add_argument("--code-commit-marker", required=True)
     parser.add_argument("--primary-branches-root", type=Path, required=True)
     parser.add_argument("--primary-binding", type=Path, required=True)
     parser.add_argument("--actor-authority", type=Path, required=True)
@@ -851,6 +991,22 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     )
     for name in path_names:
         setattr(args, name, getattr(args, name).expanduser().resolve())
+    if args.code_manifest is None:
+        args.code_manifest = args.state.with_name(
+            args.state.stem + ".code_manifest.json"
+        )
+    else:
+        args.code_manifest = args.code_manifest.expanduser().resolve()
+    if (
+        len(args.code_commit_marker) != 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in args.code_commit_marker
+        )
+    ):
+        raise SharedHeadUpgradeError(
+            "code commit marker must be one full lowercase Git commit SHA"
+        )
     if args.poll_seconds <= 0:
         raise SharedHeadUpgradeError("poll interval must be positive")
     return args
@@ -866,6 +1022,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
         raise SharedHeadUpgradeError("another shared-head upgrade watcher is active") from error
+    code_manifest = freeze_code_manifest(
+        args.code_manifest,
+        code_root=args.code_root,
+        commit_marker=args.code_commit_marker,
+    )
+    code_manifest_file_sha256 = sha256_file(args.code_manifest)
 
     def write_state(status: str, **extra: Any) -> None:
         atomic_json(
@@ -884,6 +1046,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "expected_supplement_decisions": EXPECTED_SUPPLEMENT_DECISIONS,
                 "expected_supplement_branches": EXPECTED_SUPPLEMENT_BRANCHES,
                 "gpu_uuid": args.expected_gpu_uuid,
+                "code_commit_marker": args.code_commit_marker,
+                "code_manifest": str(args.code_manifest),
+                "code_manifest_logical_sha256": code_manifest[
+                    "logical_sha256"
+                ],
+                "code_manifest_file_sha256": code_manifest_file_sha256,
                 **extra,
             },
         )
@@ -904,6 +1072,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         cwd: Path,
         environment: Mapping[str, str],
     ) -> None:
+        validate_frozen_code_manifest(
+            args.code_manifest,
+            code_root=args.code_root,
+            commit_marker=args.code_commit_marker,
+            expected_logical_sha256=code_manifest["logical_sha256"],
+            expected_file_sha256=code_manifest_file_sha256,
+        )
         log_path = args.log_root / log_name
         write_state(
             stage,
@@ -922,9 +1097,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stderr=subprocess.STDOUT,
                 check=False,
             )
+        validate_frozen_code_manifest(
+            args.code_manifest,
+            code_root=args.code_root,
+            commit_marker=args.code_commit_marker,
+            expected_logical_sha256=code_manifest["logical_sha256"],
+            expected_file_sha256=code_manifest_file_sha256,
+        )
         raise_for_stage_returncode(stage, result.returncode)
 
     while True:
+        validate_frozen_code_manifest(
+            args.code_manifest,
+            code_root=args.code_root,
+            commit_marker=args.code_commit_marker,
+            expected_logical_sha256=code_manifest["logical_sha256"],
+            expected_file_sha256=code_manifest_file_sha256,
+        )
         try:
             upstream = read_json(args.upstream_state, "upstream ablation state")
         except (OSError, ValueError, json.JSONDecodeError, SharedHeadUpgradeError):
@@ -962,16 +1151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if any(not path.exists() or path.is_symlink() for path in static_paths):
         raise SharedHeadUpgradeError("one or more immutable upgrade inputs are missing/symbolic")
-    required_scripts = (
-        "collect_robotwin2_scripted_expert_root_actor_branches_v1.py",
-        "materialize_robotwin2_scripted_expert_root_supplement_binding_v1.py",
-        "train_robotwin2_five_body_lobo_shared_event_head_v1.py",
-        "watch_robotwin2_five_body_branches_to_lobo_training_v1.py",
-        "run_robotwin2_five_body_paired_success_v1.py",
-        "run_robotwin2_five_body_postformal_candidate_pool_v1.py",
-        "run_robotwin2_five_body_nested_n4_n8_paired_success_v1.py",
-        "evaluate_robotwin2_cross_embodiment_paired_success_v1.py",
-    )
+    required_scripts = CRITICAL_CODE_FILES
     if any(
         not (args.code_root / name).is_file()
         or (args.code_root / name).is_symlink()
@@ -1041,6 +1221,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     nested_completion = validate_nested_completion(args.augmented_n8_root)
     nested_report = Path(str(nested_completion["report"]))
 
+    validate_frozen_code_manifest(
+        args.code_manifest,
+        code_root=args.code_root,
+        commit_marker=args.code_commit_marker,
+        expected_logical_sha256=code_manifest["logical_sha256"],
+        expected_file_sha256=code_manifest_file_sha256,
+    )
     atomic_text(args.run_exit, "0\n")
     write_state(
         "complete",
@@ -1066,6 +1253,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _existing_code_state_fields(state: Path) -> dict[str, Any]:
+    try:
+        prior = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(prior, Mapping):
+        return {}
+    return {
+        key: prior[key]
+        for key in (
+            "code_commit_marker",
+            "code_manifest",
+            "code_manifest_logical_sha256",
+            "code_manifest_file_sha256",
+        )
+        if key in prior
+    }
+
+
 def record_failure(
     state: Path | None, run_exit: Path | None, error: BaseException
 ) -> None:
@@ -1080,6 +1286,7 @@ def record_failure(
                 "updated_at_utc": utc_now(),
                 "error_type": type(error).__name__,
                 "error_message": str(error),
+                **_existing_code_state_fields(state),
             },
         )
 
@@ -1103,6 +1310,7 @@ def record_recoverable_interruption(
                 "child_signal_number": error.signal_number,
                 "child_signal_name": error.signal_name,
                 "run_exit_written": False,
+                **_existing_code_state_fields(state),
             },
         )
 

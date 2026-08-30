@@ -2,10 +2,10 @@
 """Run a shared-raw16 actor/N4/N8 paired RoboTwin2 study.
 
 For every policy query this runner draws one ordered set of sixteen proposals
-from the frozen actor using the frozen two-instruction-by-eight-flow roster.
-A deterministic, outcome/event/critic-score-blind greedy farthest-point order
-in the held-out fold's source-train-normalized first-five-action effect space is
-frozen once.
+from the frozen actor using the frozen two-instruction conditional-translation
+flow roster.  A deterministic, outcome/event/critic-score-blind mixed
+translation/full-effect farthest-point order in the held-out fold's
+source-train-normalized first-five-action effect space is frozen once.
 The first four entries form N4 and the first eight form N8, so N4 is an exact
 ordered prefix of N8 and raw proposal zero is candidate zero in every arm.
 
@@ -48,11 +48,11 @@ CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v1"
 OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
 REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
 COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
-NESTED_POOL_AUDIT_FORMAT = "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v2"
+NESTED_POOL_AUDIT_FORMAT = "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v3"
 SOURCE_ACTION_NORMALIZER_FORMAT = (
     "etsf_robotwin2_fold_source_action_normalizer_binding_v1"
 )
-INITIAL_COMMITMENT_FORMAT = "etsf_robotwin2_initial_raw16_nested_n4_n8_commitment_v1"
+INITIAL_COMMITMENT_FORMAT = "etsf_robotwin2_initial_raw16_nested_n4_n8_commitment_v2"
 METHOD_START_FORMAT = "etsf_robotwin2_nested_method_start_v1"
 METHOD_RESUME_FORMAT = "etsf_robotwin2_nested_method_noninformative_resume_v1"
 METHOD_RESULT_FORMAT = "etsf_robotwin2_nested_method_result_v1"
@@ -69,6 +69,16 @@ SEED_COUNT = 100
 RAW_PROPOSAL_COUNT = 16
 N4_CANDIDATE_COUNT = 4
 N8_CANDIDATE_COUNT = 8
+MIXED_SELECTION_METRIC_ORDER = (
+    "anchor_candidate_zero",
+    "translation",
+    "translation",
+    "full",
+    "translation",
+    "translation",
+    "translation",
+    "full",
+)
 METHOD_ACTOR = "actor_baseline"
 METHOD_N4 = "etsf_nested_best_of_4_from_raw16"
 METHOD_N8 = "etsf_nested_best_of_8_from_raw16"
@@ -418,8 +428,13 @@ def nested_pool_contract() -> dict[str, Any]:
         "retained_candidate_counts": [N4_CANDIDATE_COUNT, N8_CANDIDATE_COUNT],
         "single_actor_generation_per_policy_query": True,
         "ordering": (
-            "greedy_maximize_minimum_rms_in_source_train_zscore_clip5_first_"
-            "five_canonical_action_effect14_anchor_raw_zero_tie_lowest_raw_index"
+            "fixed_anchor_translation_translation_full_translation_translation_"
+            "translation_full_greedy_maximin_rms_in_source_train_zscore_clip5_"
+            "first_five_canonical_effects_tie_lowest_raw_index"
+        ),
+        "ordered_selection_metrics_n8": list(MIXED_SELECTION_METRIC_ORDER),
+        "ordered_selection_metrics_n4": list(
+            MIXED_SELECTION_METRIC_ORDER[:N4_CANDIDATE_COUNT]
         ),
         "diversity_metric": {
             "format": pool_runner.SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT,
@@ -429,6 +444,11 @@ def nested_pool_contract() -> dict[str, Any]:
                 shared_head.CROSS_BODY_STANDARDIZED_INPUT_CLIP
             ),
             "same_geometry_as_shared_head_action_input": True,
+            "translation_channels": list(
+                pool_runner.CANONICAL_TRANSLATION_EFFECT_CHANNELS
+            ),
+            "translation_metric_uses_only_canonical_dual_arm_xyz": True,
+            "full_metric_uses_all_canonical_effect14_channels": True,
             "heldout_rows_used": 0,
             "reads_heldout_labels_outcomes_events_or_critic_scores": False,
         },
@@ -438,6 +458,11 @@ def nested_pool_contract() -> dict[str, Any]:
         "selection_reads_source_train_action_normalizer": True,
         "raw16_flow_noise_contract": pool_runner.postformal_noise_contract(
             RAW_PROPOSAL_COUNT, RAW_PROPOSAL_COUNT
+        ),
+        "raw16_flow_noise_contract_sha256": canonical_sha256(
+            pool_runner.postformal_noise_contract(
+                RAW_PROPOSAL_COUNT, RAW_PROPOSAL_COUNT
+            )
         ),
         "raw16_instruction_coverage_contract": pool_runner.candidate_pool_contract(
             RAW_PROPOSAL_COUNT, RAW_PROPOSAL_COUNT
@@ -464,6 +489,48 @@ def _pairwise_rms(values: np.ndarray) -> np.ndarray:
     return np.asarray(rows, dtype=np.float64)
 
 
+def mixed_metric_farthest_point_indices(
+    translation_embeddings: np.ndarray,
+    full_embeddings: np.ndarray,
+    *,
+    metric_order: Sequence[str] = MIXED_SELECTION_METRIC_ORDER,
+) -> list[int]:
+    """Freeze the label-blind T/T/full/T/T/T/full order around candidate zero."""
+
+    translation = np.asarray(translation_embeddings, dtype=np.float64)
+    full = np.asarray(full_embeddings, dtype=np.float64)
+    order = tuple(metric_order)
+    if (
+        translation.ndim != 2
+        or full.ndim != 2
+        or translation.shape[0] != full.shape[0]
+        or translation.shape[0] < len(order)
+        or translation.shape[1] == 0
+        or full.shape[1] == 0
+        or not np.isfinite(translation).all()
+        or not np.isfinite(full).all()
+        or order != MIXED_SELECTION_METRIC_ORDER
+    ):
+        raise NestedCandidatePoolError("mixed candidate diversity inputs changed")
+    selected = [0]
+    remaining = list(range(1, len(translation)))
+    for metric in order[1:]:
+        values = translation if metric == "translation" else full
+        if metric not in {"translation", "full"}:
+            raise NestedCandidatePoolError("mixed candidate metric is invalid")
+        minimum_rms = []
+        for raw_index in remaining:
+            delta = values[selected] - values[raw_index]
+            minimum_rms.append(
+                float(np.sqrt(np.mean(np.square(delta), axis=1)).min())
+            )
+        position = int(np.argmax(np.asarray(minimum_rms, dtype=np.float64)))
+        selected.append(remaining.pop(position))
+    if selected[0] != 0 or len(selected) != len(set(selected)):
+        raise NestedCandidatePoolError("mixed candidate selection changed identity")
+    return selected
+
+
 def nested_pool_selection_audit(
     *,
     current_ee: np.ndarray,
@@ -479,14 +546,23 @@ def nested_pool_selection_audit(
     )
     effects, raw_embeddings = pool_runner.canonical_effect_embeddings(current_ee, raw)
     mean, std, clip = validate_source_action_normalizer(source_action_normalizer)
-    embeddings = pool_runner.source_train_normalized_effect_embeddings(
+    full_embeddings = pool_runner.source_train_normalized_effect_embeddings(
         effects,
         action_mean=mean,
         action_std=std,
         normalization_clip=clip,
     )
-    n8_indices = pool_runner.greedy_farthest_point_indices(
-        embeddings, retain_count=N8_CANDIDATE_COUNT
+    translation_embeddings = (
+        pool_runner.source_train_normalized_translation_effect_embeddings(
+            effects,
+            action_mean=mean,
+            action_std=std,
+            normalization_clip=clip,
+        )
+    )
+    n8_indices = mixed_metric_farthest_point_indices(
+        translation_embeddings,
+        full_embeddings,
     )
     n4_indices = n8_indices[:N4_CANDIDATE_COUNT]
     if (
@@ -502,16 +578,29 @@ def nested_pool_selection_audit(
     if not np.array_equal(raw[0], n4[0]) or not np.array_equal(raw[0], n8[0]):
         raise NestedCandidatePoolError("raw proposal zero identity changed")
     raw_unscaled_distances = _pairwise_rms(raw_embeddings)
-    raw_distances = _pairwise_rms(embeddings)
-    n4_distances = _pairwise_rms(embeddings[n4_indices])
-    n8_distances = _pairwise_rms(embeddings[n8_indices])
+    raw_distances = _pairwise_rms(full_embeddings)
+    n4_distances = _pairwise_rms(full_embeddings[n4_indices])
+    n8_distances = _pairwise_rms(full_embeddings[n8_indices])
+    raw_translation_distances = _pairwise_rms(translation_embeddings)
+    n4_translation_distances = _pairwise_rms(
+        translation_embeddings[n4_indices]
+    )
+    n8_translation_distances = _pairwise_rms(
+        translation_embeddings[n8_indices]
+    )
+    noise_contract_sha256 = nested_pool_contract()[
+        "raw16_flow_noise_contract_sha256"
+    ]
     base = {
         **nested_pool_contract(),
         "raw_shape": list(raw.shape),
         "raw_ordered_proposals_sha256": array_sha256(raw),
         "raw_proposal_zero_sha256": array_sha256(raw[:1]),
         "canonical_first_five_effects_sha256": array_sha256(effects),
-        "canonical_effect_embedding_shape": list(embeddings.shape),
+        "canonical_effect_embedding_shape": list(full_embeddings.shape),
+        "canonical_translation_effect_embedding_shape": list(
+            translation_embeddings.shape
+        ),
         "canonical_effect_diversity_metric_format": (
             pool_runner.SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT
         ),
@@ -520,7 +609,15 @@ def nested_pool_selection_audit(
             "logical_sha256"
         ],
         "normalized_clipped_effect_embeddings_sha256": array_sha256(
-            embeddings.astype(np.float32)
+            full_embeddings.astype(np.float32)
+        ),
+        "normalized_clipped_translation_effect_embeddings_sha256": array_sha256(
+            translation_embeddings.astype(np.float32)
+        ),
+        "raw16_flow_noise_contract_sha256": noise_contract_sha256,
+        "ordered_selection_metrics_n8": list(MIXED_SELECTION_METRIC_ORDER),
+        "ordered_selection_metrics_n4": list(
+            MIXED_SELECTION_METRIC_ORDER[:N4_CANDIDATE_COUNT]
         ),
         "ordered_fps_raw_indices_n8": n8_indices,
         "ordered_fps_raw_indices_n4": n4_indices,
@@ -538,15 +635,30 @@ def nested_pool_selection_audit(
                 "median": float(np.median(raw_distances)),
                 "maximum": float(raw_distances.max()),
             },
+            "raw16_source_train_zscore_clip5_translation_only": {
+                "minimum": float(raw_translation_distances.min()),
+                "median": float(np.median(raw_translation_distances)),
+                "maximum": float(raw_translation_distances.max()),
+            },
             "nested_n4": {
                 "minimum": float(n4_distances.min()),
                 "median": float(np.median(n4_distances)),
                 "maximum": float(n4_distances.max()),
             },
+            "nested_n4_translation_only": {
+                "minimum": float(n4_translation_distances.min()),
+                "median": float(np.median(n4_translation_distances)),
+                "maximum": float(n4_translation_distances.max()),
+            },
             "nested_n8": {
                 "minimum": float(n8_distances.min()),
                 "median": float(np.median(n8_distances)),
                 "maximum": float(n8_distances.max()),
+            },
+            "nested_n8_translation_only": {
+                "minimum": float(n8_translation_distances.min()),
+                "median": float(np.median(n8_translation_distances)),
+                "maximum": float(n8_translation_distances.max()),
             },
         },
     }
@@ -574,6 +686,21 @@ def validate_nested_pool_audit(value: Mapping[str, Any]) -> None:
         is not True
         or value.get("canonical_effect_diversity_metric_format")
         != pool_runner.SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT
+        or value.get("ordered_selection_metrics_n8")
+        != list(MIXED_SELECTION_METRIC_ORDER)
+        or value.get("ordered_selection_metrics_n4")
+        != list(MIXED_SELECTION_METRIC_ORDER[:N4_CANDIDATE_COUNT])
+        or value.get("raw16_flow_noise_contract_sha256")
+        != nested_pool_contract()["raw16_flow_noise_contract_sha256"]
+        or value.get("raw16_flow_noise_contract_sha256")
+        != canonical_sha256(value.get("raw16_flow_noise_contract"))
+        or value.get("canonical_translation_effect_embedding_shape")
+        != [RAW_PROPOSAL_COUNT, ACTION_EXEC_STEPS * 6]
+        or not _is_sha256(
+            value.get(
+                "normalized_clipped_translation_effect_embeddings_sha256"
+            )
+        )
         or value.get("source_action_normalizer_logical_sha256")
         != normalizer.get("logical_sha256")
         or value.get("selection_reads_outcomes_events_labels_or_critic_scores")
@@ -723,6 +850,12 @@ def prepare_initial_commitment(
                 pools[N8_CANDIDATE_COUNT]
             ),
             "nested_pool_audit": audit,
+            "nested_pool_contract_sha256": canonical_sha256(
+                nested_pool_contract()
+            ),
+            "raw16_flow_noise_contract_sha256": audit[
+                "raw16_flow_noise_contract_sha256"
+            ],
             "source_action_normalizer_logical_sha256": (
                 source_action_normalizer_logical_sha256
             ),
@@ -777,6 +910,10 @@ def verify_initial_commitment(
         or commitment.get("n8_ordered_candidates_sha256")
         != array_sha256(pools[N8_CANDIDATE_COUNT])
         or commitment.get("nested_pool_audit") != dict(audit)
+        or commitment.get("nested_pool_contract_sha256")
+        != canonical_sha256(nested_pool_contract())
+        or commitment.get("raw16_flow_noise_contract_sha256")
+        != audit.get("raw16_flow_noise_contract_sha256")
         or commitment.get("source_action_normalizer_logical_sha256")
         != audit.get("source_action_normalizer_logical_sha256")
         or audit.get("source_action_normalizer_logical_sha256")
@@ -994,6 +1131,9 @@ def execute_rollout(
                     "raw_ordered_proposals_sha256": array_sha256(raw),
                     "raw_proposal_zero_sha256": array_sha256(raw[:1]),
                     "nested_pool_audit": audit,
+                    "raw16_flow_noise_contract_sha256": audit[
+                        "raw16_flow_noise_contract_sha256"
+                    ],
                     "source_action_normalizer_logical_sha256": (
                         source_action_normalizer_logical_sha256
                     ),
@@ -1138,6 +1278,8 @@ def validate_rollout(
             != audit.get("raw_ordered_proposals_sha256")
             or decision.get("source_action_normalizer_logical_sha256")
             != expected_source_action_normalizer_logical_sha256
+            or decision.get("raw16_flow_noise_contract_sha256")
+            != audit.get("raw16_flow_noise_contract_sha256")
             or audit.get("source_action_normalizer_logical_sha256")
             != expected_source_action_normalizer_logical_sha256
             or decision.get("selection_pool_candidate_count") != expected_count
@@ -1220,6 +1362,10 @@ def validate_stored_initial_commitment(
         or commitment.get("resolved_seed") != expected["requested_seed"]
         or commitment.get("frozen_before_any_method_execution") is not True
         or commitment.get("candidate_generation_advanced_simulator") is not False
+        or commitment.get("nested_pool_contract_sha256")
+        != canonical_sha256(nested_pool_contract())
+        or commitment.get("raw16_flow_noise_contract_sha256")
+        != audit.get("raw16_flow_noise_contract_sha256")
         or commitment.get("source_action_normalizer_logical_sha256")
         != audit.get("source_action_normalizer_logical_sha256")
         or audit.get("source_action_normalizer_logical_sha256")
@@ -1376,6 +1522,9 @@ def materialize_triplet(
     if set(method_result_bindings) != set(METHODS):
         raise NestedCandidatePoolError("triplet lacks exact method-result bindings")
     commitment_audit = commitment.get("nested_pool_audit")
+    expected_noise_contract_sha256 = nested_pool_contract()[
+        "raw16_flow_noise_contract_sha256"
+    ]
     if (
         not _is_sha256(source_action_normalizer_logical_sha256)
         or not isinstance(commitment_audit, Mapping)
@@ -1383,6 +1532,10 @@ def materialize_triplet(
         != source_action_normalizer_logical_sha256
         or commitment_audit.get("source_action_normalizer_logical_sha256")
         != source_action_normalizer_logical_sha256
+        or commitment.get("raw16_flow_noise_contract_sha256")
+        != expected_noise_contract_sha256
+        or commitment_audit.get("raw16_flow_noise_contract_sha256")
+        != expected_noise_contract_sha256
     ):
         raise NestedCandidatePoolError(
             "triplet source action normalizer authority changed"
@@ -1464,6 +1617,7 @@ def materialize_triplet(
         "initial_candidate_commitment_sha256": commitment.get(
             "commitment_sha256"
         ),
+        "raw16_flow_noise_contract_sha256": expected_noise_contract_sha256,
         "method_result_bindings": normalized_method_bindings,
         "same_resolved_reset_actor_n4_n8": same_reset,
         "same_initial_raw16_and_nested_pool_audit": same_initial_raw16,
@@ -1497,6 +1651,8 @@ def validate_triplet(
         != execution_contract_logical_sha256
         or value.get("source_action_normalizer_logical_sha256")
         != expected_source_action_normalizer_logical_sha256
+        or value.get("raw16_flow_noise_contract_sha256")
+        != nested_pool_contract()["raw16_flow_noise_contract_sha256"]
         or not isinstance(value.get("method_result_bindings"), Mapping)
         or set(value["method_result_bindings"]) != set(METHODS)
         or (
@@ -2647,6 +2803,7 @@ __all__ = [
     "METHOD_ACTOR",
     "METHOD_N4",
     "METHOD_N8",
+    "MIXED_SELECTION_METRIC_ORDER",
     "N4_CANDIDATE_COUNT",
     "N8_CANDIDATE_COUNT",
     "NestedCandidatePoolError",
@@ -2660,6 +2817,7 @@ __all__ = [
     "existing_separate_n4_n8_comparability_audit",
     "inspect_fold_source_action_normalizer",
     "materialize_triplet",
+    "mixed_metric_farthest_point_indices",
     "nested_pool_contract",
     "nested_evaluation_protocol",
     "nested_pool_selection_audit",

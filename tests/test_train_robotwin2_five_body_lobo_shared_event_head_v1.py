@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -93,6 +94,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     build_preflight_receipt,
     canonical_sha256,
     checkpoint_candidate_rank_contract,
+    combine_primary_and_supplement_strict_proper,
     candidate_checkpoint_selection_key,
     effect_preserving_group_bootstrap_weights,
     proper_outcome_preserving_group_bootstrap_weights,
@@ -108,6 +110,7 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     source_group_split,
     standardized_input_clip_diagnostics,
     supplement_group_bootstrap_weights,
+    supplement_inner_validation_body,
     supplement_reserve_attempt_id,
     supplement_reserve_group_id,
     supplement_reserve_horizon_by_seed,
@@ -606,7 +609,7 @@ def _supplement_fixture(
             "candidate_count": 4,
             "action_exec_steps": 5,
             "supplement_role": (
-                "expert_event_root_proper_world_and_utility_rank_source_train_only"
+                "expert_event_root_outer_source_crossfit_proper_world_and_utility_rank"
             ),
             "root_policy": "robotwin_scripted_expert",
             "candidate_and_continuation_policy": (
@@ -891,7 +894,8 @@ def test_supplement_heldout_manifest_and_payload_are_zero_open(
         split_seed=23,
         supplement_audit=supplement,
     )
-    assert receipt["supplement"]["source_train_groups"] == 120
+    assert receipt["supplement"]["source_train_groups"] == 90
+    assert receipt["supplement"]["source_validation_groups"] == 30
     assert receipt["supplement"]["heldout_groups_deferred"] == 30
     assert receipt["supplement"]["heldout_manifest_file_opened"] == 0
     assert receipt["supplement"]["heldout_group_npz_opened"] == 0
@@ -938,7 +942,7 @@ def test_supplement_binding_reserve_provenance_fails_closed(
         )
 
 
-def test_supplement_is_source_train_only_and_never_enters_validation(
+def test_supplement_uses_label_blind_inner_body_proper_validation_only(
     tmp_path: Path,
 ) -> None:
     binding, digest = _fixture(tmp_path)
@@ -955,14 +959,23 @@ def test_supplement_is_source_train_only_and_never_enters_validation(
     _primary_train, primary_validation, _primary_heldout = source_group_split(
         primary, held_out_body="franka", split_seed=19
     )
-    supplement_train, supplement_heldout = supplement_source_train_split(
-        supplement, held_out_body="franka"
+    supplement_train, supplement_validation, supplement_heldout = (
+        supplement_source_train_split(
+            supplement, held_out_body="franka", split_seed=19
+        )
+    )
+    validation_body = supplement_inner_validation_body(
+        held_out_body="franka", split_seed=19
     )
     assert supplement_heldout["declared_group_count"] == 30
     assert all(group["body"] != "franka" for group in supplement_train)
+    assert {group["body"] for group in supplement_validation} == {
+        validation_body
+    }
+    assert validation_body not in {group["body"] for group in supplement_train}
     assert all(
         group.get("source_role") == "proper_world_supplement"
-        for group in supplement_train
+        for group in supplement_train + supplement_validation
     )
     validation_identities = {
         (row["body"], row["condition"], row["group_id"])
@@ -970,13 +983,17 @@ def test_supplement_is_source_train_only_and_never_enters_validation(
     }
     supplement_identities = {
         (row["body"], row["condition"], row["group_id"])
-        for row in supplement_train
+        for row in supplement_train + supplement_validation
     }
     assert validation_identities.isdisjoint(supplement_identities)
     rows = materialize_supplement_rows(
         supplement_train, held_out_body="franka"
     )
-    assert len(rows) == 480
+    validation_rows = materialize_supplement_rows(
+        supplement_validation, held_out_body="franka"
+    )
+    assert len(rows) == 360
+    assert len(validation_rows) == 120
     assert {int(row["current_event_id"]) for row in rows} == {1, 2, 3}
     assert all(
         "|proper-world-supplement|" in row["logical_group"] for row in rows
@@ -987,9 +1004,28 @@ def test_supplement_is_source_train_only_and_never_enters_validation(
         split_seed=19,
         supplement_audit=supplement,
     )
-    assert receipt["supplement"]["source_validation_groups"] == 0
+    assert receipt["supplement"]["source_validation_groups"] == 30
+    assert receipt["supplement"]["source_validation_body"] == validation_body
+    assert receipt["supplement"]["source_validation_assignment_uses_labels"] is False
     assert receipt["supplement"]["normalization_rows_used"] == 0
-    assert receipt["supplement"]["rank_or_utility_rows_authorized"] == 480
+    assert receipt["supplement"]["rank_or_utility_rows_authorized"] == 360
+    assert receipt["supplement"]["proper_checkpoint_selection_rows_authorized"] == 120
+    assert receipt["supplement"]["proper_validation_primary_reset_overlap"] == 0
+    assert receipt["supplement"]["rank_selection_rows_authorized"] == 0
+    assert receipt["supplement"]["calibration_diagnostic_rows_authorized"] == 120
+    assert receipt["supplement"]["calibration_rows_used"] == 0
+    assert receipt["supplement"]["calibration_fit"] is False
+
+
+def test_supplement_inner_validation_is_balanced_five_fold_derangement() -> None:
+    assignments = {
+        heldout: supplement_inner_validation_body(
+            held_out_body=heldout, split_seed=20260901
+        )
+        for heldout in BODIES
+    }
+    assert all(validation != heldout for heldout, validation in assignments.items())
+    assert set(assignments.values()) == set(BODIES)
 
 
 def test_supplement_seed_and_expert_root_contracts_fail_closed(
@@ -1113,8 +1149,8 @@ def test_supplement_fixed_lambda_updates_only_proper_world_objectives(
         primary_audit=primary,
         held_out_body="franka",
     )
-    groups, _heldout = supplement_source_train_split(
-        supplement, held_out_body="franka"
+    groups, _validation, _heldout = supplement_source_train_split(
+        supplement, held_out_body="franka", split_seed=20260901
     )
     rows = materialize_supplement_rows(groups[:1], held_out_body="franka")
     mapping = {body: 0 for body in BODIES if body != "franka"}
@@ -1155,8 +1191,8 @@ def test_supplement_rank_fixed_lambda_updates_only_detached_utility(
         primary_audit=primary,
         held_out_body="franka",
     )
-    groups, _heldout = supplement_source_train_split(
-        supplement, held_out_body="franka"
+    groups, _validation, _heldout = supplement_source_train_split(
+        supplement, held_out_body="franka", split_seed=20260901
     )
     rows = materialize_supplement_rows(groups[:1], held_out_body="franka")
     mapping = {body: 0 for body in BODIES if body != "franka"}
@@ -1199,8 +1235,8 @@ def test_supplement_bootstrap_is_member_specific_and_complete_group_constant(
         primary_audit=primary,
         held_out_body="franka",
     )
-    groups, _heldout = supplement_source_train_split(
-        supplement, held_out_body="franka"
+    groups, _validation, _heldout = supplement_source_train_split(
+        supplement, held_out_body="franka", split_seed=20260901
     )
     rows = materialize_supplement_rows(groups[:8], held_out_body="franka")
     weights, audit, bootstrap_seed = supplement_group_bootstrap_weights(
@@ -1334,6 +1370,14 @@ def test_rank_gradient_updates_only_consequence_utility_not_world_model() -> Non
     assert all(parameter.grad is None for parameter in model.object_scale.parameters())
     assert all(
         parameter.grad is None
+        for parameter in model.object_delta_component_mean.parameters()
+    )
+    assert all(
+        parameter.grad is None
+        for parameter in model.object_delta_component_scale.parameters()
+    )
+    assert all(
+        parameter.grad is None
         for parameter in model.terminal_context_encoder.parameters()
     )
     assert all(
@@ -1345,11 +1389,11 @@ def test_rank_gradient_updates_only_consequence_utility_not_world_model() -> Non
     )
     assert all(
         parameter.grad is None
-        for parameter in model.terminal_goal_progress_mean.parameters()
+        for parameter in model.terminal_goal_progress_component_mean.parameters()
     )
     assert all(
         parameter.grad is None
-        for parameter in model.terminal_goal_progress_scale.parameters()
+        for parameter in model.terminal_goal_progress_component_scale.parameters()
     )
 
 
@@ -1381,10 +1425,186 @@ def test_terminal_proper_loss_updates_long_horizon_predictors_and_backbone() -> 
     assert any(parameter.grad is not None for parameter in model.terminal_event.parameters())
     assert any(
         parameter.grad is not None
-        for parameter in model.terminal_goal_progress_mean.parameters()
+        for parameter in model.terminal_goal_progress_component_mean.parameters()
     )
     assert any(parameter.grad is not None for parameter in model.action.parameters())
     assert any(parameter.grad is not None for parameter in model.transition.parameters())
+
+
+def test_v11_event_mixture_outputs_have_exact_mean_and_total_variance() -> None:
+    torch.manual_seed(19)
+    model = EffectAlignedSharedEventHead().eval()
+    output = model(_model_batch(torch.full((3,), 5.0 / 15.0)))
+
+    assert all(not parameter.requires_grad for parameter in model.object_mean.parameters())
+    assert all(not parameter.requires_grad for parameter in model.object_scale.parameters())
+    post_probability = output["object_delta_mixture_probability"]
+    object_component_mean = output["object_delta_component_mean"]
+    object_component_scale = torch.exp(
+        output["object_delta_component_log_scale"]
+    )
+    expected_object_mean = (
+        post_probability[:, :, None] * object_component_mean
+    ).sum(dim=1)
+    expected_object_variance = (
+        post_probability[:, :, None]
+        * (3.0 * object_component_scale.square() + object_component_mean.square())
+    ).sum(dim=1) - expected_object_mean.square()
+    torch.testing.assert_close(output["object_delta_mean"], expected_object_mean)
+    torch.testing.assert_close(
+        output["object_delta_std"], torch.sqrt(expected_object_variance)
+    )
+    torch.testing.assert_close(
+        output["object_delta_std"],
+        math.sqrt(3.0) * torch.exp(output["object_delta_log_scale"]),
+    )
+
+    terminal_probability = output["terminal_goal_progress_mixture_probability"]
+    terminal_component_mean = output["terminal_goal_progress_component_mean"]
+    terminal_component_scale = torch.exp(
+        output["terminal_goal_progress_component_log_scale"]
+    )
+    expected_terminal_mean = (
+        terminal_probability * terminal_component_mean
+    ).sum(dim=1)
+    expected_terminal_variance = (
+        terminal_probability
+        * (3.0 * terminal_component_scale.square() + terminal_component_mean.square())
+    ).sum(dim=1) - expected_terminal_mean.square()
+    torch.testing.assert_close(
+        output["terminal_goal_progress_mean"], expected_terminal_mean
+    )
+    torch.testing.assert_close(
+        output["terminal_goal_progress_std"],
+        torch.sqrt(expected_terminal_variance),
+    )
+    torch.testing.assert_close(
+        output["terminal_goal_progress_std"],
+        math.sqrt(3.0)
+        * torch.exp(output["terminal_goal_progress_log_scale"]),
+    )
+
+
+def test_v11_centered_mixture_variance_avoids_float32_cancellation() -> None:
+    probability = torch.tensor([[0.5, 0.5]], dtype=torch.float32)
+    component_mean = torch.tensor([[10_000.0, 10_001.0]], dtype=torch.float32)
+    component_log_scale = torch.full_like(component_mean, -7.0)
+    mixture_mean, mixture_std, _log_scale = (
+        trainer_entry._event_conditioned_student_t3_mixture_moments(
+            probability,
+            component_mean,
+            component_log_scale,
+        )
+    )
+    expected_variance = torch.tensor(
+        [0.25 + 3.0 * math.exp(-14.0)], dtype=torch.float32
+    )
+    torch.testing.assert_close(mixture_mean, torch.tensor([10_000.5]))
+    torch.testing.assert_close(
+        mixture_std.square(), expected_variance, atol=1e-6, rtol=1e-6
+    )
+    assert float(mixture_std) > 0.49
+
+
+def test_v11_short_goal_risk_uses_centered_between_event_variance() -> None:
+    torch.manual_seed(23)
+    model = EffectAlignedSharedEventHead().eval()
+    with torch.no_grad():
+        model.post_event.weight.zero_()
+        model.post_event.bias.copy_(
+            torch.tensor([0.0, 0.0, -100.0, -100.0, -100.0])
+        )
+        model.object_delta_component_mean.weight.zero_()
+        component_bias = model.object_delta_component_mean.bias.view(
+            len(core.CANONICAL_EVENTS), core.OBJECT_DELTA_DIM
+        )
+        component_bias.zero_()
+        component_bias[0, 0] = 10_000.0
+        component_bias[1, 0] = 10_001.0
+        model.object_delta_component_scale.weight.zero_()
+        model.object_delta_component_scale.bias.fill_(-7.0)
+
+    output = model(_model_batch(torch.tensor([5.0 / 15.0])))
+    probability = output["object_delta_mixture_probability"]
+    progress = output["predicted_goal_progress_component"]
+    mean = (probability * progress).sum(dim=-1)
+    within_variance = torch.full_like(
+        progress, 3.0 * math.exp(-14.0)
+    )
+    expected_variance = (
+        probability * (within_variance + (progress - mean[:, None]).square())
+    ).sum(dim=-1)
+    torch.testing.assert_close(
+        output["predicted_goal_progress_uncertainty"].square(),
+        expected_variance,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert float(
+        output["predicted_goal_progress_uncertainty"].detach()
+    ) > 0.49
+
+
+def test_v11_proper_losses_gather_only_the_observed_event_component() -> None:
+    object_mean = torch.nn.Parameter(torch.zeros(2, 5, core.OBJECT_DELTA_DIM))
+    object_log_scale = torch.zeros_like(object_mean, requires_grad=True)
+    object_batch = {
+        "post_event_id": torch.tensor([1, 3]),
+        "post_event_mask": torch.ones(2),
+        "object_delta": torch.ones(2, core.OBJECT_DELTA_DIM),
+        "object_delta_mask": torch.ones(2),
+        "action_available": torch.ones(2),
+    }
+    object_loss, _pieces = trainer_entry._robust_object_effect_loss(
+        {
+            "object_delta_component_mean": object_mean,
+            "object_delta_component_log_scale": object_log_scale,
+            # Deliberately incompatible legacy mixture fields: the proper NLL
+            # must never use them as if they were a single Student-t mode.
+            "object_delta_mean": torch.full((2, core.OBJECT_DELTA_DIM), 1000.0),
+            "object_delta_log_scale": torch.full(
+                (2, core.OBJECT_DELTA_DIM), 7.0
+            ),
+        },
+        object_batch,
+        torch.ones(2),
+    )
+    object_loss.backward()
+    assert torch.count_nonzero(object_mean.grad[0, 1]) > 0
+    assert torch.count_nonzero(object_mean.grad[1, 3]) > 0
+    assert torch.count_nonzero(object_mean.grad[0, [0, 2, 3, 4]]) == 0
+    assert torch.count_nonzero(object_mean.grad[1, [0, 1, 2, 4]]) == 0
+
+    terminal_component_mean = torch.zeros(2, 5)
+    terminal_component_mean[0, 1] = 0.25
+    terminal_component_mean[1, 4] = -0.5
+    terminal_batch = {
+        "terminal_max_event_id": torch.tensor([1, 4]),
+        "terminal_event_mask": torch.ones(2),
+        "terminal_goal_progress": torch.tensor([0.25, -0.5]),
+        "terminal_goal_progress_mask": torch.ones(2),
+        "action_available": torch.ones(2),
+    }
+    _loss, pieces = _terminal_consequence_loss(
+        {
+            "terminal_event_logits": torch.zeros(2, 5),
+            "terminal_goal_progress_component_mean": terminal_component_mean,
+            "terminal_goal_progress_component_log_scale": torch.zeros(2, 5),
+            "terminal_goal_progress_mean": torch.full((2,), 1000.0),
+            "terminal_goal_progress_log_scale": torch.full((2,), 7.0),
+        },
+        terminal_batch,
+        torch.ones(2),
+    )
+    expected_normalizer = (
+        math.lgamma(1.5)
+        + 0.5 * math.log(3.0 * math.pi)
+        - math.lgamma(2.0)
+    )
+    torch.testing.assert_close(
+        pieces["terminal_goal_progress_uniform_proper"],
+        torch.tensor(expected_normalizer),
+    )
 
 
 def test_terminal_event_ordinal_rps_rewards_nearby_stage_mass_and_is_differentiable(
@@ -1455,14 +1675,15 @@ def test_semantic_comparative_loss_updates_terminal_locations_not_utility_or_sca
     )
     torch.testing.assert_close(raw_loss, pieces["semantic_comparative_raw"])
     assert has_nonzero_gradient(model.terminal_event)
-    assert has_nonzero_gradient(model.terminal_goal_progress_mean)
+    assert has_nonzero_gradient(model.terminal_goal_progress_component_mean)
     assert has_nonzero_gradient(model.terminal_context_encoder)
     assert has_nonzero_gradient(model.terminal_residual)
     assert has_nonzero_gradient(model.transition)
     assert has_nonzero_gradient(model.action)
     assert has_nonzero_gradient(model.semantic)
     assert not has_nonzero_gradient(model.candidate_rank)
-    assert not has_nonzero_gradient(model.terminal_goal_progress_scale)
+    assert not has_nonzero_gradient(model.terminal_goal_progress_component_scale)
+    assert not has_nonzero_gradient(model.object_delta_component_scale)
     assert not has_nonzero_gradient(model.object_scale)
     assert not has_nonzero_gradient(model.clock)
     assert not has_nonzero_gradient(model.duration_mean)
@@ -1476,7 +1697,7 @@ def test_semantic_dense_goal_uses_exact_deployment_benefit_geometry() -> None:
     output = {
         "success_logit": torch.zeros(4),
         "terminal_event_logits": torch.zeros(4, len(core.CANONICAL_EVENTS)),
-        "terminal_goal_progress_mean": predictions,
+        "terminal_goal_progress_component_mean": predictions[:, None].expand(-1, 5),
     }
     batch = {
         "logical_group": ["dense"] * 4,
@@ -1550,7 +1771,7 @@ def test_single_active_union_budget_excludes_scales_and_caps_once() -> None:
         model.terminal_context_encoder,
         model.terminal_residual,
         model.terminal_event,
-        model.terminal_goal_progress_mean,
+        model.terminal_goal_progress_component_mean,
     )
     assert active_ids == {
         id(parameter)
@@ -1560,8 +1781,9 @@ def test_single_active_union_budget_excludes_scales_and_caps_once() -> None:
     }
     for excluded_module in (
         model.object_scale,
+        model.object_delta_component_scale,
         model.duration_scale,
-        model.terminal_goal_progress_scale,
+        model.terminal_goal_progress_component_scale,
         model.candidate_rank,
     ):
         assert active_ids.isdisjoint(
@@ -1598,6 +1820,8 @@ def _fixed_terminal_metrics(
     variant: str,
     event_supervised: bool = True,
     goal_supervised: bool = True,
+    legacy_goal_mean: float = 0.0,
+    first_row_event_unsupervised: bool = False,
 ) -> dict[str, object]:
     row_probabilities = torch.tensor(
         [probability for _group, _seed, probability in group_specs]
@@ -1625,8 +1849,22 @@ def _fixed_terminal_metrics(
                 "duration_selected_log_mean": zero,
                 "duration_selected_log_scale": zero,
                 "terminal_event_logits": terminal_probability.log(),
-                "terminal_goal_progress_mean": zero,
+                "terminal_goal_progress_mean": torch.full_like(
+                    zero, legacy_goal_mean
+                ),
                 "terminal_goal_progress_log_scale": zero,
+                "terminal_goal_progress_component_mean": zero[:, None].expand(
+                    -1, 5
+                ),
+                "terminal_goal_progress_component_log_scale": zero[:, None].expand(
+                    -1, 5
+                ),
+                "object_delta_component_mean": zero[:, None, None].expand(
+                    -1, 5, core.OBJECT_DELTA_DIM
+                ),
+                "object_delta_component_log_scale": zero[:, None, None].expand(
+                    -1, 5, core.OBJECT_DELTA_DIM
+                ),
                 "success_logit": torch.logit(probability),
                 "recovery_logit": zero,
                 "regression_probability": zero,
@@ -1634,17 +1872,22 @@ def _fixed_terminal_metrics(
             }
 
     count = len(row_probabilities)
+    terminal_event_mask = torch.full((count,), float(event_supervised))
+    if first_row_event_unsupervised:
+        terminal_event_mask[0] = 0.0
     batch = {
         "success": torch.ones(count),
         "success_mask": torch.ones(count),
         "terminal_max_event_id": torch.full((count,), 4, dtype=torch.long),
-        "terminal_event_mask": torch.full((count,), float(event_supervised)),
+        "terminal_event_mask": terminal_event_mask,
         "terminal_goal_progress": torch.zeros(count),
         "terminal_goal_progress_mask": torch.full(
             (count,), float(goal_supervised)
         ),
         "post_event_id": torch.zeros(count, dtype=torch.long),
         "post_event_mask": torch.ones(count),
+        "object_delta": torch.zeros(count, core.OBJECT_DELTA_DIM),
+        "object_delta_mask": torch.ones(count),
         "next_event_id": torch.zeros(count, dtype=torch.long),
         "next_event_mask": torch.ones(count),
         "duration": torch.ones(count),
@@ -1667,6 +1910,52 @@ def _fixed_terminal_metrics(
         torch.device("cpu"),
         ablation_variant=variant,
     )
+
+
+def test_v11_validation_nll_uses_observed_event_conditionals_not_mixture_mean(
+) -> None:
+    metrics = _fixed_terminal_metrics(
+        [
+            (f"{BODIES[0]}|clean|a", 10, 0.8),
+            (f"{BODIES[0]}|clean|b", 11, 0.4),
+        ],
+        variant="full",
+        legacy_goal_mean=1000.0,
+    )
+    expected_normalizer = (
+        math.lgamma(1.5)
+        + 0.5 * math.log(3.0 * math.pi)
+        - math.lgamma(2.0)
+    )
+    assert metrics["terminal_goal_progress"]["mae_meters"] == pytest.approx(
+        1000.0
+    )
+    assert metrics["terminal_goal_progress"]["student_t3_nll"] == pytest.approx(
+        expected_normalizer
+    )
+    assert metrics["terminal_goal_progress"]["point_prediction"] == (
+        "terminal_event_mixture_mean"
+    )
+    assert metrics["terminal_goal_progress"]["student_t3_nll_distribution"] == (
+        "observed_terminal_event_conditional_component"
+    )
+    assert metrics["object_transition"]["likelihood"] == (
+        "observed_post_event_conditional_independent_student_t_dof_3"
+    )
+
+
+def test_terminal_goal_validation_excludes_goal_when_event_is_unobserved() -> None:
+    metrics = _fixed_terminal_metrics(
+        [
+            (f"{BODIES[0]}|clean|a", 10, 0.8),
+            (f"{BODIES[0]}|clean|b", 11, 0.4),
+        ],
+        variant="full",
+        first_row_event_unsupervised=True,
+    )
+    assert metrics["terminal_event"]["support"] == 7
+    assert metrics["terminal_goal_progress"]["support"] == 7
+    assert np.isfinite(metrics["strict_proper"]["macro_score"])
 
 
 def test_terminal_consequence_metrics_report_strict_proper_macro_se_and_success_nll(
@@ -1874,14 +2163,22 @@ def test_rank_features_are_only_explicit_predicted_consequences() -> None:
             - output["joint_recovery_probability"]
         ).clamp(0.0, 1.0),
     )
-    expected_progress = torch.linalg.vector_norm(batch["state"][:, :3], dim=-1) - (
-        torch.linalg.vector_norm(
-            batch["state"][:, :3] - output["object_delta_mean"][:, :3], dim=-1
+    expected_component_progress = (
+        torch.linalg.vector_norm(batch["state"][:, :3], dim=-1)[:, None]
+        - torch.linalg.vector_norm(
+            batch["state"][:, None, :3]
+            - output["object_delta_component_mean"][:, :, :3],
+            dim=-1,
         )
     )
     assert torch.allclose(
         block("short_goal_progress_benefit")[:, 0],
-        trainer_entry._goal_progress_benefit_value(expected_progress),
+        (
+            post_probability
+            * trainer_entry._goal_progress_benefit_value(
+                expected_component_progress
+            )
+        ).sum(dim=-1),
     )
     assert torch.allclose(
         block("short_goal_progress_uncertainty_risk")[:, 0],
@@ -1897,9 +2194,12 @@ def test_rank_features_are_only_explicit_predicted_consequences() -> None:
     )
     assert torch.allclose(
         block("terminal_goal_progress_benefit")[:, 0],
-        trainer_entry._goal_progress_benefit_value(
-            output["terminal_goal_progress_mean"]
-        ),
+        (
+            terminal_probability
+            * trainer_entry._goal_progress_benefit_value(
+                output["terminal_goal_progress_component_mean"]
+            )
+        ).sum(dim=-1),
     )
     assert torch.allclose(
         block("terminal_goal_progress_uncertainty_risk")[:, 0],
@@ -2142,9 +2442,9 @@ def test_terminal_prediction_conditions_on_remaining_action_budget() -> None:
         model.terminal_context_encoder[2].weight[
             core.SEMANTIC_DIM, 0
         ] = 1.0
-        model.terminal_goal_progress_mean.weight.zero_()
-        model.terminal_goal_progress_mean.bias.zero_()
-        model.terminal_goal_progress_mean.weight[0, 0] = 1.0
+        model.terminal_goal_progress_component_mean.weight.zero_()
+        model.terminal_goal_progress_component_mean.bias.zero_()
+        model.terminal_goal_progress_component_mean.weight[:, 0] = 1.0
         model.terminal_event.weight.zero_()
         model.terminal_event.bias.zero_()
         model.terminal_event.weight[-1, 0] = 1.0
@@ -2187,9 +2487,9 @@ def test_terminal_candidate_difference_changes_with_shared_horizon_context(
         model.terminal_context_encoder[0].weight[0, context_channel] = 0.2
         # The first half of the FiLM vector modulates transitioned features.
         model.terminal_context_encoder[2].weight[0, 0] = 1.0
-        model.terminal_goal_progress_mean.weight.zero_()
-        model.terminal_goal_progress_mean.bias.zero_()
-        model.terminal_goal_progress_mean.weight[0, 0] = 1.0
+        model.terminal_goal_progress_component_mean.weight.zero_()
+        model.terminal_goal_progress_component_mean.bias.zero_()
+        model.terminal_goal_progress_component_mean.weight[:, 0] = 1.0
 
     candidate_a = torch.zeros(core.SEMANTIC_DIM)
     candidate_b = torch.zeros(core.SEMANTIC_DIM)
@@ -2207,7 +2507,7 @@ def test_terminal_candidate_difference_changes_with_shared_horizon_context(
         (low_context, low_context, high_context, high_context)
     )
     terminal_hidden = model._terminal_hidden(transitioned, context)
-    prediction = model.terminal_goal_progress_mean(terminal_hidden).squeeze(-1)
+    prediction = model.terminal_goal_progress_component_mean(terminal_hidden)[:, 0]
     low_difference = prediction[0] - prediction[1]
     high_difference = prediction[2] - prediction[3]
 
@@ -2921,6 +3221,36 @@ def test_calibration_guard_selects_rank_only_inside_proper_one_se_set() -> None:
     assert audit["heldout_rows_used"] == 0
 
 
+def test_supplement_strict_proper_adds_fixed_weight_and_independent_variance() -> None:
+    primary = [
+        {"macro_score": 1.0 + index, "macro_standard_error": 0.1 + 0.01 * index}
+        for index in range(5)
+    ]
+    supplement = [
+        {"macro_score": 4.0 + index, "macro_standard_error": 0.2 + 0.01 * index}
+        for index in range(5)
+    ]
+    combined = combine_primary_and_supplement_strict_proper(
+        primary, supplement
+    )
+    assert combined["mean_member_primary_strict_proper_score"] == pytest.approx(3.0)
+    assert combined["mean_member_supplement_strict_proper_score"] == pytest.approx(
+        6.0
+    )
+    assert combined["mean_member_strict_proper_score"] == pytest.approx(4.5)
+    assert combined["supplement_strict_proper_weight"] == 0.25
+    assert combined["conservative_strict_proper_standard_error"] == pytest.approx(
+        math.sqrt(0.14**2 + (0.25 * 0.24) ** 2)
+    )
+    primary_only = combine_primary_and_supplement_strict_proper(
+        primary, [None] * 5
+    )
+    assert primary_only["mean_member_strict_proper_score"] == pytest.approx(3.0)
+    assert primary_only["conservative_strict_proper_standard_error"] == pytest.approx(
+        0.14
+    )
+
+
 def test_calibration_guard_without_comparative_evidence_uses_strict_proper_step(
 ) -> None:
     records = [
@@ -3078,7 +3408,7 @@ def test_ensemble_seeds_must_be_five_distinct_integers(
 
 
 def test_ablation_variants_change_only_declared_score_features() -> None:
-    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v10"
+    assert MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v11"
     batch = _model_batch(torch.full((4,), 5.0 / 15.0))
     success_only = EffectAlignedSharedEventHead("success_only").eval()(batch)
     torch.testing.assert_close(
@@ -3218,26 +3548,45 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
     assert full_contract["dense_only_listwise_weight"] == DENSE_ONLY_RANK_WEIGHT
     assert full_contract["world_and_utility_gradient_clipping_are_separate"] is True
     assert full_contract["checkpoint_selection_calibration_guard"] == (
-        "source_body_condition_macro_seed_clustered_strict_proper_score_"
-        "one_standard_error_then_minimum_10_comparative_seed_clusters_"
-        "across_minimum_2_requested_seeds_4_body_condition_units_2_bodies"
+        "primary_source_body_condition_macro_seed_clustered_strict_proper_"
+        "plus_fixed_0.25_label_blind_inner_cross_body_supplement_strict_"
+        "proper_with_independent_variance_one_standard_error_then_formal_"
+        "only_minimum_10_comparative_seed_clusters_across_minimum_2_"
+        "requested_seeds_4_body_condition_units_2_bodies"
     )
+    assert full_contract["supplement_proper_validation_weight"] == 0.25
+    assert full_contract["supplement_validation_used_for_rank_comparison"] is False
+    assert full_contract["supplement_validation_calibration_diagnostics"] is True
+    assert full_contract["supplement_validation_calibration_fit"] is False
     assert full_contract["strict_proper_components"] == [
         "post_event_categorical_nll_weight_1.0",
         "next_event_categorical_nll_weight_0.5",
         "duration_censored_lognormal_nll_weight_0.5",
         "success_binary_nll",
         "recovery_binary_nll_weight_0.5_when_supervised",
-        "object_student_t3_nll_weight_0.5",
+        "object_given_post_event_student_t3_nll_weight_0.5",
         "terminal_event_categorical_nll_weight_0.5",
         "terminal_event_ordinal_ranked_probability_score_weight_0.25",
-        "terminal_goal_student_t3_nll_weight_0.5",
+        "terminal_goal_given_terminal_event_student_t3_nll_weight_0.5",
     ]
     assert full_contract["terminal_stage_progress_loss"] == (
         "terminal_event_cdf_ranked_probability_score_weight_0.25"
     )
     assert full_contract["raw_world_frame_object_axes_in_rank_input"] is False
     assert full_contract["cross_feature_layer_normalization"] is False
+    assert full_contract["conditional_consequence_proper_nll"] == (
+        "gather_observed_event_component_on_uniform_proper_stream"
+    )
+    assert full_contract["legacy_consequence_mean_semantics"] == (
+        "categorical_event_mixture_mean"
+    )
+    assert full_contract["legacy_consequence_log_scale_semantics"] == (
+        "log_of_total_mixture_std_divided_by_sqrt3_moment_equivalent_"
+        "student_t3_scale"
+    )
+    assert full_contract["aleatoric_consequence_risk"] == (
+        "law_of_total_variance_within_event_student_t3_plus_between_event"
+    )
     assert full_contract["feature_schema"] == {
         name: list(bounds) for name, bounds in CANDIDATE_RANK_FEATURE_SCHEMA.items()
     }

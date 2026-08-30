@@ -3,10 +3,13 @@
 
 This experiment is deliberately separate from the preregistered best-of-four
 study.  By default every actor query makes exactly N actor proposals using a
-two-language-by-N/2-independent-flow-noise factorial roster and retains their
-original order (N=8 by default, optionally N=16).  One language condition is
-the frozen runtime instruction; the other is an exact instruction from actor
-training.  A separately budgeted run may explicitly draw more than N
+two-language flow-noise factorial roster and retains their original order
+(N=8 by default, optionally N=16).  The raw16 roster keeps four full iid draws
+per language and adds first-five-step and full-chunk XYZ-only conditional
+antithetic pairs.  Every individual noise tensor remains exactly marginal
+N(0,I), while proposal zero remains bit-exact legacy noise.  One language
+condition is the frozen runtime instruction; the other is an exact instruction
+from actor training.  A separately budgeted run may explicitly draw more than N
 proposals, in which case legacy
 proposal zero remains final candidate zero and the remaining N-1 proposals are
 selected with deterministic farthest-point sampling in the canonical
@@ -85,6 +88,14 @@ TRAINING_SEEN_INSTRUCTION_SHA256 = hashlib.sha256(
 SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT = (
     "etsf_source_train_normalized_canonical_effect_diversity_v1"
 )
+POOL_AUDIT_FORMAT = "etsf_robotwin2_canonical_effect_candidate_pool_audit_v2"
+FLOW_NOISE_CONTRACT_FORMAT = (
+    "etsf_postformal_conditional_translation_flow_noise_contract_v2"
+)
+RAW16_PROPOSAL_COUNT = 16
+RAW16_NOISE_PER_INSTRUCTION = 8
+NATIVE_XYZ_NOISE_CHANNELS = (0, 1, 2, 8, 9, 10)
+CANONICAL_TRANSLATION_EFFECT_CHANNELS = (0, 1, 2, 7, 8, 9)
 
 
 class PostformalCandidatePoolError(RuntimeError):
@@ -196,6 +207,117 @@ def postformal_make_noise(
     )
 
 
+def flow_noise_construction_roster(
+    raw_candidate_count: int,
+) -> list[dict[str, Any]]:
+    """Return the frozen per-candidate noise construction for both languages."""
+
+    if (
+        isinstance(raw_candidate_count, bool)
+        or not isinstance(raw_candidate_count, int)
+        or raw_candidate_count < 2
+        or raw_candidate_count % 2 != 0
+    ):
+        raise PostformalCandidatePoolError(
+            "language/noise candidate roster requires an even count >=2"
+        )
+    half = raw_candidate_count // 2
+    if raw_candidate_count == RAW16_PROPOSAL_COUNT:
+        one_language = [
+            {"kind": "full_iid", "source_noise_index": 0, "sign": 1},
+            {"kind": "full_iid", "source_noise_index": 1, "sign": 1},
+            {"kind": "full_iid", "source_noise_index": 2, "sign": 1},
+            {"kind": "full_iid", "source_noise_index": 3, "sign": 1},
+            {
+                "kind": "conditional_first5_xyz",
+                "source_noise_index": 4,
+                "sign": 1,
+            },
+            {
+                "kind": "conditional_first5_xyz",
+                "source_noise_index": 4,
+                "sign": -1,
+            },
+            {
+                "kind": "conditional_fullchunk_xyz",
+                "source_noise_index": 6,
+                "sign": 1,
+            },
+            {
+                "kind": "conditional_fullchunk_xyz",
+                "source_noise_index": 6,
+                "sign": -1,
+            },
+        ]
+        if len(one_language) != RAW16_NOISE_PER_INSTRUCTION:
+            raise PostformalCandidatePoolError("raw16 noise roster cardinality changed")
+    else:
+        one_language = [
+            {"kind": "full_iid", "source_noise_index": index, "sign": 1}
+            for index in range(half)
+        ]
+    return [dict(row) for row in one_language] + [
+        dict(row) for row in one_language
+    ]
+
+
+def postformal_rostered_noise(
+    config: Any,
+    scene_seed: int,
+    query_index: int,
+    construction: Mapping[str, Any],
+    device: torch.device,
+) -> torch.Tensor:
+    """Materialize one full-iid or conditional XYZ noise tensor.
+
+    For a conditional candidate, coordinates outside the declared XYZ mask
+    come from legacy ``z0`` and coordinates inside it come from an independent
+    standard-normal draw (or its negative).  Disjoint coordinates therefore
+    remain independent standard normals within every candidate: the marginal
+    tensor is exactly N(0,I), despite deliberate cross-candidate correlation.
+    """
+
+    kind = construction.get("kind")
+    source_index = construction.get("source_noise_index")
+    sign = construction.get("sign")
+    if (
+        kind
+        not in {
+            "full_iid",
+            "conditional_first5_xyz",
+            "conditional_fullchunk_xyz",
+        }
+        or isinstance(source_index, bool)
+        or not isinstance(source_index, int)
+        or source_index < 0
+        or sign not in {-1, 1}
+    ):
+        raise PostformalCandidatePoolError("flow-noise construction is invalid")
+    source = postformal_make_noise(
+        config, scene_seed, query_index, source_index, device
+    )
+    if kind == "full_iid":
+        if sign != 1:
+            raise PostformalCandidatePoolError("full iid noise cannot change sign")
+        return source
+    if int(config.max_action_dim) <= max(NATIVE_XYZ_NOISE_CHANNELS):
+        raise PostformalCandidatePoolError(
+            "actor noise tensor lacks the native dual-arm XYZ channels"
+        )
+    base = postformal_make_noise(config, scene_seed, query_index, 0, device)
+    result = base.clone()
+    stop = (
+        min(ACTION_EXEC_STEPS, int(config.chunk_size))
+        if kind == "conditional_first5_xyz"
+        else int(config.chunk_size)
+    )
+    channels = torch.as_tensor(
+        NATIVE_XYZ_NOISE_CHANNELS, dtype=torch.long, device=device
+    )
+    result[:, :stop, channels] = float(sign) * source[:, :stop, channels]
+    return result
+
+
 def candidate_instruction_roster(
     runtime_instruction: str, raw_candidate_count: int
 ) -> list[str]:
@@ -221,19 +343,12 @@ def candidate_instruction_roster(
 
 
 def flow_noise_index_roster(raw_candidate_count: int) -> list[int]:
-    """Pair both language conditions under the same independent flow draws."""
+    """Return source draw indices for the frozen construction roster."""
 
-    if (
-        isinstance(raw_candidate_count, bool)
-        or not isinstance(raw_candidate_count, int)
-        or raw_candidate_count < 2
-        or raw_candidate_count % 2 != 0
-    ):
-        raise PostformalCandidatePoolError(
-            "language/noise candidate roster requires an even count >=2"
-        )
-    half = raw_candidate_count // 2
-    return [index % half for index in range(raw_candidate_count)]
+    return [
+        int(row["source_noise_index"])
+        for row in flow_noise_construction_roster(raw_candidate_count)
+    ]
 
 
 def generate_postformal_flow_candidates(
@@ -260,22 +375,22 @@ def generate_postformal_flow_candidates(
         task, list(policy.config.image_features), instruction
     )
     instruction_roster = candidate_instruction_roster(instruction, candidate_count)
-    noise_roster = flow_noise_index_roster(candidate_count)
+    noise_roster = flow_noise_construction_roster(candidate_count)
     processed_by_instruction = {}
     for candidate_instruction in dict.fromkeys(instruction_roster):
         candidate_raw = dict(raw)
         candidate_raw["task"] = candidate_instruction
         processed_by_instruction[candidate_instruction] = preprocessor(candidate_raw)
     candidates = []
-    for candidate_index, (candidate_instruction, flow_noise_index) in enumerate(
-        zip(instruction_roster, noise_roster, strict=True)
+    for candidate_instruction, noise_construction in zip(
+        instruction_roster, noise_roster, strict=True
     ):
         policy.reset()
-        noise = postformal_make_noise(
+        noise = postformal_rostered_noise(
             policy.config,
             scene_seed,
             query_index,
-            flow_noise_index,
+            noise_construction,
             device,
         )
         with torch.inference_mode():
@@ -367,6 +482,33 @@ def source_train_normalized_effect_embeddings(
     return embeddings
 
 
+def source_train_normalized_translation_effect_embeddings(
+    effects: np.ndarray,
+    *,
+    action_mean: np.ndarray,
+    action_std: np.ndarray,
+    normalization_clip: float,
+) -> np.ndarray:
+    """Return the source-only normalized first-five dual-arm XYZ geometry."""
+
+    full = source_train_normalized_effect_embeddings(
+        effects,
+        action_mean=action_mean,
+        action_std=action_std,
+        normalization_clip=normalization_clip,
+    ).reshape(len(effects), ACTION_EXEC_STEPS, collector.CANONICAL_ACTION_DIM)
+    translation = full[:, :, CANONICAL_TRANSLATION_EFFECT_CHANNELS]
+    embeddings = translation.reshape(len(effects), -1).astype(np.float64)
+    if embeddings.shape != (
+        len(effects),
+        ACTION_EXEC_STEPS * len(CANONICAL_TRANSLATION_EFFECT_CHANNELS),
+    ) or not np.isfinite(embeddings).all():
+        raise PostformalCandidatePoolError(
+            "source-normalized translation effect embedding is invalid"
+        )
+    return embeddings
+
+
 def greedy_farthest_point_indices(
     embeddings: np.ndarray, *, retain_count: int
 ) -> list[int]:
@@ -440,7 +582,7 @@ def pool_selection_audit(
     raw_distances = _pairwise_rms(embeddings)
     final_distances = _pairwise_rms(embeddings[selected_indices])
     audit_base = {
-        "format": "etsf_robotwin2_canonical_effect_candidate_pool_audit_v1",
+        "format": POOL_AUDIT_FORMAT,
         "raw_proposal_count": raw_count,
         "retained_candidate_count": candidate_count,
         "raw_proposal_shape": list(raw.shape),
@@ -463,8 +605,15 @@ def pool_selection_audit(
             for index in selected_indices
         ],
         "raw_candidate_flow_noise_indices": flow_noise_index_roster(raw_count),
+        "raw_candidate_flow_noise_constructions": (
+            flow_noise_construction_roster(raw_count)
+        ),
         "retained_candidate_flow_noise_indices": [
             flow_noise_index_roster(raw_count)[index] for index in selected_indices
+        ],
+        "retained_candidate_flow_noise_constructions": [
+            flow_noise_construction_roster(raw_count)[index]
+            for index in selected_indices
         ],
         "legacy_raw_proposal_zero_is_final_candidate_zero": True,
         "subset_selection_applied": raw_count > candidate_count,
@@ -524,14 +673,25 @@ def postformal_noise_contract(
     raw_count = proposal_count(candidate_count, raw_proposal_count)
     indices = list(range(raw_count))
     noise_indices = flow_noise_index_roster(raw_count)
+    constructions = flow_noise_construction_roster(raw_count)
+    conditional_raw16 = raw_count == RAW16_PROPOSAL_COUNT
     return {
+        "format": FLOW_NOISE_CONTRACT_FORMAT,
         "distribution": (
-            "deterministic_independent_standard_normal_flow_draws_paired_across_"
-            "two_semantically_equivalent_instruction_conditions_each_marginal_N_0_I"
+            (
+                "four_full_iid_plus_first5_xyz_and_fullchunk_xyz_conditional_"
+                "antithetic_pairs_per_instruction_each_candidate_marginal_N_0_I"
+            )
+            if conditional_raw16
+            else (
+                "deterministic_independent_standard_normal_flow_draws_paired_across_"
+                "two_semantically_equivalent_instruction_conditions_each_marginal_N_0_I"
+            )
         ),
         "raw_proposal_indices": indices,
         "raw_proposal_flow_noise_indices": noise_indices,
-        "independent_flow_noise_draws": raw_count // 2,
+        "raw_proposal_noise_constructions": constructions,
+        "independent_flow_noise_draws": len(set(noise_indices)),
         "same_flow_noise_language_condition_pairs": [
             [index, index + raw_count // 2] for index in range(raw_count // 2)
         ],
@@ -541,6 +701,32 @@ def postformal_noise_contract(
         ),
         "candidate_zero_legacy_noise_unchanged": True,
         "candidate_zero_uses_formal_collector_make_noise": True,
+        "conditional_translation_resampling_enabled": conditional_raw16,
+        "conditional_translation_native_xyz_channels": (
+            list(NATIVE_XYZ_NOISE_CHANNELS) if conditional_raw16 else []
+        ),
+        "conditional_translation_prefix_steps": (
+            ACTION_EXEC_STEPS if conditional_raw16 else 0
+        ),
+        "conditional_translation_fullchunk_uses_config_chunk_size": (
+            conditional_raw16
+        ),
+        "raw16_per_instruction_mode_counts": (
+            {
+                "full_iid": 4,
+                "conditional_first5_xyz": 2,
+                "conditional_fullchunk_xyz": 2,
+            }
+            if conditional_raw16
+            else None
+        ),
+        "candidate_marginal_distribution_proof": (
+            "disjoint_coordinates_select_independent_standard_normal_z0_or_"
+            "signed_znew_so_each_complete_tensor_is_exactly_N_0_I"
+            if conditional_raw16
+            else "each_complete_tensor_is_one_independent_standard_normal_draw"
+        ),
+        "candidate_joint_distribution_claimed_iid": False,
         "same_seed_query_and_observation_reproduce_ordered_noise": True,
         "actor_call_count_equals_raw_proposal_count": True,
         "frozen_actor_weights_changed": False,
@@ -562,7 +748,12 @@ def candidate_pool_contract(
         "subset_selection_applied": raw_count > candidate_count,
         "flow_noise_contract": postformal_noise_contract(candidate_count, raw_count),
         "instruction_coverage_contract": {
-            "design": "two_instruction_conditions_crossed_with_identical_flow_noise_draws",
+            "design": (
+                "two_instruction_conditions_crossed_with_identical_conditional_"
+                "translation_and_full_iid_flow_noise_roster"
+                if raw_count == RAW16_PROPOSAL_COUNT
+                else "two_instruction_conditions_crossed_with_identical_flow_noise_draws"
+            ),
             "runtime_instruction_condition": "execution_contract_instruction",
             "actor_training_seen_condition": TRAINING_SEEN_INSTRUCTION,
             "actor_training_seen_condition_utf8_sha256": (
@@ -591,6 +782,9 @@ def candidate_pool_contract(
         "candidate_zero": "raw_proposal_zero_retained_as_final_candidate_zero",
         "effect_schema": collector.ACTION_SCHEMA,
         "effect_horizon_actions": ACTION_EXEC_STEPS,
+        "canonical_translation_effect_channels": list(
+            CANONICAL_TRANSLATION_EFFECT_CHANNELS
+        ),
         "selection": (
             "identity_original_actor_order"
             if raw_count == candidate_count
@@ -1936,6 +2130,9 @@ if __name__ == "__main__":
 
 __all__ = [
     "FORMAT",
+    "FLOW_NOISE_CONTRACT_FORMAT",
+    "NATIVE_XYZ_NOISE_CHANNELS",
+    "POOL_AUDIT_FORMAT",
     "PAIR_FORMAT",
     "PostformalCandidatePoolError",
     "SOURCE_TRAIN_NORMALIZED_DIVERSITY_FORMAT",
@@ -1947,12 +2144,15 @@ __all__ = [
     "evaluation_schedule",
     "greedy_farthest_point_indices",
     "generate_postformal_flow_candidates",
+    "flow_noise_construction_roster",
     "method_name",
     "postformal_make_noise",
+    "postformal_rostered_noise",
     "pool_selection_audit",
     "proposal_count",
     "runtime_rank_ensemble_contract",
     "score_candidates",
     "select_candidate",
     "source_train_normalized_effect_embeddings",
+    "source_train_normalized_translation_effect_embeddings",
 ]

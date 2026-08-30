@@ -60,20 +60,30 @@ EXPECTED_FIVE_BODY_BRANCHES = EXPECTED_BRANCHES_PER_BODY * len(base.BODIES)
 SUPPLEMENT_PROPER_LOSS_WEIGHT = 0.25
 SUPPLEMENT_RANK_LOSS_WEIGHT = 0.25
 SUPPLEMENT_USAGE_CONTRACT = {
-    "outer_lobo_source_train_only": True,
+    "outer_lobo_source_only": True,
+    "source_train_bodies_per_outer_fold": 3,
+    "label_blind_inner_cross_body_proper_validation": True,
+    "proper_validation_bodies_per_outer_fold": 1,
+    "proper_validation_body_selection": (
+        "sha256_split_seed_ordered_five_body_cycle_successor_derangement"
+    ),
     "multitask_proper_loss": True,
     "robust_object_effect_proper_loss": True,
     "terminal_event_proper_loss": True,
     "terminal_goal_progress_proper_loss": True,
     "normalization_or_baseline_fit": False,
-    "candidate_rank_or_utility_loss": True,
+    "candidate_rank_or_utility_loss": "source_train_lane_only",
     "candidate_rank_or_utility_loss_weight": SUPPLEMENT_RANK_LOSS_WEIGHT,
     "candidate_rank_updates": (
         "bounded_monotone_utility_only_from_detached_consequence_features"
     ),
     "semantic_comparative_loss": False,
-    "source_validation_or_checkpoint_selection": False,
-    "calibration": False,
+    "source_validation_or_checkpoint_selection": (
+        "proper_only_fixed_weight_0.25_no_rank_selection"
+    ),
+    "proper_checkpoint_selection_weight": SUPPLEMENT_PROPER_LOSS_WEIGHT,
+    "calibration_diagnostics": True,
+    "calibration_fit": False,
     "heldout_payload_access": False,
 }
 EXPERT_ROOT_PROVENANCE_CONTRACT = {
@@ -1287,7 +1297,7 @@ def main() -> None:
         "candidate_count": base.CANDIDATE_COUNT,
         "action_exec_steps": base.FORMAL_ACTION_EXEC_STEPS,
         "supplement_role": (
-            "expert_event_root_proper_world_and_utility_rank_source_train_only"
+            "expert_event_root_outer_source_crossfit_proper_world_and_utility_rank"
         ),
         "root_policy": "robotwin_scripted_expert",
         "candidate_and_continuation_policy": (

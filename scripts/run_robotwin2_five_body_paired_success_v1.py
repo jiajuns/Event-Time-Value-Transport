@@ -60,6 +60,43 @@ MINIMUM_CANDIDATE_HORIZON = ACTION_EXEC_STEPS
 PLANNED_DT_SECONDS = ACTION_EXEC_STEPS / ACTOR_DATASET_FPS
 PREREGISTRATION_SHA256 = evaluator.APPROVED_PREREGISTRATION_SHA256
 EVENT_SPEC_SHA256 = analytic_event.EVENT_SPEC_SHA256
+SUPPLEMENT_SPLIT_SEED = 20260901
+SUPPLEMENT_FOLD_RECEIPT_CONTRACT = {
+    "format": "etsf_proper_world_supplement_outer_lobo_split_v1",
+    "candidate_count": CANDIDATE_COUNT,
+    "groups_per_body": 30,
+    "five_body_groups": 150,
+    "five_body_rows": 150 * CANDIDATE_COUNT,
+    "source_train_bodies": 3,
+    "source_train_groups": 90,
+    "source_train_rows": 90 * CANDIDATE_COUNT,
+    "proper_validation_bodies": 1,
+    "proper_validation_split_seed": SUPPLEMENT_SPLIT_SEED,
+    "proper_validation_groups": 30,
+    "proper_validation_rows": 30 * CANDIDATE_COUNT,
+    "outer_heldout_bodies": 1,
+    "outer_heldout_groups_deferred": 30,
+    "outer_heldout_rows_deferred": 30 * CANDIDATE_COUNT,
+    "proper_validation_use": (
+        "strict_proper_checkpoint_selection_only_no_rank_selection_"
+        "calibration_diagnostics_without_fit"
+    ),
+    "rank_selection_rows": 0,
+    "calibration_fit_rows": 0,
+    "heldout_payload_rows_opened": 0,
+}
+SUPPLEMENT_STRICT_PROPER_SCORE = (
+    "primary_strict_proper_plus_fixed_0.25_times_label_blind_"
+    "inner_cross_body_supplement_strict_proper"
+)
+SUPPLEMENT_STRICT_PROPER_SE_COMBINATION = (
+    "per_member_sqrt_primary_variance_plus_0.25_squared_times_"
+    "supplement_variance_then_conservative_max_across_members"
+)
+STRICT_PROPER_SELECTION_RULE = (
+    "minimize_source_body_condition_macro_proper_score_then_"
+    "maximize_rank_within_one_standard_error"
+)
 
 
 class PairedExecutionError(RuntimeError):
@@ -493,6 +530,191 @@ def inspect_fold(body: str, fold_root: Path) -> dict[str, Any]:
     }
 
 
+def supplement_proper_validation_body(held_out_body: str) -> str:
+    """Replay the trainer's frozen label-blind cross-body assignment."""
+
+    if held_out_body not in BODIES:
+        raise PairedExecutionError(
+            "supplement split received an unknown held-out body"
+        )
+    ordered = sorted(
+        BODIES,
+        key=lambda body: hashlib.sha256(
+            (
+                f"{SUPPLEMENT_SPLIT_SEED}|supplement-crossfit-order|{body}"
+            ).encode()
+        ).hexdigest(),
+    )
+    return ordered[(ordered.index(held_out_body) + 1) % len(ordered)]
+
+
+def validate_augmented_strict_proper_selection(summary: Mapping[str, Any]) -> None:
+    """Replay the augmented proper-score/one-SE checkpoint-selection receipt."""
+
+    ensemble = summary.get("ensemble_checkpoint_selection")
+    if not isinstance(ensemble, Mapping):
+        raise PairedExecutionError("augmented fold lacks ensemble selection evidence")
+    records = ensemble.get("evaluated_common_steps")
+    selection = ensemble.get("strict_proper_selection")
+    if (
+        ensemble.get("strict_proper_score") != SUPPLEMENT_STRICT_PROPER_SCORE
+        or ensemble.get("supplement_validation_never_used_for_rank_comparison")
+        is not True
+        or ensemble.get("calibration_diagnostics_only_no_parameter_fit") is not True
+        or not isinstance(records, list)
+        or not records
+        or not isinstance(selection, Mapping)
+        or selection.get("rule") != STRICT_PROPER_SELECTION_RULE
+        or selection.get("heldout_rows_used") != 0
+    ):
+        raise PairedExecutionError(
+            "augmented fold strict-proper selection contract changed"
+        )
+
+    def finite(value: Any, *, nonnegative: bool = False) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or (nonnegative and float(value) < 0.0)
+        ):
+            raise PairedExecutionError(
+                "augmented fold strict-proper numeric evidence changed"
+            )
+        return float(value)
+
+    normalized = []
+    observed_steps: set[int] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise PairedExecutionError(
+                "augmented fold evaluated-step evidence changed"
+            )
+        step = record.get("step")
+        key = record.get("selection_key")
+        ranking = record.get("ensemble_candidate_ranking")
+        if (
+            isinstance(step, bool)
+            or not isinstance(step, int)
+            or step <= 0
+            or step in observed_steps
+            or not isinstance(key, list)
+            or len(key) != 7
+            or not isinstance(ranking, Mapping)
+        ):
+            raise PairedExecutionError(
+                "augmented fold evaluated-step identity changed"
+            )
+        observed_steps.add(step)
+        key_values = [finite(value) for value in key]
+        if key_values[-1] != float(step):
+            raise PairedExecutionError(
+                "augmented fold selection key does not bind its step"
+            )
+        primary_score = finite(
+            record.get("mean_member_primary_strict_proper_score")
+        )
+        supplement_score = finite(
+            record.get("mean_member_supplement_strict_proper_score")
+        )
+        weight = finite(record.get("supplement_strict_proper_weight"))
+        combined_score = finite(record.get("mean_member_strict_proper_score"))
+        primary_se = finite(
+            record.get("primary_conservative_strict_proper_standard_error"),
+            nonnegative=True,
+        )
+        supplement_se = finite(
+            record.get("supplement_conservative_strict_proper_standard_error"),
+            nonnegative=True,
+        )
+        combined_se = finite(
+            record.get("conservative_strict_proper_standard_error"),
+            nonnegative=True,
+        )
+        expected_score = primary_score + 0.25 * supplement_score
+        lower_se = max(primary_se, 0.25 * supplement_se)
+        upper_se = math.sqrt(primary_se**2 + (0.25 * supplement_se) ** 2)
+        if (
+            weight != 0.25
+            or not math.isclose(
+                combined_score, expected_score, rel_tol=1e-9, abs_tol=1e-12
+            )
+            or combined_se < lower_se - 1e-12
+            or combined_se > upper_se + 1e-12
+            or record.get("strict_proper_standard_error_combination")
+            != SUPPLEMENT_STRICT_PROPER_SE_COMBINATION
+        ):
+            raise PairedExecutionError(
+                "augmented fold combined strict-proper evidence changed"
+            )
+        diagnostic = finite(record.get("mean_member_diagnostic_multitask_score"))
+        normalized.append(
+            {
+                "record": record,
+                "step": step,
+                "key": (*key_values[:6], float(step)),
+                "score": combined_score,
+                "standard_error": combined_se,
+                "diagnostic": diagnostic,
+            }
+        )
+
+    proper_best = min(normalized, key=lambda row: (row["score"], row["step"]))
+    threshold = proper_best["score"] + proper_best["standard_error"]
+    comparative = selection.get("comparative_validation_evidence")
+    if not isinstance(comparative, bool):
+        raise PairedExecutionError(
+            "augmented fold comparative-selection audit changed"
+        )
+    eligible = (
+        [row for row in normalized if row["score"] <= threshold + 1e-12]
+        if comparative
+        else [proper_best]
+    )
+    selected = min(eligible, key=lambda row: row["key"])
+    if (
+        selection.get("eligible_steps") != [row["step"] for row in eligible]
+        or selection.get("selected_step") != selected["step"]
+        or ensemble.get("selected_step") != selected["step"]
+        or not math.isclose(
+            finite(selection.get("best_score")),
+            proper_best["score"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            finite(selection.get("conservative_one_standard_error")),
+            proper_best["standard_error"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            finite(selection.get("eligible_threshold")),
+            threshold,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            finite(selection.get("selected_score")),
+            selected["score"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or ensemble.get("selected_key") != list(selected["record"]["selection_key"])
+        or ensemble.get("selected_ensemble_candidate_ranking")
+        != selected["record"]["ensemble_candidate_ranking"]
+        or not math.isclose(
+            finite(ensemble.get("selected_mean_member_diagnostic_multitask_score")),
+            selected["diagnostic"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    ):
+        raise PairedExecutionError(
+            "augmented fold selected strict-proper audit cannot be replayed"
+        )
+
+
 def inspect_fold_training_regime(
     folds: Mapping[str, Mapping[str, Any]],
     *,
@@ -513,6 +735,7 @@ def inspect_fold_training_regime(
             "required supplement binding must be a lowercase SHA-256"
         )
 
+    receipt_contract = SUPPLEMENT_FOLD_RECEIPT_CONTRACT
     rows: dict[str, dict[str, Any]] = {}
     regimes: set[tuple[bool, str | None]] = set()
     for body in BODIES:
@@ -524,6 +747,9 @@ def inspect_fold_training_regime(
             binding_sha = None
             source_groups = 0
             source_rows = 0
+            validation_groups = 0
+            validation_rows = 0
+            validation_body = None
             heldout_groups = 0
             declaration = "legacy_c_only_summary_without_supplement_field"
         elif not isinstance(supplement, Mapping):
@@ -535,9 +761,13 @@ def inspect_fold_training_regime(
             binding_sha = supplement.get("binding_file_sha256")
             source_groups = supplement.get("source_train_groups")
             source_rows = supplement.get("source_train_rows")
+            validation_groups = supplement.get("source_validation_groups")
+            validation_rows = supplement.get("source_validation_rows")
+            validation_body = supplement.get("source_validation_body")
             heldout_groups = supplement.get("heldout_groups_deferred")
             declaration = "explicit_c_plus_supplement" if enabled else "explicit_c_only"
             if enabled:
+                validate_augmented_strict_proper_selection(summary)
                 if (
                     not isinstance(binding_sha, str)
                     or len(binding_sha) != 64
@@ -550,10 +780,25 @@ def inspect_fold_training_regime(
                     != shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
                     or supplement.get("usage_contract")
                     != shared_head.SUPPLEMENT_USAGE_CONTRACT
-                    or source_groups != 120
-                    or source_rows != 480
-                    or heldout_groups != 30
-                    or supplement.get("rank_or_utility_rows_used") != 480
+                    or source_groups != receipt_contract["source_train_groups"]
+                    or source_rows != receipt_contract["source_train_rows"]
+                    or validation_groups
+                    != receipt_contract["proper_validation_groups"]
+                    or validation_rows
+                    != receipt_contract["proper_validation_rows"]
+                    or validation_body
+                    != supplement_proper_validation_body(body)
+                    or supplement.get("source_validation_body_selection")
+                    != (
+                        "label_blind_sha256_ordered_five_body_cycle_successor_"
+                        "derangement"
+                    )
+                    or supplement.get("source_validation_assignment_uses_labels")
+                    is not False
+                    or heldout_groups
+                    != receipt_contract["outer_heldout_groups_deferred"]
+                    or supplement.get("rank_or_utility_rows_used")
+                    != receipt_contract["source_train_rows"]
                     or supplement.get(
                         "rank_or_utility_groups_with_real_comparative_supervision",
                         0,
@@ -561,9 +806,37 @@ def inspect_fold_training_regime(
                     <= 0
                     or supplement.get("semantic_comparative_rows_used") != 0
                     or supplement.get("normalization_rows_used") != 0
-                    or supplement.get("source_validation_rows_used") != 0
-                    or supplement.get("checkpoint_selection_rows_used") != 0
-                    or supplement.get("calibration_rows_used") != 0
+                    or supplement.get("baseline_fit_rows_used") != 0
+                    or supplement.get("source_validation_rows_used")
+                    != receipt_contract["proper_validation_rows"]
+                    or supplement.get(
+                        "proper_checkpoint_selection_rows_authorized"
+                    )
+                    != receipt_contract["proper_validation_rows"]
+                    or supplement.get("proper_checkpoint_selection_weight")
+                    != shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
+                    or supplement.get("checkpoint_selection_rows_used")
+                    != receipt_contract["proper_validation_rows"]
+                    or supplement.get("checkpoint_selection_use")
+                    != "strict_proper_only_primary_plus_fixed_0.25_supplement"
+                    or supplement.get("rank_selection_rows_authorized")
+                    != receipt_contract["rank_selection_rows"]
+                    or supplement.get("rank_selection_rows_used")
+                    != receipt_contract["rank_selection_rows"]
+                    or supplement.get("calibration_diagnostic_rows_authorized")
+                    != receipt_contract["proper_validation_rows"]
+                    or supplement.get("calibration_diagnostic_rows_used")
+                    != receipt_contract["proper_validation_rows"]
+                    or supplement.get("calibration_rows_used")
+                    != receipt_contract["calibration_fit_rows"]
+                    or supplement.get("calibration_fit") is not False
+                    or supplement.get("proper_validation_primary_reset_overlap")
+                    != 0
+                    or supplement.get("heldout_group_npz_opened") != 0
+                    or supplement.get("heldout_group_payload_bytes_read") != 0
+                    or supplement.get("heldout_group_payload_deserialized") != 0
+                    or supplement.get("heldout_manifest_file_opened") != 0
+                    or supplement.get("heldout_manifest_bytes_read") != 0
                 ):
                     raise PairedExecutionError(
                         f"LOBO fold augmented training contract changed for {body}"
@@ -579,6 +852,9 @@ def inspect_fold_training_regime(
                 binding_sha = None
                 source_groups = 0
                 source_rows = 0
+                validation_groups = 0
+                validation_rows = 0
+                validation_body = None
                 heldout_groups = 0
         regimes.add((enabled, str(binding_sha) if binding_sha is not None else None))
         rows[body] = {
@@ -587,7 +863,16 @@ def inspect_fold_training_regime(
             "supplement_binding_file_sha256": binding_sha,
             "source_train_groups": int(source_groups),
             "source_train_rows": int(source_rows),
+            "proper_validation_groups": int(validation_groups),
+            "proper_validation_rows": int(validation_rows),
+            "proper_validation_body": validation_body,
+            "proper_checkpoint_selection_rows_used": (
+                int(validation_rows) if enabled else 0
+            ),
+            "rank_selection_rows_used": 0,
+            "calibration_fit_rows_used": 0,
             "heldout_groups_deferred": int(heldout_groups),
+            "heldout_rows_deferred": int(heldout_groups) * CANDIDATE_COUNT,
             "training_summary_sha256": folds[body]["training_summary_sha256"],
         }
     if len(regimes) != 1:
@@ -604,6 +889,9 @@ def inspect_fold_training_regime(
         "supplement_enabled": enabled,
         "supplement_binding_file_sha256": binding_sha,
         "required_supplement_binding_sha256": required_supplement_binding_sha256,
+        "supplement_fold_receipt_contract": (
+            receipt_contract if enabled else None
+        ),
         "folds": rows,
     }
     return {**base, "regime_sha256": canonical_sha256(base)}

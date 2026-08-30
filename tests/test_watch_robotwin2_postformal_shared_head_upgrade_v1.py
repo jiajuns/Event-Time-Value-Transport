@@ -40,15 +40,24 @@ def test_stage_returncode_only_authorizes_direct_interruption_signals(
         assert type(ordinary.value) is watcher.SharedHeadUpgradeError
 
     state = tmp_path / "watcher-state.json"
+    frozen_code_fields = {
+        "code_commit_marker": "a" * 40,
+        "code_manifest": str(tmp_path / "code-manifest.json"),
+        "code_manifest_logical_sha256": "b" * 64,
+        "code_manifest_file_sha256": "c" * 64,
+    }
+    state.write_text(json.dumps(frozen_code_fields), encoding="utf-8")
     watcher.record_recoverable_interruption(state, error)
     document = json.loads(state.read_text(encoding="utf-8"))
     assert document["status"] == watcher.RECOVERABLE_INTERRUPTION_STATUS
     assert document["child_returncode"] == -int(signal.SIGTERM)
     assert document["run_exit_written"] is False
+    assert all(document[key] == value for key, value in frozen_code_fields.items())
     run_exit = tmp_path / "run.exit"
     assert not run_exit.exists()
 
     failure_state = tmp_path / "failure-state.json"
+    failure_state.write_text(json.dumps(frozen_code_fields), encoding="utf-8")
     watcher.record_failure(
         failure_state,
         run_exit,
@@ -57,6 +66,11 @@ def test_stage_returncode_only_authorizes_direct_interruption_signals(
     assert run_exit.read_text(encoding="utf-8") == "1\n"
     assert json.loads(failure_state.read_text(encoding="utf-8"))["status"] == (
         "failed"
+    )
+    failure_document = json.loads(failure_state.read_text(encoding="utf-8"))
+    assert all(
+        failure_document[key] == value
+        for key, value in frozen_code_fields.items()
     )
 
 
@@ -148,6 +162,70 @@ def test_runtime_environment_includes_explicit_etsf_dependency_site(
     assert python_paths.index(str(args.etsf_site)) > python_paths.index(
         str(args.robotwin_eval_site)
     )
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_code_manifest_freezes_commit_and_rejects_wait_time_byte_drift(
+    tmp_path: Path,
+) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    for index, relative in enumerate(watcher.CRITICAL_CODE_FILES):
+        (code_root / relative).write_text(
+            f"# frozen critical file {index}\n", encoding="utf-8"
+        )
+    commit_marker = "a" * 40
+    manifest_path = tmp_path / "upgrade.code_manifest.json"
+    frozen = watcher.freeze_code_manifest(
+        manifest_path,
+        code_root=code_root,
+        commit_marker=commit_marker,
+    )
+    assert frozen["commit_marker"] == commit_marker
+    assert len(frozen["critical_files"]) == len(watcher.CRITICAL_CODE_FILES)
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_file_sha256 = watcher.sha256_file(manifest_path)
+    watcher.validate_frozen_code_manifest(
+        manifest_path,
+        code_root=code_root,
+        commit_marker=commit_marker,
+        expected_logical_sha256=frozen["logical_sha256"],
+        expected_file_sha256=manifest_file_sha256,
+    )
+
+    manifest_path.write_bytes(manifest_bytes + b" \n")
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="bytes changed"):
+        watcher.validate_frozen_code_manifest(
+            manifest_path,
+            code_root=code_root,
+            commit_marker=commit_marker,
+            expected_logical_sha256=frozen["logical_sha256"],
+            expected_file_sha256=manifest_file_sha256,
+        )
+    manifest_path.write_bytes(manifest_bytes)
+
+    drifted = code_root / watcher.CRITICAL_CODE_FILES[-1]
+    drifted.write_text("# silently replaced while waiting\n", encoding="utf-8")
+    with pytest.raises(
+        watcher.SharedHeadUpgradeError,
+        match="drifted after watcher startup",
+    ):
+        watcher.validate_frozen_code_manifest(
+            manifest_path,
+            code_root=code_root,
+            commit_marker=commit_marker,
+            expected_logical_sha256=frozen["logical_sha256"],
+            expected_file_sha256=manifest_file_sha256,
+        )
+
+
+def test_code_manifest_requires_full_explicit_commit_sha(tmp_path: Path) -> None:
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    for relative in watcher.CRITICAL_CODE_FILES:
+        (code_root / relative).write_text("# frozen\n", encoding="utf-8")
+    with pytest.raises(watcher.SharedHeadUpgradeError, match="full lowercase"):
+        watcher.build_code_manifest(code_root, "83c87a4")
 
 
 def test_supplement_completion_is_exact_design_not_just_group_count(

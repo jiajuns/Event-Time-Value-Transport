@@ -22,6 +22,7 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
+import watch_robotwin2_five_body_branches_to_lobo_training_v1 as watcher  # noqa: E402
 
 
 def _snapshot() -> dict:
@@ -537,37 +538,119 @@ def test_load_ensemble_binds_checkpoint_seed_to_summary_seed(
 def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None:
     supplement_sha = "a" * 64
 
+    assert runner.SUPPLEMENT_FOLD_RECEIPT_CONTRACT == (
+        watcher.SUPPLEMENT_FOLD_RECEIPT_CONTRACT
+    )
+    assert runner.SUPPLEMENT_STRICT_PROPER_SCORE == (
+        watcher.SUPPLEMENT_STRICT_PROPER_SCORE
+    )
+    assert runner.SUPPLEMENT_STRICT_PROPER_SE_COMBINATION == (
+        watcher.SUPPLEMENT_STRICT_PROPER_SE_COMBINATION
+    )
+
+    def augmented_receipt(body: str) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "binding_file_sha256": supplement_sha,
+            "proper_loss_weight": (
+                runner.shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
+            ),
+            "rank_loss_weight": runner.shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT,
+            "rank_or_utility_loss_weight": (
+                runner.shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
+            ),
+            "usage_contract": dict(runner.shared_head.SUPPLEMENT_USAGE_CONTRACT),
+            "source_train_groups": 90,
+            "source_train_rows": 360,
+            "heldout_groups_deferred": 30,
+            "source_validation_groups": 30,
+            "source_validation_rows": 120,
+            "source_validation_body": runner.supplement_proper_validation_body(
+                body
+            ),
+            "source_validation_body_selection": (
+                "label_blind_sha256_ordered_five_body_cycle_successor_"
+                "derangement"
+            ),
+            "source_validation_assignment_uses_labels": False,
+            "rank_or_utility_rows_used": 360,
+            "rank_or_utility_groups_with_real_comparative_supervision": 90,
+            "semantic_comparative_rows_used": 0,
+            "normalization_rows_used": 0,
+            "baseline_fit_rows_used": 0,
+            "source_validation_rows_used": 120,
+            "proper_checkpoint_selection_rows_authorized": 120,
+            "proper_checkpoint_selection_weight": (
+                runner.shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
+            ),
+            "checkpoint_selection_rows_used": 120,
+            "checkpoint_selection_use": (
+                "strict_proper_only_primary_plus_fixed_0.25_supplement"
+            ),
+            "rank_selection_rows_authorized": 0,
+            "rank_selection_rows_used": 0,
+            "calibration_diagnostic_rows_authorized": 120,
+            "calibration_diagnostic_rows_used": 120,
+            "calibration_rows_used": 0,
+            "calibration_fit": False,
+            "proper_validation_primary_reset_overlap": 0,
+            "heldout_group_npz_opened": 0,
+            "heldout_group_payload_bytes_read": 0,
+            "heldout_group_payload_deserialized": 0,
+            "heldout_manifest_file_opened": 0,
+            "heldout_manifest_bytes_read": 0,
+        }
+
+    def augmented_selection() -> dict[str, object]:
+        step = 100
+        combined_score = 1.0 + 0.25 * 2.0
+        combined_se = float(np.sqrt(0.1**2 + (0.25 * 0.2) ** 2))
+        selection_key = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, step]
+        return {
+            "strict_proper_score": runner.SUPPLEMENT_STRICT_PROPER_SCORE,
+            "supplement_validation_never_used_for_rank_comparison": True,
+            "calibration_diagnostics_only_no_parameter_fit": True,
+            "selected_step": step,
+            "selected_key": selection_key,
+            "selected_ensemble_candidate_ranking": {},
+            "selected_mean_member_diagnostic_multitask_score": 0.4,
+            "strict_proper_selection": {
+                "rule": runner.STRICT_PROPER_SELECTION_RULE,
+                "comparative_validation_evidence": False,
+                "best_score": combined_score,
+                "conservative_one_standard_error": combined_se,
+                "eligible_threshold": combined_score + combined_se,
+                "eligible_steps": [step],
+                "selected_step": step,
+                "selected_score": combined_score,
+                "heldout_rows_used": 0,
+            },
+            "evaluated_common_steps": [
+                {
+                    "step": step,
+                    "selection_key": selection_key,
+                    "ensemble_candidate_ranking": {},
+                    "mean_member_diagnostic_multitask_score": 0.4,
+                    "mean_member_primary_strict_proper_score": 1.0,
+                    "mean_member_supplement_strict_proper_score": 2.0,
+                    "supplement_strict_proper_weight": 0.25,
+                    "mean_member_strict_proper_score": combined_score,
+                    "primary_conservative_strict_proper_standard_error": 0.1,
+                    "supplement_conservative_strict_proper_standard_error": 0.2,
+                    "conservative_strict_proper_standard_error": combined_se,
+                    "strict_proper_standard_error_combination": (
+                        runner.SUPPLEMENT_STRICT_PROPER_SE_COMBINATION
+                    ),
+                }
+            ],
+        }
+
     def folds(enabled_by_body: dict[str, bool]) -> dict[str, dict]:
         result = {}
         for body in runner.BODIES:
             summary_path = tmp_path / f"{body}-{int(enabled_by_body[body])}.json"
             if enabled_by_body[body]:
-                supplement = {
-                    "enabled": True,
-                    "binding_file_sha256": supplement_sha,
-                        "proper_loss_weight": (
-                            runner.shared_head.SUPPLEMENT_PROPER_LOSS_WEIGHT
-                        ),
-                        "rank_loss_weight": (
-                            runner.shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
-                        ),
-                        "rank_or_utility_loss_weight": (
-                            runner.shared_head.SUPPLEMENT_RANK_LOSS_WEIGHT
-                        ),
-                    "usage_contract": dict(
-                        runner.shared_head.SUPPLEMENT_USAGE_CONTRACT
-                    ),
-                        "source_train_groups": 120,
-                        "source_train_rows": 480,
-                        "heldout_groups_deferred": 30,
-                        "rank_or_utility_rows_used": 480,
-                        "rank_or_utility_groups_with_real_comparative_supervision": 120,
-                        "semantic_comparative_rows_used": 0,
-                    "normalization_rows_used": 0,
-                    "source_validation_rows_used": 0,
-                    "checkpoint_selection_rows_used": 0,
-                    "calibration_rows_used": 0,
-                }
+                supplement = augmented_receipt(body)
             else:
                 supplement = {
                     "enabled": False,
@@ -576,10 +659,10 @@ def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None
                     "source_train_rows": 0,
                     "heldout_groups_deferred": 0,
                 }
-            summary_path.write_text(
-                json.dumps({"proper_world_supplement": supplement}),
-                encoding="utf-8",
-            )
+            summary = {"proper_world_supplement": supplement}
+            if enabled_by_body[body]:
+                summary["ensemble_checkpoint_selection"] = augmented_selection()
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
             result[body] = {
                 "training_summary": str(summary_path),
                 "training_summary_sha256": runner.sha256_file(summary_path),
@@ -592,6 +675,91 @@ def test_fold_training_regime_binds_one_exact_supplement(tmp_path: Path) -> None
     )
     assert augmented["name"] == "c_plus_expert_root_supplement"
     assert augmented["supplement_binding_file_sha256"] == supplement_sha
+    assert augmented["supplement_fold_receipt_contract"] == (
+        runner.SUPPLEMENT_FOLD_RECEIPT_CONTRACT
+    )
+    assert augmented["supplement_fold_receipt_contract"][
+        "proper_validation_split_seed"
+    ] == 20260901
+    assert all(
+        row["source_train_groups"] == 90
+        and row["source_train_rows"] == 360
+        and row["proper_validation_groups"] == 30
+        and row["proper_validation_rows"] == 120
+        and row["proper_checkpoint_selection_rows_used"] == 120
+        and row["rank_selection_rows_used"] == 0
+        and row["calibration_fit_rows_used"] == 0
+        and row["heldout_groups_deferred"] == 30
+        and row["heldout_rows_deferred"] == 120
+        for row in augmented["folds"].values()
+    )
+
+    legacy = folds({body: True for body in runner.BODIES})
+    for body, fold in legacy.items():
+        summary_path = Path(fold["training_summary"])
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        supplement = summary["proper_world_supplement"]
+        supplement.update(
+            {
+                "source_train_groups": 120,
+                "source_train_rows": 480,
+                "source_validation_groups": 0,
+                "source_validation_rows": 0,
+                "source_validation_rows_used": 0,
+                "checkpoint_selection_rows_used": 0,
+                "rank_or_utility_rows_used": 480,
+            }
+        )
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        fold["training_summary_sha256"] = runner.sha256_file(summary_path)
+    with pytest.raises(runner.PairedExecutionError, match="augmented training"):
+        runner.inspect_fold_training_regime(legacy)
+
+    for field, invalid_value in (
+        ("rank_selection_rows_used", 1),
+        ("calibration_rows_used", 1),
+        ("calibration_fit", True),
+    ):
+        leaking = folds({body: True for body in runner.BODIES})
+        first = runner.BODIES[0]
+        fold = leaking[first]
+        summary_path = Path(fold["training_summary"])
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["proper_world_supplement"][field] = invalid_value
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        fold["training_summary_sha256"] = runner.sha256_file(summary_path)
+        with pytest.raises(runner.PairedExecutionError, match="augmented training"):
+            runner.inspect_fold_training_regime(leaking)
+
+    for path, invalid_value in (
+        (("strict_proper_score",), "primary_only"),
+        (
+            ("evaluated_common_steps", 0, "mean_member_strict_proper_score"),
+            9.0,
+        ),
+        (
+            (
+                "evaluated_common_steps",
+                0,
+                "strict_proper_standard_error_combination",
+            ),
+            "sum_standard_errors",
+        ),
+        (("strict_proper_selection", "selected_score"), 9.0),
+    ):
+        tampered = folds({body: True for body in runner.BODIES})
+        first = runner.BODIES[0]
+        fold = tampered[first]
+        summary_path = Path(fold["training_summary"])
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        cursor = summary["ensemble_checkpoint_selection"]
+        for component in path[:-1]:
+            cursor = cursor[component]
+        cursor[path[-1]] = invalid_value
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        fold["training_summary_sha256"] = runner.sha256_file(summary_path)
+        with pytest.raises(runner.PairedExecutionError, match="strict-proper"):
+            runner.inspect_fold_training_regime(tampered)
 
     mixed = {body: True for body in runner.BODIES}
     mixed[runner.BODIES[-1]] = False

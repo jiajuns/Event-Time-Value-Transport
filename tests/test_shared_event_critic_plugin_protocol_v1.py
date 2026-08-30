@@ -364,7 +364,7 @@ def test_protocol_module_has_no_policy_or_environment_imports() -> None:
 
 
 @pytest.mark.parametrize("candidate_count", (4, 8))
-def test_current_v10_members_run_through_the_policy_independent_scorer(
+def test_current_v11_members_run_through_the_policy_independent_scorer(
     candidate_count: int,
 ) -> None:
     torch.manual_seed(20260831)
@@ -379,7 +379,7 @@ def test_current_v10_members_run_through_the_policy_independent_scorer(
     result = plugin.SharedEventCriticScorer(members, authority=bound).score(
         canonical_batch(bound)
     )
-    assert trainer.MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v10"
+    assert trainer.MODEL_FAMILY == "terminal_consequence_utility_shared_event_head_v11"
     assert result.member_scores.shape == (
         plugin.ENSEMBLE_MEMBER_COUNT,
         candidate_count,

@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import statistics
 import struct
 import subprocess
@@ -148,6 +149,52 @@ TOTAL_DECISIONS = len(BODIES) * DECISIONS_PER_BODY
 TOTAL_BRANCHES = TOTAL_DECISIONS * CANDIDATE_COUNT
 EXPECTED_GPU_UUID = "GPU-06f6e50e-5296-258f-dd86-8f838390a7d1"
 ENSEMBLE_SEEDS = (20260901, 20260902, 20260903, 20260904, 20260905)
+SUPPLEMENT_SPLIT_SEED = 20260901
+SUPPLEMENT_FOLD_RECEIPT_CONTRACT = {
+    "format": "etsf_proper_world_supplement_outer_lobo_split_v1",
+    "candidate_count": CANDIDATE_COUNT,
+    "groups_per_body": 30,
+    "five_body_groups": 150,
+    "five_body_rows": 150 * CANDIDATE_COUNT,
+    "source_train_bodies": 3,
+    "source_train_groups": 90,
+    "source_train_rows": 90 * CANDIDATE_COUNT,
+    "proper_validation_bodies": 1,
+    "proper_validation_split_seed": SUPPLEMENT_SPLIT_SEED,
+    "proper_validation_groups": 30,
+    "proper_validation_rows": 30 * CANDIDATE_COUNT,
+    "outer_heldout_bodies": 1,
+    "outer_heldout_groups_deferred": 30,
+    "outer_heldout_rows_deferred": 30 * CANDIDATE_COUNT,
+    "proper_validation_use": (
+        "strict_proper_checkpoint_selection_only_no_rank_selection_"
+        "calibration_diagnostics_without_fit"
+    ),
+    "rank_selection_rows": 0,
+    "calibration_fit_rows": 0,
+    "heldout_payload_rows_opened": 0,
+}
+SUPPLEMENT_STRICT_PROPER_SCORE = (
+    "primary_strict_proper_plus_fixed_0.25_times_label_blind_"
+    "inner_cross_body_supplement_strict_proper"
+)
+SUPPLEMENT_STRICT_PROPER_SE_COMBINATION = (
+    "per_member_sqrt_primary_variance_plus_0.25_squared_times_"
+    "supplement_variance_then_conservative_max_across_members"
+)
+STRICT_PROPER_SELECTION_RULE = (
+    "minimize_source_body_condition_macro_proper_score_then_"
+    "maximize_rank_within_one_standard_error"
+)
+FOLD_ATTEMPT_FORMAT = "etsf_robotwin2_lobo_fold_training_attempt_v1"
+FOLD_ATTEMPT_FAILURE_FORMAT = "etsf_robotwin2_lobo_fold_attempt_failure_v1"
+FOLD_SUMMARY_REBIND_FORMAT = "etsf_robotwin2_lobo_fold_summary_rebind_v1"
+FOLD_ATTEMPT_PROMOTION_FORMAT = "etsf_robotwin2_lobo_fold_promotion_v1"
+FOLD_ATTEMPT_DIRECTORY = "fold_attempts"
+RECOVERABLE_TRAINING_SIGNALS = frozenset(
+    int(member)
+    for member in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGKILL)
+)
 REQUIRED_ARRAYS = {
     "state",
     "actions",
@@ -331,6 +378,537 @@ def verify_logical_sha(value: Mapping[str, Any], label: str) -> None:
     observed = unsigned.pop("logical_sha256", None)
     if observed != canonical_sha256(unsigned):
         raise LoboWatcherError(f"{label} logical SHA-256 mismatch")
+
+
+def fold_training_command(
+    args: argparse.Namespace,
+    held_out_body: str,
+    binding_sha256: str,
+    output: Path,
+) -> list[str]:
+    command = [
+        str(args.training_python),
+        str(args.trainer),
+        "--mode", "train-fold",
+        "--binding", str(args.binding),
+        "--binding-sha256", binding_sha256,
+        "--held-out-body", held_out_body,
+        "--split-seed", str(SUPPLEMENT_SPLIT_SEED),
+        "--output", str(output),
+        "--device", "cuda",
+        "--steps", "3000",
+        "--eval-every", "100",
+        "--batch-size", "64",
+        "--learning-rate", "0.0003",
+        "--ensemble-seeds", *[str(seed) for seed in ENSEMBLE_SEEDS],
+    ]
+    if args.supplement_binding is not None:
+        command.extend(
+            [
+                "--supplement-binding",
+                str(args.supplement_binding),
+                "--supplement-binding-sha256",
+                str(args.supplement_binding_sha256),
+            ]
+        )
+    return command
+
+
+def _fold_attempt_root(output_root: Path, held_out_body: str) -> Path:
+    if held_out_body not in BODIES:
+        raise LoboWatcherError("unknown LOBO attempt body")
+    return output_root / FOLD_ATTEMPT_DIRECTORY / held_out_body
+
+
+def validate_fold_attempt_history(
+    args: argparse.Namespace,
+    held_out_body: str,
+    binding_sha256: str,
+) -> list[dict[str, Any]]:
+    """Validate every immutable attempt record without deleting partial work."""
+
+    root = _fold_attempt_root(args.output_root, held_out_body)
+    if not root.exists():
+        return []
+    if not root.is_dir() or root.is_symlink():
+        raise LoboWatcherError("fold attempt root must be one real directory")
+    all_entries = sorted(root.iterdir(), key=lambda path: path.name)
+    entries = []
+    for entry in all_entries:
+        if entry.name.startswith(".precommit-attempt-"):
+            if not entry.is_dir() or entry.is_symlink():
+                raise LoboWatcherError("fold precommit staging is invalid")
+            children = list(entry.iterdir())
+            if any(
+                child.name != "attempt.json"
+                and not child.name.startswith("attempt.json.create-")
+                for child in children
+            ):
+                raise LoboWatcherError("fold precommit staging contains artifacts")
+            authority = entry / "attempt.json"
+            if authority.exists():
+                staged = read_json(authority, "staged fold attempt manifest")
+                verify_logical_sha(staged, "staged fold attempt manifest")
+                if (
+                    staged.get("format") != FOLD_ATTEMPT_FORMAT
+                    or staged.get(
+                        "attempt_selected_using_training_or_validation_outcome"
+                    )
+                    is not False
+                ):
+                    raise LoboWatcherError("staged fold attempt manifest changed")
+            continue
+        entries.append(entry)
+    if any(
+        not entry.is_dir()
+        or entry.is_symlink()
+        or not entry.name.startswith("attempt-")
+        or not entry.name.removeprefix("attempt-").isdigit()
+        for entry in entries
+    ):
+        raise LoboWatcherError("fold attempt root contains an unknown entry")
+    records: list[dict[str, Any]] = []
+    promoted_count = 0
+    promoted_ordinal: int | None = None
+    trainer_sha256 = sha256_file(args.trainer)
+    prior_logical_sha256s: list[str] = []
+    final_output = args.output_root / f"outer_lobo_{held_out_body}"
+    for ordinal, attempt_dir in enumerate(entries, start=1):
+        if attempt_dir.name != f"attempt-{ordinal:06d}":
+            raise LoboWatcherError("fold attempt ordinals are not contiguous")
+        manifest = read_json(attempt_dir / "attempt.json", "fold attempt manifest")
+        verify_logical_sha(manifest, "fold attempt manifest")
+        training_output = attempt_dir / "training_output"
+        log_path = attempt_dir / "training.log"
+        expected_command = fold_training_command(
+            args, held_out_body, binding_sha256, training_output
+        )
+        if (
+            manifest.get("format") != FOLD_ATTEMPT_FORMAT
+            or manifest.get("watcher_format") != FORMAT
+            or manifest.get("held_out_body") != held_out_body
+            or manifest.get("attempt_ordinal") != ordinal
+            or manifest.get("attempt_directory") != str(attempt_dir)
+            or manifest.get("training_output") != str(training_output)
+            or manifest.get("final_fold_output") != str(final_output)
+            or manifest.get("training_log") != str(log_path)
+            or manifest.get("binding_file_sha256") != binding_sha256
+            or manifest.get("supplement_binding_file_sha256")
+            != args.supplement_binding_sha256
+            or manifest.get("trainer") != str(args.trainer)
+            or manifest.get("trainer_file_sha256") != trainer_sha256
+            or manifest.get("command") != expected_command
+            or manifest.get("command_sha256") != canonical_sha256(expected_command)
+            or manifest.get("prior_attempt_logical_sha256s")
+            != prior_logical_sha256s
+            or manifest.get("attempt_selected_using_training_or_validation_outcome")
+            is not False
+        ):
+            raise LoboWatcherError("fold attempt manifest changed")
+        failure_path = attempt_dir / "failure.json"
+        rebind_path = attempt_dir / "summary_rebinding.json"
+        promotion_path = attempt_dir / "promotion.json"
+        failure = None
+        summary_rebinding = None
+        promotion = None
+        if failure_path.exists():
+            failure = read_json(failure_path, "fold attempt failure")
+            verify_logical_sha(failure, "fold attempt failure")
+            returncode = failure.get("training_returncode")
+            if (
+                failure.get("format") != FOLD_ATTEMPT_FAILURE_FORMAT
+                or failure.get("held_out_body") != held_out_body
+                or failure.get("attempt_ordinal") != ordinal
+                or failure.get("attempt_logical_sha256")
+                != manifest["logical_sha256"]
+                or isinstance(returncode, bool)
+                or not isinstance(returncode, int)
+                or failure.get("retry_selection_reads_model_outcome") is not False
+            ):
+                raise LoboWatcherError("fold attempt failure receipt changed")
+        if rebind_path.exists():
+            summary_rebinding = read_json(
+                rebind_path, "fold attempt summary rebinding"
+            )
+            verify_logical_sha(
+                summary_rebinding, "fold attempt summary rebinding"
+            )
+            if (
+                summary_rebinding.get("format") != FOLD_SUMMARY_REBIND_FORMAT
+                or summary_rebinding.get("held_out_body") != held_out_body
+                or summary_rebinding.get("attempt_ordinal") != ordinal
+                or summary_rebinding.get("attempt_logical_sha256")
+                != manifest["logical_sha256"]
+                or not isinstance(
+                    summary_rebinding.get("original_training_summary_file_sha256"),
+                    str,
+                )
+                or not isinstance(
+                    summary_rebinding.get("promoted_training_summary_file_sha256"),
+                    str,
+                )
+                or summary_rebinding.get("checkpoint_path_rebind_count") != 5
+                or summary_rebinding.get("checkpoint_payloads_modified") is not False
+            ):
+                raise LoboWatcherError("fold summary rebinding receipt changed")
+        if promotion_path.exists():
+            promotion = read_json(promotion_path, "fold attempt promotion")
+            verify_logical_sha(promotion, "fold attempt promotion")
+            if (
+                promotion.get("format") != FOLD_ATTEMPT_PROMOTION_FORMAT
+                or promotion.get("held_out_body") != held_out_body
+                or promotion.get("attempt_ordinal") != ordinal
+                or promotion.get("attempt_logical_sha256")
+                != manifest["logical_sha256"]
+                or promotion.get("final_fold_output") != str(final_output)
+                or promotion.get("training_output_moved_atomically") is not True
+                or not isinstance(summary_rebinding, Mapping)
+                or promotion.get("summary_rebinding_logical_sha256")
+                != summary_rebinding.get("logical_sha256")
+                or training_output.exists()
+                or not final_output.is_dir()
+                or sha256_file(final_output / "training_summary.json")
+                != promotion.get("training_summary_file_sha256")
+            ):
+                raise LoboWatcherError("fold attempt promotion receipt changed")
+            promoted_count += 1
+            promoted_ordinal = ordinal
+        if failure is not None and (
+            summary_rebinding is not None or promotion is not None
+        ):
+            raise LoboWatcherError("one fold attempt cannot fail then promote")
+        records.append(
+            {
+                "directory": attempt_dir,
+                "manifest": manifest,
+                "training_output": training_output,
+                "log": log_path,
+                "failure": failure,
+                "summary_rebinding": summary_rebinding,
+                "promotion": promotion,
+            }
+        )
+        prior_logical_sha256s.append(str(manifest["logical_sha256"]))
+    if promoted_count > 1:
+        raise LoboWatcherError("more than one fold attempt claims promotion")
+    if promoted_ordinal is not None and promoted_ordinal != len(records):
+        raise LoboWatcherError("a promoted fold attempt must be the final attempt")
+    if promoted_count and not final_output.is_dir():
+        raise LoboWatcherError("promoted fold output is missing")
+    return records
+
+
+def create_fold_attempt(
+    args: argparse.Namespace,
+    held_out_body: str,
+    binding_sha256: str,
+) -> dict[str, Any]:
+    """Commit a new outcome-blind attempt while retaining all prior attempts."""
+
+    history = validate_fold_attempt_history(args, held_out_body, binding_sha256)
+    if (args.output_root / f"outer_lobo_{held_out_body}").exists():
+        raise LoboWatcherError("cannot create an attempt after final fold promotion")
+    ordinal = len(history) + 1
+    root = _fold_attempt_root(args.output_root, held_out_body)
+    root.mkdir(parents=True, exist_ok=True)
+    attempt_dir = root / f"attempt-{ordinal:06d}"
+    training_output = attempt_dir / "training_output"
+    log_path = attempt_dir / "training.log"
+    command = fold_training_command(
+        args, held_out_body, binding_sha256, training_output
+    )
+    manifest = signed(
+        {
+            "format": FOLD_ATTEMPT_FORMAT,
+            "watcher_format": FORMAT,
+            "held_out_body": held_out_body,
+            "attempt_ordinal": ordinal,
+            "created_at_utc": utc_now(),
+            "watcher_pid": os.getpid(),
+            "attempt_directory": str(attempt_dir),
+            "training_output": str(training_output),
+            "final_fold_output": str(
+                args.output_root / f"outer_lobo_{held_out_body}"
+            ),
+            "training_log": str(log_path),
+            "binding_file_sha256": binding_sha256,
+            "supplement_binding_file_sha256": args.supplement_binding_sha256,
+            "trainer": str(args.trainer),
+            "trainer_file_sha256": sha256_file(args.trainer),
+            "command": command,
+            "command_sha256": canonical_sha256(command),
+            "prior_attempt_logical_sha256s": [
+                record["manifest"]["logical_sha256"] for record in history
+            ],
+            "attempt_selected_using_training_or_validation_outcome": False,
+        }
+    )
+    staging = root / (
+        f".precommit-attempt-{ordinal:06d}-{os.getpid()}-{time.time_ns()}"
+    )
+    staging.mkdir()
+    create_once_or_verify(staging / "attempt.json", manifest, "staged fold attempt")
+    try:
+        os.rename(staging, attempt_dir)
+    except FileExistsError as error:
+        raise LoboWatcherError("fold attempt appeared concurrently") from error
+    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {
+        "directory": attempt_dir,
+        "manifest": manifest,
+        "training_output": training_output,
+        "log": log_path,
+        "failure": None,
+        "summary_rebinding": None,
+        "promotion": None,
+    }
+
+
+def record_fold_attempt_failure(
+    attempt: Mapping[str, Any],
+    *,
+    returncode: int,
+    reason: str,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    manifest = attempt["manifest"]
+    value = signed(
+        {
+            "format": FOLD_ATTEMPT_FAILURE_FORMAT,
+            "held_out_body": manifest["held_out_body"],
+            "attempt_ordinal": manifest["attempt_ordinal"],
+            "attempt_logical_sha256": manifest["logical_sha256"],
+            "recorded_at_utc": utc_now(),
+            "training_returncode": int(returncode),
+            "reason": reason,
+            "error_type": type(error).__name__ if error is not None else None,
+            "error_message": str(error) if error is not None else None,
+            "retry_selection_reads_model_outcome": False,
+        }
+    )
+    create_once_or_verify(
+        Path(attempt["directory"]) / "failure.json",
+        value,
+        "fold attempt failure",
+    )
+    return value
+
+
+def rebind_fold_summary_for_atomic_promotion(
+    attempt: Mapping[str, Any], final_output: Path
+) -> dict[str, Any]:
+    """Mechanically rebase five checkpoint paths before the directory rename."""
+
+    training_output = Path(attempt["training_output"])
+    summary_path = training_output / "training_summary.json"
+    summary = read_json(summary_path, "attempt training summary")
+    members = summary.get("members")
+    if not isinstance(members, list) or len(members) != 5:
+        raise LoboWatcherError("attempt summary lacks five checkpoint members")
+    original_sha256 = sha256_file(summary_path)
+    rebound = dict(summary)
+    rebound_members = []
+    mappings = []
+    for member in members:
+        if not isinstance(member, Mapping):
+            raise LoboWatcherError("attempt summary member is invalid")
+        declared_source = Path(str(member.get("checkpoint", ""))).expanduser()
+        if declared_source.is_symlink():
+            raise LoboWatcherError("attempt checkpoint may not be symbolic")
+        source = declared_source.resolve()
+        try:
+            relative = source.relative_to(training_output.resolve())
+        except ValueError as error:
+            raise LoboWatcherError(
+                "attempt checkpoint path escapes its training output"
+            ) from error
+        if not relative.parts or not source.is_file() or source.is_symlink():
+            raise LoboWatcherError("attempt checkpoint is missing/symbolic")
+        if sha256_file(source) != member.get("checkpoint_sha256"):
+            raise LoboWatcherError("attempt checkpoint SHA changed before promotion")
+        target = final_output / relative
+        rebound_member = dict(member)
+        rebound_member["checkpoint"] = str(target)
+        rebound_members.append(rebound_member)
+        mappings.append(
+            {
+                "member": member.get("member"),
+                "source": str(source),
+                "target": str(target),
+                "checkpoint_sha256": member.get("checkpoint_sha256"),
+            }
+        )
+    rebound["members"] = rebound_members
+    atomic_json(summary_path, rebound)
+    promoted_sha256 = sha256_file(summary_path)
+    manifest = attempt["manifest"]
+    receipt = signed(
+        {
+            "format": FOLD_SUMMARY_REBIND_FORMAT,
+            "held_out_body": manifest["held_out_body"],
+            "attempt_ordinal": manifest["attempt_ordinal"],
+            "attempt_logical_sha256": manifest["logical_sha256"],
+            "recorded_at_utc": utc_now(),
+            "original_training_summary_file_sha256": original_sha256,
+            "promoted_training_summary_file_sha256": promoted_sha256,
+            "checkpoint_path_rebind_count": len(mappings),
+            "checkpoint_path_mappings": mappings,
+            "checkpoint_payloads_modified": False,
+        }
+    )
+    create_once_or_verify(
+        Path(attempt["directory"]) / "summary_rebinding.json",
+        receipt,
+        "fold summary rebinding",
+    )
+    return receipt
+
+
+def promote_fold_attempt(
+    attempt: Mapping[str, Any], final_output: Path, *, recovered: bool = False
+) -> dict[str, Any]:
+    """Atomically rename one complete attempt output to its create-once final path."""
+
+    training_output = Path(attempt["training_output"])
+    if final_output.exists():
+        raise LoboWatcherError("final fold output already exists before promotion")
+    summary_path = training_output / "training_summary.json"
+    if not training_output.is_dir() or not summary_path.is_file():
+        raise LoboWatcherError("attempt lacks a complete fold summary")
+    summary_sha256 = sha256_file(summary_path)
+    rebinding = read_json(
+        Path(attempt["directory"]) / "summary_rebinding.json",
+        "fold summary rebinding",
+    )
+    verify_logical_sha(rebinding, "fold summary rebinding")
+    if (
+        rebinding.get("attempt_logical_sha256")
+        != attempt["manifest"]["logical_sha256"]
+        or rebinding.get("promoted_training_summary_file_sha256")
+        != summary_sha256
+    ):
+        raise LoboWatcherError("fold summary was not rebound for this promotion")
+    os.rename(training_output, final_output)
+    directory_fd = os.open(final_output.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    manifest = attempt["manifest"]
+    value = signed(
+        {
+            "format": FOLD_ATTEMPT_PROMOTION_FORMAT,
+            "held_out_body": manifest["held_out_body"],
+            "attempt_ordinal": manifest["attempt_ordinal"],
+            "attempt_logical_sha256": manifest["logical_sha256"],
+            "promoted_at_utc": utc_now(),
+            "final_fold_output": str(final_output),
+            "training_summary_file_sha256": summary_sha256,
+            "summary_rebinding_logical_sha256": rebinding["logical_sha256"],
+            "training_output_moved_atomically": True,
+            "promotion_receipt_recovered_after_interruption": bool(recovered),
+        }
+    )
+    create_once_or_verify(
+        Path(attempt["directory"]) / "promotion.json",
+        value,
+        "fold attempt promotion",
+    )
+    return value
+
+
+def recover_missing_promotion_receipt(
+    history: Sequence[Mapping[str, Any]], final_output: Path
+) -> dict[str, Any]:
+    """Recover only the narrow post-rename/pre-receipt interruption window."""
+
+    promoted = [record for record in history if record.get("promotion") is not None]
+    if promoted:
+        if len(promoted) != 1:
+            raise LoboWatcherError("ambiguous promoted fold attempt")
+        return dict(promoted[0]["promotion"])
+    if not history:
+        raise LoboWatcherError("final fold has no create-once attempt authority")
+    candidate = history[-1]
+    if (
+        candidate.get("failure") is not None
+        or Path(candidate["training_output"]).exists()
+        or not Path(candidate["log"]).is_file()
+        or not final_output.is_dir()
+        or not (final_output / "training_summary.json").is_file()
+    ):
+        raise LoboWatcherError("final fold cannot be bound to its last attempt")
+    manifest = candidate["manifest"]
+    summary_sha256 = sha256_file(final_output / "training_summary.json")
+    rebinding = read_json(
+        Path(candidate["directory"]) / "summary_rebinding.json",
+        "fold summary rebinding",
+    )
+    verify_logical_sha(rebinding, "fold summary rebinding")
+    if (
+        rebinding.get("attempt_logical_sha256") != manifest["logical_sha256"]
+        or rebinding.get("promoted_training_summary_file_sha256")
+        != summary_sha256
+    ):
+        raise LoboWatcherError("recovered final fold summary differs from rebinding")
+    value = signed(
+        {
+            "format": FOLD_ATTEMPT_PROMOTION_FORMAT,
+            "held_out_body": manifest["held_out_body"],
+            "attempt_ordinal": manifest["attempt_ordinal"],
+            "attempt_logical_sha256": manifest["logical_sha256"],
+            "promoted_at_utc": utc_now(),
+            "final_fold_output": str(final_output),
+            "training_summary_file_sha256": summary_sha256,
+            "summary_rebinding_logical_sha256": rebinding["logical_sha256"],
+            "training_output_moved_atomically": True,
+            "promotion_receipt_recovered_after_interruption": True,
+        }
+    )
+    create_once_or_verify(
+        Path(candidate["directory"]) / "promotion.json",
+        value,
+        "recovered fold attempt promotion",
+    )
+    return value
+
+
+def fold_attempt_audit(
+    attempt: Mapping[str, Any], promotion: Mapping[str, Any]
+) -> dict[str, Any]:
+    manifest = attempt["manifest"]
+    if promotion.get("attempt_logical_sha256") != manifest["logical_sha256"]:
+        raise LoboWatcherError("promotion does not bind its fold attempt")
+    return {
+        "attempt_directory": str(attempt["directory"]),
+        "attempt_ordinal": manifest["attempt_ordinal"],
+        "attempt_manifest_logical_sha256": manifest["logical_sha256"],
+        "trainer_file_sha256": manifest["trainer_file_sha256"],
+        "promotion_logical_sha256": promotion["logical_sha256"],
+        "promotion_receipt_recovered_after_interruption": promotion[
+            "promotion_receipt_recovered_after_interruption"
+        ],
+        "attempt_selected_using_training_or_validation_outcome": False,
+        "prior_attempt_count": len(manifest["prior_attempt_logical_sha256s"]),
+        "prior_attempts_retained": True,
+    }
+
+
+def propagate_recoverable_training_signal(returncode: int) -> None:
+    """Make the parent watcher/guardian observe the trainer's direct signal."""
+
+    if (
+        isinstance(returncode, bool)
+        or returncode >= 0
+        or -returncode not in RECOVERABLE_TRAINING_SIGNALS
+    ):
+        raise LoboWatcherError("training return code is not a recoverable signal")
+    os.kill(os.getpid(), -returncode)
+    raise AssertionError("signal propagation unexpectedly returned")
 
 
 def _read_exact(stream: BinaryIO, count: int, label: str) -> bytes:
@@ -1041,6 +1619,226 @@ def nested_values(members: Sequence[Mapping[str, Any]], *keys: str) -> list[Any]
     return result
 
 
+def supplement_proper_validation_body(held_out_body: str) -> str:
+    """Replay the trainer's frozen label-blind cross-body assignment."""
+
+    if held_out_body not in BODIES:
+        raise LoboWatcherError("supplement split received an unknown held-out body")
+    ordered = sorted(
+        BODIES,
+        key=lambda body: hashlib.sha256(
+            (
+                f"{SUPPLEMENT_SPLIT_SEED}|supplement-crossfit-order|{body}"
+            ).encode()
+        ).hexdigest(),
+    )
+    return ordered[(ordered.index(held_out_body) + 1) % len(ordered)]
+
+
+def validate_augmented_strict_proper_selection(
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replay the augmented proper-score/one-SE checkpoint-selection receipt."""
+
+    ensemble = summary.get("ensemble_checkpoint_selection")
+    if not isinstance(ensemble, Mapping):
+        raise LoboWatcherError("augmented fold lacks ensemble selection evidence")
+    records = ensemble.get("evaluated_common_steps")
+    selection = ensemble.get("strict_proper_selection")
+    if (
+        ensemble.get("strict_proper_score") != SUPPLEMENT_STRICT_PROPER_SCORE
+        or ensemble.get("supplement_validation_never_used_for_rank_comparison")
+        is not True
+        or ensemble.get("calibration_diagnostics_only_no_parameter_fit") is not True
+        or not isinstance(records, list)
+        or not records
+        or not isinstance(selection, Mapping)
+        or selection.get("rule") != STRICT_PROPER_SELECTION_RULE
+        or selection.get("heldout_rows_used") != 0
+    ):
+        raise LoboWatcherError(
+            "augmented fold strict-proper selection contract changed"
+        )
+
+    def finite(value: Any, *, nonnegative: bool = False) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or (nonnegative and float(value) < 0.0)
+        ):
+            raise LoboWatcherError(
+                "augmented fold strict-proper numeric evidence changed"
+            )
+        return float(value)
+
+    normalized = []
+    observed_steps: set[int] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise LoboWatcherError(
+                "augmented fold evaluated-step evidence changed"
+            )
+        step = record.get("step")
+        key = record.get("selection_key")
+        ranking = record.get("ensemble_candidate_ranking")
+        if (
+            isinstance(step, bool)
+            or not isinstance(step, int)
+            or step <= 0
+            or step in observed_steps
+            or not isinstance(key, list)
+            or len(key) != 7
+            or not isinstance(ranking, Mapping)
+        ):
+            raise LoboWatcherError(
+                "augmented fold evaluated-step identity changed"
+            )
+        observed_steps.add(step)
+        key_values = [finite(value) for value in key]
+        if key_values[-1] != float(step):
+            raise LoboWatcherError(
+                "augmented fold selection key does not bind its step"
+            )
+        primary_score = finite(
+            record.get("mean_member_primary_strict_proper_score")
+        )
+        supplement_score = finite(
+            record.get("mean_member_supplement_strict_proper_score")
+        )
+        weight = finite(record.get("supplement_strict_proper_weight"))
+        combined_score = finite(record.get("mean_member_strict_proper_score"))
+        primary_se = finite(
+            record.get("primary_conservative_strict_proper_standard_error"),
+            nonnegative=True,
+        )
+        supplement_se = finite(
+            record.get("supplement_conservative_strict_proper_standard_error"),
+            nonnegative=True,
+        )
+        combined_se = finite(
+            record.get("conservative_strict_proper_standard_error"),
+            nonnegative=True,
+        )
+        expected_score = primary_score + 0.25 * supplement_score
+        lower_se = max(primary_se, 0.25 * supplement_se)
+        upper_se = math.sqrt(primary_se**2 + (0.25 * supplement_se) ** 2)
+        if (
+            weight != 0.25
+            or not math.isclose(
+                combined_score, expected_score, rel_tol=1e-9, abs_tol=1e-12
+            )
+            or combined_se < lower_se - 1e-12
+            or combined_se > upper_se + 1e-12
+            or record.get("strict_proper_standard_error_combination")
+            != SUPPLEMENT_STRICT_PROPER_SE_COMBINATION
+        ):
+            raise LoboWatcherError(
+                "augmented fold combined strict-proper evidence changed"
+            )
+        diagnostic = finite(record.get("mean_member_diagnostic_multitask_score"))
+        normalized.append(
+            {
+                "record": record,
+                "step": step,
+                "key": (*key_values[:6], float(step)),
+                "score": combined_score,
+                "standard_error": combined_se,
+                "diagnostic": diagnostic,
+            }
+        )
+
+    proper_best = min(normalized, key=lambda row: (row["score"], row["step"]))
+    threshold = proper_best["score"] + proper_best["standard_error"]
+    comparative = selection.get("comparative_validation_evidence")
+    if not isinstance(comparative, bool):
+        raise LoboWatcherError(
+            "augmented fold comparative-selection audit changed"
+        )
+    eligible = (
+        [row for row in normalized if row["score"] <= threshold + 1e-12]
+        if comparative
+        else [proper_best]
+    )
+    selected = min(eligible, key=lambda row: row["key"])
+    if (
+        selection.get("eligible_steps") != [row["step"] for row in eligible]
+        or selection.get("selected_step") != selected["step"]
+        or ensemble.get("selected_step") != selected["step"]
+        or not math.isclose(
+            finite(selection.get("best_score")),
+            proper_best["score"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            finite(selection.get("conservative_one_standard_error")),
+            proper_best["standard_error"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            finite(selection.get("eligible_threshold")),
+            threshold,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            finite(selection.get("selected_score")),
+            selected["score"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        or ensemble.get("selected_key") != list(selected["record"]["selection_key"])
+        or ensemble.get("selected_ensemble_candidate_ranking")
+        != selected["record"]["ensemble_candidate_ranking"]
+        or not math.isclose(
+            finite(ensemble.get("selected_mean_member_diagnostic_multitask_score")),
+            selected["diagnostic"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    ):
+        raise LoboWatcherError(
+            "augmented fold selected strict-proper audit cannot be replayed"
+        )
+    selected_record = selected["record"]
+    return {
+        "strict_proper_score": ensemble["strict_proper_score"],
+        "evaluated_common_step_count": len(normalized),
+        "selected_step": selected["step"],
+        "selected_combined_strict_proper_evidence": {
+            "mean_member_primary_strict_proper_score": selected_record[
+                "mean_member_primary_strict_proper_score"
+            ],
+            "mean_member_supplement_strict_proper_score": selected_record[
+                "mean_member_supplement_strict_proper_score"
+            ],
+            "supplement_strict_proper_weight": selected_record[
+                "supplement_strict_proper_weight"
+            ],
+            "mean_member_strict_proper_score": selected_record[
+                "mean_member_strict_proper_score"
+            ],
+            "primary_conservative_strict_proper_standard_error": selected_record[
+                "primary_conservative_strict_proper_standard_error"
+            ],
+            "supplement_conservative_strict_proper_standard_error": (
+                selected_record[
+                    "supplement_conservative_strict_proper_standard_error"
+                ]
+            ),
+            "conservative_strict_proper_standard_error": selected_record[
+                "conservative_strict_proper_standard_error"
+            ],
+            "strict_proper_standard_error_combination": selected_record[
+                "strict_proper_standard_error_combination"
+            ],
+        },
+        "strict_proper_selection": dict(selection),
+    }
+
+
 def summarize_fold(
     path: Path,
     held_out_body: str,
@@ -1052,6 +1850,7 @@ def summarize_fold(
     members = summary.get("members")
     ensemble_selection = summary.get("ensemble_checkpoint_selection")
     supplement = summary.get("proper_world_supplement")
+    supplement_selection_audit: dict[str, Any] | None = None
     if expected_supplement_binding_sha256 is None:
         supplement_matches = (
             supplement is None
@@ -1064,6 +1863,10 @@ def summarize_fold(
             )
         )
     else:
+        receipt_contract = SUPPLEMENT_FOLD_RECEIPT_CONTRACT
+        supplement_selection_audit = validate_augmented_strict_proper_selection(
+            summary
+        )
         supplement_matches = bool(
             isinstance(supplement, Mapping)
             and supplement.get("enabled") is True
@@ -1072,18 +1875,57 @@ def summarize_fold(
             and supplement.get("proper_loss_weight") == 0.25
             and supplement.get("rank_loss_weight") == 0.25
             and supplement.get("rank_or_utility_loss_weight") == 0.25
-            and supplement.get("source_train_groups") == 120
-            and supplement.get("source_train_rows") == 480
-            and supplement.get("heldout_groups_deferred") == 30
-            and supplement.get("source_validation_groups") == 0
-            and supplement.get("rank_or_utility_rows_used") == 480
+            and supplement.get("source_train_groups")
+            == receipt_contract["source_train_groups"]
+            and supplement.get("source_train_rows")
+            == receipt_contract["source_train_rows"]
+            and supplement.get("heldout_groups_deferred")
+            == receipt_contract["outer_heldout_groups_deferred"]
+            and supplement.get("source_validation_groups")
+            == receipt_contract["proper_validation_groups"]
+            and supplement.get("source_validation_rows")
+            == receipt_contract["proper_validation_rows"]
+            and supplement.get("source_validation_body")
+            == supplement_proper_validation_body(held_out_body)
+            and supplement.get("source_validation_body_selection")
+            == (
+                "label_blind_sha256_ordered_five_body_cycle_successor_"
+                "derangement"
+            )
+            and supplement.get("rank_or_utility_rows_used")
+            == receipt_contract["source_train_rows"]
             and supplement.get("rank_or_utility_groups_with_real_comparative_supervision", 0)
             > 0
             and supplement.get("semantic_comparative_rows_used") == 0
             and supplement.get("normalization_rows_used") == 0
-            and supplement.get("source_validation_rows_used") == 0
-            and supplement.get("checkpoint_selection_rows_used") == 0
-            and supplement.get("calibration_rows_used") == 0
+            and supplement.get("baseline_fit_rows_used") == 0
+            and supplement.get("source_validation_assignment_uses_labels") is False
+            and supplement.get("source_validation_rows_used")
+            == receipt_contract["proper_validation_rows"]
+            and supplement.get("proper_checkpoint_selection_rows_authorized")
+            == receipt_contract["proper_validation_rows"]
+            and supplement.get("proper_checkpoint_selection_weight") == 0.25
+            and supplement.get("checkpoint_selection_rows_used")
+            == receipt_contract["proper_validation_rows"]
+            and supplement.get("checkpoint_selection_use")
+            == "strict_proper_only_primary_plus_fixed_0.25_supplement"
+            and supplement.get("rank_selection_rows_authorized")
+            == receipt_contract["rank_selection_rows"]
+            and supplement.get("rank_selection_rows_used")
+            == receipt_contract["rank_selection_rows"]
+            and supplement.get("calibration_diagnostic_rows_authorized")
+            == receipt_contract["proper_validation_rows"]
+            and supplement.get("calibration_diagnostic_rows_used")
+            == receipt_contract["proper_validation_rows"]
+            and supplement.get("calibration_rows_used")
+            == receipt_contract["calibration_fit_rows"]
+            and supplement.get("calibration_fit") is False
+            and supplement.get("proper_validation_primary_reset_overlap") == 0
+            and supplement.get("heldout_group_npz_opened") == 0
+            and supplement.get("heldout_group_payload_bytes_read") == 0
+            and supplement.get("heldout_group_payload_deserialized") == 0
+            and supplement.get("heldout_manifest_file_opened") == 0
+            and supplement.get("heldout_manifest_bytes_read") == 0
         )
     if (
         summary.get("status") != "source_only_checkpoint_selection_complete"
@@ -1249,6 +2091,35 @@ def summarize_fold(
         "ensemble_common_selection_step": ensemble_selection["selected_step"],
         "trainer_file_sha256": summary["trainer_file_sha256"],
         "proper_world_supplement": supplement,
+        "proper_world_supplement_fold_receipt_contract": (
+            SUPPLEMENT_FOLD_RECEIPT_CONTRACT
+            if expected_supplement_binding_sha256 is not None
+            else None
+        ),
+        "proper_world_supplement_proper_validation": (
+            {
+                "body": supplement.get("source_validation_body"),
+                "groups": supplement.get("source_validation_groups"),
+                "rows": supplement.get("source_validation_rows"),
+                "checkpoint_selection_rows_used": supplement.get(
+                    "checkpoint_selection_rows_used"
+                ),
+                "rank_selection_rows_used": supplement.get(
+                    "rank_selection_rows_used"
+                ),
+                "calibration_diagnostic_rows_used": supplement.get(
+                    "calibration_diagnostic_rows_used"
+                ),
+                "calibration_rows_used": supplement.get(
+                    "calibration_rows_used"
+                ),
+                "calibration_fit": supplement.get("calibration_fit"),
+                **supplement_selection_audit,
+            }
+            if isinstance(supplement, Mapping)
+            and supplement_selection_audit is not None
+            else None
+        ),
         "member_best_steps": [member.get("best_step") for member in members],
         "member_checkpoints": [
             {
@@ -1552,6 +2423,7 @@ def main() -> int:
     environment.update(
         {
             "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
             "CUDA_VISIBLE_DEVICES": "0",
             "PYTHONPATH": str(code_root),
@@ -1563,15 +2435,29 @@ def main() -> int:
     for fold_index, held_out_body in enumerate(BODIES):
         fold_output = args.output_root / f"outer_lobo_{held_out_body}"
         completed_summary = fold_output / "training_summary.json"
+        attempt_history = validate_fold_attempt_history(
+            args, held_out_body, binding_sha
+        )
         if completed_summary.is_file():
-            fold_results.append(
-                summarize_fold(
-                    fold_output,
-                    held_out_body,
-                    binding_sha,
-                    args.supplement_binding_sha256,
-                )
+            completed_result = summarize_fold(
+                fold_output,
+                held_out_body,
+                binding_sha,
+                args.supplement_binding_sha256,
             )
+            promotion = recover_missing_promotion_receipt(
+                attempt_history, fold_output
+            )
+            promoted_attempt = next(
+                record
+                for record in attempt_history
+                if record["manifest"]["logical_sha256"]
+                == promotion["attempt_logical_sha256"]
+            )
+            completed_result["training_attempt"] = fold_attempt_audit(
+                promoted_attempt, promotion
+            )
+            fold_results.append(completed_result)
             write_state(
                 "fold_already_complete",
                 collection_audit=collection,
@@ -1582,7 +2468,7 @@ def main() -> int:
             continue
         if fold_output.exists():
             raise LoboWatcherError(
-                f"incomplete fold output requires a new formal version: {fold_output}"
+                f"non-atomic/incomplete final fold output is invalid: {fold_output}"
             )
         while True:
             compute_pids = gpu_compute_pids()
@@ -1597,38 +2483,20 @@ def main() -> int:
                 gpu_reserved_by_watcher=False,
             )
             time.sleep(args.poll_seconds)
-        command = [
-            str(args.training_python),
-            str(args.trainer),
-            "--mode", "train-fold",
-            "--binding", str(args.binding),
-            "--binding-sha256", binding_sha,
-            "--held-out-body", held_out_body,
-            "--split-seed", "20260901",
-            "--output", str(fold_output),
-            "--device", "cuda",
-            "--steps", "3000",
-            "--eval-every", "100",
-            "--batch-size", "64",
-            "--learning-rate", "0.0003",
-            "--ensemble-seeds", *[str(seed) for seed in ENSEMBLE_SEEDS],
-        ]
-        if args.supplement_binding is not None:
-            command.extend(
-                [
-                    "--supplement-binding",
-                    str(args.supplement_binding),
-                    "--supplement-binding-sha256",
-                    str(args.supplement_binding_sha256),
-                ]
-            )
-        log_path = logs / f"outer_lobo_{held_out_body}.log"
+        attempt = create_fold_attempt(args, held_out_body, binding_sha)
+        command = list(attempt["manifest"]["command"])
+        log_path = Path(attempt["log"])
         write_state(
             "training_fold",
             collection_audit=collection,
             completed_folds=[row["held_out_body"] for row in fold_results],
             fold_index=fold_index,
             current_fold=held_out_body,
+            fold_attempt_ordinal=attempt["manifest"]["attempt_ordinal"],
+            fold_attempt_manifest_logical_sha256=attempt["manifest"][
+                "logical_sha256"
+            ],
+            prior_fold_attempt_count=len(attempt_history),
             command=command,
             log=str(log_path),
             ensemble_members=5,
@@ -1645,22 +2513,59 @@ def main() -> int:
                 check=False,
             )
         if training.returncode != 0:
+            record_fold_attempt_failure(
+                attempt,
+                returncode=training.returncode,
+                reason=(
+                    "trainer_process_interrupted"
+                    if training.returncode < 0
+                    and -training.returncode in RECOVERABLE_TRAINING_SIGNALS
+                    else "trainer_process_failed"
+                ),
+            )
+            if (
+                training.returncode < 0
+                and -training.returncode in RECOVERABLE_TRAINING_SIGNALS
+            ):
+                propagate_recoverable_training_signal(training.returncode)
             raise LoboWatcherError(
                 f"outer LOBO fold {held_out_body} failed with exit {training.returncode}"
             )
-        fold_results.append(
+        try:
             summarize_fold(
-                fold_output,
+                Path(attempt["training_output"]),
                 held_out_body,
                 binding_sha,
                 args.supplement_binding_sha256,
             )
+        except Exception as error:
+            record_fold_attempt_failure(
+                attempt,
+                returncode=0,
+                reason="trainer_returned_zero_but_fold_validation_failed",
+                error=error,
+            )
+            raise
+        rebind_fold_summary_for_atomic_promotion(attempt, fold_output)
+        promotion = promote_fold_attempt(attempt, fold_output)
+        completed_result = summarize_fold(
+            fold_output,
+            held_out_body,
+            binding_sha,
+            args.supplement_binding_sha256,
         )
+        completed_result["training_attempt"] = fold_attempt_audit(
+            attempt, promotion
+        )
+        fold_results.append(completed_result)
         write_state(
             "fold_complete",
             collection_audit=collection,
             completed_folds=[row["held_out_body"] for row in fold_results],
             last_fold_result=fold_results[-1],
+            promoted_fold_attempt_ordinal=attempt["manifest"][
+                "attempt_ordinal"
+            ],
             gpu=gpu,
         )
 

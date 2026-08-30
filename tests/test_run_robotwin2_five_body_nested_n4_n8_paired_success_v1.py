@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -100,7 +101,16 @@ def test_raw16_blind_fps_produces_exact_nested_prefix_and_candidate_zero() -> No
     assert audit[
         "selection_reads_outcomes_events_labels_or_critic_scores"
     ] is False
-    assert audit["format"].endswith("audit_v2")
+    assert audit["format"].endswith("audit_v3")
+    assert audit["ordered_selection_metrics_n8"] == list(
+        runner.MIXED_SELECTION_METRIC_ORDER
+    )
+    assert audit["ordered_selection_metrics_n4"] == list(
+        runner.MIXED_SELECTION_METRIC_ORDER[: runner.N4_CANDIDATE_COUNT]
+    )
+    assert audit["raw16_flow_noise_contract_sha256"] == runner.canonical_sha256(
+        runner.nested_pool_contract()["raw16_flow_noise_contract"]
+    )
     assert audit["source_action_normalizer"] == _normalizer()
     assert audit["source_action_normalizer_logical_sha256"] == _normalizer()[
         "logical_sha256"
@@ -116,6 +126,18 @@ def test_raw16_blind_fps_produces_exact_nested_prefix_and_candidate_zero() -> No
     )
     with pytest.raises(runner.NestedCandidatePoolError):
         runner.validate_nested_pool_audit(tampered)
+
+    tampered_noise = copy.deepcopy(audit)
+    tampered_noise["raw16_flow_noise_contract_sha256"] = "f" * 64
+    tampered_noise["audit_sha256"] = runner.canonical_sha256(
+        {
+            key: value
+            for key, value in tampered_noise.items()
+            if key != "audit_sha256"
+        }
+    )
+    with pytest.raises(runner.NestedCandidatePoolError):
+        runner.validate_nested_pool_audit(tampered_noise)
 
 
 def test_source_normalized_fps_reverses_raw_unit_dominance_toward_translation() -> None:
@@ -146,6 +168,47 @@ def test_source_normalized_fps_reverses_raw_unit_dominance_toward_translation() 
     )
     assert normalized_indices == [0, 2]
     assert effects[normalized_indices[1], :, 0].mean() == pytest.approx(0.02)
+
+    translation = (
+        runner.pool_runner.source_train_normalized_translation_effect_embeddings(
+            effects,
+            action_mean=np.zeros(14, dtype=np.float32),
+            action_std=std,
+            normalization_clip=float(
+                runner.shared_head.CROSS_BODY_STANDARDIZED_INPUT_CLIP
+            ),
+        )
+    )
+    translation_indices = runner.pool_runner.greedy_farthest_point_indices(
+        translation, retain_count=2
+    )
+    assert translation_indices == [0, 2]
+
+
+def test_mixed_metric_order_preserves_opposite_translation_then_full_coverage() -> None:
+    translation = np.zeros((16, 2), dtype=np.float64)
+    full = np.zeros((16, 3), dtype=np.float64)
+    translation[1] = [10.0, 0.0]
+    translation[2] = [-10.0, 0.0]
+    full[:, :2] = translation
+    # Raw 3 has no translation difference but provides a large orientation/
+    # gripper-like direction.  It must enter only at the declared full slot.
+    full[3, 2] = 100.0
+    selected = runner.mixed_metric_farthest_point_indices(translation, full)
+    assert selected[:4] == [0, 1, 2, 3]
+    assert runner.MIXED_SELECTION_METRIC_ORDER == (
+        "anchor_candidate_zero",
+        "translation",
+        "translation",
+        "full",
+        "translation",
+        "translation",
+        "translation",
+        "full",
+    )
+    assert runner.nested_pool_contract()[
+        "selection_reads_outcomes_events_labels_or_critic_scores"
+    ] is False
 
 
 def test_fold_fails_closed_when_one_member_normalizer_differs(
@@ -223,6 +286,12 @@ def test_audit_and_commitment_normalizer_sha_tampering_fails_closed() -> None:
         "requested_seed": expected["requested_seed"],
         "resolved_seed": expected["requested_seed"],
         "nested_pool_audit": audit,
+        "nested_pool_contract_sha256": runner.canonical_sha256(
+            runner.nested_pool_contract()
+        ),
+        "raw16_flow_noise_contract_sha256": audit[
+            "raw16_flow_noise_contract_sha256"
+        ],
         "source_action_normalizer_logical_sha256": audit[
             "source_action_normalizer_logical_sha256"
         ],
@@ -259,6 +328,22 @@ def test_audit_and_commitment_normalizer_sha_tampering_fails_closed() -> None:
             expected_source_action_normalizer_logical_sha256=authority_sha,
         )
 
+    changed_noise_commitment = copy.deepcopy(commitment)
+    changed_noise_commitment["raw16_flow_noise_contract_sha256"] = "d" * 64
+    changed_noise_commitment["commitment_sha256"] = runner.canonical_sha256(
+        {
+            key: value
+            for key, value in changed_noise_commitment.items()
+            if key != "commitment_sha256"
+        }
+    )
+    with pytest.raises(runner.NestedCandidatePoolError):
+        runner.validate_stored_initial_commitment(
+            changed_noise_commitment,
+            expected,
+            expected_source_action_normalizer_logical_sha256=authority_sha,
+        )
+
 
 def test_self_consistent_replacement_commitment_normalizer_is_rejected() -> None:
     expected = runner.evaluation_schedule()[0]
@@ -278,6 +363,12 @@ def test_self_consistent_replacement_commitment_normalizer_is_rejected() -> None
         "requested_seed": expected["requested_seed"],
         "resolved_seed": expected["requested_seed"],
         "nested_pool_audit": changed_audit,
+        "nested_pool_contract_sha256": runner.canonical_sha256(
+            runner.nested_pool_contract()
+        ),
+        "raw16_flow_noise_contract_sha256": changed_audit[
+            "raw16_flow_noise_contract_sha256"
+        ],
         "source_action_normalizer_logical_sha256": changed_audit[
             "source_action_normalizer_logical_sha256"
         ],
@@ -431,6 +522,9 @@ def _decision(
         "raw_ordered_proposals_sha256": audit["raw_ordered_proposals_sha256"],
         "raw_proposal_zero_sha256": audit["raw_proposal_zero_sha256"],
         "nested_pool_audit": audit,
+        "raw16_flow_noise_contract_sha256": audit[
+            "raw16_flow_noise_contract_sha256"
+        ],
         "source_action_normalizer_logical_sha256": audit[
             "source_action_normalizer_logical_sha256"
         ],
@@ -474,6 +568,9 @@ def test_triplet_materialization_requires_one_reset_and_initial_raw16() -> None:
         "canonical_query_snapshot": {"format": "canonical", "step": 1},
         "raw_ordered_proposals_sha256": audit["raw_ordered_proposals_sha256"],
         "nested_pool_audit": audit,
+        "raw16_flow_noise_contract_sha256": audit[
+            "raw16_flow_noise_contract_sha256"
+        ],
         "source_action_normalizer_logical_sha256": audit[
             "source_action_normalizer_logical_sha256"
         ],
@@ -667,6 +764,12 @@ def _persist_complete_triplet(
         "requested_seed": expected["requested_seed"],
         "resolved_seed": expected["requested_seed"],
         "nested_pool_audit": audit,
+        "nested_pool_contract_sha256": runner.canonical_sha256(
+            runner.nested_pool_contract()
+        ),
+        "raw16_flow_noise_contract_sha256": audit[
+            "raw16_flow_noise_contract_sha256"
+        ],
         "source_action_normalizer_logical_sha256": audit[
             "source_action_normalizer_logical_sha256"
         ],
@@ -784,6 +887,33 @@ def test_existing_pair_embedded_outcome_must_match_method_result(
     with pytest.raises(
         runner.NestedCandidatePoolError,
         match="differs from its method results",
+    ):
+        runner.recover_complete_existing_triplet(**paths, **context)
+
+
+def test_recovery_rejects_changed_raw16_noise_contract_binding(
+    tmp_path: Path,
+) -> None:
+    context, _pair, paths = _persist_complete_triplet(tmp_path)
+    commitment_path = paths["commitment_path"]
+    commitment = json.loads(commitment_path.read_text(encoding="utf-8"))
+    commitment["raw16_flow_noise_contract_sha256"] = "e" * 64
+    commitment["commitment_sha256"] = runner.canonical_sha256(
+        {
+            key: value
+            for key, value in commitment.items()
+            if key != "commitment_sha256"
+        }
+    )
+    commitment_path.chmod(0o644)
+    commitment_path.write_text(
+        json.dumps(commitment, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    commitment_path.chmod(0o444)
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="stored initial commitment changed",
     ):
         runner.recover_complete_existing_triplet(**paths, **context)
 
