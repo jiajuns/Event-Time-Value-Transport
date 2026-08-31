@@ -39,6 +39,9 @@ import run_robotwin2_five_body_paired_success_v1 as formal
 import run_robotwin2_five_body_postformal_candidate_pool_v1 as pool_runner
 import robotwin2_relative_action_critic_adapter_v1 as rac_adapter
 import train_robotwin2_five_body_lobo_relative_action_critic_v1 as rac_trainer
+import robotwin2_wcm_future_latent_adapter_v1 as wcm_adapter
+import robotwin2_wcm_future_latent_baseline_v1 as wcm_baseline
+import train_robotwin2_five_body_lobo_wcm_future_latent_baseline_v1 as wcm_trainer
 
 
 collector = formal.collector
@@ -52,7 +55,8 @@ OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
 REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
 COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
 RAC_RANK_RECEIPT_FORMAT = "etsf_robotwin2_nested_rac_rank_receipt_v1"
-CRITIC_KINDS = ("etsf", "rac")
+WCM_RANK_RECEIPT_FORMAT = wcm_adapter.RANK_RECEIPT_FORMAT
+CRITIC_KINDS = ("etsf", "rac", "wcm")
 ORACLE_TRUTH_FORMAT = "etsf_robotwin2_nested_query0_oracle_truth_v1"
 ORACLE_TRUTH_STATUS = "complete_1000_query0_groups_8000_candidate_rollouts"
 ORACLE_GROUP_FORMAT = "etsf_robotwin2_nested_query0_oracle_group_v1"
@@ -698,6 +702,56 @@ def validate_runtime_rac_action_normalizer(
             raise NestedCandidatePoolError("runtime RAC normalizer differs from binding")
 
 
+def inspect_wcm_fold(body: str, fold_root: Path) -> dict[str, Any]:
+    try:
+        return wcm_adapter.inspect_fold(
+            body,
+            fold_root,
+            expected_actor_protocol_binding=formal.actor_execution_protocol_binding(),
+        )
+    except wcm_adapter.WCMAdapterError as error:
+        raise NestedCandidatePoolError(str(error)) from error
+
+
+def inspect_wcm_fold_source_action_normalizer(
+    fold: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        result = wcm_adapter.inspect_source_action_normalizer(fold)
+    except wcm_adapter.WCMAdapterError as error:
+        raise NestedCandidatePoolError(str(error)) from error
+    validate_source_action_normalizer(
+        result, expected_heldout_body=str(fold.get("heldout_body"))
+    )
+    return result
+
+
+def inspect_wcm_fold_training_regime(
+    folds: Mapping[str, Mapping[str, Any]],
+    *,
+    required_supplement_binding_sha256: str | None,
+) -> dict[str, Any]:
+    try:
+        return wcm_adapter.inspect_training_regime(
+            folds,
+            required_supplement_binding_sha256=(
+                required_supplement_binding_sha256
+            ),
+        )
+    except wcm_adapter.WCMAdapterError as error:
+        raise NestedCandidatePoolError(str(error)) from error
+
+
+def validate_runtime_wcm_action_normalizer(
+    ensemble: wcm_baseline.WCMFutureLatentEnsemble,
+    binding: Mapping[str, Any],
+) -> None:
+    try:
+        wcm_adapter.validate_runtime_action_normalizer(ensemble, binding)
+    except wcm_adapter.WCMAdapterError as error:
+        raise NestedCandidatePoolError(str(error)) from error
+
+
 def existing_separate_n4_n8_comparability_audit() -> dict[str, Any]:
     """State why the two existing independent studies are not a pool-size RCT."""
 
@@ -1307,21 +1361,33 @@ def _score_candidates(
             )
         )
     if not isinstance(critic_load_receipt, Mapping):
-        raise NestedCandidatePoolError("RAC score lacks ensemble load receipt")
-    try:
-        result = (
-            rac_adapter.score_n4_candidates(ensemble, batch)
-            if method == METHOD_N4
-            else rac_adapter.score_n8_candidates(ensemble, batch)
+        raise NestedCandidatePoolError("critic score lacks ensemble load receipt")
+    if critic_kind == "rac":
+        try:
+            result = (
+                rac_adapter.score_n4_candidates(ensemble, batch)
+                if method == METHOD_N4
+                else rac_adapter.score_n8_candidates(ensemble, batch)
+            )
+        except rac_adapter.RelativeActionCriticAdapterError as error:
+            raise NestedCandidatePoolError(str(error)) from error
+        receipt = build_rac_rank_receipt(
+            result,
+            method=method,
+            critic_load_receipt=critic_load_receipt,
         )
-    except rac_adapter.RelativeActionCriticAdapterError as error:
+        return {**result, "critic_kind": "rac", "rank_receipt": receipt}
+    try:
+        return wcm_adapter.score_candidates(
+            ensemble,
+            batch,
+            candidate_count=_expected_pool_count(method),
+            method=method,
+            load_receipt=critic_load_receipt,
+            candidate_roster_sha256=array_sha256(candidates),
+        )
+    except wcm_adapter.WCMAdapterError as error:
         raise NestedCandidatePoolError(str(error)) from error
-    receipt = build_rac_rank_receipt(
-        result,
-        method=method,
-        critic_load_receipt=critic_load_receipt,
-    )
-    return {**result, "critic_kind": "rac", "rank_receipt": receipt}
 
 
 def build_rac_rank_receipt(
@@ -2300,6 +2366,25 @@ def validate_rollout(
             except rac_adapter.RelativeActionCriticAdapterError as error:
                 raise NestedCandidatePoolError(str(error)) from error
             validate_rac_rank_receipt(scores, method=method, expected=expected)
+        elif critic_kind == "wcm":
+            try:
+                recomputed_tensor = wcm_baseline.aggregate_epistemic_lcb(
+                    torch.as_tensor(member_scores)
+                )
+                wcm_adapter.validate_rank_receipt(
+                    scores,
+                    method=method,
+                    candidate_count=expected_count,
+                    expected_heldout_body=str(expected["heldout_body"]),
+                    expected_candidate_roster_sha256=str(
+                        decision["selection_pool_sha256"]
+                    ),
+                )
+            except (
+                wcm_baseline.WCMBaselineError,
+                wcm_adapter.WCMAdapterError,
+            ) as error:
+                raise NestedCandidatePoolError(str(error)) from error
         else:
             recomputed_tensor = (
                 shared_head.aggregate_risk_adjusted_rank_scores(
@@ -3294,6 +3379,18 @@ def implementation_binding(
             {"path": str(path), "sha256": sha256_file(path)}
             for path in rac_paths
         ]
+    elif critic_kind == "wcm":
+        wcm_paths = [
+            Path(inspect.getsourcefile(wcm_adapter) or "").resolve(),
+            Path(inspect.getsourcefile(wcm_baseline) or "").resolve(),
+            Path(inspect.getsourcefile(wcm_trainer) or "").resolve(),
+        ]
+        result["critic_kind"] = "wcm"
+        result["matched_wcm_style_files"] = [
+            {"path": str(path), "sha256": sha256_file(path)}
+            for path in wcm_paths
+        ]
+        result["not_official_wcm_architecture_or_weights"] = True
     elif critic_kind != "etsf":
         raise NestedCandidatePoolError("unknown critic kind")
     return result
@@ -3374,7 +3471,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.required_supplement_binding_sha256
             ),
         )
-    else:
+    elif args.critic_kind == "rac":
         folds = {
             body: inspect_rac_fold(body, fold_paths[body]) for body in BODIES
         }
@@ -3383,6 +3480,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             for body in BODIES
         }
         fold_training_regime = inspect_rac_fold_training_regime(
+            folds,
+            required_supplement_binding_sha256=(
+                args.required_supplement_binding_sha256
+            ),
+        )
+    else:
+        folds = {
+            body: inspect_wcm_fold(body, fold_paths[body]) for body in BODIES
+        }
+        fold_action_normalizers = {
+            body: inspect_wcm_fold_source_action_normalizer(folds[body])
+            for body in BODIES
+        }
+        fold_training_regime = inspect_wcm_fold_training_regime(
             folds,
             required_supplement_binding_sha256=(
                 args.required_supplement_binding_sha256
@@ -3478,19 +3589,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             fold_action_normalizers
         ),
         "fold_training_regime": fold_training_regime,
-        "candidate_rank_ensemble_contracts": (
-            {
+        "candidate_rank_ensemble_contracts": {
+            "etsf": {
                 "nested_n4": shared_head.risk_adjusted_rank_ensemble_contract(),
                 "nested_n8": pool_runner.runtime_rank_ensemble_contract(
                     N8_CANDIDATE_COUNT
                 ),
-            }
-            if args.critic_kind == "etsf"
-            else {
+            },
+            "rac": {
                 "nested_n4": rac_adapter.runtime_contract(N4_CANDIDATE_COUNT),
                 "nested_n8": rac_adapter.runtime_contract(N8_CANDIDATE_COUNT),
-            }
-        ),
+            },
+            "wcm": {
+                "nested_n4": wcm_adapter.runtime_contract(N4_CANDIDATE_COUNT),
+                "nested_n8": wcm_adapter.runtime_contract(N8_CANDIDATE_COUNT),
+            },
+        }[args.critic_kind],
         "event_spec": str(event_spec_path),
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "analytic_event_contract": analytic_event.event_contract(calibration),
@@ -3525,6 +3639,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             METHOD_N8: "rac",
         }
         contract_base["rac_rank_receipt_format"] = RAC_RANK_RECEIPT_FORMAT
+    elif args.critic_kind == "wcm":
+        contract_base["critic_kind"] = "wcm"
+        contract_base["method_critic_assignment"] = {
+            METHOD_ACTOR: None,
+            METHOD_N4: "wcm",
+            METHOD_N8: "wcm",
+        }
+        contract_base["wcm_rank_receipt_format"] = WCM_RANK_RECEIPT_FORMAT
+        contract_base["not_official_wcm_architecture_or_weights"] = True
     contract = {**contract_base, "logical_sha256": canonical_sha256(contract_base)}
     contract_file_sha = promote_create_once_json(
         contract_path, contract, label="nested execution contract"
@@ -3669,7 +3792,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ensemble, fold_action_normalizers[body]
                 )
                 critic_load_receipt = None
-            else:
+            elif args.critic_kind == "rac":
                 try:
                     ensemble, critic_load_receipt = rac_adapter.load_fold_ensemble(
                         Path(str(folds[body]["training_summary"])),
@@ -3681,6 +3804,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 validate_runtime_rac_action_normalizer(
                     ensemble, fold_action_normalizers[body]
                 )
+            else:
+                try:
+                    ensemble, critic_load_receipt = wcm_adapter.load_fold_ensemble(
+                        folds[body], device=device
+                    )
+                    validate_runtime_wcm_action_normalizer(
+                        ensemble, fold_action_normalizers[body]
+                    )
+                except wcm_adapter.WCMAdapterError as error:
+                    raise NestedCandidatePoolError(str(error)) from error
             active_body = body
         promote_create_once_json(
             attempt_path, attempt, label="nested triplet attempt"

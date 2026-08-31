@@ -106,7 +106,6 @@ CANDIDATE_RANK_FEATURE_DIM = max(
 MONOTONE_BENEFIT_FEATURES = (
     "post_expected_stage_progress",
     "next_event_advance_rate",
-    "success_probability",
     "no_unrecovered_regression_probability",
     "short_goal_progress_benefit",
     "terminal_expected_stage_progress",
@@ -240,7 +239,14 @@ SEMANTIC_COMPARATIVE_GRADIENT_BUDGET = 0.1
 SEMANTIC_GRADIENT_SCALE_CAP = 1.0
 TERMINAL_FILM_MODULATION_BOUND = 0.1
 EVENT_UTILITY_RESIDUAL_BOUND = 1.0
-EVENT_PRIORITY_SECONDARY_SCALE = 0.05
+# The non-success residual lies in [-1, 1].  Scaling it by half this margin
+# bounds the largest pairwise residual reversal by exactly the margin, so any
+# coherent success-probability advantage strictly above it must win.
+SUCCESS_PROBABILITY_PRIORITY_MARGIN = 0.05
+NON_SUCCESS_RESIDUAL_HALF_RANGE = SUCCESS_PROBABILITY_PRIORITY_MARGIN / 2.0
+# Backward-compatible public name; its semantics are now the proven half-range
+# of a failure-conditioned residual, not an event-stage secondary scale.
+EVENT_PRIORITY_SECONDARY_SCALE = NON_SUCCESS_RESIDUAL_HALF_RANGE
 DENSE_RANK_LABEL_EQUALITY_TOLERANCE = 1e-4
 MINIMUM_COMPARATIVE_VALIDATION_SEED_CLUSTERS = 10
 MINIMUM_COMPARATIVE_VALIDATION_REQUESTED_SEEDS = 2
@@ -609,12 +615,14 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "direct_transitioned_or_clock_hidden_rank_path": False,
         "rank_inputs_are_detached_consequence_predictions": variant != "success_only",
         "rank_utility": (
-            "bounded_invariant_monotone_global_plus_canonical_event_residual_utility"
+            "coherent_success_primary_plus_bounded_failure_conditioned_"
+            "invariant_monotone_consequence_residual"
             if variant != "success_only"
             else "coherent_bounded_terminal_success_probability"
         ),
         "utility_conditioning": (
-            "canonical_current_event_global_logits_plus_bounded_event_residual"
+            "coherent_success_primary_plus_canonical_current_event_shared_"
+            "convex_non_success_consequence_weights"
             if variant != "success_only"
             else "coherent_success_probability_only"
         ),
@@ -622,7 +630,7 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             EVENT_UTILITY_RESIDUAL_BOUND if variant != "success_only" else 0.0
         ),
         "event_priority_primary": (
-            "terminal_expected_stage_progress"
+            "terminal_eK_success_probability"
             if variant != "success_only"
             else "terminal_eK_probability"
         ),
@@ -630,9 +638,40 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             EVENT_PRIORITY_SECONDARY_SCALE if variant != "success_only" else 0.0
         ),
         "deterministic_one_event_step_dominates_all_secondary_features": (
-            variant != "success_only"
+            False
         ),
         "strict_lexicographic_for_arbitrary_expected_stage_difference": False,
+        "success_probability_priority_margin": (
+            SUCCESS_PROBABILITY_PRIORITY_MARGIN
+            if variant != "success_only"
+            else 0.0
+        ),
+        "success_probability_advantage_strictly_dominates_above_margin": True,
+        "non_success_residual_conditioning": (
+            "one_minus_coherent_terminal_eK_success_probability"
+            if variant != "success_only"
+            else "disabled"
+        ),
+        "non_success_residual_half_range": (
+            NON_SUCCESS_RESIDUAL_HALF_RANGE
+            if variant != "success_only"
+            else 0.0
+        ),
+        "non_success_residual_pairwise_maximum_reversal": (
+            SUCCESS_PROBABILITY_PRIORITY_MARGIN
+            if variant != "success_only"
+            else 0.0
+        ),
+        "non_success_benefit_aggregation": (
+            "convex_softmax_shared_across_bodies_with_bounded_event_residual"
+            if variant != "success_only"
+            else "disabled"
+        ),
+        "non_success_risk_aggregation": (
+            "convex_softmax_shared_across_bodies_with_bounded_event_residual"
+            if variant != "success_only"
+            else "disabled"
+        ),
         "body_conditioned_utility_parameters": False,
         "raw_world_frame_object_axes_in_rank_input": False,
         "cross_feature_layer_normalization": False,
@@ -674,14 +713,18 @@ def checkpoint_candidate_rank_contract(variant: str) -> dict[str, Any]:
             "law_of_total_variance_within_event_student_t3_plus_between_event"
         ),
         "duration_joint_distribution": (
-            "p(next_event)_times_lognormal_log1p_duration_conditioned_on_"
-            "next_event"
+            "p(next_event_not_equal_current_event)_times_lognormal_log1p_"
+            "duration_conditioned_on_supported_next_event"
         ),
+        "next_event_supported_destination_set": "all_canonical_events_except_current_event",
+        "next_event_self_class_probability": "exact_zero_after_fail_closed_mask",
+        "next_event_no_boundary_representation": "right_censor_only_not_self_class",
         "duration_observed_likelihood": (
             "observed_next_event_component_nll_with_separate_next_event_ce"
         ),
         "duration_censored_likelihood": (
-            "negative_log_sum_next_event_probability_times_component_survival"
+            "negative_log_sum_supported_nonself_next_event_probability_times_"
+            "component_survival"
         ),
         "censored_duration_updates_next_event_probability": True,
         "duration_component_clock_gradient_updates_semantic_transition": False,
@@ -932,6 +975,27 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         "strict_lexicographic_for_arbitrary_expected_stage_difference": checkpoint[
             "strict_lexicographic_for_arbitrary_expected_stage_difference"
         ],
+        "success_probability_priority_margin": checkpoint[
+            "success_probability_priority_margin"
+        ],
+        "success_probability_advantage_strictly_dominates_above_margin": checkpoint[
+            "success_probability_advantage_strictly_dominates_above_margin"
+        ],
+        "non_success_residual_conditioning": checkpoint[
+            "non_success_residual_conditioning"
+        ],
+        "non_success_residual_half_range": checkpoint[
+            "non_success_residual_half_range"
+        ],
+        "non_success_residual_pairwise_maximum_reversal": checkpoint[
+            "non_success_residual_pairwise_maximum_reversal"
+        ],
+        "non_success_benefit_aggregation": checkpoint[
+            "non_success_benefit_aggregation"
+        ],
+        "non_success_risk_aggregation": checkpoint[
+            "non_success_risk_aggregation"
+        ],
         "body_conditioned_utility_parameters": checkpoint[
             "body_conditioned_utility_parameters"
         ],
@@ -1033,6 +1097,15 @@ def summary_candidate_rank_contract(variant: str) -> dict[str, Any]:
         ],
         "duration_joint_distribution": checkpoint[
             "duration_joint_distribution"
+        ],
+        "next_event_supported_destination_set": checkpoint[
+            "next_event_supported_destination_set"
+        ],
+        "next_event_self_class_probability": checkpoint[
+            "next_event_self_class_probability"
+        ],
+        "next_event_no_boundary_representation": checkpoint[
+            "next_event_no_boundary_representation"
         ],
         "duration_observed_likelihood": checkpoint[
             "duration_observed_likelihood"
@@ -3072,6 +3145,10 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
             (arrays["duration_observed"] > 0.5)
             & ~(arrays["next_event_mask"] > 0.5)
         )
+        or np.any(
+            (arrays["next_event_mask"] > 0.5)
+            & (arrays["next_event_id"] == arrays["current_event_id"])
+        )
     ):
         raise FiveBodyContractError(
             f"{path} next-event/duration supervision is invalid"
@@ -3630,25 +3707,26 @@ class MacroBalancedRankDecisionBatchSampler:
 class InvariantMonotoneConsequenceUtility(torch.nn.Module):
     """Signed utility over bounded, cross-embodiment consequences.
 
-    Terminal event progress is the primary value.  Benefits have non-negative
-    softmax weights and uncertainties have non-positive bounded coefficients in
-    a small tie-break term.  Canonical-current-event residuals are shared across
-    bodies.  There is no cross-feature LayerNorm, raw world-frame object axis,
-    or unconstrained sign-flipping MLP.
+    Coherent terminal success probability is the strict primary value.  All
+    stage, duration, effect, recovery and uncertainty terms form one
+    failure-conditioned residual with a proven pairwise range no larger than
+    ``SUCCESS_PROBABILITY_PRIORITY_MARGIN``.  Benefits and risks each use a
+    convex combination, and canonical-current-event residuals only change those
+    shared convex weights.  There is no cross-feature LayerNorm, raw world-frame
+    object axis, body-private parameter, or unconstrained sign-flipping MLP.
     """
 
     def __init__(self) -> None:
         super().__init__()
         benefit_initial = torch.zeros(len(MONOTONE_BENEFIT_FEATURES))
-        benefit_initial[MONOTONE_BENEFIT_FEATURES.index("success_probability")] = 2.0
         benefit_initial[
             MONOTONE_BENEFIT_FEATURES.index(
                 "terminal_expected_stage_progress"
             )
-        ] = 1.0
+        ] = 2.0
         self.benefit_logits = torch.nn.Parameter(benefit_initial)
         self.risk_logits = torch.nn.Parameter(
-            torch.full((len(MONOTONE_RISK_FEATURES),), -2.0)
+            torch.zeros(len(MONOTONE_RISK_FEATURES))
         )
         self.event_benefit_residual = torch.nn.Parameter(
             torch.zeros(len(core.CANONICAL_EVENTS), len(MONOTONE_BENEFIT_FEATURES))
@@ -3713,21 +3791,23 @@ class InvariantMonotoneConsequenceUtility(torch.nn.Module):
         benefit_weights = torch.softmax(
             self.benefit_logits[None] + benefit_residual, dim=-1
         )
-        risk_weights = torch.sigmoid(self.risk_logits[None] + risk_residual)
-        secondary = (benefit * benefit_weights).sum(dim=-1) - (
-            risk * risk_weights
-        ).sum(dim=-1)
-        terminal_stage_index = CANDIDATE_RANK_FEATURE_SCHEMA[
-            "terminal_expected_stage_progress"
-        ][0]
-        # ``secondary`` is strictly bounded to (-2, 1): benefits are a convex
-        # combination of [0, 1] values and the two risks each have coefficients
-        # in (0, 1).  At scale 0.05 its entire possible reversal is < 0.15, so a
-        # deterministic canonical one-event step (0.25) remains absolute while
-        # the learned consequences can still break event ties.
+        risk_weights = torch.softmax(
+            self.risk_logits[None] + risk_residual, dim=-1
+        )
+        benefit_value = (benefit * benefit_weights).sum(dim=-1)
+        risk_value = (risk * risk_weights).sum(dim=-1)
+        success_index = CANDIDATE_RANK_FEATURE_SCHEMA["success_probability"][0]
+        success_probability = features[:, success_index]
+        failure_probability = 1.0 - success_probability
+        # Both convex values lie in [0, 1], hence ``residual_unit`` lies in
+        # [-1, 1].  A single candidate residual therefore lies in
+        # [-margin/2, margin/2] and a pairwise reversal is at most ``margin``.
+        # For candidates a,b, p_a-p_b > margin implies U_a-U_b > 0 regardless
+        # of every non-success consequence and uncertainty prediction.
+        residual_unit = failure_probability * (benefit_value - risk_value)
         return (
-            features[:, terminal_stage_index]
-            + EVENT_PRIORITY_SECONDARY_SCALE * secondary
+            success_probability
+            + NON_SUCCESS_RESIDUAL_HALF_RANGE * residual_unit
         )
 
 
@@ -3830,6 +3910,57 @@ def _next_event_duration_mixture_moments(
     return mixture_mean, mixture_std, torch.log(mixture_std)
 
 
+def _mask_next_event_self_class(
+    logits: torch.Tensor, current_event_id: torch.Tensor
+) -> torch.Tensor:
+    """Remove the current event from the next-boundary competing-risk support.
+
+    ``next_event`` is defined by the collector as the first future canonical
+    event *different* from the event at the branch root.  A continuation with
+    no such boundary is right-censored; it is not an observation of
+    ``next_event == current_event``.  Keeping the self class in the categorical
+    support would let the model explain censoring with an unidentifiable
+    long-lived pseudo-cause.  Masking here is shared by inference and the
+    censored likelihood and deliberately does not alter ``post_event`` or
+    ``terminal_event`` support.
+    """
+
+    if (
+        not isinstance(logits, torch.Tensor)
+        or not logits.is_floating_point()
+        or logits.ndim != 2
+        or logits.shape[-1] != len(core.CANONICAL_EVENTS)
+        or not isinstance(current_event_id, torch.Tensor)
+        or current_event_id.shape != logits.shape[:1]
+        or current_event_id.dtype
+        not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }
+        or bool(
+            (
+                (current_event_id < 0)
+                | (current_event_id >= len(core.CANONICAL_EVENTS))
+            ).any()
+        )
+    ):
+        raise FiveBodyContractError("next-event self-class mask input is invalid")
+    current = current_event_id.to(device=logits.device, dtype=torch.long)[:, None]
+    event = torch.arange(logits.shape[-1], device=logits.device)[None]
+    supported = event != current
+    if not bool(torch.isfinite(logits[supported]).all()):
+        raise FiveBodyContractError(
+            "next-event supported destination logits contain non-finite values"
+        )
+    # Use the finite dtype minimum rather than -inf so generic checkpoint and
+    # diagnostic finite-value checks remain valid.  Softmax underflows this
+    # class to exact zero for every supported floating dtype.
+    return logits.masked_fill(~supported, torch.finfo(logits.dtype).min)
+
+
 def _competing_risks_duration_nll_rows(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, torch.Tensor],
@@ -3844,7 +3975,9 @@ def _competing_risks_duration_nll_rows(
     current-event duration.
     """
 
-    logits = output["next_event_logits"]
+    logits = _mask_next_event_self_class(
+        output["next_event_logits"], batch["current_event_id"]
+    )
     mean = output["duration_component_log_mean"]
     log_scale = output["duration_component_log_scale"]
     duration = batch["duration"].to(mean)
@@ -3876,6 +4009,15 @@ def _competing_risks_duration_nll_rows(
     if bool((observed & ~next_mask).any()):
         raise FiveBodyContractError(
             "observed duration requires an observed next-event label"
+        )
+    if bool(
+        (
+            next_mask
+            & (next_event == batch["current_event_id"].to(next_event).long())
+        ).any()
+    ):
+        raise FiveBodyContractError(
+            "observed next-event label cannot equal the current event"
         )
     target = torch.log1p(duration)
     scale = torch.exp(log_scale).clamp_min(1e-4)
@@ -4012,6 +4154,9 @@ class EffectAlignedSharedEventHead(core.MultibodyCanonicalEventWorldModel):
             max=CROSS_BODY_STANDARDIZED_INPUT_CLIP,
         )
         output = super().forward(normalized_batch)
+        output["next_event_logits"] = _mask_next_event_self_class(
+            output["next_event_logits"], batch["current_event_id"]
+        )
         post_probability = torch.softmax(output["post_event_logits"], dim=-1)
         object_component_mean = self.object_delta_component_mean(
             output["transitioned"]
@@ -8587,6 +8732,8 @@ __all__ = [
     "DENSE_RANK_LABEL_EQUALITY_TOLERANCE",
     "EPISTEMIC_RANK_RISK_WEIGHT", "GOAL_PROGRESS_NORMALIZATION_METERS",
     "EVENT_PRIORITY_SECONDARY_SCALE", "EVENT_UTILITY_RESIDUAL_BOUND",
+    "NON_SUCCESS_RESIDUAL_HALF_RANGE",
+    "SUCCESS_PROBABILITY_PRIORITY_MARGIN",
     "CONDITIONS", "FORMAT",
     "EffectAlignedSharedEventHead", "FiveBodyContractError",
     "InvariantMonotoneConsequenceUtility", "MANIFEST_FORMAT",

@@ -45,6 +45,36 @@ def _rac_load_receipt(body: str) -> dict[str, object]:
     return {**base, "logical_sha256": runner.canonical_sha256(base)}
 
 
+def _wcm_load_receipt(body: str) -> dict[str, object]:
+    base = {
+        "format": runner.wcm_adapter.LOAD_RECEIPT_FORMAT,
+        "critic_kind": "wcm",
+        "model_family": runner.wcm_baseline.MODEL_FAMILY,
+        "held_out_body": body,
+        "source_bodies": [candidate for candidate in runner.BODIES if candidate != body],
+        "common_selection_step": 3000,
+        "training_summary": "/frozen/wcm/training_summary.json",
+        "training_summary_sha256": "a" * 64,
+        "training_summary_logical_sha256": "b" * 64,
+        "members": [
+            {
+                "member": member,
+                "seed": runner.wcm_trainer.DEFAULT_ENSEMBLE_SEEDS[member],
+                "step": 3000,
+                "checkpoint": f"/frozen/wcm/member-{member}.pt",
+                "checkpoint_sha256": f"{member + 1:x}" * 64,
+                "normalization_logical_sha256": "c" * 64,
+            }
+            for member in range(5)
+        ],
+        "rank_score_contract": copy.deepcopy(
+            runner.wcm_baseline.RANK_SCORE_CONTRACT
+        ),
+        "heldout_payloads_or_labels_opened": 0,
+    }
+    return runner.wcm_adapter.signed(base)
+
+
 class _FakeRac:
     def __init__(self, offset: float) -> None:
         self.offset = offset
@@ -55,6 +85,17 @@ class _FakeRac:
     def __call__(self, batch):
         delta = batch["action_i"][:, 0, 0] - batch["action_j"][:, 0, 0]
         return delta * 10.0 + self.offset
+
+
+class _FakeWcmMember(torch.nn.Module):
+    def __init__(self, offset: float) -> None:
+        super().__init__()
+        self.offset = offset
+
+    def forward(self, batch):
+        return {
+            "candidate_rank_logit": batch["actions"][:, 0, 0] + self.offset
+        }
 
 
 def _current() -> np.ndarray:
@@ -76,6 +117,64 @@ def _raw16() -> np.ndarray:
         chunk[:, 15] = (index % 5) / 4.0
         rows.append(chunk)
     return np.stack(rows).astype(np.float32)
+
+
+@pytest.mark.parametrize(
+    ("method", "count"),
+    [
+        ("etsf_nested_best_of_4_from_raw16", 4),
+        ("etsf_nested_best_of_8_from_raw16", 8),
+    ],
+)
+def test_nested_wcm_path_scores_and_replays_bound_candidate_roster(
+    method: str, count: int
+) -> None:
+    state = np.zeros(runner.collector.STATE_DIM, dtype=np.float32)
+    state[18] = 1.0
+    candidates = _raw16()[:count]
+    ensemble = runner.wcm_baseline.WCMFutureLatentEnsemble(
+        [_FakeWcmMember(0.01 * member) for member in range(5)]  # type: ignore[list-item]
+    )
+    scores = runner._score_candidates(
+        method=method,
+        ensemble=ensemble,
+        state=state,
+        current_ee=_current(),
+        candidates=candidates,
+        current_event=0,
+        event_age_seconds=0.0,
+        remaining_action_budget=200,
+        device=torch.device("cpu"),
+        critic_kind="wcm",
+        critic_load_receipt=_wcm_load_receipt(runner.BODIES[0]),
+    )
+    assert scores["critic_kind"] == "wcm"
+    assert scores["candidate_roster_sha256"] == runner.array_sha256(candidates)
+    runner.wcm_adapter.validate_rank_receipt(
+        scores,
+        method=method,
+        candidate_count=count,
+        expected_heldout_body=runner.BODIES[0],
+        expected_candidate_roster_sha256=runner.array_sha256(candidates),
+    )
+    changed = copy.deepcopy(scores)
+    changed["candidate_roster_sha256"] = "f" * 64
+    changed["rank_receipt"]["candidate_roster_sha256"] = "f" * 64
+    changed["rank_receipt"]["logical_sha256"] = runner.canonical_sha256(
+        {
+            key: value
+            for key, value in changed["rank_receipt"].items()
+            if key != "logical_sha256"
+        }
+    )
+    with pytest.raises(runner.wcm_adapter.WCMAdapterError):
+        runner.wcm_adapter.validate_rank_receipt(
+            changed,
+            method=method,
+            candidate_count=count,
+            expected_heldout_body=runner.BODIES[0],
+            expected_candidate_roster_sha256=runner.array_sha256(candidates),
+        )
 
 
 def _normalizer(

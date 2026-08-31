@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import robotwin2_actor_execution_protocol_v1 as actor_execution
+import robotwin2_wcm_future_latent_adapter_v1 as adapter
 import robotwin2_wcm_future_latent_baseline_v1 as wcm
 import train_robotwin2_five_body_lobo_wcm_future_latent_baseline_v1 as trainer
 
@@ -249,6 +250,100 @@ def test_runtime_tie_break_is_lowest_candidate_index() -> None:
     )
     result = wcm.score_candidate_pool(ensemble, runtime_batch(4), candidate_count=4)
     assert result["selected_candidate_index"] == 0
+
+
+def _wcm_load_receipt(body: str = "ur5") -> dict[str, object]:
+    base: dict[str, object] = {
+        "format": adapter.LOAD_RECEIPT_FORMAT,
+        "critic_kind": "wcm",
+        "model_family": wcm.MODEL_FAMILY,
+        "held_out_body": body,
+        "source_bodies": [candidate for candidate in wcm.BODIES if candidate != body],
+        "common_selection_step": 3000,
+        "training_summary": "/frozen/wcm/training_summary.json",
+        "training_summary_sha256": "a" * 64,
+        "training_summary_logical_sha256": "b" * 64,
+        "members": [
+            {
+                "member": member,
+                "seed": trainer.DEFAULT_ENSEMBLE_SEEDS[member],
+                "step": 3000,
+                "checkpoint": f"/frozen/wcm/member-{member}.pt",
+                "checkpoint_sha256": f"{member + 1:x}" * 64,
+                "normalization_logical_sha256": "c" * 64,
+            }
+            for member in range(5)
+        ],
+        "rank_score_contract": copy.deepcopy(wcm.RANK_SCORE_CONTRACT),
+        "heldout_payloads_or_labels_opened": 0,
+    }
+    return adapter.signed(base)
+
+
+@pytest.mark.parametrize("candidate_count", [4, 8])
+def test_wcm_adapter_rank_receipt_binds_roster_and_replays_all_statistics(
+    candidate_count: int,
+) -> None:
+    members = [
+        _FixedMember([float(index + member) for index in range(candidate_count)])
+        for member in range(5)
+    ]
+    ensemble = wcm.WCMFutureLatentEnsemble(members)  # type: ignore[arg-type]
+    roster_sha = f"{candidate_count:x}" * 64
+    method = "etsf_nested_best_of_4_from_raw16" if candidate_count == 4 else (
+        "etsf_nested_best_of_8_from_raw16"
+    )
+    scores = adapter.score_candidates(
+        ensemble,
+        runtime_batch(candidate_count),
+        candidate_count=candidate_count,
+        method=method,
+        load_receipt=_wcm_load_receipt(),
+        candidate_roster_sha256=roster_sha,
+    )
+    adapter.validate_rank_receipt(
+        scores,
+        method=method,
+        candidate_count=candidate_count,
+        expected_heldout_body="ur5",
+        expected_candidate_roster_sha256=roster_sha,
+    )
+    assert scores["selected_candidate_index"] == candidate_count - 1
+    assert scores["rank_receipt"]["candidate_roster_sha256"] == roster_sha
+
+    changed_roster = copy.deepcopy(scores)
+    changed_roster["candidate_roster_sha256"] = "f" * 64
+    changed_roster["rank_receipt"]["candidate_roster_sha256"] = "f" * 64
+    receipt = changed_roster["rank_receipt"]
+    receipt["logical_sha256"] = wcm.canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "logical_sha256"}
+    )
+    with pytest.raises(adapter.WCMAdapterError, match="cannot be replayed"):
+        adapter.validate_rank_receipt(
+            changed_roster,
+            method=method,
+            candidate_count=candidate_count,
+            expected_heldout_body="ur5",
+            expected_candidate_roster_sha256=roster_sha,
+        )
+
+    changed_mean = copy.deepcopy(scores)
+    changed_mean["candidate_rank_score_mean"][0] += 1.0
+    receipt = changed_mean["rank_receipt"]
+    receipt["candidate_rank_score_mean_sha256"] = wcm.canonical_sha256(
+        changed_mean["candidate_rank_score_mean"]
+    )
+    receipt["logical_sha256"] = wcm.canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "logical_sha256"}
+    )
+    with pytest.raises(adapter.WCMAdapterError, match="cannot be replayed"):
+        adapter.validate_rank_receipt(
+            changed_mean,
+            method=method,
+            candidate_count=candidate_count,
+            expected_heldout_body="ur5",
+            expected_candidate_roster_sha256=roster_sha,
+        )
 
 
 def test_five_member_checkpoint_roundtrip_and_protocol_tamper_fail_closed(

@@ -929,8 +929,10 @@ def train_fold(
         "body_or_condition_trainable_input": False,
         "actor_frozen": True,
         "task_success_evaluation_authorized": False,
+        "trainer_file_sha256": trainer_file_sha256,
         "preflight": preflight,
     }
+    summary["logical_sha256"] = wcm.canonical_sha256(summary)
     core.atomic_json(output / "training_summary.json", summary)
     return summary
 

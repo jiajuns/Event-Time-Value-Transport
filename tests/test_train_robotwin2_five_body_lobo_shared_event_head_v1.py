@@ -58,6 +58,8 @@ from train_robotwin2_five_body_lobo_shared_event_head_v1 import (  # noqa: E402
     DENSE_RANK_LABEL_EQUALITY_TOLERANCE,
     EPISTEMIC_RANK_RISK_WEIGHT,
     EVENT_PRIORITY_SECONDARY_SCALE,
+    NON_SUCCESS_RESIDUAL_HALF_RANGE,
+    SUCCESS_PROBABILITY_PRIORITY_MARGIN,
     BRANCH_DIAGNOSTIC_CONTRACT,
     EffectAlignedSharedEventHead,
     InvariantMonotoneConsequenceUtility,
@@ -322,8 +324,10 @@ def _group(
             np.asarray([1, 2, 3, 4], dtype=np.int64), current_event
         ),
         post_event_mask=np.ones(count, dtype=np.float32),
-        next_event_id=np.maximum(
-            np.asarray([1, 2, 3, 4], dtype=np.int64), current_event
+        next_event_id=np.where(
+            np.asarray([1, 2, 3, 4], dtype=np.int64) == current_event,
+            (current_event + 1) % 5,
+            np.asarray([1, 2, 3, 4], dtype=np.int64),
         ),
         next_event_mask=np.ones(count, dtype=np.float32),
         duration=np.asarray([0, 2, 3, 4], dtype=np.float32),
@@ -1675,6 +1679,20 @@ def _model_batch(dt: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 
+def test_next_event_self_class_has_exactly_zero_support_without_masking_terminal() -> None:
+    model = EffectAlignedSharedEventHead().eval()
+    batch = _model_batch(torch.full((5,), 5.0 / 15.0))
+    batch["current_event_id"] = torch.arange(5, dtype=torch.long)
+    batch["state"][:, 18:23] = torch.eye(5)
+    output = model(batch)
+    row = torch.arange(5)
+    next_probability = torch.softmax(output["next_event_logits"], dim=-1)
+    assert torch.equal(next_probability[row, row], torch.zeros(5))
+    torch.testing.assert_close(next_probability.sum(dim=-1), torch.ones(5))
+    # Terminal maximum may legitimately remain at the current event.
+    assert bool(torch.isfinite(output["terminal_event_logits"][row, row]).all())
+
+
 def test_next_event_duration_mixture_moments_include_between_event_uncertainty() -> None:
     probability = torch.tensor([[0.25, 0.75]])
     component_mean = torch.tensor([[0.0, 2.0]])
@@ -1709,6 +1727,23 @@ def test_observed_duration_uses_observed_next_event_component_not_current_event(
     assert nll.item() == pytest.approx(0.5 * math.log(2.0 * math.pi))
 
 
+def test_observed_next_event_self_class_fails_closed() -> None:
+    output = {
+        "next_event_logits": torch.zeros(1, 5),
+        "duration_component_log_mean": torch.zeros(1, 5),
+        "duration_component_log_scale": torch.zeros(1, 5),
+    }
+    batch = {
+        "duration": torch.tensor([1.0]),
+        "duration_observed": torch.tensor([1.0]),
+        "next_event_id": torch.tensor([2]),
+        "next_event_mask": torch.tensor([1.0]),
+        "current_event_id": torch.tensor([2]),
+    }
+    with pytest.raises(FiveBodyContractError, match="cannot equal"):
+        trainer_entry._competing_risks_duration_nll_rows(output, batch)
+
+
 def test_censored_duration_is_probability_weighted_competing_risks_survival() -> None:
     logits = torch.tensor([[2.0, 0.5, -1.0, -2.0, -3.0]], requires_grad=True)
     means = torch.tensor(
@@ -1725,17 +1760,23 @@ def test_censored_duration_is_probability_weighted_competing_risks_survival() ->
         "duration_observed": torch.tensor([0.0]),
         "next_event_id": torch.tensor([0]),
         "next_event_mask": torch.tensor([0.0]),
+        "current_event_id": torch.tensor([0]),
     }
     nll = trainer_entry._competing_risks_duration_nll_rows(output, batch)
     z = (torch.log1p(batch["duration"])[:, None] - means) / torch.exp(log_scales)
     expected = -torch.logsumexp(
-        torch.log_softmax(logits, dim=-1) + torch.special.log_ndtr(-z), dim=-1
+        torch.log_softmax(logits[:, 1:], dim=-1)
+        + torch.special.log_ndtr(-z[:, 1:]),
+        dim=-1,
     )
     assert torch.allclose(nll, expected)
     nll.sum().backward()
-    assert logits.grad is not None and bool((logits.grad.abs() > 0).any())
-    assert means.grad is not None and bool((means.grad.abs() > 0).all())
-    assert log_scales.grad is not None and bool((log_scales.grad.abs() > 0).all())
+    assert logits.grad is not None and logits.grad[0, 0] == 0.0
+    assert bool((logits.grad[0, 1:].abs() > 0).any())
+    assert means.grad is not None and means.grad[0, 0] == 0.0
+    assert bool((means.grad[0, 1:].abs() > 0).all())
+    assert log_scales.grad is not None and log_scales.grad[0, 0] == 0.0
+    assert bool((log_scales.grad[0, 1:].abs() > 0).all())
 
 
 @pytest.mark.parametrize(
@@ -1755,6 +1796,7 @@ def test_competing_risks_duration_rejects_nonbinary_masks(
         "duration_observed": torch.tensor([0.0]),
         "next_event_id": torch.tensor([0]),
         "next_event_mask": torch.tensor([0.0]),
+        "current_event_id": torch.tensor([0]),
     }
     batch[field] = torch.tensor([value])
     with pytest.raises(FiveBodyContractError, match="supervision is invalid"):
@@ -2449,9 +2491,11 @@ def _fixed_terminal_metrics(
             zero = probability.new_zeros(count)
             event_logits = probability.new_full((count, 5), -4.0)
             event_logits[:, 0] = 0.0
+            next_event_logits = probability.new_full((count, 5), -4.0)
+            next_event_logits[:, 1] = 0.0
             return {
                 "post_event_logits": event_logits,
-                "next_event_logits": event_logits,
+                "next_event_logits": next_event_logits,
                 "duration_component_log_mean": zero[:, None].expand(-1, 5),
                 "duration_component_log_scale": zero[:, None].expand(-1, 5),
                 "duration_selected_log_mean": zero,
@@ -2496,7 +2540,7 @@ def _fixed_terminal_metrics(
         "post_event_mask": torch.ones(count),
         "object_delta": torch.zeros(count, core.OBJECT_DELTA_DIM),
         "object_delta_mask": torch.ones(count),
-        "next_event_id": torch.zeros(count, dtype=torch.long),
+        "next_event_id": torch.ones(count, dtype=torch.long),
         "next_event_mask": torch.ones(count),
         "duration": torch.ones(count),
         "duration_observed": torch.ones(count),
@@ -2822,8 +2866,10 @@ def test_rank_features_are_only_explicit_predicted_consequences() -> None:
 
 def test_bounded_utility_is_monotone_and_has_no_raw_world_axis() -> None:
     assert CANDIDATE_RANK_FEATURE_DIM == 9
-    assert set(CANDIDATE_RANK_FEATURE_SCHEMA) == set(MONOTONE_BENEFIT_FEATURES) | set(
-        MONOTONE_RISK_FEATURES
+    assert set(CANDIDATE_RANK_FEATURE_SCHEMA) == (
+        set(MONOTONE_BENEFIT_FEATURES)
+        | set(MONOTONE_RISK_FEATURES)
+        | {"success_probability"}
     )
     assert set(MONOTONE_BENEFIT_FEATURES).isdisjoint(MONOTONE_RISK_FEATURES)
     assert all(
@@ -2851,6 +2897,11 @@ def test_bounded_utility_is_monotone_and_has_no_raw_world_axis() -> None:
         riskier = baseline_features.clone()
         riskier[:, CANDIDATE_RANK_FEATURE_SCHEMA[name][0]] += 0.1
         assert utility(riskier, current_event)[0] < baseline_score
+    more_successful = baseline_features.clone()
+    more_successful[
+        :, CANDIDATE_RANK_FEATURE_SCHEMA["success_probability"][0]
+    ] += 0.1
+    assert utility(more_successful, current_event)[0] > baseline_score
 
     # Moving 0.1 terminal probability mass from e4 (level .75) to eK (1.0)
     # raises both expected stage by .025 and coherent success by .1.  Even a
@@ -2877,20 +2928,24 @@ def test_bounded_utility_is_monotone_and_has_no_raw_world_axis() -> None:
 def test_event_conditioned_utility_uses_shared_bounded_residuals() -> None:
     utility = InvariantMonotoneConsequenceUtility().eval()
     features = torch.zeros(2, CANDIDATE_RANK_FEATURE_DIM)
-    success_index = CANDIDATE_RANK_FEATURE_SCHEMA["success_probability"][0]
     goal_index = CANDIDATE_RANK_FEATURE_SCHEMA["short_goal_progress_benefit"][0]
-    features[0, success_index] = 1.0
+    stage_index = CANDIDATE_RANK_FEATURE_SCHEMA[
+        "terminal_expected_stage_progress"
+    ][0]
+    features[0, stage_index] = 1.0
     features[1, goal_index] = 1.0
     with torch.no_grad():
         utility.benefit_logits.zero_()
         utility.event_benefit_residual.zero_()
-        success_position = MONOTONE_BENEFIT_FEATURES.index("success_probability")
+        stage_position = MONOTONE_BENEFIT_FEATURES.index(
+            "terminal_expected_stage_progress"
+        )
         goal_position = MONOTONE_BENEFIT_FEATURES.index(
             "short_goal_progress_benefit"
         )
-        utility.event_benefit_residual[0, success_position] = -100.0
+        utility.event_benefit_residual[0, stage_position] = -100.0
         utility.event_benefit_residual[0, goal_position] = 100.0
-        utility.event_benefit_residual[4, success_position] = 100.0
+        utility.event_benefit_residual[4, stage_position] = 100.0
         utility.event_benefit_residual[4, goal_position] = -100.0
     e0_scores = utility(features, torch.zeros(2, dtype=torch.long))
     ek_scores = utility(features, torch.full((2,), 4, dtype=torch.long))
@@ -2907,59 +2962,47 @@ def test_event_conditioned_utility_uses_shared_bounded_residuals() -> None:
     assert not any("body" in name for name, _parameter in utility.named_parameters())
 
 
-def test_deterministic_event_step_dominates_entire_secondary_utility_range() -> None:
+def test_success_margin_dominates_worst_non_success_residual_reversal() -> None:
     utility = InvariantMonotoneConsequenceUtility().eval()
     features = torch.zeros(2, CANDIDATE_RANK_FEATURE_DIM)
-    terminal_stage = CANDIDATE_RANK_FEATURE_SCHEMA[
-        "terminal_expected_stage_progress"
-    ][0]
-    features[0, terminal_stage] = 0.25
+    success = CANDIDATE_RANK_FEATURE_SCHEMA["success_probability"][0]
+    features[0, success] = SUCCESS_PROBABILITY_PRIORITY_MARGIN + 1e-3
+    # Candidate 0 receives the worst residual and candidate 1 the best residual.
     for name in MONOTONE_BENEFIT_FEATURES:
         features[1, CANDIDATE_RANK_FEATURE_SCHEMA[name][0]] = 1.0
     for name in MONOTONE_RISK_FEATURES:
         features[0, CANDIDATE_RANK_FEATURE_SCHEMA[name][0]] = 1.0
-    # Restore the later candidate's primary after constructing the worst-case
-    # secondary assignment.  Its 0.25 canonical event lead must remain larger
-    # than the complete secondary reversal (< 3 * 0.05).
-    features[0, terminal_stage] = 0.25
-    features[1, terminal_stage] = 0.0
-    with torch.no_grad():
-        utility.benefit_logits.fill_(-100.0)
-        utility.benefit_logits[
-            MONOTONE_BENEFIT_FEATURES.index("success_probability")
-        ] = 100.0
-        utility.risk_logits.fill_(100.0)
     current_event = torch.zeros(2, dtype=torch.long)
-    assert EVENT_PRIORITY_SECONDARY_SCALE * 3.0 < 0.25
     assert utility(features, current_event)[0] > utility(features, current_event)[1]
+    assert EVENT_PRIORITY_SECONDARY_SCALE == NON_SUCCESS_RESIDUAL_HALF_RANGE
+    assert 2.0 * NON_SUCCESS_RESIDUAL_HALF_RANGE == (
+        SUCCESS_PROBABILITY_PRIORITY_MARGIN
+    )
 
 
-def test_submargin_expected_stage_difference_can_be_refined_by_secondary() -> None:
+def test_submargin_success_difference_can_be_refined_by_non_success_stage() -> None:
     utility = InvariantMonotoneConsequenceUtility().eval()
     features = torch.zeros(2, CANDIDATE_RANK_FEATURE_DIM)
     terminal_stage = CANDIDATE_RANK_FEATURE_SCHEMA[
         "terminal_expected_stage_progress"
     ][0]
     success = CANDIDATE_RANK_FEATURE_SCHEMA["success_probability"][0]
-    features[0, terminal_stage] = 0.10
-    risk_indices = [
-        CANDIDATE_RANK_FEATURE_SCHEMA[name][0]
-        for name in MONOTONE_RISK_FEATURES
-    ]
-    features[0, risk_indices] = 1.0
-    features[1, success] = 1.0
+    features[0, terminal_stage] = 1.0
+    features[1, success] = SUCCESS_PROBABILITY_PRIORITY_MARGIN / 4.0
     with torch.no_grad():
         utility.benefit_logits.fill_(-100.0)
         utility.benefit_logits[
-            MONOTONE_BENEFIT_FEATURES.index("success_probability")
+            MONOTONE_BENEFIT_FEATURES.index("terminal_expected_stage_progress")
         ] = 100.0
-        utility.risk_logits.fill_(100.0)
     scores = utility(features, torch.zeros(2, dtype=torch.long))
-    assert features[0, terminal_stage] > features[1, terminal_stage]
-    assert scores[1] > scores[0]
+    assert features[1, success] > features[0, success]
+    assert scores[0] > scores[1]
     assert checkpoint_candidate_rank_contract("full")[
-        "strict_lexicographic_for_arbitrary_expected_stage_difference"
-    ] is False
+        "success_probability_priority_margin"
+    ] == SUCCESS_PROBABILITY_PRIORITY_MARGIN
+    assert checkpoint_candidate_rank_contract("full")[
+        "success_probability_advantage_strictly_dominates_above_margin"
+    ] is True
 
 
 def test_dense_rank_tolerance_is_consistent_for_training_and_evaluation() -> None:
@@ -3011,7 +3054,9 @@ def test_rank_score_has_explicit_numeric_dt_path_through_clock() -> None:
         model.clock.candidate.bias[0] = 1.0
         model.duration_mean.weight.zero_()
         model.duration_mean.bias.zero_()
-        model.duration_mean.weight[0, 0] = 1.0
+        # Current event 0 is excluded from next-boundary support; use a real
+        # destination component for the explicit clock path.
+        model.duration_mean.weight[1, 0] = 1.0
     model.candidate_rank = linear
     batch = _model_batch(torch.tensor([1.0 / 15.0, 5.0 / 15.0]))
     batch["state"][1] = batch["state"][0]
@@ -3030,7 +3075,7 @@ def test_duration_prediction_conditions_on_physical_event_age() -> None:
         model.event_age_encoder[2].weight[0, 0] = 1.0
         model.duration_mean.weight.zero_()
         model.duration_mean.bias.zero_()
-        model.duration_mean.weight[0, 0] = 1.0
+        model.duration_mean.weight[1, 0] = 1.0
     batch = _model_batch(torch.full((2,), 5.0 / 15.0))
     batch["state"][1] = batch["state"][0]
     batch["actions"][1] = batch["actions"][0]
@@ -4142,14 +4187,35 @@ def test_ablation_variants_change_only_declared_score_features() -> None:
         TERMINAL_FILM_MODULATION_BOUND
     )
     assert full_contract["event_priority_primary"] == (
-        "terminal_expected_stage_progress"
+        "terminal_eK_success_probability"
     )
     assert full_contract["event_priority_secondary_scale"] == (
         EVENT_PRIORITY_SECONDARY_SCALE
     )
     assert full_contract[
         "deterministic_one_event_step_dominates_all_secondary_features"
+    ] is False
+    assert full_contract["success_probability_priority_margin"] == (
+        SUCCESS_PROBABILITY_PRIORITY_MARGIN
+    )
+    assert full_contract[
+        "success_probability_advantage_strictly_dominates_above_margin"
     ] is True
+    assert full_contract["non_success_residual_half_range"] == (
+        NON_SUCCESS_RESIDUAL_HALF_RANGE
+    )
+    assert full_contract["non_success_residual_pairwise_maximum_reversal"] == (
+        SUCCESS_PROBABILITY_PRIORITY_MARGIN
+    )
+    assert full_contract["next_event_supported_destination_set"] == (
+        "all_canonical_events_except_current_event"
+    )
+    assert full_contract["next_event_self_class_probability"] == (
+        "exact_zero_after_fail_closed_mask"
+    )
+    assert full_contract["next_event_no_boundary_representation"] == (
+        "right_censor_only_not_self_class"
+    )
     assert full_contract["dense_rank_label_equality_tolerance"] == (
         DENSE_RANK_LABEL_EQUALITY_TOLERANCE
     )
