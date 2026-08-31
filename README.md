@@ -24,7 +24,7 @@ Event-Time Value Transport（ETSF）研究跨机器人本体的 critic/value 迁
 
 若 actor 训练时已经见过目标本体，不能把这个实验写成“actor 与 critic 联合零样本跨本体”。共享头的 AUROC、Brier、时长 MAE 等是机制指标；最终迁移结论必须来自完整五折的 paired `DeltaSR`。
 
-最新远程接管信息见 [模型与远程队列交接](docs/PROGRESS_20260831_1047_MODEL_HANDOFF.md)。该文件记录的是接管时快照，不替代服务器最终 report；只有完整五折和闭环报告可以作为效果结论。
+最新远程状态见 [当前状态](docs/CURRENT_STATUS.md)。该文件是人工核对快照，不替代服务器最终 report；只有完整五折和闭环报告可以作为效果结论。
 
 ## 最新共享头
 
@@ -59,10 +59,8 @@ tests/       长期协议/数据契约回归测试（不是实验结果）
 ```
 
 - [scripts 分类与当前生产依赖](scripts/README.md)
-- [docs 分类与阅读顺序](docs/README.md)
-- [五折数据闭包与基线协议 v1](docs/robotwin2_cross_embodiment_baseline_and_metrics_v1.md)
-- [早期 Stage0–Stage3 运行手册](docs/ETSF_agent_runbook.md)
-- [OpenVLA-OFT 技术路线](docs/ETSF_OpenVLA_OFT_full_technical_route.md)
+- [当前远程状态](docs/CURRENT_STATUS.md)
+- [docs 当前文档入口](docs/README.md)
 
 `scripts/` 暂时保持扁平布局，因为 runner、`PYTHONPATH=scripts` 导入、远端命令和冻结文件哈希都依赖现有 basename。分类通过 `scripts/README.md` 完成，不为目录整齐而破坏当前队列。
 
@@ -125,4 +123,4 @@ python -m pytest -q -p no:cacheprovider <focused-test-files>
 - SmolVLA/Piper schema5/schema6：单本体数据契约、paired-success 和 observer 线；
 - RoboTwin2 v6/v8/v9/v10/v12：共享头设计演化。
 
-这些代码和文档用于复现与方法演化，不是当前 v13 运行入口。精确分类见 [scripts 索引](scripts/README.md) 和 [docs 索引](docs/README.md)。
+这些历史代码仍可从 Git 追溯，但旧文档不再保留在当前工作树。当前入口见 [scripts 索引](scripts/README.md) 和 [docs 入口](docs/README.md)。

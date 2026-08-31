@@ -376,4 +376,4 @@ AURC 越低越好。coverage 阈值必须在训练折 validation 上冻结；留
 - [scikit-survival evaluation guide](https://scikit-survival.readthedocs.io/en/stable/user_guide/evaluating-survival-models.html)：删失数据的 C-index、cumulative/dynamic AUC 与 IPCW Brier/IBS。
 - [Competing-risk calibration analysis](https://arxiv.org/abs/2602.00194)：普通生存校准方法不能无条件直接解释为 competing-risk CIF 校准。
 
-旧协议 `robotwin2_cross_embodiment_baseline_and_metrics_v1.md` 和外部补充 v2 仍作为推导记录；当定义冲突时，以本文 v3 为准。
+旧协议和外部补充已从当前工作树删除，只保留在 Git 历史中；正式定义以本文 v3 为准。
