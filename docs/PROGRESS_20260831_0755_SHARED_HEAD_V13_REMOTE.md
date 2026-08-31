@@ -129,3 +129,15 @@ RAC 已增加五折自动 supervisor 和 nested `--critic-kind rac` 路径。sup
 相关 RAC、supervisor、nested、最终报告与 postformal watcher 定向回归共 71 项通过。该队列仍须部署
 到 4090，且必须排在主 v13 最终成功收据之后；因此这里仍只记录执行能力，不记录尚未产生的 RAC
 成功率。
+
+## 08:36 CST matched WCM-style 对照
+
+已实现近等容量 future-latent 基线：221,558 参数，对应 v13 的 223,287 参数（0.9923x）。输入为
+causal state/history 与 candidate action，输出有限时域 canonical consequence/effect latent、
+success/value/event/object effect；目标包括 latent MSE、proper loss、SIGReg 与 variance/covariance。
+runtime 明确拒绝候选 outcome 字段，source-only normalization/checkpoint selection 保持 held-out
+payload zero-open。相关 WCM/共享头/nested 定向回归本次复验 162 项通过。
+
+当前只完成模型、单折五成员 trainer、N4/N8 scorer 和文档，尚未部署远端五折 supervisor 或闭环
+runner。因此它是已实现但未训练的强对照，不能用参数量、单元测试或 source validation 代替任务
+成功率。

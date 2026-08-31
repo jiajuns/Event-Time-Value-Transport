@@ -320,6 +320,15 @@ rollout 数和 LOBO split 不变。ETSF 的可主张创新不应写成“首次�
 事件因子化在严格 held-out-body、critic-only best-of-N 中比标量 RAC 和非结构化 future-latent
 critic 得到更好的校准、oracle regret 与配对任务成功率。**
 
+截至 2026-08-31，matched WCM-style 主体已经实现。由于当前 branch 没有未来图像或完整终端原始
+观测，它严格预测 96-D **finite-horizon canonical terminal consequence/effect latent**，不冒充视觉
+世界模型。模型使用 causal state/history 与 candidate action GRU，联合 success/value/event/effect
+proper loss、latent MSE、SIGReg 和 variance/covariance 防坍塌；参数量为 221,558，是 v13
+223,287 的 0.9923 倍。训练器复用相同 primary/supplement、actor protocol、source-only LOBO、
+causal balance 和五成员共同 step，runtime 只接受因果输入并支持 N4/N8 epistemic LCB。该实现是
+WCM-style 公平结构对照，不是官方 WCM 权重复现；在五折训练和同 schedule 闭环完成前仍没有可填入
+表格的成功率数字。
+
 ## 7. 正式 100 seeds/cell 配对协议
 
 ### 7.1 配对单位
