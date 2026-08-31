@@ -25,6 +25,38 @@ runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
 
 
+def _rac_load_receipt(body: str) -> dict[str, object]:
+    base = {
+        "format": "etsf_rac_fold_ensemble_load_receipt_v1",
+        "held_out_body": body,
+        "source_bodies": [candidate for candidate in runner.BODIES if candidate != body],
+        "selected_step": 3000,
+        "members": [
+            {
+                "member": member,
+                "seed": runner.rac_trainer.DEFAULT_ENSEMBLE_SEEDS[member],
+                "checkpoint": f"/fold/member_{member}.pt",
+                "checkpoint_sha256": f"{member + 1:x}" * 64,
+            }
+            for member in range(5)
+        ],
+        "heldout_payloads_or_labels_opened": 0,
+    }
+    return {**base, "logical_sha256": runner.canonical_sha256(base)}
+
+
+class _FakeRac:
+    def __init__(self, offset: float) -> None:
+        self.offset = offset
+
+    def eval(self):
+        return self
+
+    def __call__(self, batch):
+        delta = batch["action_i"][:, 0, 0] - batch["action_j"][:, 0, 0]
+        return delta * 10.0 + self.offset
+
+
 def _current() -> np.ndarray:
     value = np.zeros(16, dtype=np.float32)
     value[6] = 1.0
@@ -687,6 +719,212 @@ def test_rollout_validator_replays_n4_and_n8_selection_without_new_gate() -> Non
     assert runner.nested_pool_contract()[
         "additional_authorization_or_confidence_gate"
     ] is False
+
+
+@pytest.mark.parametrize(
+    ("method", "count"),
+    [
+        (runner.METHOD_N4, runner.N4_CANDIDATE_COUNT),
+        (runner.METHOD_N8, runner.N8_CANDIDATE_COUNT),
+    ],
+)
+def test_rac_n4_n8_scores_all_pairs_and_emits_replayable_rank_receipt(
+    method: str, count: int
+) -> None:
+    pools, _audit = _nested()
+    state = np.zeros(runner.rac_trainer.core.STATE_DIM, dtype=np.float32)
+    state[18] = 1.0
+    receipt = _rac_load_receipt(runner.BODIES[0])
+    scores = runner._score_candidates(
+        method=method,
+        ensemble=[_FakeRac(0.01 * member) for member in range(5)],
+        state=state,
+        current_ee=_current(),
+        candidates=pools[count],
+        current_event=0,
+        event_age_seconds=0.0,
+        remaining_action_budget=200,
+        device=torch.device("cpu"),
+        critic_kind="rac",
+        critic_load_receipt=receipt,
+    )
+    assert scores["critic_kind"] == "rac"
+    assert scores["rac_unordered_pairs_evaluated_per_member"] == count * (count - 1) // 2
+    assert scores["rank_receipt"]["critic_ensemble_load_receipt"] == receipt
+
+    rollout = _rollout(method, "c" * 64)
+    rollout["decisions"][0]["critic_scores"] = scores
+    rollout["decisions"][0]["selected_candidate_index"] = scores[
+        "selected_candidate_index"
+    ]
+    indices = rollout["decisions"][0]["selection_pool_raw_indices"]
+    rollout["decisions"][0]["selected_raw_proposal_index"] = indices[
+        scores["selected_candidate_index"]
+    ]
+    runner.validate_rollout(
+        rollout,
+        method=method,
+        expected=runner.evaluation_schedule()[0],
+        expected_source_action_normalizer_logical_sha256=str(
+            _normalizer()["logical_sha256"]
+        ),
+    )
+
+    tampered = copy.deepcopy(rollout)
+    rank_receipt = tampered["decisions"][0]["critic_scores"]["rank_receipt"]
+    rank_receipt["selected_candidate_index"] = (
+        rank_receipt["selected_candidate_index"] + 1
+    ) % count
+    unsigned = {
+        key: value for key, value in rank_receipt.items()
+        if key != "logical_sha256"
+    }
+    rank_receipt["logical_sha256"] = runner.canonical_sha256(unsigned)
+    with pytest.raises(runner.NestedCandidatePoolError, match="rank receipt"):
+        runner.validate_rollout(
+            tampered,
+            method=method,
+            expected=runner.evaluation_schedule()[0],
+            expected_source_action_normalizer_logical_sha256=str(
+                _normalizer()["logical_sha256"]
+            ),
+        )
+
+    self_signed_semantic_tamper = copy.deepcopy(rollout)
+    tampered_scores = self_signed_semantic_tamper["decisions"][0]["critic_scores"]
+    tampered_scores["rac_pair_probability_matrix_members"][0][0][1] = 0.5
+    tampered_scores["rac_pair_probability_matrix_members"][0][1][0] = 0.5
+    semantic_receipt = tampered_scores["rank_receipt"]
+    semantic_receipt["pair_probability_matrix_members_sha256"] = (
+        runner.canonical_sha256(
+            tampered_scores["rac_pair_probability_matrix_members"]
+        )
+    )
+    semantic_receipt["logical_sha256"] = runner.canonical_sha256(
+        {
+            key: value
+            for key, value in semantic_receipt.items()
+            if key != "logical_sha256"
+        }
+    )
+    with pytest.raises(runner.NestedCandidatePoolError, match="rank receipt"):
+        runner.validate_rollout(
+            self_signed_semantic_tamper,
+            method=method,
+            expected=runner.evaluation_schedule()[0],
+            expected_source_action_normalizer_logical_sha256=str(
+                _normalizer()["logical_sha256"]
+            ),
+        )
+
+
+def test_critic_kind_cli_defaults_to_etsf_and_rac_is_explicit() -> None:
+    common = [
+        "--actor-checkpoint", "/actor",
+        "--vlm-metadata-path", "/vlm",
+        "--robotwin-root", "/robotwin",
+        "--event-spec", "/event.json",
+        "--reference-preregistration", "/pre.json",
+        "--actor-execution-protocol", "/protocol.json",
+        "--actor-execution-protocol-sha256", "a" * 64,
+        "--path-root", "/root",
+        "--output", "/out",
+    ]
+    folds = [item for body in runner.BODIES for item in ("--lobo-fold", f"{body}=/fold/{body}")]
+    assert runner.parse_args(common + folds).critic_kind == "etsf"
+    assert runner.parse_args(common + folds + ["--critic-kind", "rac"]).critic_kind == "rac"
+
+
+def _write_rac_fold(tmp_path: Path, body: str) -> Path:
+    fold = tmp_path / body
+    fold.mkdir()
+    binding = runner.formal.actor_execution_protocol_binding()
+    members = []
+    for member, seed in enumerate(runner.rac_trainer.DEFAULT_ENSEMBLE_SEEDS):
+        checkpoint = fold / f"member_{member}.pt"
+        checkpoint.write_bytes(f"rac-{member}".encode())
+        members.append(
+            {
+                "member": member,
+                "seed": seed,
+                "best_step": 3000,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": runner.sha256_file(checkpoint),
+            }
+        )
+    summary = {
+        "format": runner.rac_trainer.SUMMARY_FORMAT,
+        "status": "source_only_rac_checkpoint_selection_complete",
+        "model_family": runner.rac_trainer.MODEL_FAMILY,
+        "held_out_body": body,
+        "source_bodies": [candidate for candidate in runner.BODIES if candidate != body],
+        "rac_contract": runner.rac_trainer.rac_contract(),
+        "state_action_frame_contract": runner.STATE_ACTION_FRAME_CONTRACT,
+        "actor_execution_protocol": binding["protocol"],
+        "actor_execution_protocol_binding": binding,
+        "actor_execution_protocol_file_sha256": binding["file_sha256"],
+        "trainer_file_sha256": runner.sha256_file(
+            Path(runner.rac_trainer.__file__).resolve()
+        ),
+        "training_budget": {"steps_per_member": 3000, "ensemble_members": 5},
+        "checkpoint_selection": {
+            "scope": "primary_source_validation_only",
+            "selected_step": 3000,
+            "supplement_rows_used": 0,
+            "heldout_rows_used": 0,
+        },
+        "supplement_train_pairs": None,
+        "members": members,
+        "heldout_rows_used_for_training_normalization_or_selection": 0,
+        "all_checkpoints_selected_before_any_heldout_payload_open": True,
+    }
+    summary["logical_sha256"] = runner.canonical_sha256(summary)
+    runner.atomic_json(fold / "training_summary.json", summary)
+    preflight = {
+        "format": runner.rac_trainer.FORMAT,
+        "status": "rac_preflight_passed_payloads_still_unopened",
+        "held_out_body": body,
+        "source_bodies": [candidate for candidate in runner.BODIES if candidate != body],
+        "actor_execution_protocol_binding": binding,
+        "heldout_group_npz_opened": 0,
+        "heldout_group_payload_bytes_read": 0,
+        "heldout_labels_used_for_training_or_selection": False,
+        "supplement": {
+            "enabled": False,
+            "binding_file_sha256": None,
+            "heldout_groups_deferred": 0,
+        },
+    }
+    preflight["logical_sha256"] = runner.canonical_sha256(preflight)
+    runner.atomic_json(fold / "preflight_receipt.json", preflight)
+    return fold
+
+
+def test_rac_fold_inspection_fails_closed_on_checkpoint_and_heldout_tamper(
+    tmp_path: Path,
+) -> None:
+    body = runner.BODIES[0]
+    fold = _write_rac_fold(tmp_path, body)
+    inspected = runner.inspect_rac_fold(body, fold)
+    assert inspected["critic_kind"] == "rac"
+    assert inspected["source_bodies"] == [
+        candidate for candidate in runner.BODIES if candidate != body
+    ]
+
+    checkpoint = fold / "member_0.pt"
+    checkpoint.write_bytes(b"tamper")
+    with pytest.raises(runner.NestedCandidatePoolError, match="member binding"):
+        runner.inspect_rac_fold(body, fold)
+
+    fold = _write_rac_fold(tmp_path, runner.BODIES[1])
+    preflight_path = fold / "preflight_receipt.json"
+    preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+    preflight["heldout_group_npz_opened"] = 1
+    preflight.pop("logical_sha256")
+    preflight["logical_sha256"] = runner.canonical_sha256(preflight)
+    runner.atomic_json(preflight_path, preflight)
+    with pytest.raises(runner.NestedCandidatePoolError, match="contract changed"):
+        runner.inspect_rac_fold(runner.BODIES[1], fold)
 
 
 def test_query_after_zero_cannot_switch_to_another_self_consistent_normalizer() -> None:

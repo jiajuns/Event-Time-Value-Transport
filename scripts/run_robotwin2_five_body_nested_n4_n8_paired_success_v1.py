@@ -37,6 +37,8 @@ import torch
 
 import run_robotwin2_five_body_paired_success_v1 as formal
 import run_robotwin2_five_body_postformal_candidate_pool_v1 as pool_runner
+import robotwin2_relative_action_critic_adapter_v1 as rac_adapter
+import train_robotwin2_five_body_lobo_relative_action_critic_v1 as rac_trainer
 
 
 collector = formal.collector
@@ -49,6 +51,8 @@ CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v2_actor_proto
 OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
 REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
 COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
+RAC_RANK_RECEIPT_FORMAT = "etsf_robotwin2_nested_rac_rank_receipt_v1"
+CRITIC_KINDS = ("etsf", "rac")
 ORACLE_TRUTH_FORMAT = "etsf_robotwin2_nested_query0_oracle_truth_v1"
 ORACLE_TRUTH_STATUS = "complete_1000_query0_groups_8000_candidate_rollouts"
 ORACLE_GROUP_FORMAT = "etsf_robotwin2_nested_query0_oracle_group_v1"
@@ -412,6 +416,251 @@ def inspect_fold_source_action_normalizer(
     return binding
 
 
+def _read_signed_rac_json(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise NestedCandidatePoolError(f"{label} is missing or symbolic")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise NestedCandidatePoolError(f"{label} is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise NestedCandidatePoolError(f"{label} must be an object")
+    unsigned = {key: item for key, item in value.items() if key != "logical_sha256"}
+    if value.get("logical_sha256") != canonical_sha256(unsigned):
+        raise NestedCandidatePoolError(f"{label} logical SHA changed")
+    return value
+
+
+def inspect_rac_fold(body: str, fold_root: Path) -> dict[str, Any]:
+    """Inspect one signed RAC fold without opening any held-out payload."""
+
+    fold_root = fold_root.expanduser().resolve()
+    summary_path = fold_root / "training_summary.json"
+    preflight_path = fold_root / "preflight_receipt.json"
+    summary = _read_signed_rac_json(summary_path, f"{body} RAC summary")
+    preflight = _read_signed_rac_json(preflight_path, f"{body} RAC preflight")
+    selection = summary.get("checkpoint_selection")
+    budget = summary.get("training_budget")
+    expected_binding = formal.actor_execution_protocol_binding()
+    expected_source = [candidate for candidate in BODIES if candidate != body]
+    if (
+        summary.get("format") != rac_trainer.SUMMARY_FORMAT
+        or summary.get("status")
+        != "source_only_rac_checkpoint_selection_complete"
+        or summary.get("model_family") != rac_trainer.MODEL_FAMILY
+        or summary.get("rac_contract") != rac_trainer.rac_contract()
+        or summary.get("held_out_body") != body
+        or summary.get("source_bodies") != expected_source
+        or summary.get("state_action_frame_contract")
+        != STATE_ACTION_FRAME_CONTRACT
+        or summary.get("actor_execution_protocol_binding") != expected_binding
+        or summary.get("actor_execution_protocol") != expected_binding["protocol"]
+        or summary.get("actor_execution_protocol_file_sha256")
+        != expected_binding["file_sha256"]
+        or summary.get("trainer_file_sha256")
+        != sha256_file(Path(rac_trainer.__file__).resolve())
+        or summary.get("heldout_rows_used_for_training_normalization_or_selection")
+        != 0
+        or summary.get("all_checkpoints_selected_before_any_heldout_payload_open")
+        is not True
+        or not isinstance(selection, Mapping)
+        or selection.get("scope") != "primary_source_validation_only"
+        or not isinstance(selection.get("selected_step"), int)
+        or selection.get("selected_step", 0) <= 0
+        or selection.get("supplement_rows_used") != 0
+        or selection.get("heldout_rows_used") != 0
+        or not isinstance(budget, Mapping)
+        or budget.get("steps_per_member") != rac_trainer.DEFAULT_STEPS
+        or budget.get("ensemble_members") != rac_trainer.ENSEMBLE_SIZE
+        or preflight.get("format") != rac_trainer.FORMAT
+        or preflight.get("status")
+        != "rac_preflight_passed_payloads_still_unopened"
+        or preflight.get("held_out_body") != body
+        or preflight.get("source_bodies") != expected_source
+        or preflight.get("actor_execution_protocol_binding") != expected_binding
+        or preflight.get("heldout_group_npz_opened") != 0
+        or preflight.get("heldout_group_payload_bytes_read") != 0
+        or preflight.get("heldout_labels_used_for_training_or_selection") is not False
+    ):
+        raise NestedCandidatePoolError(f"RAC LOBO fold contract changed for {body}")
+    members = summary.get("members")
+    if not isinstance(members, list) or len(members) != rac_trainer.ENSEMBLE_SIZE:
+        raise NestedCandidatePoolError("RAC fold must contain five members")
+    normalized = []
+    for expected_member, item in enumerate(members):
+        if not isinstance(item, Mapping):
+            raise NestedCandidatePoolError("RAC member is invalid")
+        checkpoint = Path(str(item.get("checkpoint", ""))).expanduser().resolve()
+        try:
+            checkpoint.relative_to(fold_root)
+        except ValueError as error:
+            raise NestedCandidatePoolError("RAC checkpoint escapes fold root") from error
+        if (
+            item.get("member") != expected_member
+            or item.get("seed") != rac_trainer.DEFAULT_ENSEMBLE_SEEDS[expected_member]
+            or item.get("best_step") != selection["selected_step"]
+            or not checkpoint.is_file()
+            or checkpoint.is_symlink()
+            or sha256_file(checkpoint) != item.get("checkpoint_sha256")
+        ):
+            raise NestedCandidatePoolError("RAC member binding changed")
+        normalized.append(
+            {
+                "member": expected_member,
+                "seed": item["seed"],
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": item["checkpoint_sha256"],
+            }
+        )
+    return {
+        "critic_kind": "rac",
+        "heldout_body": body,
+        "source_bodies": expected_source,
+        "body_adapter": "none_body_identity_not_an_input",
+        "state_action_frame_contract": dict(STATE_ACTION_FRAME_CONTRACT),
+        "actor_execution_protocol": expected_binding["protocol"],
+        "actor_execution_protocol_binding": expected_binding,
+        "actor_execution_protocol_file_sha256": expected_binding["file_sha256"],
+        "fold_root": str(fold_root),
+        "training_summary": str(summary_path),
+        "training_summary_sha256": sha256_file(summary_path),
+        "training_summary_logical_sha256": summary["logical_sha256"],
+        "preflight_receipt": str(preflight_path),
+        "preflight_receipt_sha256": sha256_file(preflight_path),
+        "preflight_receipt_logical_sha256": preflight["logical_sha256"],
+        "ensemble_common_selection_step": selection["selected_step"],
+        "members": normalized,
+    }
+
+
+def inspect_rac_fold_source_action_normalizer(
+    fold: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind RAC's identical four-source-body action normalizer."""
+
+    rows = []
+    for item in fold.get("members", []):
+        checkpoint = torch.load(
+            item["checkpoint"], map_location="cpu", weights_only=True
+        )
+        normalization = checkpoint.get("normalization")
+        model_state = checkpoint.get("model")
+        if not isinstance(normalization, Mapping) or not isinstance(model_state, Mapping):
+            raise NestedCandidatePoolError("RAC checkpoint lacks normalization/model")
+        action = normalization.get("action")
+        if not isinstance(action, Mapping):
+            raise NestedCandidatePoolError("RAC action normalization is missing")
+        mean = np.asarray(action.get("mean"), dtype=np.float32)
+        std = np.asarray(action.get("std"), dtype=np.float32)
+        state_mean = model_state.get("action_mean")
+        state_std = model_state.get("action_std")
+        if (
+            mean.shape != (collector.CANONICAL_ACTION_DIM,)
+            or std.shape != (collector.CANONICAL_ACTION_DIM,)
+            or not np.isfinite(mean).all()
+            or not np.isfinite(std).all()
+            or np.any(std < 1e-4)
+            or not isinstance(state_mean, torch.Tensor)
+            or not isinstance(state_std, torch.Tensor)
+            or not np.array_equal(state_mean.detach().cpu().numpy(), mean)
+            or not np.array_equal(state_std.detach().cpu().numpy(), std)
+            or checkpoint.get("heldout_rows_used_for_training_normalization_or_selection")
+            != 0
+        ):
+            raise NestedCandidatePoolError("RAC model/action normalization disagree")
+        rows.append(
+            {
+                "member": int(item["member"]),
+                "normalization_sha256": canonical_sha256(normalization),
+                "action_mean": mean.astype(float).tolist(),
+                "action_std": std.astype(float).tolist(),
+            }
+        )
+        del checkpoint
+    if len(rows) != rac_trainer.ENSEMBLE_SIZE or any(
+        row != {**rows[0], "member": row["member"]} for row in rows
+    ):
+        raise NestedCandidatePoolError("five RAC members do not share one normalizer")
+    base = {
+        "format": SOURCE_ACTION_NORMALIZER_FORMAT,
+        "heldout_body": str(fold.get("heldout_body")),
+        "canonical_action_schema": collector.ACTION_SCHEMA,
+        "normalization_fit_scope": "four_source_bodies_train_only",
+        "heldout_rows_used": 0,
+        "checkpoint_action_normalization_sha256": rows[0][
+            "normalization_sha256"
+        ],
+        "action_mean": rows[0]["action_mean"],
+        "action_std": rows[0]["action_std"],
+        "normalization_clip": float(rac_trainer.CROSS_BODY_STANDARDIZED_INPUT_CLIP),
+        "five_member_normalizers_bit_exact_equal": True,
+        "selection_reads_heldout_labels_outcomes_or_critic_scores": False,
+    }
+    result = {**base, "logical_sha256": canonical_sha256(base)}
+    validate_source_action_normalizer(
+        result, expected_heldout_body=str(fold.get("heldout_body"))
+    )
+    return result
+
+
+def inspect_rac_fold_training_regime(
+    folds: Mapping[str, Mapping[str, Any]],
+    *,
+    required_supplement_binding_sha256: str | None,
+) -> dict[str, Any]:
+    if set(folds) != set(BODIES):
+        raise NestedCandidatePoolError("RAC regime requires five folds")
+    regimes: set[tuple[bool, str | None]] = set()
+    rows = {}
+    for body in BODIES:
+        fold = folds[body]
+        preflight = _read_signed_rac_json(
+            Path(str(fold["preflight_receipt"])), f"{body} RAC preflight"
+        )
+        summary = _read_signed_rac_json(
+            Path(str(fold["training_summary"])), f"{body} RAC summary"
+        )
+        supplement = preflight.get("supplement")
+        if not isinstance(supplement, Mapping):
+            raise NestedCandidatePoolError("RAC preflight lacks supplement declaration")
+        enabled = supplement.get("enabled") is True
+        binding_sha = supplement.get("binding_file_sha256") if enabled else None
+        if (
+            (enabled and not _is_sha256(binding_sha))
+            or supplement.get("heldout_groups_deferred", 0) < 0
+            or summary.get("checkpoint_selection", {}).get("supplement_rows_used") != 0
+            or summary.get("checkpoint_selection", {}).get("heldout_rows_used") != 0
+            or (enabled and summary.get("supplement_train_pairs") is None)
+            or (not enabled and summary.get("supplement_train_pairs") is not None)
+        ):
+            raise NestedCandidatePoolError("RAC supplement regime changed")
+        regimes.add((enabled, binding_sha))
+        rows[body] = {
+            "supplement_enabled": enabled,
+            "supplement_binding_file_sha256": binding_sha,
+            "checkpoint_selection_supplement_rows_used": 0,
+            "heldout_rows_used": 0,
+            "training_summary_sha256": fold["training_summary_sha256"],
+        }
+    if len(regimes) != 1:
+        raise NestedCandidatePoolError("five RAC folds mix training regimes")
+    enabled, binding_sha = next(iter(regimes))
+    if required_supplement_binding_sha256 is not None and (
+        not enabled or binding_sha != required_supplement_binding_sha256
+    ):
+        raise NestedCandidatePoolError("RAC folds do not use required supplement")
+    base = {
+        "name": "rac_c_plus_expert_root_supplement" if enabled else "rac_c_only",
+        "critic_kind": "rac",
+        "supplement_enabled": enabled,
+        "supplement_binding_file_sha256": binding_sha,
+        "required_supplement_binding_sha256": required_supplement_binding_sha256,
+        "checkpoint_selection_scope": "primary_source_validation_only",
+        "folds": rows,
+    }
+    return {**base, "regime_sha256": canonical_sha256(base)}
+
+
 def validate_runtime_ensemble_action_normalizer(
     ensemble: Sequence[shared_head.EffectAlignedSharedEventHead],
     binding: Mapping[str, Any],
@@ -432,6 +681,21 @@ def validate_runtime_ensemble_action_normalizer(
             raise NestedCandidatePoolError(
                 "runtime ensemble action normalizer differs from binding"
             )
+
+
+def validate_runtime_rac_action_normalizer(
+    ensemble: Sequence[Any], binding: Mapping[str, Any]
+) -> None:
+    mean, std, clip = validate_source_action_normalizer(binding)
+    if len(ensemble) != rac_trainer.ENSEMBLE_SIZE:
+        raise NestedCandidatePoolError("runtime RAC requires five members")
+    for model in ensemble:
+        if (
+            not np.array_equal(model.action_mean.detach().cpu().numpy(), mean)
+            or not np.array_equal(model.action_std.detach().cpu().numpy(), std)
+            or float(model.config.normalization_clip) != clip
+        ):
+            raise NestedCandidatePoolError("runtime RAC normalizer differs from binding")
 
 
 def existing_separate_n4_n8_comparability_audit() -> dict[str, Any]:
@@ -995,7 +1259,7 @@ def _method_candidates(
 def _score_candidates(
     *,
     method: str,
-    ensemble: Sequence[shared_head.EffectAlignedSharedEventHead],
+    ensemble: Sequence[Any],
     state: np.ndarray,
     current_ee: np.ndarray,
     candidates: np.ndarray,
@@ -1003,38 +1267,115 @@ def _score_candidates(
     event_age_seconds: float,
     remaining_action_budget: int,
     device: torch.device,
+    critic_kind: str = "etsf",
+    critic_load_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if critic_kind not in CRITIC_KINDS:
+        raise NestedCandidatePoolError("unknown critic kind")
+    batch: Mapping[str, torch.Tensor]
     if method == METHOD_N4:
-        return formal.score_candidates(
-            ensemble,
-            formal.scoring_batch(
-                state=state,
-                current_ee=current_ee,
-                candidates=candidates,
-                current_event=current_event,
-                event_age_seconds=event_age_seconds,
-                remaining_action_budget=remaining_action_budget,
-                action_exec_steps=ACTION_EXEC_STEPS,
-                dt=1.0 / ACTOR_DATASET_FPS,
-                device=device,
-            ),
+        batch = formal.scoring_batch(
+            state=state,
+            current_ee=current_ee,
+            candidates=candidates,
+            current_event=current_event,
+            event_age_seconds=event_age_seconds,
+            remaining_action_budget=remaining_action_budget,
+            action_exec_steps=ACTION_EXEC_STEPS,
+            dt=1.0 / ACTOR_DATASET_FPS,
+            device=device,
         )
-    if method == METHOD_N8:
-        return pool_runner.score_candidates(
-            ensemble,
-            pool_runner.scoring_batch(
-                state=state,
-                current_ee=current_ee,
-                candidates=candidates,
-                current_event=current_event,
-                event_age_seconds=event_age_seconds,
-                remaining_action_budget=remaining_action_budget,
-                candidate_count=N8_CANDIDATE_COUNT,
-                device=device,
-            ),
+    elif method == METHOD_N8:
+        batch = pool_runner.scoring_batch(
+            state=state,
+            current_ee=current_ee,
+            candidates=candidates,
+            current_event=current_event,
+            event_age_seconds=event_age_seconds,
+            remaining_action_budget=remaining_action_budget,
             candidate_count=N8_CANDIDATE_COUNT,
+            device=device,
         )
-    raise NestedCandidatePoolError("actor baseline may not call the critic")
+    else:
+        raise NestedCandidatePoolError("actor baseline may not call the critic")
+    if critic_kind == "etsf":
+        return (
+            formal.score_candidates(ensemble, batch)
+            if method == METHOD_N4
+            else pool_runner.score_candidates(
+                ensemble, batch, candidate_count=N8_CANDIDATE_COUNT
+            )
+        )
+    if not isinstance(critic_load_receipt, Mapping):
+        raise NestedCandidatePoolError("RAC score lacks ensemble load receipt")
+    try:
+        result = (
+            rac_adapter.score_n4_candidates(ensemble, batch)
+            if method == METHOD_N4
+            else rac_adapter.score_n8_candidates(ensemble, batch)
+        )
+    except rac_adapter.RelativeActionCriticAdapterError as error:
+        raise NestedCandidatePoolError(str(error)) from error
+    receipt = build_rac_rank_receipt(
+        result,
+        method=method,
+        critic_load_receipt=critic_load_receipt,
+    )
+    return {**result, "critic_kind": "rac", "rank_receipt": receipt}
+
+
+def build_rac_rank_receipt(
+    scores: Mapping[str, Any],
+    *,
+    method: str,
+    critic_load_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    count = _expected_pool_count(method)
+    load_unsigned = {
+        key: item for key, item in critic_load_receipt.items()
+        if key != "logical_sha256"
+    }
+    if (
+        method not in (METHOD_N4, METHOD_N8)
+        or critic_load_receipt.get("logical_sha256")
+        != canonical_sha256(load_unsigned)
+        or critic_load_receipt.get("heldout_payloads_or_labels_opened") != 0
+        or len(critic_load_receipt.get("members", [])) != rac_trainer.ENSEMBLE_SIZE
+        or scores.get("relative_action_critic_runtime_contract")
+        != rac_adapter.runtime_contract(count)
+    ):
+        raise NestedCandidatePoolError("RAC rank authority changed")
+    base = {
+        "format": RAC_RANK_RECEIPT_FORMAT,
+        "critic_kind": "rac",
+        "method": method,
+        "candidate_count": count,
+        "relative_action_critic_runtime_contract": rac_adapter.runtime_contract(
+            count
+        ),
+        "critic_ensemble_load_receipt": dict(critic_load_receipt),
+        "critic_ensemble_load_receipt_logical_sha256": critic_load_receipt[
+            "logical_sha256"
+        ],
+        "candidate_rank_score_members_sha256": canonical_sha256(
+            scores.get("candidate_rank_score_members")
+        ),
+        "risk_adjusted_candidate_score_sha256": canonical_sha256(
+            scores.get("candidate_rank_score_epistemic_lcb_ensemble")
+        ),
+        "pair_probability_matrix_members_sha256": canonical_sha256(
+            scores.get("rac_pair_probability_matrix_members")
+        ),
+        "unordered_pair_indices": scores.get("rac_unordered_pair_indices"),
+        "unordered_pairs_evaluated_per_member": scores.get(
+            "rac_unordered_pairs_evaluated_per_member"
+        ),
+        "selected_candidate_index": scores.get("selected_candidate_index"),
+        "all_pairs_evaluated": True,
+        "single_elimination_bracket_used": False,
+        "heldout_labels_or_outcomes_read_for_ranking": False,
+    }
+    return {**base, "logical_sha256": canonical_sha256(base)}
 
 
 def execute_rollout(
@@ -1048,13 +1389,15 @@ def execute_rollout(
     policy: Any,
     preprocessor: Any,
     postprocessor: Any,
-    ensemble: Sequence[shared_head.EffectAlignedSharedEventHead],
+    ensemble: Sequence[Any],
     calibration: Mapping[str, Any],
     initial_commitment: Mapping[str, Any],
     source_action_normalizer: Mapping[str, Any],
     instruction: str,
     max_steps: int,
     device: torch.device,
+    critic_kind: str = "etsf",
+    critic_load_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if method not in METHODS:
         raise NestedCandidatePoolError(f"unknown nested method {method!r}")
@@ -1154,6 +1497,8 @@ def execute_rollout(
                     remaining_action_budget=max_steps
                     - int(getattr(task, "take_action_cnt", 0)),
                     device=device,
+                    critic_kind=critic_kind,
+                    critic_load_receipt=critic_load_receipt,
                 )
                 selected = int(score_record["selected_candidate_index"])
             executed = 0
@@ -1932,7 +2277,10 @@ def validate_rollout(
                 )
             continue
         if not isinstance(scores, Mapping):
-            raise NestedCandidatePoolError("nested ETSF decision lacks critic scores")
+            raise NestedCandidatePoolError("nested decision lacks critic scores")
+        critic_kind = scores.get("critic_kind", "etsf")
+        if critic_kind not in CRITIC_KINDS:
+            raise NestedCandidatePoolError("nested critic kind changed")
         member_scores = np.asarray(
             scores.get("candidate_rank_score_members"), dtype=np.float64
         )
@@ -1944,15 +2292,24 @@ def validate_rollout(
             expected_count,
         ):
             raise NestedCandidatePoolError("nested critic score shape changed")
-        recomputed_tensor = (
-            shared_head.aggregate_risk_adjusted_rank_scores(
-                torch.as_tensor(member_scores)
+        if critic_kind == "rac":
+            try:
+                recomputed_tensor = rac_adapter.aggregate_member_candidate_scores(
+                    torch.as_tensor(member_scores)
+                )
+            except rac_adapter.RelativeActionCriticAdapterError as error:
+                raise NestedCandidatePoolError(str(error)) from error
+            validate_rac_rank_receipt(scores, method=method, expected=expected)
+        else:
+            recomputed_tensor = (
+                shared_head.aggregate_risk_adjusted_rank_scores(
+                    torch.as_tensor(member_scores)
+                )
+                if method == METHOD_N4
+                else pool_runner.aggregate_risk_adjusted_rank_scores(
+                    torch.as_tensor(member_scores)
+                )
             )
-            if method == METHOD_N4
-            else pool_runner.aggregate_risk_adjusted_rank_scores(
-                torch.as_tensor(member_scores)
-            )
-        )
         recomputed = recomputed_tensor.cpu().numpy()
         if not np.allclose(recorded, recomputed, atol=1e-6, rtol=0.0):
             raise NestedCandidatePoolError("nested critic score cannot be replayed")
@@ -1962,6 +2319,126 @@ def validate_rollout(
             or decision["selected_candidate_index"] != selected
         ):
             raise NestedCandidatePoolError("nested critic selection changed")
+
+
+def validate_rac_rank_receipt(
+    scores: Mapping[str, Any],
+    *,
+    method: str,
+    expected: Mapping[str, Any],
+) -> None:
+    count = _expected_pool_count(method)
+    receipt = scores.get("rank_receipt")
+    if not isinstance(receipt, Mapping):
+        raise NestedCandidatePoolError("RAC decision lacks rank receipt")
+    unsigned = {key: item for key, item in receipt.items() if key != "logical_sha256"}
+    load_receipt = receipt.get("critic_ensemble_load_receipt")
+    if not isinstance(load_receipt, Mapping):
+        raise NestedCandidatePoolError("RAC rank receipt lacks load authority")
+    load_unsigned = {
+        key: item for key, item in load_receipt.items() if key != "logical_sha256"
+    }
+    expected_pairs = [
+        [left, right]
+        for left in range(count)
+        for right in range(left + 1, count)
+    ]
+    matrices = np.asarray(
+        scores.get("rac_pair_probability_matrix_members"), dtype=np.float64
+    )
+    member_scores = np.asarray(
+        scores.get("candidate_rank_score_members"), dtype=np.float64
+    )
+    if matrices.shape == (rac_trainer.ENSEMBLE_SIZE, count, count):
+        replayed_member_scores = (
+            matrices.sum(axis=2) - np.diagonal(matrices, axis1=1, axis2=2)
+        ) / float(count - 1)
+    else:
+        replayed_member_scores = np.empty((0, 0), dtype=np.float64)
+    if (
+        receipt.get("format") != RAC_RANK_RECEIPT_FORMAT
+        or receipt.get("logical_sha256") != canonical_sha256(unsigned)
+        or receipt.get("critic_kind") != "rac"
+        or receipt.get("method") != method
+        or receipt.get("candidate_count") != count
+        or receipt.get("relative_action_critic_runtime_contract")
+        != rac_adapter.runtime_contract(count)
+        or receipt.get("critic_ensemble_load_receipt_logical_sha256")
+        != load_receipt.get("logical_sha256")
+        or load_receipt.get("logical_sha256") != canonical_sha256(load_unsigned)
+        or load_receipt.get("held_out_body") != expected["heldout_body"]
+        or load_receipt.get("heldout_payloads_or_labels_opened") != 0
+        or len(load_receipt.get("members", [])) != rac_trainer.ENSEMBLE_SIZE
+        or receipt.get("candidate_rank_score_members_sha256")
+        != canonical_sha256(scores.get("candidate_rank_score_members"))
+        or receipt.get("risk_adjusted_candidate_score_sha256")
+        != canonical_sha256(
+            scores.get("candidate_rank_score_epistemic_lcb_ensemble")
+        )
+        or receipt.get("pair_probability_matrix_members_sha256")
+        != canonical_sha256(scores.get("rac_pair_probability_matrix_members"))
+        or receipt.get("unordered_pair_indices") != expected_pairs
+        or scores.get("rac_unordered_pair_indices") != expected_pairs
+        or receipt.get("unordered_pairs_evaluated_per_member")
+        != math.comb(count, 2)
+        or scores.get("rac_unordered_pairs_evaluated_per_member")
+        != math.comb(count, 2)
+        or receipt.get("selected_candidate_index")
+        != scores.get("selected_candidate_index")
+        or receipt.get("all_pairs_evaluated") is not True
+        or receipt.get("single_elimination_bracket_used") is not False
+        or receipt.get("heldout_labels_or_outcomes_read_for_ranking") is not False
+        or matrices.shape != (rac_trainer.ENSEMBLE_SIZE, count, count)
+        or not np.isfinite(matrices).all()
+        or np.any(matrices < 0.0)
+        or np.any(matrices > 1.0)
+        or not np.allclose(
+            matrices + matrices.transpose(0, 2, 1), 1.0, atol=1e-6, rtol=0.0
+        )
+        or not np.allclose(
+            np.diagonal(matrices, axis1=1, axis2=2),
+            0.5,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        or member_scores.shape != (rac_trainer.ENSEMBLE_SIZE, count)
+        or not np.allclose(
+            member_scores, replayed_member_scores, atol=1e-6, rtol=0.0
+        )
+        or not np.allclose(
+            np.asarray(scores.get("rac_pair_probability_matrix_mean")),
+            matrices.mean(axis=0),
+            atol=1e-6,
+            rtol=0.0,
+        )
+        or not np.allclose(
+            np.asarray(scores.get("candidate_rank_score_mean")),
+            member_scores.mean(axis=0),
+            atol=1e-6,
+            rtol=0.0,
+        )
+        or not np.allclose(
+            np.asarray(scores.get("candidate_rank_score_raw_candidate_population_std")),
+            member_scores.std(axis=0, ddof=0),
+            atol=1e-6,
+            rtol=0.0,
+        )
+        or not np.allclose(
+            np.asarray(scores.get("candidate_rank_score_raw_member_candidate_mean")),
+            member_scores.mean(axis=1),
+            atol=1e-6,
+            rtol=0.0,
+        )
+        or not np.allclose(
+            np.asarray(
+                scores.get("candidate_rank_score_raw_member_candidate_population_std")
+            ),
+            member_scores.std(axis=1, ddof=0),
+            atol=1e-6,
+            rtol=0.0,
+        )
+    ):
+        raise NestedCandidatePoolError("RAC rank receipt cannot be replayed")
 
 
 def validate_stored_initial_commitment(
@@ -2781,6 +3258,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--actor-execution-protocol-sha256", required=True)
     parser.add_argument("--path-root", type=Path, required=True)
     parser.add_argument("--lobo-fold", action="append", required=True)
+    parser.add_argument("--critic-kind", choices=CRITIC_KINDS, default="etsf")
     parser.add_argument("--required-supplement-binding-sha256")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--action-exec-steps", type=int)
@@ -2790,13 +3268,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def implementation_binding(robotwin_root: Path) -> dict[str, Any]:
+def implementation_binding(
+    robotwin_root: Path, *, critic_kind: str = "etsf"
+) -> dict[str, Any]:
     inherited = formal.implementation_binding(robotwin_root)
     paths = [
         Path(__file__).resolve(),
         Path(inspect.getsourcefile(pool_runner) or "").resolve(),
     ]
-    return {
+    result = {
         **inherited,
         "nested_runner_files": [
             {"path": str(path), "sha256": sha256_file(path)} for path in paths
@@ -2804,6 +3284,19 @@ def implementation_binding(robotwin_root: Path) -> dict[str, Any]:
         "nested_pool_contract": nested_pool_contract(),
         "formal_n4_or_existing_n8_output_mutated": False,
     }
+    if critic_kind == "rac":
+        rac_paths = [
+            Path(inspect.getsourcefile(rac_adapter) or "").resolve(),
+            Path(inspect.getsourcefile(rac_trainer) or "").resolve(),
+        ]
+        result["critic_kind"] = "rac"
+        result["relative_action_critic_files"] = [
+            {"path": str(path), "sha256": sha256_file(path)}
+            for path in rac_paths
+        ]
+    elif critic_kind != "etsf":
+        raise NestedCandidatePoolError("unknown critic kind")
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2867,14 +3360,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.reference_preregistration.expanduser().resolve()
     )
     fold_paths = formal.parse_fold_specs(args.lobo_fold)
-    folds = {body: formal.inspect_fold(body, fold_paths[body]) for body in BODIES}
-    fold_action_normalizers = {
-        body: inspect_fold_source_action_normalizer(folds[body]) for body in BODIES
-    }
-    fold_training_regime = formal.inspect_fold_training_regime(
-        folds,
-        required_supplement_binding_sha256=args.required_supplement_binding_sha256,
-    )
+    if args.critic_kind == "etsf":
+        folds = {
+            body: formal.inspect_fold(body, fold_paths[body]) for body in BODIES
+        }
+        fold_action_normalizers = {
+            body: inspect_fold_source_action_normalizer(folds[body])
+            for body in BODIES
+        }
+        fold_training_regime = formal.inspect_fold_training_regime(
+            folds,
+            required_supplement_binding_sha256=(
+                args.required_supplement_binding_sha256
+            ),
+        )
+    else:
+        folds = {
+            body: inspect_rac_fold(body, fold_paths[body]) for body in BODIES
+        }
+        fold_action_normalizers = {
+            body: inspect_rac_fold_source_action_normalizer(folds[body])
+            for body in BODIES
+        }
+        fold_training_regime = inspect_rac_fold_training_regime(
+            folds,
+            required_supplement_binding_sha256=(
+                args.required_supplement_binding_sha256
+            ),
+        )
     actor_checkpoint = args.actor_checkpoint.expanduser().resolve()
     actor_tree_sha, actor_file_count, actor_size = shared_head.sha256_tree(
         actor_checkpoint
@@ -2965,12 +3478,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             fold_action_normalizers
         ),
         "fold_training_regime": fold_training_regime,
-        "candidate_rank_ensemble_contracts": {
-            "nested_n4": shared_head.risk_adjusted_rank_ensemble_contract(),
-            "nested_n8": pool_runner.runtime_rank_ensemble_contract(
-                N8_CANDIDATE_COUNT
-            ),
-        },
+        "candidate_rank_ensemble_contracts": (
+            {
+                "nested_n4": shared_head.risk_adjusted_rank_ensemble_contract(),
+                "nested_n8": pool_runner.runtime_rank_ensemble_contract(
+                    N8_CANDIDATE_COUNT
+                ),
+            }
+            if args.critic_kind == "etsf"
+            else {
+                "nested_n4": rac_adapter.runtime_contract(N4_CANDIDATE_COUNT),
+                "nested_n8": rac_adapter.runtime_contract(N8_CANDIDATE_COUNT),
+            }
+        ),
         "event_spec": str(event_spec_path),
         "event_spec_sha256": EVENT_SPEC_SHA256,
         "analytic_event_contract": analytic_event.event_contract(calibration),
@@ -2990,11 +3510,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "max_steps": args.max_steps,
         "fps": args.fps,
         "instruction": args.instruction,
-        "runtime_binding": implementation_binding(robotwin_root),
+        "runtime_binding": implementation_binding(
+            robotwin_root, critic_kind=args.critic_kind
+        ),
         "no_training": True,
         "formal_n4_or_existing_n8_output_mutated": False,
         "official_expert_or_protected_internal_payloads_opened": False,
     }
+    if args.critic_kind == "rac":
+        contract_base["critic_kind"] = "rac"
+        contract_base["method_critic_assignment"] = {
+            METHOD_ACTOR: None,
+            METHOD_N4: "rac",
+            METHOD_N8: "rac",
+        }
+        contract_base["rac_rank_receipt_format"] = RAC_RANK_RECEIPT_FORMAT
     contract = {**contract_base, "logical_sha256": canonical_sha256(contract_base)}
     contract_file_sha = promote_create_once_json(
         contract_path, contract, label="nested execution contract"
@@ -3037,7 +3567,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows = []
     completed = 0
     active_body = None
-    ensemble: list[shared_head.EffectAlignedSharedEventHead] = []
+    ensemble: list[Any] = []
+    critic_load_receipt: dict[str, Any] | None = None
     started = time.time()
 
     def record_completed_pair(
@@ -3132,10 +3663,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             del ensemble
             gc.collect()
             torch.cuda.empty_cache()
-            ensemble = formal.load_ensemble(folds[body], device)
-            validate_runtime_ensemble_action_normalizer(
-                ensemble, fold_action_normalizers[body]
-            )
+            if args.critic_kind == "etsf":
+                ensemble = formal.load_ensemble(folds[body], device)
+                validate_runtime_ensemble_action_normalizer(
+                    ensemble, fold_action_normalizers[body]
+                )
+                critic_load_receipt = None
+            else:
+                try:
+                    ensemble, critic_load_receipt = rac_adapter.load_fold_ensemble(
+                        Path(str(folds[body]["training_summary"])),
+                        device=device,
+                        expected_held_out_body=body,
+                    )
+                except rac_adapter.RelativeActionCriticAdapterError as error:
+                    raise NestedCandidatePoolError(str(error)) from error
+                validate_runtime_rac_action_normalizer(
+                    ensemble, fold_action_normalizers[body]
+                )
             active_body = body
         promote_create_once_json(
             attempt_path, attempt, label="nested triplet attempt"
@@ -3285,6 +3830,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             instruction=args.instruction,
                             max_steps=args.max_steps,
                             device=device,
+                            critic_kind=args.critic_kind,
+                            critic_load_receipt=critic_load_receipt,
                         )
                         result_value = build_method_result(
                             expected,

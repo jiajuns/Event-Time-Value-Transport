@@ -286,9 +286,12 @@ loss 学习真实 branch 偏好，并冻结 tournament bracket；正式 nested r
 - checkpoint 加载器校验 held-out body、actor protocol、binding、成员数、step 和文件 SHA，且保持
   `heldout_rows_used=0`。
 
-该实现已经形成可训练、可加载和可重放的基线主体，但代码回归通过不等于 RAC 已得到闭环效果。
-正式结果仍需五折 checkpoint、nested runner 的显式 `critic_kind=relative_action_critic` 接入，以及
-与 ETSF 完全相同的 N1/N4/N8 schedule；在这些产物完成前不得填入 RAC 的成功率数字。
+该实现已经形成可训练、可加载和可重放的基线闭环。五折 supervisor 会在主 v13 成功链完整结束后
+按五个 held-out body 顺序训练，并在 deferred supplement binding 出现、通过 actor protocol 认证后
+一次性冻结其 SHA；nested runner 已提供显式 `--critic-kind rac`，与 ETSF 使用相同 N1/N4/N8
+候选池、reset 和 schedule。RAC rank receipt 会从所有 pairwise 概率矩阵重放 soft-Copeland、五成员
+均值/方差与 epistemic LCB，不能只修改结果后重新自签名。代码回归通过仍不等于 RAC 已得到闭环
+效果；在五折 checkpoint 和完整 rollout 产物完成前不得填入 RAC 的成功率数字。
 
 ### 6.6 WCM / World Value Model
 

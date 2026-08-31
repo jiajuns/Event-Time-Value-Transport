@@ -111,6 +111,21 @@ truth 时仍完整报告标准迁移指标，但严格写入 `oracle_evidence_su
 共享头增益。权威 `progress.json` 在并发读取时为 `53/200`，随后第 54 个 pair 原子落盘，属于正常
 运行中的瞬时差异。
 
-matched VLA-ATTC-style Relative Action Critic 已实现单折五成员 LOBO 训练器和 N4/N8 全 pair
-soft-Copeland 运行时适配器；定向联合回归 163 项通过。它尚未在 4090 上训练，也尚未接入已部署
-nested runner，因此当前仍无 RAC 闭环成功率结果，不能用代码测试代替效果数字。
+matched VLA-ATTC-style Relative Action Critic 在 08:09 时已实现单折五成员 LOBO 训练器和 N4/N8
+全 pair soft-Copeland 运行时适配器；当时定向联合回归 163 项通过、尚未接入 nested runner。其后
+闭环接线状态见下一节；当前仍无 RAC 闭环成功率结果，不能用代码测试代替效果数字。
+
+## 08:32 CST RAC 正式闭环接线
+
+RAC 已增加五折自动 supervisor 和 nested `--critic-kind rac` 路径。supervisor 支持：
+
+- 主 v13 完成收据与最终报告未冻结前不打开 branch payload、不竞争 GPU；
+- supplement binding 尚未生成时只读等待，生成后验证 actor protocol 与 logical SHA，再一次性冻结
+  file SHA；
+- 每折五成员、每成员 3000 steps，create-once attempt、失败保留、原子晋升和中断恢复；
+- 五本体 N4/N8 使用全 pair soft-Copeland，并把 pair matrix、member score、均值/方差、epistemic
+  LCB 和最终选择全部写入可重放 rank receipt。
+
+相关 RAC、supervisor、nested、最终报告与 postformal watcher 定向回归共 71 项通过。该队列仍须部署
+到 4090，且必须排在主 v13 最终成功收据之后；因此这里仍只记录执行能力，不记录尚未产生的 RAC
+成功率。
