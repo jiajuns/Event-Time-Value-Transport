@@ -30,6 +30,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 FORMAT = "etsf_robotwin2_five_body_lobo_n1_n4_n8_oracle_input_v1"
 REPORT_FORMAT = "etsf_robotwin2_five_body_lobo_n1_n4_n8_oracle_report_v1"
+POLICY_ONLY_STATUS = (
+    "complete_policy_transfer_metrics_oracle_unavailable_fail_closed"
+)
 BENCHMARK = "RoboTwin2.0"
 TASK = "move_can_pot"
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
@@ -393,10 +396,10 @@ def _validate_oracle_groups(
         }
         groups[identity] = normalized
         seed_cell_counts[(body, condition, seed)] += 1
-    if 0 in seed_cell_counts.values() or len(set(seed_cell_counts.values())) != 1:
+    if set(seed_cell_counts.values()) != {1}:
         raise CrossEmbodimentReportError(
-            "oracle diagnostic must have nonempty equal decision-group counts per "
-            "body-condition-seed; outcome-dependent missing groups are forbidden"
+            "oracle diagnostic must have exactly one query-zero decision group per "
+            "body-condition-seed; outcome-dependent missing/extra groups are forbidden"
         )
     return [groups[key] for key in sorted(groups)]
 
@@ -417,6 +420,30 @@ def validate_document(value: Mapping[str, Any]) -> dict[str, Any]:
     folds = _validate_folds(document["critic_folds"])
     policy_rows = _validate_policy_rows(document["policy_rows"], folds)
     oracle_groups = _validate_oracle_groups(document["oracle_groups"], folds)
+    policy_by_identity = {
+        (
+            row["heldout_body"],
+            row["condition"],
+            row["requested_seed"],
+        ): row
+        for row in policy_rows
+    }
+    for group in oracle_groups:
+        identity = (
+            group["heldout_body"],
+            group["condition"],
+            group["requested_seed"],
+        )
+        policy = policy_by_identity[identity]
+        if (
+            group["shared_raw8_candidate_pool_sha256"]
+            != policy["shared_raw8_candidate_pool_sha256"]
+            or group["critic_checkpoint_sha256"]
+            != policy["critic_checkpoint_sha256"]
+        ):
+            raise CrossEmbodimentReportError(
+                "oracle query-zero group is not bound to the paired policy pool/critic"
+            )
     return {
         "document_sha256": recorded_sha,
         "actor": actor,
@@ -712,11 +739,10 @@ def _oracle_scope(
     return result
 
 
-def build_report(value: Mapping[str, Any]) -> dict[str, Any]:
-    validated = validate_document(value)
-    rows = validated["policy_rows"]
-    groups = validated["oracle_groups"]
-    actor_training = set(validated["actor"]["training_bodies"])
+def _transfer_claim(
+    actor: Mapping[str, Any],
+) -> dict[str, Any]:
+    actor_training = set(actor["training_bodies"])
     actor_zero_shot_by_body = {
         body: body not in actor_training for body in BODIES
     }
@@ -727,10 +753,76 @@ def build_report(value: Mapping[str, Any]) -> dict[str, Any]:
         if all_actor_zero_shot
         else "heldout_critic_transfer_with_actor_body_exposure"
     )
-    base = {
+    return {
+        "claim_type": claim_type,
+        "critic_transfer_proven_by_manifest_per_body": critic_transfer_by_body,
+        "all_five_critic_folds_are_label_free_on_target_body": True,
+        "actor_zero_shot_proven_by_manifest_per_body": actor_zero_shot_by_body,
+        "actor_zero_shot_to_all_five_bodies": all_actor_zero_shot,
+        "actor_training_bodies": actor["training_bodies"],
+        "critic_transfer_does_not_imply_actor_zero_shot": True,
+    }
+
+
+def _policy_evaluation(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "pair_count": len(rows),
+        "rollout_count": len(rows) * len(METHODS),
+        "global_equal_body_condition_macro": _policy_scope(rows, scope="global"),
+        "by_heldout_body": {
+            body: _policy_scope(
+                [row for row in rows if row["heldout_body"] == body],
+                scope=f"body:{body}",
+            )
+            for body in BODIES
+        },
+        "by_condition_equal_body_macro": {
+            condition: _policy_scope(
+                [row for row in rows if row["condition"] == condition],
+                scope=f"condition:{condition}",
+            )
+            for condition in CONDITIONS
+        },
+        "by_heldout_body_and_condition": {
+            f"{body}|{condition}": _policy_scope(
+                [
+                    row
+                    for row in rows
+                    if row["heldout_body"] == body
+                    and row["condition"] == condition
+                ],
+                scope=f"cell:{body}|{condition}",
+            )
+            for body in BODIES
+            for condition in CONDITIONS
+        },
+    }
+
+
+def _interpretation_boundary() -> dict[str, Any]:
+    return {
+        "critic_auc_brier_mae_are_not_transfer_success_metrics": True,
+        "no_auc_is_computed_or_accepted_by_this_report": True,
+        "actor_training_receipt_contents_opened_by_this_evaluator": False,
+        "critic_training_receipt_contents_opened_by_this_evaluator": False,
+        "training_body_roster_completeness_must_be_verified_upstream": True,
+        "delta_success_rate_requires_same_seed_paired_closed_loop_rollouts": True,
+        "stage_progress_cannot_rescue_a_failed_binary_success_claim": True,
+        "oracle_regret_requires_separate_executed_candidate_branches": True,
+        "oracle_values_are_not_mixed_into_closed_loop_delta_success_rate": True,
+    }
+
+
+def _report_common(
+    *,
+    input_document_sha256: str,
+    actor: Mapping[str, Any],
+    folds: Mapping[str, Mapping[str, Any]],
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
         "format": REPORT_FORMAT,
-        "status": "complete_outcome_only_metrics_no_training_or_execution_authority",
-        "input_document_sha256": validated["document_sha256"],
+        "input_document_sha256": input_document_sha256,
         "benchmark": BENCHMARK,
         "task": TASK,
         "closed_loop_primary_endpoint": "paired_binary_task_success",
@@ -741,49 +833,91 @@ def build_report(value: Mapping[str, Any]) -> dict[str, Any]:
             "n8": "same_heldout_body_lobo_critic_rerank_nested_first_eight",
             "oracle": "sealed_offline_true_outcome_upper_bound_never_deployable",
         },
-        "transfer_claim": {
-            "claim_type": claim_type,
-            "critic_transfer_proven_by_manifest_per_body": critic_transfer_by_body,
-            "all_five_critic_folds_are_label_free_on_target_body": True,
-            "actor_zero_shot_proven_by_manifest_per_body": actor_zero_shot_by_body,
-            "actor_zero_shot_to_all_five_bodies": all_actor_zero_shot,
-            "actor_training_bodies": validated["actor"]["training_bodies"],
-            "critic_transfer_does_not_imply_actor_zero_shot": True,
-        },
-        "fold_bindings": [validated["folds"][body] for body in BODIES],
-        "policy_evaluation": {
-            "pair_count": len(rows),
-            "rollout_count": len(rows) * len(METHODS),
-            "global_equal_body_condition_macro": _policy_scope(rows, scope="global"),
-            "by_heldout_body": {
-                body: _policy_scope(
-                    [row for row in rows if row["heldout_body"] == body],
-                    scope=f"body:{body}",
-                )
-                for body in BODIES
-            },
-            "by_condition_equal_body_macro": {
-                condition: _policy_scope(
-                    [row for row in rows if row["condition"] == condition],
-                    scope=f"condition:{condition}",
-                )
-                for condition in CONDITIONS
-            },
-            "by_heldout_body_and_condition": {
-                f"{body}|{condition}": _policy_scope(
-                    [
-                        row
-                        for row in rows
-                        if row["heldout_body"] == body
-                        and row["condition"] == condition
-                    ],
-                    scope=f"cell:{body}|{condition}",
-                )
-                for body in BODIES
-                for condition in CONDITIONS
-            },
-        },
+        "transfer_claim": _transfer_claim(actor),
+        "fold_bindings": [folds[body] for body in BODIES],
+        "policy_evaluation": _policy_evaluation(rows),
+    }
+
+
+def build_policy_only_report(
+    *,
+    input_document_sha256: str,
+    actor_provenance: Mapping[str, Any],
+    critic_folds: Sequence[Mapping[str, Any]],
+    policy_rows: Sequence[Mapping[str, Any]],
+    oracle_unavailability: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build all transfer metrics while refusing to invent oracle outcomes.
+
+    This is the only accepted fallback for a completed nested policy study
+    whose eight candidate interventions were not separately executed.  It
+    deliberately reports no oracle number, not even a proxy derived from the
+    three selected closed-loop arms.
+    """
+
+    document_sha = _sha(input_document_sha256, "policy-only input document")
+    actor = _validate_actor(actor_provenance)
+    folds = _validate_folds(list(critic_folds))
+    rows = _validate_policy_rows(list(policy_rows), folds)
+    if (
+        not isinstance(oracle_unavailability, Mapping)
+        or set(oracle_unavailability)
+        != {
+            "reason",
+            "candidate_truth_artifact_present",
+            "candidate_rollouts_observed",
+        }
+        or not isinstance(oracle_unavailability.get("reason"), str)
+        or not oracle_unavailability["reason"]
+        or oracle_unavailability.get("candidate_truth_artifact_present") is not False
+        or oracle_unavailability.get("candidate_rollouts_observed") != 0
+    ):
+        raise CrossEmbodimentReportError(
+            "policy-only oracle unavailability must prove zero candidate truth"
+        )
+    base = {
+        **_report_common(
+            input_document_sha256=document_sha,
+            actor=actor,
+            folds=folds,
+            rows=rows,
+        ),
+        "status": POLICY_ONLY_STATUS,
         "oracle_branch_diagnostic": {
+            "status": "unavailable_insufficient_candidate_level_truth",
+            "evidence_sufficient": False,
+            "oracle_regret_reported": False,
+            "oracle_regret": None,
+            "reason": oracle_unavailability["reason"],
+            "candidate_truth_artifact_present": False,
+            "candidate_rollouts_observed": 0,
+            "required_evidence": (
+                "one sealed query-zero group per body-condition-seed with all "
+                "eight independently executed candidate interventions"
+            ),
+            "selected_closed_loop_arms_are_not_oracle_counterfactuals": True,
+        },
+        "interpretation_boundary": _interpretation_boundary(),
+    }
+    return {**base, "report_sha256": canonical_sha256(base)}
+
+
+def build_report(value: Mapping[str, Any]) -> dict[str, Any]:
+    validated = validate_document(value)
+    rows = validated["policy_rows"]
+    groups = validated["oracle_groups"]
+    base = {
+        **_report_common(
+            input_document_sha256=validated["document_sha256"],
+            actor=validated["actor"],
+            folds=validated["folds"],
+            rows=rows,
+        ),
+        "status": "complete_outcome_only_metrics_no_training_or_execution_authority",
+        "oracle_branch_diagnostic": {
+            "status": "available_complete_sealed_candidate_truth",
+            "evidence_sufficient": True,
+            "oracle_regret_reported": True,
             "decision_group_count": len(groups),
             "separate_from_closed_loop_success_estimand": True,
             "unexecuted_candidate_outcomes_never_used_online": True,
@@ -822,17 +956,7 @@ def build_report(value: Mapping[str, Any]) -> dict[str, Any]:
                 for condition in CONDITIONS
             },
         },
-        "interpretation_boundary": {
-            "critic_auc_brier_mae_are_not_transfer_success_metrics": True,
-            "no_auc_is_computed_or_accepted_by_this_report": True,
-            "actor_training_receipt_contents_opened_by_this_evaluator": False,
-            "critic_training_receipt_contents_opened_by_this_evaluator": False,
-            "training_body_roster_completeness_must_be_verified_upstream": True,
-            "delta_success_rate_requires_same_seed_paired_closed_loop_rollouts": True,
-            "stage_progress_cannot_rescue_a_failed_binary_success_claim": True,
-            "oracle_regret_requires_separate_executed_candidate_branches": True,
-            "oracle_values_are_not_mixed_into_closed_loop_delta_success_rate": True,
-        },
+        "interpretation_boundary": _interpretation_boundary(),
     }
     return {**base, "report_sha256": canonical_sha256(base)}
 

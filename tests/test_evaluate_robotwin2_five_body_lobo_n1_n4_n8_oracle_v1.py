@@ -287,6 +287,12 @@ def test_auc_or_prediction_fields_cannot_masquerade_as_transfer(
             ),
             "nested first-4",
         ),
+        (
+            lambda value: value["oracle_groups"][0].__setitem__(
+                "shared_raw8_candidate_pool_sha256", "1" * 64
+            ),
+            "paired policy pool/critic",
+        ),
     ],
 )
 def test_leakage_incomplete_rosters_and_non_nested_selection_fail_closed(

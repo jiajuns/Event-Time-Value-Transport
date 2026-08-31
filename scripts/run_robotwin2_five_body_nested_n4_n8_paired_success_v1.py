@@ -49,6 +49,13 @@ CONTRACT_FORMAT = "etsf_robotwin2_nested_n4_n8_execution_contract_v2_actor_proto
 OUTCOME_FORMAT = "etsf_robotwin2_nested_n4_n8_outcomes_v2"
 REPORT_FORMAT = "etsf_robotwin2_nested_n4_n8_report_v2"
 COMPLETION_FORMAT = "etsf_robotwin2_nested_n4_n8_completion_receipt_v2"
+ORACLE_TRUTH_FORMAT = "etsf_robotwin2_nested_query0_oracle_truth_v1"
+ORACLE_TRUTH_STATUS = "complete_1000_query0_groups_8000_candidate_rollouts"
+ORACLE_GROUP_FORMAT = "etsf_robotwin2_nested_query0_oracle_group_v1"
+ORACLE_RESULT_FORMAT = "etsf_robotwin2_nested_query0_candidate_result_v1"
+ORACLE_CONTINUATION_POLICY = (
+    "force_query0_nested_n8_candidate_then_actor_candidate0_at_all_future_queries"
+)
 NESTED_POOL_AUDIT_FORMAT = (
     "etsf_robotwin2_shared_raw16_nested_n4_n8_audit_v4_actor_protocol"
 )
@@ -1229,6 +1236,591 @@ def execute_rollout(
         }
     finally:
         task.close_env(clear_cache=False)
+
+
+def build_query0_oracle_candidate_result(
+    *,
+    candidate_index: int,
+    raw_proposal_index: int,
+    initial_candidate_commitment_sha256: str,
+    paired_reset_sha256: str,
+    shared_raw8_candidate_pool_sha256: str,
+    binary_success: int,
+    stage_progress: float,
+    goal_progress: float,
+    action_execution_error: None = None,
+) -> dict[str, Any]:
+    """Sign one real query-zero candidate intervention result.
+
+    Callers may only use outcomes returned by
+    :func:`execute_query0_oracle_candidate_rollout`.  In particular, critic
+    predictions and the three selected policy arms are not candidate truth.
+    """
+
+    if (
+        type(candidate_index) is not int
+        or not 0 <= candidate_index < N8_CANDIDATE_COUNT
+        or type(raw_proposal_index) is not int
+        or not 0 <= raw_proposal_index < RAW_PROPOSAL_COUNT
+        or not _is_sha256(initial_candidate_commitment_sha256)
+        or not _is_sha256(paired_reset_sha256)
+        or not _is_sha256(shared_raw8_candidate_pool_sha256)
+        or type(binary_success) is not int
+        or binary_success not in (0, 1)
+        or isinstance(stage_progress, bool)
+        or not isinstance(stage_progress, (int, float))
+        or not math.isfinite(float(stage_progress))
+        or float(stage_progress)
+        not in tuple(
+            index / float(STAGE_DENOMINATOR)
+            for index in range(STAGE_DENOMINATOR + 1)
+        )
+        or (float(stage_progress) == 1.0) != bool(binary_success)
+        or isinstance(goal_progress, bool)
+        or not isinstance(goal_progress, (int, float))
+        or not math.isfinite(float(goal_progress))
+        or action_execution_error is not None
+    ):
+        raise NestedCandidatePoolError("query-zero oracle candidate result is invalid")
+    base = {
+        "format": ORACLE_RESULT_FORMAT,
+        "candidate_index": candidate_index,
+        "raw_proposal_index": raw_proposal_index,
+        "initial_candidate_commitment_sha256": (
+            initial_candidate_commitment_sha256
+        ),
+        "paired_reset_sha256": paired_reset_sha256,
+        "shared_raw8_candidate_pool_sha256": shared_raw8_candidate_pool_sha256,
+        "continuation_policy": ORACLE_CONTINUATION_POLICY,
+        "binary_success": binary_success,
+        "stage_progress": float(stage_progress),
+        "goal_progress": float(goal_progress),
+        "action_execution_error": None,
+    }
+    return {**base, "result_sha256": canonical_sha256(base)}
+
+
+def validate_query0_oracle_candidate_result(
+    result: Mapping[str, Any],
+    *,
+    candidate_index: int,
+    initial_candidate_commitment_sha256: str,
+    paired_reset_sha256: str,
+    shared_raw8_candidate_pool_sha256: str,
+) -> None:
+    """Replay the complete signed candidate-result contract.
+
+    A self-consistent hash alone is deliberately insufficient: every semantic
+    field is rebuilt through :func:`build_query0_oracle_candidate_result` so a
+    forged success/stage combination, non-finite goal, execution failure, or
+    extra field cannot enter the sealed oracle authority.
+    """
+
+    expected_fields = {
+        "format",
+        "candidate_index",
+        "raw_proposal_index",
+        "initial_candidate_commitment_sha256",
+        "paired_reset_sha256",
+        "shared_raw8_candidate_pool_sha256",
+        "continuation_policy",
+        "binary_success",
+        "stage_progress",
+        "goal_progress",
+        "action_execution_error",
+        "result_sha256",
+    }
+    if set(result) != expected_fields:
+        raise NestedCandidatePoolError(
+            "query-zero oracle candidate result fields changed"
+        )
+    try:
+        rebuilt = build_query0_oracle_candidate_result(
+            candidate_index=result["candidate_index"],
+            raw_proposal_index=result["raw_proposal_index"],
+            initial_candidate_commitment_sha256=result[
+                "initial_candidate_commitment_sha256"
+            ],
+            paired_reset_sha256=result["paired_reset_sha256"],
+            shared_raw8_candidate_pool_sha256=result[
+                "shared_raw8_candidate_pool_sha256"
+            ],
+            binary_success=result["binary_success"],
+            stage_progress=result["stage_progress"],
+            goal_progress=result["goal_progress"],
+            action_execution_error=result["action_execution_error"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise NestedCandidatePoolError(
+            "query-zero oracle candidate result is invalid"
+        ) from error
+    if (
+        dict(result) != rebuilt
+        or result["candidate_index"] != candidate_index
+        or result["initial_candidate_commitment_sha256"]
+        != initial_candidate_commitment_sha256
+        or result["paired_reset_sha256"] != paired_reset_sha256
+        or result["shared_raw8_candidate_pool_sha256"]
+        != shared_raw8_candidate_pool_sha256
+    ):
+        raise NestedCandidatePoolError(
+            "query-zero oracle candidate result binding changed"
+        )
+
+
+def execute_query0_oracle_candidate_rollout(
+    *,
+    candidate_index: int,
+    body: str,
+    condition: str,
+    seed: int,
+    task_class: Any,
+    task_args: Mapping[str, Any],
+    policy: Any,
+    preprocessor: Any,
+    postprocessor: Any,
+    calibration: Mapping[str, Any],
+    initial_commitment: Mapping[str, Any],
+    source_action_normalizer: Mapping[str, Any],
+    instruction: str,
+    max_steps: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Execute one sealed query-zero intervention and actor-only continuation.
+
+    Every invocation creates a fresh deterministic scene.  Query zero uses the
+    requested member of the frozen nested N8 pool; all later queries use raw
+    actor candidate zero.  Thus eight invocations form a realizable candidate
+    oracle for one common root without changing the online N1/N4/N8 policies.
+    """
+
+    if type(candidate_index) is not int or not 0 <= candidate_index < 8:
+        raise NestedCandidatePoolError("oracle candidate index must be 0..7")
+    validate_source_action_normalizer(
+        source_action_normalizer, expected_heldout_body=body
+    )
+    normalizer_sha = str(source_action_normalizer["logical_sha256"])
+    if initial_commitment.get("source_action_normalizer_logical_sha256") != normalizer_sha:
+        raise NestedCandidatePoolError("oracle normalizer differs from commitment")
+    required_names = {str(calibration["moving"])}
+    anchor = str(calibration.get("anchor", "")).strip()
+    if anchor:
+        required_names.add(anchor)
+    random.seed(int(seed))
+    task = collector._new_task(task_class, task_args, seed, instruction)
+    try:
+        names, objects = collector.discover_pose_objects(task, required_names)
+        initial_snapshot = formal.capture_reset_snapshot(task, names, objects)
+        trajectory = [collector.read_poses(objects)]
+        sim_times = [collector._sim_time(task)]
+        query_index = 0
+        selected_raw_index: int | None = None
+        query0_pool_sha: str | None = None
+        query0_trajectory_index: int | None = None
+        while not collector._episode_done(task, max_steps):
+            task.scene.step()
+            collector._append_physical_observation(task, objects, trajectory, sim_times)
+            pre_pool_snapshot = formal.capture_reset_snapshot(task, names, objects)
+            raw, pools, audit = generate_nested_pools(
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                task=task,
+                instruction=instruction,
+                scene_seed=seed,
+                query_index=query_index,
+                source_action_normalizer=source_action_normalizer,
+                device=device,
+            )
+            if formal.capture_reset_snapshot(task, names, objects) != pre_pool_snapshot:
+                raise NestedCandidatePoolError(
+                    "oracle candidate generation changed simulator state"
+                )
+            if query_index == 0:
+                verify_initial_commitment(
+                    initial_commitment,
+                    body=body,
+                    condition=condition,
+                    seed=seed,
+                    reset_snapshot=initial_snapshot,
+                    canonical_query_snapshot=pre_pool_snapshot,
+                    raw=raw,
+                    pools=pools,
+                    audit=audit,
+                    expected_source_action_normalizer_logical_sha256=normalizer_sha,
+                )
+                candidates = pools[N8_CANDIDATE_COUNT]
+                raw_indices = list(audit["ordered_fps_raw_indices_n8"])
+                selected = candidate_index
+                selected_raw_index = int(raw_indices[selected])
+                query0_pool_sha = array_sha256(candidates)
+                query0_trajectory_index = len(trajectory) - 1
+            else:
+                candidates = raw[:1]
+                selected = 0
+            for action in candidates[selected, :ACTION_EXEC_STEPS]:
+                if collector._episode_done(task, max_steps):
+                    break
+                task.take_action(action, action_type="ee")
+                collector._append_physical_observation(
+                    task, objects, trajectory, sim_times
+                )
+            query_index += 1
+        success = bool(getattr(task, "eval_success", False))
+        if not success:
+            success = bool(task.check_success())
+        trajectory_array = np.stack(trajectory).astype(np.float64)
+        _predicates, events = collector.derive_predicates_and_events(
+            trajectory_array,
+            np.asarray(sim_times, dtype=np.float64),
+            names,
+            success,
+            calibration,
+            collector.success_height_reference_z(task),
+        )
+        if (
+            selected_raw_index is None
+            or query0_pool_sha is None
+            or query0_trajectory_index is None
+        ):
+            raise NestedCandidatePoolError("oracle rollout did not reach query zero")
+        _moving_root, root_goal = analytic_event.goal_vector(
+            trajectory_array, names, query0_trajectory_index, calibration
+        )
+        _moving_terminal, terminal_goal = analytic_event.goal_vector(
+            trajectory_array, names, len(trajectory_array) - 1, calibration
+        )
+        stage = formal.stage_progress(events, success)
+        return build_query0_oracle_candidate_result(
+            candidate_index=candidate_index,
+            raw_proposal_index=selected_raw_index,
+            initial_candidate_commitment_sha256=str(
+                initial_commitment["commitment_sha256"]
+            ),
+            paired_reset_sha256=formal.reset_identity(initial_snapshot),
+            shared_raw8_candidate_pool_sha256=query0_pool_sha,
+            binary_success=int(success),
+            stage_progress=stage,
+            goal_progress=(
+                float(np.linalg.norm(root_goal))
+                - float(np.linalg.norm(terminal_goal))
+            ),
+        )
+    finally:
+        task.close_env(clear_cache=False)
+
+
+def execute_query0_oracle_group(
+    *,
+    expected: Mapping[str, Any],
+    pair: Mapping[str, Any],
+    initial_commitment: Mapping[str, Any],
+    task_class: Any,
+    task_args: Mapping[str, Any],
+    policy: Any,
+    preprocessor: Any,
+    postprocessor: Any,
+    calibration: Mapping[str, Any],
+    source_action_normalizer: Mapping[str, Any],
+    instruction: str,
+    max_steps: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Execute and bind all eight query-zero branches for one frozen pair.
+
+    This is the nested runner's collection primitive.  It intentionally takes
+    a completed formal pair and its query-zero commitment; it never derives
+    candidate truth from the actor/N4/N8 selected-arm outcomes.
+    """
+
+    pair_unsigned = {
+        key: value for key, value in pair.items() if key != "pair_sha256"
+    }
+    validate_source_action_normalizer(
+        source_action_normalizer,
+        expected_heldout_body=str(expected.get("heldout_body")),
+    )
+    normalizer_sha = source_action_normalizer["logical_sha256"]
+    rollouts = pair.get("rollouts")
+    if (
+        pair.get("format") != PAIR_FORMAT
+        or any(
+            pair.get(key) != expected.get(key)
+            for key in ("heldout_body", "condition", "requested_seed")
+        )
+        or pair.get("pair_sha256") != canonical_sha256(pair_unsigned)
+        or not isinstance(rollouts, Mapping)
+        or set(rollouts) != set(METHODS)
+        or pair.get("initial_candidate_commitment_sha256")
+        != initial_commitment.get("commitment_sha256")
+        or pair.get("source_action_normalizer_logical_sha256") != normalizer_sha
+        or initial_commitment.get("source_action_normalizer_logical_sha256")
+        != normalizer_sha
+    ):
+        raise NestedCandidatePoolError(
+            "oracle collection pair/commitment binding changed"
+        )
+    actor_rollout = rollouts[METHOD_ACTOR]
+    n4_decisions = rollouts[METHOD_N4].get("decisions")
+    n8_decisions = rollouts[METHOD_N8].get("decisions")
+    if (
+        not isinstance(n4_decisions, list)
+        or not n4_decisions
+        or not isinstance(n8_decisions, list)
+        or not n8_decisions
+    ):
+        raise NestedCandidatePoolError(
+            "oracle collection lacks query-zero nested decisions"
+        )
+    n4 = n4_decisions[0]
+    n8 = n8_decisions[0]
+    if not isinstance(n4, Mapping) or not isinstance(n8, Mapping):
+        raise NestedCandidatePoolError(
+            "oracle collection query-zero decisions are invalid"
+        )
+    n8_audit = n8.get("nested_pool_audit")
+    n8_raw_indices = n8.get("selection_pool_raw_indices")
+    if (
+        not isinstance(n8_audit, Mapping)
+        or not isinstance(n8_raw_indices, list)
+        or len(n8_raw_indices) != N8_CANDIDATE_COUNT
+        or n4.get("selection_pool_raw_indices")
+        != n8_raw_indices[:N4_CANDIDATE_COUNT]
+        or n4.get("selection_pool_sha256")
+        != n8_audit.get("n4_ordered_candidates_sha256")
+        or not _is_sha256(n8.get("selection_pool_sha256"))
+    ):
+        raise NestedCandidatePoolError(
+            "oracle collection nested pool binding changed"
+        )
+    results = []
+    for candidate_index in range(N8_CANDIDATE_COUNT):
+        result = execute_query0_oracle_candidate_rollout(
+            candidate_index=candidate_index,
+            body=str(expected["heldout_body"]),
+            condition=str(expected["condition"]),
+            seed=int(expected["requested_seed"]),
+            task_class=task_class,
+            task_args=task_args,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            calibration=calibration,
+            initial_commitment=initial_commitment,
+            source_action_normalizer=source_action_normalizer,
+            instruction=instruction,
+            max_steps=max_steps,
+            device=device,
+        )
+        validate_query0_oracle_candidate_result(
+            result,
+            candidate_index=candidate_index,
+            initial_candidate_commitment_sha256=str(
+                initial_commitment["commitment_sha256"]
+            ),
+            paired_reset_sha256=str(
+                actor_rollout["initial_reset_identity_sha256"]
+            ),
+            shared_raw8_candidate_pool_sha256=str(
+                n8["selection_pool_sha256"]
+            ),
+        )
+        if result["raw_proposal_index"] != n8_raw_indices[candidate_index]:
+            raise NestedCandidatePoolError(
+                "oracle result does not match frozen nested candidate index"
+            )
+        results.append(result)
+    if (
+        results[0]["binary_success"] != actor_rollout.get("binary_success")
+        or results[0]["stage_progress"] != actor_rollout.get("stage_progress")
+    ):
+        raise NestedCandidatePoolError(
+            "oracle candidate zero does not reproduce paired actor N1"
+        )
+    return build_query0_oracle_group(
+        heldout_body=str(expected["heldout_body"]),
+        condition=str(expected["condition"]),
+        requested_seed=int(expected["requested_seed"]),
+        pair_sha256=str(pair["pair_sha256"]),
+        initial_candidate_commitment_sha256=str(
+            initial_commitment["commitment_sha256"]
+        ),
+        paired_reset_sha256=str(actor_rollout["initial_reset_identity_sha256"]),
+        shared_raw8_candidate_pool_sha256=str(n8["selection_pool_sha256"]),
+        selected_index_n4=int(n4["selected_candidate_index"]),
+        selected_index_n8=int(n8["selected_candidate_index"]),
+        candidate_results=results,
+    )
+
+
+def build_query0_oracle_group(
+    *,
+    heldout_body: str,
+    condition: str,
+    requested_seed: int,
+    pair_sha256: str,
+    initial_candidate_commitment_sha256: str,
+    paired_reset_sha256: str,
+    shared_raw8_candidate_pool_sha256: str,
+    selected_index_n4: int,
+    selected_index_n8: int,
+    candidate_results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bind eight independently persisted results into one query-zero group."""
+
+    if (
+        heldout_body not in BODIES
+        or condition not in CONDITIONS
+        or type(requested_seed) is not int
+        or not SEED_BASE <= requested_seed < SEED_BASE + SEED_COUNT
+        or not all(
+            _is_sha256(value)
+            for value in (
+                pair_sha256,
+                initial_candidate_commitment_sha256,
+                paired_reset_sha256,
+                shared_raw8_candidate_pool_sha256,
+            )
+        )
+        or type(selected_index_n4) is not int
+        or not 0 <= selected_index_n4 < 4
+        or type(selected_index_n8) is not int
+        or not 0 <= selected_index_n8 < 8
+        or len(candidate_results) != 8
+    ):
+        raise NestedCandidatePoolError("query-zero oracle group identity is invalid")
+    normalized = [dict(value) for value in candidate_results]
+    raw_indices: list[int] = []
+    for index, result in enumerate(normalized):
+        validate_query0_oracle_candidate_result(
+            result,
+            candidate_index=index,
+            initial_candidate_commitment_sha256=(
+                initial_candidate_commitment_sha256
+            ),
+            paired_reset_sha256=paired_reset_sha256,
+            shared_raw8_candidate_pool_sha256=(
+                shared_raw8_candidate_pool_sha256
+            ),
+        )
+        raw_indices.append(int(result["raw_proposal_index"]))
+    if raw_indices[0] != 0 or len(set(raw_indices)) != N8_CANDIDATE_COUNT:
+        raise NestedCandidatePoolError(
+            "query-zero oracle results are not one nested N8 candidate pool"
+        )
+    base = {
+        "format": ORACLE_GROUP_FORMAT,
+        "heldout_body": heldout_body,
+        "condition": condition,
+        "requested_seed": requested_seed,
+        "decision_group_id": (
+            f"query0|{heldout_body}|{condition}|{requested_seed}"
+        ),
+        "pair_sha256": pair_sha256,
+        "initial_candidate_commitment_sha256": (
+            initial_candidate_commitment_sha256
+        ),
+        "paired_reset_sha256": paired_reset_sha256,
+        "shared_raw8_candidate_pool_sha256": shared_raw8_candidate_pool_sha256,
+        "selected_index_n1": 0,
+        "selected_index_n4": selected_index_n4,
+        "selected_index_n8": selected_index_n8,
+        "candidate_results": normalized,
+    }
+    return {**base, "group_sha256": canonical_sha256(base)}
+
+
+def validate_query0_oracle_group(group: Mapping[str, Any]) -> None:
+    """Replay a sealed eight-branch query-zero oracle group."""
+
+    expected_fields = {
+        "format",
+        "heldout_body",
+        "condition",
+        "requested_seed",
+        "decision_group_id",
+        "pair_sha256",
+        "initial_candidate_commitment_sha256",
+        "paired_reset_sha256",
+        "shared_raw8_candidate_pool_sha256",
+        "selected_index_n1",
+        "selected_index_n4",
+        "selected_index_n8",
+        "candidate_results",
+        "group_sha256",
+    }
+    if set(group) != expected_fields or not isinstance(
+        group.get("candidate_results"), list
+    ):
+        raise NestedCandidatePoolError("query-zero oracle group fields changed")
+    try:
+        rebuilt = build_query0_oracle_group(
+            heldout_body=group["heldout_body"],
+            condition=group["condition"],
+            requested_seed=group["requested_seed"],
+            pair_sha256=group["pair_sha256"],
+            initial_candidate_commitment_sha256=group[
+                "initial_candidate_commitment_sha256"
+            ],
+            paired_reset_sha256=group["paired_reset_sha256"],
+            shared_raw8_candidate_pool_sha256=group[
+                "shared_raw8_candidate_pool_sha256"
+            ],
+            selected_index_n4=group["selected_index_n4"],
+            selected_index_n8=group["selected_index_n8"],
+            candidate_results=group["candidate_results"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise NestedCandidatePoolError(
+            "query-zero oracle group is invalid"
+        ) from error
+    if (
+        dict(group) != rebuilt
+        or group["selected_index_n1"] != 0
+        or group["decision_group_id"]
+        != (
+            f"query0|{group['heldout_body']}|{group['condition']}|"
+            f"{group['requested_seed']}"
+        )
+    ):
+        raise NestedCandidatePoolError("query-zero oracle group binding changed")
+
+
+def build_query0_oracle_truth_document(
+    *,
+    nested_completion_logical_sha256: str,
+    nested_outcome_document_sha256: str,
+    groups: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze the exact 1,000-group/8,000-rollout oracle truth authority."""
+
+    normalized = [dict(group) for group in groups]
+    schedule = evaluation_schedule()
+    if (
+        not _is_sha256(nested_completion_logical_sha256)
+        or not _is_sha256(nested_outcome_document_sha256)
+        or len(normalized) != len(schedule)
+    ):
+        raise NestedCandidatePoolError("oracle truth document is incomplete")
+    for group, expected in zip(normalized, schedule, strict=True):
+        validate_query0_oracle_group(group)
+        if (
+            any(group.get(key) != expected[key] for key in (
+                "heldout_body", "condition", "requested_seed"
+            ))
+        ):
+            raise NestedCandidatePoolError("oracle truth schedule/group SHA changed")
+    base = {
+        "format": ORACLE_TRUTH_FORMAT,
+        "status": ORACLE_TRUTH_STATUS,
+        "nested_completion_logical_sha256": nested_completion_logical_sha256,
+        "nested_outcome_document_sha256": nested_outcome_document_sha256,
+        "group_count": len(normalized),
+        "candidate_rollout_count": len(normalized) * N8_CANDIDATE_COUNT,
+        "groups": normalized,
+        "groups_sha256": canonical_sha256(normalized),
+    }
+    return {**base, "logical_sha256": canonical_sha256(base)}
 
 
 def _expected_pool_count(method: str) -> int:
@@ -2888,11 +3480,21 @@ __all__ = [
     "NestedCandidatePoolError",
     "RAW_PROPOSAL_COUNT",
     "SOURCE_ACTION_NORMALIZER_FORMAT",
+    "ORACLE_CONTINUATION_POLICY",
+    "ORACLE_GROUP_FORMAT",
+    "ORACLE_RESULT_FORMAT",
+    "ORACLE_TRUTH_FORMAT",
+    "ORACLE_TRUTH_STATUS",
+    "build_query0_oracle_candidate_result",
+    "build_query0_oracle_group",
+    "build_query0_oracle_truth_document",
     "build_outcome_document",
     "build_report",
     "build_method_result",
     "build_method_start",
     "evaluation_schedule",
+    "execute_query0_oracle_candidate_rollout",
+    "execute_query0_oracle_group",
     "existing_separate_n4_n8_comparability_audit",
     "inspect_fold_source_action_normalizer",
     "materialize_triplet",
@@ -2905,6 +3507,8 @@ __all__ = [
     "read_create_once_json",
     "recover_complete_existing_triplet",
     "validate_complete_outcome_rows",
+    "validate_query0_oracle_candidate_result",
+    "validate_query0_oracle_group",
     "validate_nested_pool_audit",
     "validate_method_result",
     "validate_runtime_ensemble_action_normalizer",

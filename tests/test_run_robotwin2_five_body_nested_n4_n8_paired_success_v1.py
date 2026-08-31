@@ -988,3 +988,196 @@ def test_existing_pair_with_missing_method_result_fails_without_rollout(
     ):
         runner.recover_complete_existing_triplet(**paths, **context)
     assert rollout_called is False
+
+
+def _oracle_candidate_result(
+    candidate_index: int,
+    *,
+    commitment_sha: str = "1" * 64,
+    reset_sha: str = "2" * 64,
+    pool_sha: str = "3" * 64,
+) -> dict[str, object]:
+    raw_indices = [0, 3, 5, 7, 9, 11, 13, 15]
+    success = int(candidate_index in {1, 7})
+    failed_stage = [0.0, 1.0, 0.25, 0.5, 0.75, 0.25, 0.5, 1.0]
+    return runner.build_query0_oracle_candidate_result(
+        candidate_index=candidate_index,
+        raw_proposal_index=raw_indices[candidate_index],
+        initial_candidate_commitment_sha256=commitment_sha,
+        paired_reset_sha256=reset_sha,
+        shared_raw8_candidate_pool_sha256=pool_sha,
+        binary_success=success,
+        stage_progress=failed_stage[candidate_index],
+        goal_progress=float(candidate_index),
+    )
+
+
+def _oracle_group(expected: dict[str, object]) -> dict[str, object]:
+    return runner.build_query0_oracle_group(
+        heldout_body=str(expected["heldout_body"]),
+        condition=str(expected["condition"]),
+        requested_seed=int(expected["requested_seed"]),
+        pair_sha256="0" * 64,
+        initial_candidate_commitment_sha256="1" * 64,
+        paired_reset_sha256="2" * 64,
+        shared_raw8_candidate_pool_sha256="3" * 64,
+        selected_index_n4=1,
+        selected_index_n8=7,
+        candidate_results=[_oracle_candidate_result(index) for index in range(8)],
+    )
+
+
+def test_query0_oracle_candidate_contract_rejects_self_signed_false_truth() -> None:
+    valid = _oracle_candidate_result(1)
+    runner.validate_query0_oracle_candidate_result(
+        valid,
+        candidate_index=1,
+        initial_candidate_commitment_sha256="1" * 64,
+        paired_reset_sha256="2" * 64,
+        shared_raw8_candidate_pool_sha256="3" * 64,
+    )
+
+    changed = copy.deepcopy(valid)
+    changed["stage_progress"] = 0.5
+    changed["result_sha256"] = runner.canonical_sha256(
+        {key: value for key, value in changed.items() if key != "result_sha256"}
+    )
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="candidate result is invalid",
+    ):
+        runner.validate_query0_oracle_candidate_result(
+            changed,
+            candidate_index=1,
+            initial_candidate_commitment_sha256="1" * 64,
+            paired_reset_sha256="2" * 64,
+            shared_raw8_candidate_pool_sha256="3" * 64,
+        )
+
+    with pytest.raises(runner.NestedCandidatePoolError):
+        runner.build_query0_oracle_candidate_result(
+            candidate_index=1,
+            raw_proposal_index=3,
+            initial_candidate_commitment_sha256="1" * 64,
+            paired_reset_sha256="2" * 64,
+            shared_raw8_candidate_pool_sha256="3" * 64,
+            binary_success=1,
+            stage_progress=1.0,
+            goal_progress=float("inf"),
+        )
+
+
+def test_query0_oracle_group_requires_all_eight_distinct_nested_candidates() -> None:
+    valid = _oracle_group(runner.evaluation_schedule()[0])
+    runner.validate_query0_oracle_group(valid)
+    assert len(valid["candidate_results"]) == runner.N8_CANDIDATE_COUNT
+
+    duplicated = [
+        _oracle_candidate_result(index) for index in range(runner.N8_CANDIDATE_COUNT)
+    ]
+    changed = copy.deepcopy(duplicated[1])
+    changed["raw_proposal_index"] = duplicated[0]["raw_proposal_index"]
+    changed["result_sha256"] = runner.canonical_sha256(
+        {key: value for key, value in changed.items() if key != "result_sha256"}
+    )
+    duplicated[1] = changed
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="not one nested N8 candidate pool",
+    ):
+        runner.build_query0_oracle_group(
+            heldout_body=runner.BODIES[0],
+            condition=runner.CONDITIONS[0],
+            requested_seed=runner.SEED_BASE,
+            pair_sha256="0" * 64,
+            initial_candidate_commitment_sha256="1" * 64,
+            paired_reset_sha256="2" * 64,
+            shared_raw8_candidate_pool_sha256="3" * 64,
+            selected_index_n4=1,
+            selected_index_n8=7,
+            candidate_results=duplicated,
+        )
+
+
+def test_query0_oracle_truth_requires_exact_complete_formal_schedule() -> None:
+    groups = [_oracle_group(expected) for expected in runner.evaluation_schedule()]
+    truth = runner.build_query0_oracle_truth_document(
+        nested_completion_logical_sha256="4" * 64,
+        nested_outcome_document_sha256="5" * 64,
+        groups=groups,
+    )
+    assert truth["group_count"] == 1000
+    assert truth["candidate_rollout_count"] == 8000
+    assert truth["status"] == runner.ORACLE_TRUTH_STATUS
+    assert truth["logical_sha256"] == runner.canonical_sha256(
+        {key: value for key, value in truth.items() if key != "logical_sha256"}
+    )
+
+    with pytest.raises(
+        runner.NestedCandidatePoolError,
+        match="oracle truth document is incomplete",
+    ):
+        runner.build_query0_oracle_truth_document(
+            nested_completion_logical_sha256="4" * 64,
+            nested_outcome_document_sha256="5" * 64,
+            groups=groups[:-1],
+        )
+
+
+def test_nested_runner_collects_all_eight_real_branches_from_one_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, pair, paths = _persist_complete_triplet(tmp_path)
+    commitment = json.loads(paths["commitment_path"].read_text(encoding="utf-8"))
+    actor = pair["rollouts"][runner.METHOD_ACTOR]
+    actor["initial_reset_identity_sha256"] = "2" * 64
+    pair["pair_sha256"] = runner.canonical_sha256(
+        {key: value for key, value in pair.items() if key != "pair_sha256"}
+    )
+    n8 = pair["rollouts"][runner.METHOD_N8]["decisions"][0]
+    calls = []
+
+    def fake_candidate(**kwargs: object) -> dict[str, object]:
+        index = int(kwargs["candidate_index"])
+        calls.append(index)
+        success = actor["binary_success"] if index == 0 else int(index == 7)
+        stage = actor["stage_progress"] if index == 0 else (
+            1.0 if success else 0.25
+        )
+        return runner.build_query0_oracle_candidate_result(
+            candidate_index=index,
+            raw_proposal_index=n8["selection_pool_raw_indices"][index],
+            initial_candidate_commitment_sha256=commitment["commitment_sha256"],
+            paired_reset_sha256="2" * 64,
+            shared_raw8_candidate_pool_sha256=n8["selection_pool_sha256"],
+            binary_success=success,
+            stage_progress=stage,
+            goal_progress=float(index),
+        )
+
+    monkeypatch.setattr(
+        runner, "execute_query0_oracle_candidate_rollout", fake_candidate
+    )
+    group = runner.execute_query0_oracle_group(
+        expected=context["expected"],
+        pair=pair,
+        initial_commitment=commitment,
+        task_class=object(),
+        task_args={},
+        policy=object(),
+        preprocessor=object(),
+        postprocessor=object(),
+        calibration={},
+        source_action_normalizer=_normalizer(),
+        instruction="test",
+        max_steps=100,
+        device=torch.device("cpu"),
+    )
+    assert calls == list(range(runner.N8_CANDIDATE_COUNT))
+    assert group["candidate_results"][0]["binary_success"] == actor[
+        "binary_success"
+    ]
+    assert group["selected_index_n4"] == pair["rollouts"][runner.METHOD_N4][
+        "decisions"
+    ][0]["selected_candidate_index"]
+    runner.validate_query0_oracle_group(group)

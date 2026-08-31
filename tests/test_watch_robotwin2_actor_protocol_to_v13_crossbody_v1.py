@@ -185,6 +185,7 @@ def test_commands_propagate_one_protocol_through_complete_chain(
     protocol_sha = "b" * 64
     primary = watcher.primary_command(args, protocol_path, protocol_sha)
     downstream = watcher.downstream_command(args, protocol_path, protocol_sha)
+    final_report = watcher.final_report_command(args)
     for command in (primary, downstream):
         assert command[command.index("--actor-execution-protocol") + 1] == str(
             protocol_path
@@ -195,4 +196,14 @@ def test_commands_propagate_one_protocol_through_complete_chain(
         assert command[command.index("--path-root") + 1] == str(tmp_path)
     assert downstream[downstream.index("--upstream-kind") + 1] == (
         "primary_collection"
+    )
+    assert final_report[1] == str(args.code_root / watcher.FINAL_REPORT_MATERIALIZER)
+    assert final_report[final_report.index("--nested-root") + 1] == str(
+        args.run_root / "nested_n1_n4_n8"
+    )
+    assert final_report[final_report.index("--actor-authority") + 1] == str(
+        args.run_root / "actor_authority.json"
+    )
+    assert final_report[final_report.index("--output-report") + 1] == str(
+        args.run_root / "nested_n1_n4_n8" / "crossbody_final_report.json"
     )

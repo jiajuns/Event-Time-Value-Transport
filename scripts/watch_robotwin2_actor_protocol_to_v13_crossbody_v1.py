@@ -48,6 +48,13 @@ ORDERED_SELECTION_CRITERIA = (
 )
 PRIMARY_WATCHER = "watch_robotwin2_ee16_actor_to_five_body_branches_v1.py"
 DOWNSTREAM_WATCHER = "watch_robotwin2_postformal_shared_head_upgrade_v1.py"
+FINAL_REPORT_MATERIALIZER = (
+    "materialize_robotwin2_nested_n1_n4_n8_final_report_v1.py"
+)
+FINAL_REPORT_FORMAT = "etsf_robotwin2_five_body_lobo_n1_n4_n8_oracle_report_v1"
+FINAL_REPORT_POLICY_ONLY_STATUS = (
+    "complete_policy_transfer_metrics_oracle_unavailable_fail_closed"
+)
 
 
 class CrossbodyContinuationError(RuntimeError):
@@ -438,6 +445,23 @@ def downstream_command(
     ]
 
 
+def final_report_command(args: argparse.Namespace) -> list[str]:
+    root = args.run_root
+    nested = root / "nested_n1_n4_n8"
+    return [
+        str(args.system_python),
+        str(args.code_root / FINAL_REPORT_MATERIALIZER),
+        "--nested-root",
+        str(nested),
+        "--actor-authority",
+        str(root / "actor_authority.json"),
+        "--output-input",
+        str(nested / "crossbody_final_report_input.json"),
+        "--output-report",
+        str(nested / "crossbody_final_report.json"),
+    ]
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--actor-comparison-root", type=Path, required=True)
@@ -510,7 +534,7 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     ):
         if not getattr(args, name).exists():
             raise CrossbodyContinuationError(f"required input is missing: {name}")
-    for name in (PRIMARY_WATCHER, DOWNSTREAM_WATCHER):
+    for name in (PRIMARY_WATCHER, DOWNSTREAM_WATCHER, FINAL_REPORT_MATERIALIZER):
         path = args.code_root / name
         if path.is_symlink() or not path.is_file():
             raise CrossbodyContinuationError(f"deployed code is missing {name}")
@@ -606,6 +630,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if final_state.get("status") != "complete":
         raise CrossbodyContinuationError("v13 cross-body watcher returned without completion")
+    final_report = final_report_command(args)
+    final_report_log = args.run_root / "final_crossbody_report.log"
+    with final_report_log.open("a", encoding="utf-8") as stream:
+        write_state(
+            "materializing_n1_n4_n8_crossbody_final_report",
+            command=final_report,
+        )
+        result = subprocess.run(
+            final_report,
+            cwd=args.code_root,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    if result.returncode != 0:
+        raise CrossbodyContinuationError(
+            f"final cross-body report materializer exited {result.returncode}"
+        )
+    final_report_path = (
+        args.run_root / "nested_n1_n4_n8" / "crossbody_final_report.json"
+    )
+    final_report_value = read_json(final_report_path, "final cross-body report")
+    verify_named_logical_sha(
+        final_report_value, "report_sha256", "final cross-body report"
+    )
+    oracle = final_report_value.get("oracle_branch_diagnostic")
+    if (
+        final_report_value.get("format") != FINAL_REPORT_FORMAT
+        or final_report_value.get("status") != FINAL_REPORT_POLICY_ONLY_STATUS
+        or not isinstance(oracle, Mapping)
+        or oracle.get("evidence_sufficient") is not False
+        or oracle.get("oracle_regret_reported") is not False
+        or oracle.get("oracle_regret") is not None
+    ):
+        raise CrossbodyContinuationError(
+            "final cross-body report did not fail closed without oracle truth"
+        )
     write_state(
         "complete",
         actor_execution_protocol_binding=receipt[
@@ -616,6 +677,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.run_root / "v13_crossbody.watcher_state.json"
         ),
         nested_report=final_state.get("nested_actor_n4_n8_report"),
+        final_crossbody_report=str(final_report_path),
+        final_crossbody_report_file_sha256=sha256_file(final_report_path),
+        final_crossbody_report_sha256=final_report_value["report_sha256"],
+        oracle_evidence_sufficient=False,
     )
     lock_stream.flush()
     return 0
