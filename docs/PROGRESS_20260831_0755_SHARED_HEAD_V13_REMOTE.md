@@ -141,3 +141,15 @@ payload zero-open。相关 WCM/共享头/nested 定向回归本次复验 162 项
 当前只完成模型、单折五成员 trainer、N4/N8 scorer 和文档，尚未部署远端五折 supervisor 或闭环
 runner。因此它是已实现但未训练的强对照，不能用参数量、单元测试或 source validation 代替任务
 成功率。
+
+## 08:39 CST v13 真实 materializer 阻断修复
+
+静态审计发现生产 `_npz_rows()` 原先只把 condition 编入 `logical_group`，没有生成独立
+`row["condition"]`；v13 `source_causal_stratum_proper_weights()` 会读取该字段，所以真实五折训练会
+在进入参数更新前 fail closed。现已把 manifest-visible condition 附到 source row，并在
+`TransitionDataset` 张量化前剥离，确保 condition 只用于 source 因果分层、不会成为模型输入。
+
+新增回归从真实 fixture NPZ 经 materializer 直接调用 v13 balance；共享头/WCM/watcher 相关 164 项、
+RAC/nested/final-report 相关 58 项均通过。旧远端 v13 watcher 仍处于 actor 协议等待阶段、尚未产生
+primary/supplement/checkpoint，因此必须用包含此修复的新只读代码快照替换等待 watcher，actor
+runner/guardian 不需要重启。

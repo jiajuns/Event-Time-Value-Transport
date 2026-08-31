@@ -1679,7 +1679,7 @@ class TransitionDataset(Dataset[dict[str, Any]]):
         result = {
             key: torch.as_tensor(value)
             for key, value in row.items()
-            if key not in {"logical_group", "body", "policy", "task"}
+            if key not in {"logical_group", "body", "condition", "policy", "task"}
         }
         result["body_id"] = torch.tensor(self.body_to_id[str(row["body"])])
         result["logical_group"] = str(row["logical_group"])

@@ -3220,6 +3220,7 @@ def _npz_rows(group: Mapping[str, Any], *, body: str) -> list[dict[str, Any]]:
                 "logical_group": f"{body}|{group['condition']}|{group['group_id']}",
                 "requested_seed": np.int64(group["requested_seed"]),
                 "body": body,
+                "condition": str(group["condition"]),
                 "policy": "frozen_native_actor",
                 "task": TASK,
             }

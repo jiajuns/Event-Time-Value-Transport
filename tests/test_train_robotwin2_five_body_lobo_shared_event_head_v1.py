@@ -1129,6 +1129,14 @@ def test_primary_binding_execute_protocol_golden_plans(
     assert all(int(np.asarray(row["action_mask"]).sum()) == stride for row in rows)
     assert all(float(row["dt"]) == pytest.approx(expected_dt) for row in rows)
     assert all(float(row["remaining_action_budget"]) == 200.0 for row in rows)
+    assert {row["condition"] for row in rows} == {group["condition"]}
+    weights, balance = source_causal_stratum_proper_weights(
+        rows,
+        source_bodies=[BODIES[0]],
+    )
+    assert set(weights) == {rows[0]["logical_group"]}
+    assert balance["causal_strata"] == 1
+    assert balance["outcome_label_fields_read"] == []
 
 
 @pytest.mark.parametrize("stride", (5, 50))

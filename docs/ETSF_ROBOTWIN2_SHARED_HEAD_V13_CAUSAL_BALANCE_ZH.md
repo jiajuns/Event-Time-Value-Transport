@@ -69,6 +69,11 @@ v13 没有添加 body embedding、目标机器人 adapter、本体私有 head �
 LOBO fold 只用另外四个 source bodies 计算权重；held-out body 的 manifest、NPZ、标签、频数和
 归一化统计在训练与 checkpoint 选择期间均为 zero-open。
 
+实现上，真实 NPZ materializer 必须把 manifest-visible `condition` 作为非张量元数据附到每个
+source row；`TransitionDataset` 在送入模型前显式剥离该字段。这样因果分层器可以使用
+`(body, condition, current_event)`，但网络本身不会把 condition 当作可训练输入。2026-08-31 的入口
+审计补齐了该字段并新增真实 materialization 回归，避免单元测试只用手工 row 而遗漏生产入口。
+
 因此 v13 改善的是“源域多本体监督怎样训练一个共享事件头”，而不是偷偷用目标本体校准。最终
 仍只能主张 critic/value-head 的 LOBO 跨本体迁移；当前 actor 在五种机器人数据上训练过，不能把
 结果表述为 actor zero-shot。
