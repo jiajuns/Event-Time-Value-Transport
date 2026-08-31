@@ -1,12 +1,12 @@
-# 关机交接记录（2026-08-31 08:55 CST）
+# 关机交接记录（2026-08-31 08:59 CST，最终复核）
 
 ## 远端 4090 实况
 
 RoboTwin2 actor 执行协议比较仍在运行：
 
 ```text
-完成：       92 / 200 pairs，184 / 400 rollouts
-最后一对：   franka / clean / seed 2026104017
+完成：       96 / 200 pairs，192 / 400 rollouts
+最后一对：   franka / clean / seed 2026104022
 pair failure:   0
 method failure: 0
 ```
@@ -65,6 +65,9 @@ RAC 后半 watcher 首次用 RoboTwin2 父解释器启动时因该环境没有 `
 ```
 
 三个 watcher 都先验证上游完成权威再继续；RAC 不会在 v13 阶段切换的瞬时空档抢 GPU。
+
+08:58 CST 最终进程复核：上述五个 PID 均存活且 `PPID=1`；actor guardian 为
+`monitoring`、`restart_count=0`。因此本机断网或关机不会终止这些远端任务。
 
 ## 当前效果边界
 
