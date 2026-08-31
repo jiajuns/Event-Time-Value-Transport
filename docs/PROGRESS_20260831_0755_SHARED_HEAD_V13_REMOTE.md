@@ -153,3 +153,22 @@ runner。因此它是已实现但未训练的强对照，不能用参数量、�
 RAC/nested/final-report 相关 58 项均通过。旧远端 v13 watcher 仍处于 actor 协议等待阶段、尚未产生
 primary/supplement/checkpoint，因此必须用包含此修复的新只读代码快照替换等待 watcher，actor
 runner/guardian 不需要重启。
+
+## 08:50 CST 修复版主链与 RAC 完整队列
+
+旧等待 watcher PID `3923793` 已在再次确认没有 protocol、primary、supplement、checkpoint 或
+nested 产物后终止；actor runner/guardian 未重启。修复版主链已经从提交
+`81d4724ba221d3685a75862f8b8e098b9772608b` 的只读快照重新挂起：
+
+```text
+PID:   3984587
+code:  /home/user/etsf_robotwin2_v13_protocol_code_81d4724
+state: /home/user/etsf_robotwin2_v13_crossbody_selected_r2_20260831/continuation_state.json
+```
+
+RAC 五折队列 PID `3975210` 已脱离本机运行，当前只等待主链产物；其代码快照为提交
+`a25514f73c0d31bc454767108e96ed5798d9f543`，输出根为
+`/home/user/etsf_robotwin2_rac_lobo_after_v13_20260831`。另已实现 RAC 五折完成后的独立后半 watcher：
+它延迟认证尚未生成的 actor protocol/authority，随后运行相同 N1/N4/N8、逐条重放 RAC rank receipt
+并物化独立最终报告；相关联合回归 81 项通过。该后半 watcher 仍需随本次提交部署，不能把“排队”
+写成“已经得到 RAC 效果”。
