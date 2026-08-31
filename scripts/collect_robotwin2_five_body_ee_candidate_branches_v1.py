@@ -10,7 +10,8 @@ per decision.  Events, terminal
 progress, SE(3) object effects and success are derived from the simulator
 trajectory, never from the public expert archive.
 
-Run this program only on the remote 4090 with the public RoboTwin simulator.
+Run this program only on an authorized remote 4090/5090 with the public
+RoboTwin simulator.
 One invocation collects both clean and randomized groups for one embodiment;
 the five embodiments are run sequentially because they share one GPU.
 """
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -44,14 +46,23 @@ FORMAT = (
 MANIFEST_FORMAT = (
     "etsf_robotwin2_canonical_transition_manifest_v3_actor_execution_protocol"
 )
+LIQUID_FORMAT = (
+    "etsf_robotwin2_liquid_history_ee_candidate_branches_v4_actor_execution_protocol"
+)
+LIQUID_MANIFEST_FORMAT = (
+    "etsf_robotwin2_liquid_history_transition_manifest_v4_actor_execution_protocol"
+)
 DIAGNOSTIC_FORMAT = "etsf_robotwin2_candidate_branch_diagnostics_v2_endpose_frame"
 DATASET_REPO = "TianxingChen/RoboTwin2.0"
 DATASET_REVISION = "a967b852afa21a9cbf19a198f7e653109042e87c"
 TASK = "move_can_pot"
 BODIES = ("aloha-agilex", "arx-x5", "franka", "piper", "ur5")
 CONDITIONS = ("clean", "randomized")
+AUTHORIZED_COLLECTION_GPU_TOKENS = ("4090", "5090")
+ACTOR_ACTION_CONTRACTS = ("ee16", "aloha_joint14")
 CANDIDATE_COUNT = 4
 NATIVE_EE_DIM = 16
+ALOHA_JOINT_DIM = 14
 CANONICAL_ACTION_DIM = 14
 STATE_DIM = 27
 OBJECT_DELTA_DIM = 6
@@ -91,6 +102,27 @@ STATE_ACTION_FRAME_CONTRACT = {
     "tcp_tool_axis_offset_m_excluded": 0.12,
     "state_and_action_same_frame": True,
 }
+ALOHA_JOINT14_STATE_ACTION_FRAME_CONTRACT = {
+    "format": "etsf_robotwin2_official_smolvla_aloha_joint14_to_canonical_ee_v1",
+    "actor_observation_state_source": (
+        "robot.get_left_arm_jointState_plus_get_right_arm_jointState"
+    ),
+    "actor_observation_state_dim": ALOHA_JOINT_DIM,
+    "actor_native_action_dim": ALOHA_JOINT_DIM,
+    "actor_native_action_semantics": (
+        "left_6_joint_plus_gripper_then_right_6_joint_plus_gripper"
+    ),
+    "single_arm_authority": "task.arm_tag_from_move_can_pot_scene",
+    "passive_arm_rule": "hold_current_joint_drive_targets_and_gripper",
+    "canonical_candidate_adapter": (
+        "analytic_aloha_urdf_forward_kinematics_to_absolute_world_ee16"
+    ),
+    "canonical_pose_convention": "xyz_plus_quaternion_wxyz",
+    "canonical_action_dim": CANONICAL_ACTION_DIM,
+    "environment_call": "task.take_action(native_joint14, action_type=qpos)",
+    "actor_weights_frozen": True,
+    "candidate_zero_is_unmodified_selection_baseline_after_shared_single_arm_adapter": True,
+}
 CANDIDATE_NOISE_CONTRACT = {
     "distribution": "antithetic_standard_normal_pairs_each_marginal_N_0_I",
     "candidate_indices": [0, 1, 2, 3],
@@ -122,6 +154,38 @@ EVENT_AGE_CONTRACT = {
     "available_before_candidate_execution": True,
     "same_value_for_all_candidates_at_one_root": True,
 }
+
+
+def liquid_history_contract(history_length: int) -> dict[str, Any] | None:
+    """Return the opt-in, pre-action-only finite history schema."""
+
+    if history_length == 0:
+        return None
+    if history_length < 2 or history_length > 256:
+        raise BranchCollectionError("liquid history length must be 0 or in [2,256]")
+    return {
+        "format": "etsf_robotwin2_liquid_canonical_history_v1",
+        "history_length": int(history_length),
+        "arrays": {
+            "state_history": [CANDIDATE_COUNT, int(history_length), STATE_DIM],
+            "state_history_mask": [CANDIDATE_COUNT, int(history_length)],
+            "state_history_dt": [CANDIDATE_COUNT, int(history_length)],
+            "event_history_id": [CANDIDATE_COUNT, int(history_length)],
+            "planned_action_dt": [CANDIDATE_COUNT, "native_chunk_steps"],
+        },
+        "state_sampling": (
+            "deterministic_full_prefix_anchors_event_entries_uniform_fill_"
+            "left_zero_padding"
+        ),
+        "time_source": "counted_past_successful_sapien_scene_step_calls",
+        "first_observation_dt_seconds": 0.0,
+        "padded_dt_seconds": 0.0,
+        "planned_action_dt_seconds": 1.0 / SOURCE_EVENT_SAMPLING_HZ,
+        "history_available_before_candidate_execution": True,
+        "future_realized_duration_used_as_input": False,
+        "terminal_labels_used_to_construct_history": False,
+        "persistent_hidden_state_required": False,
+    }
 def terminal_horizon_contract(
     protocol: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -197,6 +261,27 @@ BODY_EMBODIMENT = {
 
 class BranchCollectionError(RuntimeError):
     """The actor, reset, replay or canonical output is invalid."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateBatch:
+    """One ordered actor pool in both execution and canonical critic frames."""
+
+    actor_actions: np.ndarray
+    canonical_ee_actions: np.ndarray
+    execution_actions: np.ndarray
+    execution_action_type: str
+    active_arm: str | None
+
+
+def state_action_frame_contract(actor_action_contract: str) -> dict[str, Any]:
+    if actor_action_contract == "ee16":
+        return dict(STATE_ACTION_FRAME_CONTRACT)
+    if actor_action_contract == "aloha_joint14":
+        return dict(ALOHA_JOINT14_STATE_ACTION_FRAME_CONTRACT)
+    raise BranchCollectionError(
+        f"unknown actor action contract: {actor_action_contract!r}"
+    )
 
 
 class SimulationClockScene:
@@ -750,6 +835,32 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def actor_checkpoint_identity(path: Path) -> dict[str, Any]:
+    """Bind the actor weights plus the processors that define its real ABI."""
+
+    root = path.expanduser().resolve()
+    required = (
+        "config.json",
+        "model.safetensors",
+        "policy_preprocessor.json",
+        "policy_preprocessor_step_5_normalizer_processor.safetensors",
+        "policy_postprocessor.json",
+        "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    )
+    files = {}
+    for name in required:
+        value = root / name
+        if not value.is_file():
+            raise BranchCollectionError(f"actor checkpoint lacks required file: {name}")
+        files[name] = sha256_file(value)
+    return {
+        "format": "etsf_frozen_smolvla_checkpoint_identity_v1",
+        "root": str(root),
+        "files": files,
+        "logical_sha256": canonical_sha256(files),
+    }
+
+
 def canonical_sha256(value: Any) -> str:
     raw = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -943,6 +1054,41 @@ def current_ee_action16(task: Any) -> np.ndarray:
     return value
 
 
+def current_aloha_joint_action14(task: Any) -> np.ndarray:
+    """Read the exact joint state ABI consumed by official RoboTwin SmolVLA."""
+
+    robot = getattr(task, "robot", None)
+    left_getter = getattr(robot, "get_left_arm_jointState", None)
+    right_getter = getattr(robot, "get_right_arm_jointState", None)
+    if not callable(left_getter) or not callable(right_getter):
+        raise BranchCollectionError(
+            "official Aloha SmolVLA requires both arm joint-state APIs"
+        )
+    left = np.asarray(left_getter(), dtype=np.float32).reshape(-1)
+    right = np.asarray(right_getter(), dtype=np.float32).reshape(-1)
+    value = np.concatenate((left, right)).astype(np.float32)
+    if (
+        left.shape != (7,)
+        or right.shape != (7,)
+        or value.shape != (ALOHA_JOINT_DIM,)
+        or not np.isfinite(value).all()
+    ):
+        raise BranchCollectionError(
+            "official Aloha actor state must be finite left7+right7 joint14"
+        )
+    return value
+
+
+def actor_observation_state(task: Any, actor_action_contract: str) -> np.ndarray:
+    if actor_action_contract == "ee16":
+        return current_ee_action16(task)
+    if actor_action_contract == "aloha_joint14":
+        return current_aloha_joint_action14(task)
+    raise BranchCollectionError(
+        f"unknown actor action contract: {actor_action_contract!r}"
+    )
+
+
 def _camera_sources(observation: Mapping[str, Any]) -> list[Any]:
     vision = observation.get("observation", {})
     keys = ("head_camera", "left_camera", "right_camera")
@@ -956,12 +1102,17 @@ def _camera_sources(observation: Mapping[str, Any]) -> list[Any]:
 
 
 def raw_policy_input(
-    task: Any, image_keys: Sequence[str], instruction: str
+    task: Any,
+    image_keys: Sequence[str],
+    instruction: str,
+    actor_action_contract: str = "ee16",
 ) -> dict[str, Any]:
     observation = task.get_obs()
     images = _camera_sources(observation)
     result: dict[str, Any] = {
-        "observation.state": torch.from_numpy(current_ee_action16(task)),
+        "observation.state": torch.from_numpy(
+            actor_observation_state(task, actor_action_contract)
+        ),
         "task": instruction,
     }
     named = {
@@ -995,7 +1146,47 @@ def normalize_ee_chunk(value: Any) -> np.ndarray:
     return actions
 
 
-def generate_candidates(
+def _task_active_arm(task: Any) -> str:
+    value = str(getattr(task, "arm_tag", "")).strip().lower()
+    if value not in {"left", "right"}:
+        raise BranchCollectionError(
+            "move_can_pot must expose its scene-derived left/right arm_tag"
+        )
+    return value
+
+
+def _single_arm_joint_chunk(
+    task: Any, actions: np.ndarray, joint_to_ee: Any
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Apply one shared, label-free single-arm adapter before execution/FK."""
+
+    if joint_to_ee is None:
+        raise BranchCollectionError("aloha_joint14 requires the analytic FK adapter")
+    native = np.asarray(actions, dtype=np.float32)
+    if native.ndim != 2 or native.shape[1] != ALOHA_JOINT_DIM:
+        raise BranchCollectionError(
+            f"official actor must return [H,{ALOHA_JOINT_DIM}], got {native.shape}"
+        )
+    if not np.isfinite(native).all():
+        raise BranchCollectionError("official actor candidate contains non-finite values")
+    try:
+        native = np.asarray(joint_to_ee.clip_joint_chunk(native), dtype=np.float32)
+    except (TypeError, ValueError) as error:
+        raise BranchCollectionError("analytic Aloha joint clipping failed") from error
+    current = current_aloha_joint_action14(task)
+    active_arm = _task_active_arm(task)
+    if active_arm == "left":
+        native[:, 7:14] = current[None, 7:14]
+    else:
+        native[:, 0:7] = current[None, 0:7]
+    try:
+        canonical = normalize_ee_chunk(joint_to_ee.convert_chunk(native))
+    except (TypeError, ValueError) as error:
+        raise BranchCollectionError("analytic Aloha FK conversion failed") from error
+    return native, canonical, active_arm
+
+
+def generate_candidate_batch(
     *,
     policy: Any,
     preprocessor: Any,
@@ -1006,10 +1197,21 @@ def generate_candidates(
     query_index: int,
     candidate_count: int,
     device: torch.device,
-) -> np.ndarray:
-    raw = raw_policy_input(task, list(policy.config.image_features), instruction)
+    actor_action_contract: str = "ee16",
+    joint_to_ee: Any = None,
+) -> CandidateBatch:
+    """Generate one pool while keeping actor, execution and critic frames explicit."""
+
+    raw = raw_policy_input(
+        task,
+        list(policy.config.image_features),
+        instruction,
+        actor_action_contract,
+    )
     processed = preprocessor(raw)
-    candidates = []
+    actor_candidates = []
+    canonical_candidates = []
+    active_arms: set[str] = set()
     for candidate_index in range(candidate_count):
         policy.reset()
         noise = make_noise(
@@ -1023,11 +1225,65 @@ def generate_candidates(
         actions = np.asarray(actions)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
-        candidates.append(normalize_ee_chunk(actions))
-    result = np.stack(candidates)
-    if candidate_count > 1 and not np.any(result[1:] != result[0]):
+        if actor_action_contract == "ee16":
+            canonical = normalize_ee_chunk(actions)
+            actor_action = canonical.copy()
+        elif actor_action_contract == "aloha_joint14":
+            actor_action, canonical, active_arm = _single_arm_joint_chunk(
+                task, actions, joint_to_ee
+            )
+            active_arms.add(active_arm)
+        else:
+            raise BranchCollectionError(
+                f"unknown actor action contract: {actor_action_contract!r}"
+            )
+        actor_candidates.append(actor_action)
+        canonical_candidates.append(canonical)
+    actor_result = np.stack(actor_candidates)
+    canonical_result = np.stack(canonical_candidates)
+    if candidate_count > 1 and not np.any(actor_result[1:] != actor_result[0]):
         raise BranchCollectionError("four flow-noise candidates are identical")
-    return result
+    if len(active_arms) > 1:
+        raise BranchCollectionError("one scene produced inconsistent active arms")
+    execution_type = "ee" if actor_action_contract == "ee16" else "qpos"
+    return CandidateBatch(
+        actor_actions=actor_result,
+        canonical_ee_actions=canonical_result,
+        execution_actions=actor_result.copy(),
+        execution_action_type=execution_type,
+        active_arm=next(iter(active_arms)) if active_arms else None,
+    )
+
+
+def generate_candidates(
+    *,
+    policy: Any,
+    preprocessor: Any,
+    postprocessor: Any,
+    task: Any,
+    instruction: str,
+    scene_seed: int,
+    query_index: int,
+    candidate_count: int,
+    device: torch.device,
+    actor_action_contract: str = "ee16",
+    joint_to_ee: Any = None,
+) -> np.ndarray:
+    """Compatibility wrapper returning the canonical EE view of the pool."""
+
+    return generate_candidate_batch(
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        task=task,
+        instruction=instruction,
+        scene_seed=scene_seed,
+        query_index=query_index,
+        candidate_count=candidate_count,
+        device=device,
+        actor_action_contract=actor_action_contract,
+        joint_to_ee=joint_to_ee,
+    ).canonical_ee_actions
 
 
 def canonical_action_chunk(current: np.ndarray, actions: np.ndarray) -> np.ndarray:
@@ -1155,12 +1411,15 @@ def _root_prefix(
     max_steps: int,
     required_pose_names: set[str],
     device: torch.device,
+    actor_action_contract: str = "ee16",
+    joint_to_ee: Any = None,
 ) -> dict[str, Any] | None:
     task = _new_task(task_class, args, seed, instruction)
     try:
         names, objects = discover_pose_objects(task, required_pose_names)
         trajectory = [read_poses(objects)]
         sim_times = [_sim_time(task)]
+        prefix_ee_actions = [current_ee_action16(task)]
         for query_index in range(root_query):
             if _episode_done(task, max_steps):
                 return None
@@ -1169,7 +1428,8 @@ def _root_prefix(
             # every historical prefix query, not only the sampled root.
             task.scene.step()
             _append_physical_observation(task, objects, trajectory, sim_times)
-            chunk = generate_candidates(
+            prefix_ee_actions.append(current_ee_action16(task))
+            candidate_batch = generate_candidate_batch(
                 policy=policy,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
@@ -1179,12 +1439,18 @@ def _root_prefix(
                 query_index=query_index,
                 candidate_count=1,
                 device=device,
-            )[0]
+                actor_action_contract=actor_action_contract,
+                joint_to_ee=joint_to_ee,
+            )
+            chunk = candidate_batch.execution_actions[0]
             for action in chunk[:action_exec_steps]:
                 if _episode_done(task, max_steps):
                     break
-                task.take_action(action, action_type="ee")
+                task.take_action(
+                    action, action_type=candidate_batch.execution_action_type
+                )
                 _append_physical_observation(task, objects, trajectory, sim_times)
+                prefix_ee_actions.append(current_ee_action16(task))
         if _episode_done(task, max_steps):
             return None
         remaining_action_budget = max_steps - int(
@@ -1259,12 +1525,13 @@ def _root_prefix(
             raise BranchCollectionError("tracked object registry changed after restore")
         trajectory.append(read_poses(reference_objects))
         sim_times.append(_sim_time(reference))
+        prefix_ee_actions.append(current_ee_action16(reference))
         root_pose = trajectory[-1].copy()
-        current = current_ee_action16(reference)
+        current = prefix_ee_actions[-1].copy()
         canonical_snapshot_sha = branch_root_snapshot_sha256(
             capture_branch_root_snapshot(reference)
         )
-        candidates = generate_candidates(
+        candidate_batch = generate_candidate_batch(
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
@@ -1274,6 +1541,8 @@ def _root_prefix(
             query_index=root_query,
             candidate_count=CANDIDATE_COUNT,
             device=device,
+            actor_action_contract=actor_action_contract,
+            joint_to_ee=joint_to_ee,
         )
         root_sim_steps = int(reference.scene.step_count)
         sim_timestep_seconds = float(reference.scene.timestep_seconds)
@@ -1289,11 +1558,16 @@ def _root_prefix(
         "root_ee_action": current,
         "prefix_trajectory": np.stack(trajectory),
         "prefix_sim_times": np.asarray(sim_times, dtype=np.float64),
+        "prefix_ee_actions": np.asarray(prefix_ee_actions, dtype=np.float32),
         "root_sim_steps": root_sim_steps,
         "sim_timestep_seconds": sim_timestep_seconds,
         "remaining_action_budget": int(remaining_action_budget),
         "success_height_reference_z": height_reference_z,
-        "candidates": candidates,
+        "candidates": candidate_batch.canonical_ee_actions,
+        "actor_candidates": candidate_batch.actor_actions,
+        "execution_candidates": candidate_batch.execution_actions,
+        "execution_action_type": candidate_batch.execution_action_type,
+        "active_arm": candidate_batch.active_arm,
     }
 
 
@@ -1312,6 +1586,8 @@ def _execute_candidate_from_restored_root(
     action_exec_steps: int,
     max_steps: int,
     device: torch.device,
+    actor_action_contract: str = "ee16",
+    joint_to_ee: Any = None,
 ) -> dict[str, Any]:
     trajectory = [
         # Preserve simulator float64 quaternions until the official strict
@@ -1331,7 +1607,7 @@ def _execute_candidate_from_restored_root(
         # ``Fail`` plan and advancing the formal action; that is a valid policy
         # outcome.  A Python exception here instead signals broken collection
         # infrastructure and must invalidate the complete four-candidate root.
-        task.take_action(action, action_type="ee")
+        task.take_action(action, action_type=str(root["execution_action_type"]))
         first_executed += 1
         _append_physical_observation(task, objects, trajectory, sim_times)
     post_step = len(trajectory) - 1
@@ -1344,7 +1620,7 @@ def _execute_candidate_from_restored_root(
         # Policy/observation/runtime generation failures are collection
         # failures, not negative action outcomes.  They invalidate the whole
         # decision and intentionally propagate to the caller.
-        continuation = generate_candidates(
+        continuation_batch = generate_candidate_batch(
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
@@ -1354,11 +1630,18 @@ def _execute_candidate_from_restored_root(
             query_index=query_index,
             candidate_count=1,
             device=device,
-        )[0]
+            actor_action_contract=actor_action_contract,
+            joint_to_ee=joint_to_ee,
+        )
+        if continuation_batch.execution_action_type != root["execution_action_type"]:
+            raise BranchCollectionError("continuation execution action type changed")
+        continuation = continuation_batch.execution_actions[0]
         for action in continuation[:action_exec_steps]:
             if _episode_done(task, max_steps):
                 break
-            task.take_action(action, action_type="ee")
+            task.take_action(
+                action, action_type=continuation_batch.execution_action_type
+            )
             _append_physical_observation(task, objects, trajectory, sim_times)
         query_index += 1
     success = bool(getattr(task, "eval_success", False))
@@ -1395,6 +1678,8 @@ def _evaluate_candidate(
     max_steps: int,
     required_pose_names: set[str],
     device: torch.device,
+    actor_action_contract: str = "ee16",
+    joint_to_ee: Any = None,
 ) -> dict[str, Any]:
     """Evaluate one candidate in an independently restored fresh scene."""
 
@@ -1486,6 +1771,8 @@ def _evaluate_candidate(
             action_exec_steps=action_exec_steps,
             max_steps=max_steps,
             device=device,
+            actor_action_contract=actor_action_contract,
+            joint_to_ee=joint_to_ee,
         )
     finally:
         task.close_env(clear_cache=False)
@@ -1519,12 +1806,122 @@ def _state27(
     )
 
 
+def _liquid_history_indices(events: np.ndarray, history_length: int) -> list[int]:
+    """Keep episode endpoints/event entries, then fill the prefix uniformly."""
+
+    values = np.asarray(events, dtype=np.int64).reshape(-1)
+    if len(values) == 0:
+        raise BranchCollectionError("liquid history cannot sample an empty prefix")
+    if history_length < 2:
+        raise BranchCollectionError("liquid history length must be at least two")
+    if len(values) <= history_length:
+        return list(range(len(values)))
+    changes = (np.flatnonzero(values[1:] != values[:-1]) + 1).tolist()
+    anchors = sorted({0, len(values) - 1, *changes})
+    if len(anchors) > history_length:
+        # The canonical chain has only five states, but retain a deterministic
+        # fail-safe for a future event schema with more transitions.
+        anchors = sorted({0, *(anchors[-(history_length - 1) :])})
+    selected = set(anchors)
+    target_count = history_length - len(selected)
+    if target_count:
+        targets = np.linspace(0, len(values) - 1, target_count + 2)[1:-1]
+        available = set(range(len(values))) - selected
+        for target in targets:
+            if not available:
+                break
+            chosen = min(available, key=lambda index: (abs(index - target), index))
+            selected.add(chosen)
+            available.remove(chosen)
+        for index in sorted(available, reverse=True):
+            if len(selected) >= history_length:
+                break
+            selected.add(index)
+    result = sorted(selected)
+    if len(result) != history_length or result[-1] != len(values) - 1:
+        raise BranchCollectionError("liquid history selection changed its contract")
+    return result
+
+
+def materialize_liquid_history(
+    *,
+    prefix: np.ndarray,
+    prefix_times: np.ndarray,
+    prefix_ee_actions: np.ndarray,
+    names: Sequence[str],
+    initial_moving_position: np.ndarray,
+    predicates: np.ndarray,
+    events: np.ndarray,
+    calibration: Mapping[str, Any],
+    history_length: int,
+) -> dict[str, np.ndarray]:
+    """Build a fixed, pre-action continuous-time history for one root."""
+
+    prefix = np.asarray(prefix, dtype=np.float64)
+    prefix_times = np.asarray(prefix_times, dtype=np.float64).reshape(-1)
+    prefix_ee_actions = np.asarray(prefix_ee_actions, dtype=np.float32)
+    predicates = np.asarray(predicates)
+    events = np.asarray(events, dtype=np.int64).reshape(-1)
+    count = len(prefix_times)
+    if (
+        prefix.shape[0] != count
+        or prefix_ee_actions.shape != (count, NATIVE_EE_DIM)
+        or predicates.shape[0] != count
+        or events.shape != (count,)
+        or not np.isfinite(prefix_times).all()
+        or np.any(np.diff(prefix_times) < -1e-12)
+    ):
+        raise BranchCollectionError("liquid history prefix arrays are misaligned")
+    selected = _liquid_history_indices(events, history_length)
+    selected_states = np.stack(
+        [
+            _state27(
+                poses=prefix,
+                names=names,
+                step=step,
+                initial_moving_position=initial_moving_position,
+                ee_action=prefix_ee_actions[step],
+                event=int(events[step]),
+                predicates=predicates,
+                calibration=calibration,
+            )
+            for step in selected
+        ]
+    ).astype(np.float32)
+    selected_times = prefix_times[np.asarray(selected, dtype=np.int64)]
+    selected_dt = np.r_[0.0, np.diff(selected_times)].astype(np.float32)
+    if np.any(selected_dt < 0.0) or not np.isfinite(selected_dt).all():
+        raise BranchCollectionError("liquid history contains invalid past time")
+    pad = history_length - len(selected)
+    state_history = np.zeros((history_length, STATE_DIM), dtype=np.float32)
+    history_mask = np.zeros(history_length, dtype=bool)
+    history_dt = np.zeros(history_length, dtype=np.float32)
+    event_history = np.zeros(history_length, dtype=np.int64)
+    state_history[pad:] = selected_states
+    history_mask[pad:] = True
+    history_dt[pad:] = selected_dt
+    event_history[pad:] = events[np.asarray(selected, dtype=np.int64)]
+    if (
+        not history_mask[-1]
+        or not np.array_equal(state_history[-1, 18:23], selected_states[-1, 18:23])
+        or np.any(history_dt[~history_mask] != 0.0)
+    ):
+        raise BranchCollectionError("liquid history padding/root contract changed")
+    return {
+        "state_history": state_history,
+        "state_history_mask": history_mask,
+        "state_history_dt": history_dt,
+        "event_history_id": event_history,
+    }
+
+
 def materialize_group(
     *,
     root: Mapping[str, Any],
     outcomes: Sequence[Mapping[str, Any]],
     calibration: Mapping[str, Any],
     action_exec_steps: int,
+    liquid_history_length: int = 0,
 ) -> dict[str, np.ndarray]:
     if len(outcomes) != CANDIDATE_COUNT or len(root["candidates"]) != CANDIDATE_COUNT:
         raise BranchCollectionError("materialization requires exactly four complete branches")
@@ -1557,6 +1954,25 @@ def materialize_group(
         predicates=prefix_predicates,
         calibration=calibration,
     )
+    liquid_history = None
+    if liquid_history_length:
+        liquid_history = materialize_liquid_history(
+            prefix=prefix,
+            prefix_times=prefix_times,
+            prefix_ee_actions=np.asarray(root["prefix_ee_actions"]),
+            names=names,
+            initial_moving_position=initial_moving,
+            predicates=prefix_predicates,
+            events=prefix_events,
+            calibration=calibration,
+            history_length=liquid_history_length,
+        )
+        if not np.allclose(
+            liquid_history["state_history"][-1], state, atol=1e-6, rtol=0.0
+        ):
+            raise BranchCollectionError(
+                "liquid history terminal state differs from the canonical root"
+            )
     horizon = int(np.asarray(root["candidates"]).shape[1])
     actions = []
     masks = []
@@ -1714,12 +2130,32 @@ def materialize_group(
             dtype=np.float32,
         ),
     }
+    if liquid_history is not None:
+        for name, value in liquid_history.items():
+            arrays[name] = np.repeat(value[None], count, axis=0)
+        arrays["planned_action_dt"] = (
+            arrays["action_mask"].astype(np.float32) / SOURCE_EVENT_SAMPLING_HZ
+        )
     if arrays["actions"].shape != (count, horizon, CANONICAL_ACTION_DIM):
         raise BranchCollectionError("canonical group action shape changed")
     if arrays["state"].shape != (count, STATE_DIM):
         raise BranchCollectionError("canonical group state shape changed")
     if arrays["object_delta"].shape != (count, OBJECT_DELTA_DIM):
         raise BranchCollectionError("canonical object effect shape changed")
+    if liquid_history is not None:
+        expected_history = (count, liquid_history_length)
+        if (
+            arrays["state_history"].shape
+            != (*expected_history, STATE_DIM)
+            or arrays["state_history_mask"].shape != expected_history
+            or arrays["state_history_dt"].shape != expected_history
+            or arrays["event_history_id"].shape != expected_history
+            or arrays["planned_action_dt"].shape != arrays["action_mask"].shape
+            or not np.array_equal(
+                arrays["planned_action_dt"] > 0.0, arrays["action_mask"]
+            )
+        ):
+            raise BranchCollectionError("liquid history/action timing shape changed")
     if not np.array_equal(
         arrays["terminal_stage_progress"],
         np.where(
@@ -1872,6 +2308,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Absolute root used to resolve every relative artifact binding",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--actor-action-contract",
+        choices=ACTOR_ACTION_CONTRACTS,
+        default="ee16",
+        help=(
+            "ee16 keeps the legacy native EE actor; aloha_joint14 loads the "
+            "official RoboTwin SmolVLA joint actor and analytically exposes its "
+            "single-arm candidates to the canonical shared head."
+        ),
+    )
     parser.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=list(CONDITIONS))
     parser.add_argument("--seed-start", type=int, default=2026081000)
     parser.add_argument("--seed-count", type=int)
@@ -1892,6 +2338,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--action-exec-steps", type=int
     )
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--liquid-history-length",
+        type=int,
+        default=0,
+        help=(
+            "Opt in to v14 pre-action canonical history arrays; zero keeps the "
+            "v13 scalar-root payload exactly unchanged."
+        ),
+    )
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     return parser.parse_args(argv)
 
@@ -1944,6 +2399,7 @@ def bind_execution_protocol_arguments(
         raise BranchCollectionError("collector output must be contained by path_root") from error
     if args.seed_count <= 0 or args.action_exec_steps <= 0:
         raise BranchCollectionError("seed-count/action-exec-steps must be positive")
+    liquid_history_contract(int(args.liquid_history_length))
     if (
         args.action_exec_steps != action_exec_steps
         or args.max_steps != max_steps
@@ -1985,9 +2441,17 @@ def main() -> None:
     action_exec_steps = int(execution_protocol["stride"])
     max_steps = int(execution_protocol["max_steps"])
     terminal_contract = terminal_horizon_contract(execution_protocol)
+    history_contract = liquid_history_contract(int(args.liquid_history_length))
+    active_collector_format = LIQUID_FORMAT if history_contract else FORMAT
+    active_manifest_format = (
+        LIQUID_MANIFEST_FORMAT if history_contract else MANIFEST_FORMAT
+    )
     output = args.output.expanduser().resolve()
-    if not torch.cuda.is_available() or "4090" not in torch.cuda.get_device_name(0):
-        raise BranchCollectionError("real branch collection requires remote RTX 4090 CUDA")
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+    if not any(token in gpu_name for token in AUTHORIZED_COLLECTION_GPU_TOKENS):
+        raise BranchCollectionError(
+            "real branch collection requires an authorized RTX 4090/5090 CUDA GPU"
+        )
     for path in (
         args.actor_checkpoint,
         args.vlm_metadata_path,
@@ -2022,12 +2486,32 @@ def main() -> None:
     config.device = str(device)
     config.vlm_model_name = str(args.vlm_metadata_path.resolve())
     config.load_vlm_weights = False
-    if config.action_feature is None or int(config.action_feature.shape[0]) != NATIVE_EE_DIM:
-        raise BranchCollectionError("actor checkpoint must have a 16-D EE action feature")
-    if config.input_features.get("observation.state") is None or int(
-        config.input_features["observation.state"].shape[0]
-    ) != NATIVE_EE_DIM:
-        raise BranchCollectionError("actor checkpoint must have a 16-D EE state feature")
+    expected_actor_dim = (
+        NATIVE_EE_DIM
+        if args.actor_action_contract == "ee16"
+        else ALOHA_JOINT_DIM
+    )
+    if (
+        config.action_feature is None
+        or int(config.action_feature.shape[0]) != expected_actor_dim
+    ):
+        raise BranchCollectionError(
+            f"actor checkpoint must have a {expected_actor_dim}-D action feature"
+        )
+    declared_state = config.input_features.get("observation.state")
+    if args.actor_action_contract == "ee16":
+        if declared_state is None or int(declared_state.shape[0]) != NATIVE_EE_DIM:
+            raise BranchCollectionError(
+                "legacy EE actor checkpoint must have a 16-D state feature"
+            )
+    elif args.body != "aloha-agilex":
+        raise BranchCollectionError(
+            "official aloha_joint14 collection is source-Aloha only"
+        )
+    elif declared_state is None or int(declared_state.shape[0]) not in {6, 14}:
+        raise BranchCollectionError(
+            "official SmolVLA state declaration must be its known 6/14 metadata ABI"
+        )
     if int(config.chunk_size) != int(execution_protocol["native_chunk_steps"]):
         raise BranchCollectionError(
             "actor native action chunk differs from the bound execution protocol"
@@ -2035,6 +2519,10 @@ def main() -> None:
     policy = SmolVLAPolicy.from_pretrained(
         args.actor_checkpoint, config=config, local_files_only=True, strict=True
     ).eval().to(device)
+    for parameter in policy.parameters():
+        parameter.requires_grad_(False)
+    if any(parameter.requires_grad for parameter in policy.parameters()):
+        raise BranchCollectionError("frozen actor assertion failed")
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
         pretrained_path=str(args.actor_checkpoint),
@@ -2043,6 +2531,32 @@ def main() -> None:
             "tokenizer_processor": {"tokenizer_name": str(args.vlm_metadata_path)},
         },
     )
+    joint_to_ee = None
+    joint_adapter_identity = None
+    if args.actor_action_contract == "aloha_joint14":
+        from robotwin2_frozen_smolvla_aloha_to_ee_policy_v1 import (
+            AlohaJointToWorldEE,
+        )
+
+        joint_adapter_source = Path(
+            inspect.getsourcefile(AlohaJointToWorldEE) or ""
+        ).resolve()
+        joint_to_ee = AlohaJointToWorldEE(
+            args.robotwin_root
+            / "assets/embodiments/aloha-agilex/urdf/"
+            / "arx5_description_isaac.urdf",
+            args.robotwin_root / "assets/embodiments/aloha-agilex/config.yml",
+        )
+        joint_adapter_identity = {
+            "implementation_file": str(joint_adapter_source),
+            "implementation_sha256": sha256_file(joint_adapter_source),
+            "urdf_sha256": sha256_file(joint_to_ee.urdf_path),
+            "config_sha256": sha256_file(joint_to_ee.config_path),
+        }
+    active_state_action_contract = state_action_frame_contract(
+        args.actor_action_contract
+    )
+    checkpoint_identity = actor_checkpoint_identity(args.actor_checkpoint)
 
     try:
         event_spec, calibration = analytic_event.load_event_spec(args.event_spec)
@@ -2064,8 +2578,8 @@ def main() -> None:
         logical = unsigned.pop("logical_sha256", None)
         if (
             logical != canonical_sha256(unsigned)
-            or manifest.get("format") != MANIFEST_FORMAT
-            or manifest.get("collector_format") != FORMAT
+            or manifest.get("format") != active_manifest_format
+            or manifest.get("collector_format") != active_collector_format
             or manifest.get("body") != args.body
             or manifest.get("collector_file_sha256") != collector_sha
             or manifest.get("path_root") != str(path_root)
@@ -2075,6 +2589,10 @@ def main() -> None:
             or manifest.get("actor_execution_protocol_file_sha256")
             != args.actor_execution_protocol_sha256
             or manifest.get("actor_checkpoint") != str(args.actor_checkpoint.resolve())
+            or manifest.get("actor_checkpoint_identity") != checkpoint_identity
+            or manifest.get("actor_action_contract") != args.actor_action_contract
+            or manifest.get("joint_to_ee_adapter_identity")
+            != joint_adapter_identity
             or manifest.get("instruction") != DEFAULT_INSTRUCTION
             or manifest.get("candidate_count") != CANDIDATE_COUNT
             or manifest.get("root_query_indices") != manifest_queries
@@ -2082,7 +2600,7 @@ def main() -> None:
             or manifest.get("max_episode_action_steps") != args.max_steps
             or manifest.get("candidate_noise_contract") != CANDIDATE_NOISE_CONTRACT
             or manifest.get("state_action_frame_contract")
-            != STATE_ACTION_FRAME_CONTRACT
+            != active_state_action_contract
             or manifest.get("terminal_supervision_contract")
             != TERMINAL_SUPERVISION_CONTRACT
             or manifest.get("event_age_contract") != EVENT_AGE_CONTRACT
@@ -2093,12 +2611,13 @@ def main() -> None:
             or manifest.get("object_effect_schema") != OBJECT_EFFECT_SCHEMA
             or manifest.get("branch_diagnostic_contract")
             != BRANCH_DIAGNOSTIC_CONTRACT
+            or manifest.get("liquid_history_contract") != history_contract
         ):
             raise BranchCollectionError("existing manifest does not match this collection")
     else:
         manifest = {
-            "format": MANIFEST_FORMAT,
-            "collector_format": FORMAT,
+            "format": active_manifest_format,
+            "collector_format": active_collector_format,
             "dataset_repo": DATASET_REPO,
             "dataset_revision": DATASET_REVISION,
             "task": TASK,
@@ -2111,6 +2630,9 @@ def main() -> None:
                 args.actor_execution_protocol_sha256
             ),
             "actor_checkpoint": str(args.actor_checkpoint.resolve()),
+            "actor_checkpoint_identity": checkpoint_identity,
+            "actor_action_contract": args.actor_action_contract,
+            "joint_to_ee_adapter_identity": joint_adapter_identity,
             "instruction": DEFAULT_INSTRUCTION,
             "actor_checkpoint_tree_or_file_sha256_recorded_separately": True,
             "candidate_count": CANDIDATE_COUNT,
@@ -2119,7 +2641,7 @@ def main() -> None:
             "candidate_zero_is_actor_baseline": True,
             "same_ordered_candidate_set_for_baseline_and_etsf": True,
             "candidate_noise_contract": CANDIDATE_NOISE_CONTRACT,
-            "state_action_frame_contract": STATE_ACTION_FRAME_CONTRACT,
+            "state_action_frame_contract": active_state_action_contract,
             "root_query_indices": manifest_queries,
             "schema_adapter": {
                 "kind": "analytic_label_free_canonical_v1",
@@ -2161,6 +2683,11 @@ def main() -> None:
                 "event_chain_success_aligned": True,
             },
             "candidate_action_contract": {
+                "actor_action_contract": args.actor_action_contract,
+                "execution_action_type": (
+                    "ee" if args.actor_action_contract == "ee16" else "qpos"
+                ),
+                "critic_candidate_frame": "canonical_absolute_world_ee16",
                 "critic_observation_time": "before_candidate_execution",
                 "planned_action_horizon": min(
                     int(args.action_exec_steps), int(config.chunk_size)
@@ -2177,6 +2704,7 @@ def main() -> None:
             "branch_root_snapshot_contract": BRANCH_ROOT_SNAPSHOT_CONTRACT,
             "object_effect_schema": OBJECT_EFFECT_SCHEMA,
             "branch_diagnostic_contract": BRANCH_DIAGNOSTIC_CONTRACT,
+            "liquid_history_contract": history_contract,
             "event_spec_sha256": EVENT_SPEC_SHA256,
             "groups": [],
         }
@@ -2205,6 +2733,8 @@ def main() -> None:
                     max_steps=args.max_steps,
                     required_pose_names=required_pose_names,
                     device=device,
+                    actor_action_contract=args.actor_action_contract,
+                    joint_to_ee=joint_to_ee,
                 )
                 if root is None:
                     print(
@@ -2229,14 +2759,17 @@ def main() -> None:
                         max_steps=args.max_steps,
                         required_pose_names=required_pose_names,
                         device=device,
+                        actor_action_contract=args.actor_action_contract,
+                        joint_to_ee=joint_to_ee,
                     )
-                    for candidate in root["candidates"]
+                    for candidate in root["execution_candidates"]
                 ]
                 arrays = materialize_group(
                     root=root,
                     outcomes=outcomes,
                     calibration=calibration,
                     action_exec_steps=args.action_exec_steps,
+                    liquid_history_length=int(args.liquid_history_length),
                 )
                 diagnostics = materialize_branch_diagnostics(
                     root=root,

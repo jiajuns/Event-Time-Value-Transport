@@ -50,6 +50,37 @@ class _EndPoseTask:
         raise AssertionError(f"unexpected arm: {arm}")
 
 
+class _JointRobot(_EndPoseRobot):
+    def get_left_arm_jointState(self) -> list[float]:
+        return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.25]
+
+    def get_right_arm_jointState(self) -> list[float]:
+        return [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, 0.75]
+
+
+class _JointTask(_EndPoseTask):
+    def __init__(self, arm_tag: str = "left") -> None:
+        super().__init__()
+        self.robot = _JointRobot()
+        self.arm_tag = arm_tag
+
+
+class _FakeJointToEE:
+    def clip_joint_chunk(self, value: np.ndarray) -> np.ndarray:
+        return np.asarray(value, dtype=np.float32).copy()
+
+    def convert_chunk(self, value: np.ndarray) -> np.ndarray:
+        value = np.asarray(value, dtype=np.float32)
+        result = np.zeros((len(value), 16), dtype=np.float32)
+        result[:, 0:3] = value[:, 0:3]
+        result[:, 3] = 1.0
+        result[:, 7] = value[:, 6]
+        result[:, 8:11] = value[:, 7:10]
+        result[:, 11] = 1.0
+        result[:, 15] = value[:, 13]
+        return result
+
+
 def test_current_ee_action16_uses_training_endpose_api_and_exact_layout() -> None:
     task = _EndPoseTask()
     value = collector.current_ee_action16(task)
@@ -62,6 +93,46 @@ def test_current_ee_action16_uses_training_endpose_api_and_exact_layout() -> Non
             dtype=np.float32,
         ),
     )
+
+
+def test_official_joint14_state_and_single_arm_candidate_contract() -> None:
+    task = _JointTask("left")
+    current = collector.current_aloha_joint_action14(task)
+    np.testing.assert_allclose(
+        current,
+        [
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+            0.5,
+            0.6,
+            0.25,
+            -0.1,
+            -0.2,
+            -0.3,
+            -0.4,
+            -0.5,
+            -0.6,
+            0.75,
+        ],
+    )
+    proposed = np.repeat(np.arange(14, dtype=np.float32)[None], 3, axis=0)
+    deployed, canonical, active_arm = collector._single_arm_joint_chunk(
+        task, proposed, _FakeJointToEE()
+    )
+    assert active_arm == "left"
+    np.testing.assert_array_equal(
+        deployed[:, 7:14], np.repeat(current[None, 7:14], 3, axis=0)
+    )
+    np.testing.assert_array_equal(deployed[:, :7], proposed[:, :7])
+    assert canonical.shape == (3, collector.NATIVE_EE_DIM)
+    assert collector.state_action_frame_contract("aloha_joint14") == (
+        collector.ALOHA_JOINT14_STATE_ACTION_FRAME_CONTRACT
+    )
+    assert collector.ALOHA_JOINT14_STATE_ACTION_FRAME_CONTRACT[
+        "environment_call"
+    ].endswith("action_type=qpos)")
 
 
 def test_state_action_frame_contract_is_explicit_and_rejects_old_tcp_artifacts(
