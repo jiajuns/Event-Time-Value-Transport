@@ -205,6 +205,36 @@ def test_wcm_training_unlocks_only_after_complete_rac_final_report(
         supervisor.freeze_upstream_authority(args)
 
 
+def test_wcm_supervisor_waits_when_deferred_primary_binding_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _supervisor_args(tmp_path)
+    assert not args.binding.exists()
+
+    class StopAfterFirstWait(RuntimeError):
+        pass
+
+    monkeypatch.setattr(supervisor, "parse_args", lambda _argv=None: args)
+    monkeypatch.setattr(supervisor, "freeze_upstream_authority", lambda _args: None)
+    monkeypatch.setattr(
+        supervisor.v13_watch,
+        "gpu_identity",
+        lambda: (_ for _ in ()).throw(AssertionError("GPU queried while waiting")),
+    )
+    monkeypatch.setattr(
+        supervisor.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(StopAfterFirstWait()),
+    )
+    with pytest.raises(StopAfterFirstWait):
+        supervisor.main([])
+
+    state = supervisor.read_json(args.state, "waiting state")
+    assert state["status"] == "waiting_for_v13_and_rac_final_authorities"
+    assert state["gpu_reserved_by_supervisor"] is False
+    assert not args.run_exit.exists()
+
+
 def test_resigned_rac_final_report_tamper_cannot_unlock_wcm(tmp_path: Path) -> None:
     args = _complete_upstreams(tmp_path)
     report_path = args.rac_final_root / "rac_crossbody_final_report.json"

@@ -858,7 +858,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
         )
 
-    for path in (args.binding, args.trainer, args.training_python):
+    # The primary binding is a deferred artifact produced by the v13 chain.
+    # Requiring it before the authority wait would make a prospectively queued
+    # supervisor fail at launch instead of remaining CPU-only.  The binding is
+    # authenticated by ``freeze_upstream_authority`` once both upstreams are
+    # complete, before any GPU query or payload access.
+    for path in (args.trainer, args.training_python):
         if not path.exists():
             raise FileNotFoundError(path)
     upstream = None
