@@ -41,10 +41,20 @@ ACTOR_REPORT_STATUS = (
 ACTOR_COMPLETION_STATUS = "complete_200_pairs_400_rollouts_frozen"
 ACTOR_PAIR_COUNT = 200
 ACTOR_ROLLOUT_COUNT = 400
+ACTOR_BENCHMARK = "RoboTwin2.0"
 ORDERED_SELECTION_CRITERIA = (
     "binary_success",
     "stage_progress",
     "goal_progress_m",
+)
+ACTOR_FINITE_ROW_METRICS = (
+    "stage_progress",
+    "terminal_goal_distance_m",
+    "goal_progress_m",
+    "live_first_token_effect14_rms_mean",
+)
+ACTOR_NULLABLE_FINITE_ROW_METRICS = (
+    "command_boundary_effect14_rms_mean",
 )
 PRIMARY_WATCHER = "watch_robotwin2_ee16_actor_to_five_body_branches_v1.py"
 DOWNSTREAM_WATCHER = "watch_robotwin2_postformal_shared_head_upgrade_v1.py"
@@ -84,6 +94,22 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def is_finite_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
 
 
 def read_json(path: Path, label: str) -> dict[str, Any]:
@@ -226,6 +252,26 @@ def validate_actor_completion(
         actor_execution.METHOD_EXECUTE5,
         actor_execution.METHOD_EXECUTE50,
     )
+    expected_row_fields = {
+        "benchmark",
+        "task",
+        "heldout_body",
+        "condition",
+        "requested_seed",
+        "method_order",
+        "pair_sha256",
+        *(
+            f"{method}_{metric}"
+            for method in methods
+            for metric in (
+                "binary_success",
+                *ACTOR_FINITE_ROW_METRICS,
+                *ACTOR_NULLABLE_FINITE_ROW_METRICS,
+            )
+        ),
+    }
+    legal_method_orders = (list(methods), list(reversed(methods)))
+    method_order_counts = {tuple(order): 0 for order in legal_method_orders}
     observed_by_cell: dict[tuple[str, str], set[int]] = {}
     metric_deltas = {metric: [] for metric in ORDERED_SELECTION_CRITERIA}
     for row in rows:
@@ -234,33 +280,46 @@ def validate_actor_completion(
         body = row.get("heldout_body")
         condition = row.get("condition")
         seed = row.get("requested_seed")
-        rollouts = row.get("rollouts")
+        order = row.get("method_order")
         if (
-            body not in actor_execution.BODIES
+            set(row) != expected_row_fields
+            or row.get("benchmark") != ACTOR_BENCHMARK
+            or row.get("task") != actor_execution.TASK
+            or body not in actor_execution.BODIES
             or condition not in actor_execution.CONDITIONS
             or isinstance(seed, bool)
             or not isinstance(seed, int)
-            or not isinstance(rollouts, Mapping)
-            or set(rollouts) != set(methods)
+            or not isinstance(order, list)
+            or order not in legal_method_orders
+            or not is_sha256(row.get("pair_sha256"))
         ):
             raise CrossbodyContinuationError("actor outcome identity/method changed")
+        method_order_counts[tuple(order)] += 1
         cell = (str(body), str(condition))
         observed_by_cell.setdefault(cell, set())
         if seed in observed_by_cell[cell]:
             raise CrossbodyContinuationError("actor outcome seed is duplicated")
         observed_by_cell[cell].add(seed)
+        for method in methods:
+            success = row[f"{method}_binary_success"]
+            if type(success) is not int or success not in (0, 1):
+                raise CrossbodyContinuationError(
+                    "actor outcome success is invalid"
+                )
+            for metric in ACTOR_FINITE_ROW_METRICS:
+                if not is_finite_number(row[f"{method}_{metric}"]):
+                    raise CrossbodyContinuationError(
+                        "actor outcome metric is invalid"
+                    )
+            for metric in ACTOR_NULLABLE_FINITE_ROW_METRICS:
+                value = row[f"{method}_{metric}"]
+                if value is not None and not is_finite_number(value):
+                    raise CrossbodyContinuationError(
+                        "actor outcome nullable metric is invalid"
+                    )
         for metric in ORDERED_SELECTION_CRITERIA:
-            left = rollouts[methods[0]].get(metric)
-            right = rollouts[methods[1]].get(metric)
-            if (
-                isinstance(left, bool)
-                or isinstance(right, bool)
-                or not isinstance(left, (int, float))
-                or not isinstance(right, (int, float))
-                or not math.isfinite(float(left))
-                or not math.isfinite(float(right))
-            ):
-                raise CrossbodyContinuationError("actor outcome metric is invalid")
+            left = row[f"{methods[0]}_{metric}"]
+            right = row[f"{methods[1]}_{metric}"]
             metric_deltas[metric].append(float(right) - float(left))
     expected_cells = {
         (body, condition)
@@ -272,6 +331,7 @@ def validate_actor_completion(
         set(observed_by_cell) != expected_cells
         or any(len(seeds) != 20 for seeds in seed_sets)
         or any(seeds != seed_sets[0] for seeds in seed_sets[1:])
+        or set(method_order_counts.values()) != {ACTOR_PAIR_COUNT // 2}
     ):
         raise CrossbodyContinuationError("actor outcome body/condition roster changed")
     selected_metric = ORDERED_SELECTION_CRITERIA[-1]

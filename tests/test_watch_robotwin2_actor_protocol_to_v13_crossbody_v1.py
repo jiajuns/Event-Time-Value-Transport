@@ -39,28 +39,36 @@ def _actor_completion(root: Path, guardian_state: Path) -> None:
         watcher.actor_execution.METHOD_EXECUTE50,
     )
     rows = []
-    for body in watcher.actor_execution.BODIES:
-        for condition in watcher.actor_execution.CONDITIONS:
-            for seed in range(20):
-                rows.append(
-                    {
-                        "heldout_body": body,
-                        "condition": condition,
-                        "requested_seed": 2026104000 + seed,
-                        "rollouts": {
-                            methods[0]: {
-                                "binary_success": 0,
-                                "stage_progress": 0.25,
-                                "goal_progress_m": 0.0,
-                            },
-                            methods[1]: {
-                                "binary_success": 1,
-                                "stage_progress": 1.0,
-                                "goal_progress_m": 0.1,
-                            },
-                        },
-                    }
+    for body_index, body in enumerate(watcher.actor_execution.BODIES):
+        for condition_index, condition in enumerate(
+            watcher.actor_execution.CONDITIONS
+        ):
+            for seed_index in range(20):
+                order = list(
+                    methods
+                    if (body_index + condition_index + seed_index) % 2 == 0
+                    else reversed(methods)
                 )
+                row = {
+                    "benchmark": watcher.ACTOR_BENCHMARK,
+                    "task": watcher.actor_execution.TASK,
+                    "heldout_body": body,
+                    "condition": condition,
+                    "requested_seed": 2026104000 + seed_index,
+                    "method_order": order,
+                    "pair_sha256": f"{len(rows) + 1:064x}",
+                }
+                for method, success, stage, progress in (
+                    (methods[0], 0, 0.25, 0.0),
+                    (methods[1], 1, 1.0, 0.1),
+                ):
+                    row[f"{method}_binary_success"] = success
+                    row[f"{method}_stage_progress"] = stage
+                    row[f"{method}_terminal_goal_distance_m"] = 0.5
+                    row[f"{method}_goal_progress_m"] = progress
+                    row[f"{method}_live_first_token_effect14_rms_mean"] = 0.01
+                    row[f"{method}_command_boundary_effect14_rms_mean"] = None
+                rows.append(row)
     binding = _signed(
         {"format": watcher.ACTOR_BINDING_FORMAT, "frozen": True},
         "logical_sha256",
@@ -118,6 +126,29 @@ def _actor_completion(root: Path, guardian_state: Path) -> None:
     _write(guardian_state, {"status": "complete"})
 
 
+def _resign_actor_chain(root: Path) -> None:
+    outcome_path = root / "paired_outcomes.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    outcome["rows_sha256"] = watcher.canonical_sha256(outcome["rows"])
+    outcome = _signed(outcome, "document_sha256")
+    _write(outcome_path, outcome)
+
+    report_path = root / "paired_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["outcome_document_sha256"] = outcome["document_sha256"]
+    report = _signed(report, "report_sha256")
+    _write(report_path, report)
+
+    completion_path = root / "run.complete.json"
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["outcome_document_sha256"] = outcome["document_sha256"]
+    completion["outcome_file_sha256"] = watcher.sha256_file(outcome_path)
+    completion["report_sha256"] = report["report_sha256"]
+    completion["report_file_sha256"] = watcher.sha256_file(report_path)
+    completion = _signed(completion, "logical_sha256")
+    _write(completion_path, completion)
+
+
 def test_completion_replays_hierarchical_protocol_selection(
     tmp_path: Path,
 ) -> None:
@@ -130,6 +161,75 @@ def test_completion_replays_hierarchical_protocol_selection(
     assert evidence["primary_hierarchical_selection"]["preferred_protocol"] == (
         watcher.actor_execution.METHOD_EXECUTE50
     )
+
+
+@pytest.mark.parametrize("tamper", ["legacy_nested_rollouts", "missing_flat_metric"])
+def test_completion_rejects_nonproduction_outcome_row_abi(
+    tmp_path: Path, tamper: str
+) -> None:
+    root = tmp_path / "actor"
+    root.mkdir()
+    guardian = tmp_path / "guardian.json"
+    _actor_completion(root, guardian)
+    outcome_path = root / "paired_outcomes.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    row = outcome["rows"][0]
+    method = watcher.actor_execution.METHOD_EXECUTE5
+    if tamper == "legacy_nested_rollouts":
+        row["rollouts"] = {
+            method: {
+                metric: row[f"{method}_{metric}"]
+                for metric in watcher.ORDERED_SELECTION_CRITERIA
+            }
+        }
+    del row[f"{method}_binary_success"]
+    _write(outcome_path, outcome)
+    _resign_actor_chain(root)
+    with pytest.raises(
+        watcher.CrossbodyContinuationError,
+        match="actor outcome identity/method changed",
+    ):
+        watcher.validate_actor_completion(root, guardian)
+
+
+def test_completion_rejects_resigned_flat_metric_selection_tamper(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "actor"
+    root.mkdir()
+    guardian = tmp_path / "guardian.json"
+    _actor_completion(root, guardian)
+    outcome_path = root / "paired_outcomes.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    method = watcher.actor_execution.METHOD_EXECUTE50
+    outcome["rows"][0][f"{method}_binary_success"] = 0
+    _write(outcome_path, outcome)
+    _resign_actor_chain(root)
+    with pytest.raises(
+        watcher.CrossbodyContinuationError,
+        match="does not replay from complete outcomes",
+    ):
+        watcher.validate_actor_completion(root, guardian)
+
+
+def test_completion_rejects_invalid_method_order(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "actor"
+    root.mkdir()
+    guardian = tmp_path / "guardian.json"
+    _actor_completion(root, guardian)
+    outcome_path = root / "paired_outcomes.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    method = watcher.actor_execution.METHOD_EXECUTE5
+    outcome["rows"][0]["method_order"] = [method, method]
+    _write(outcome_path, outcome)
+    _resign_actor_chain(root)
+    with pytest.raises(
+        watcher.CrossbodyContinuationError,
+        match="actor outcome identity/method changed",
+    ):
+        watcher.validate_actor_completion(root, guardian)
 
 
 def test_selected_protocol_is_create_once_and_tie_fails_closed(
