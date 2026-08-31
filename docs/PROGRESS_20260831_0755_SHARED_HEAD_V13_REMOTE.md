@@ -75,3 +75,42 @@ checkpoint 与 JSON outcome 规模不会接近剩余空间，但仍应在阶段�
 - 真正 candidate oracle regret 需要对 query0 的八个候选各自执行 one-deviation branch，不能从
   N1/N4/N8 三条已经分流的闭环 rollout 伪造；
 - 多任务/双留出实验尚未开始，当前最终结论范围只能是单任务 critic LOBO 跨本体迁移。
+
+## 08:02 CST 续跑指针更新
+
+统一 N1/N4/N8 报告 materializer 与真实 query0 oracle 合同已在提交
+`717ddb9e34996b3c2bdd63795f25a771a6988ea0` 落地。等待中的旧 v13 watcher 在尚未产生训练/采集
+产物时被提交 `717ddb9` 的 watcher 正常替换；actor runner 与 guardian 仍为原 PID，没有损失
+rollout。
+
+当前权威自动续跑：
+
+```text
+PID:       3923793
+code:      /home/user/etsf_robotwin2_v13_protocol_code_717ddb9
+run root:  /home/user/etsf_robotwin2_v13_crossbody_selected_r2_20260831
+state:     /home/user/etsf_robotwin2_v13_crossbody_selected_r2_20260831/continuation_state.json
+```
+
+该版本会在 nested 3000 rollouts 完成后自动物化 `crossbody_final_report.json`。没有独立八候选
+truth 时仍完整报告标准迁移指标，但严格写入 `oracle_evidence_sufficient=false`、
+`oracle_regret=null`；不会把三条已分流策略 rollout 冒充 counterfactual oracle。
+
+## 08:09 CST 效果与 RAC 基线更新
+
+远端 actor 协议比较继续由原 runner/guardian 执行；本次读取到 54 个完整 pair 文件：
+
+| 已完成 cell | execute5 | execute50 | 局部差值 |
+| --- | ---: | ---: | ---: |
+| aloha-agilex / clean（20） | 75.0% | 50.0% | +25.0pp |
+| aloha-agilex / randomized（20） | 50.0% | 50.0% | 0.0pp |
+| arx-x5 / clean（14） | 57.1% | 64.3% | -7.1pp |
+| 当前 pooled（54） | 61.1% | 53.7% | +7.4pp |
+
+这是未完成且按 roster 顺序逐 cell 产生的 actor 执行时域比较，既不能作为最终协议选择，也不是
+共享头增益。权威 `progress.json` 在并发读取时为 `53/200`，随后第 54 个 pair 原子落盘，属于正常
+运行中的瞬时差异。
+
+matched VLA-ATTC-style Relative Action Critic 已实现单折五成员 LOBO 训练器和 N4/N8 全 pair
+soft-Copeland 运行时适配器；定向联合回归 163 项通过。它尚未在 4090 上训练，也尚未接入已部署
+nested runner，因此当前仍无 RAC 闭环成功率结果，不能用代码测试代替效果数字。

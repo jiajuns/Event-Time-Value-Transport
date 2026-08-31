@@ -271,6 +271,25 @@ loss 学习真实 branch 偏好，并冻结 tournament bracket；正式 nested r
 `RAC@4/RAC@8` 与 `ETSF@4/ETSF@8`。这能直接
 检验事件结构化多任务监督是否优于纯相对排序，而不是只和弱标量 MLP 比较。
 
+截至 2026-08-31，matched RAC 的训练与运行时主体已经实现：
+
+- `train_robotwin2_five_body_lobo_relative_action_critic_v1.py` 复用与共享头相同的 primary、
+  supplement、actor execution protocol 和 source-only LOBO 划分；默认每折五成员、每成员
+  3000 steps；
+- 标签只来自同一 root 的真实 candidate branch，并严格按
+  `binary success → terminal stage → goal progress` 比较；完全相同的候选 pair 不生成伪标签，
+  每个有效 pair 同时加入正、反两个方向；
+- 模型独立编码 `a_i`、`a_j`、`a_i-a_j` 和 causal state/context，以反对称 logit 和 focal loss
+  训练；`gamma=0` 是同接口 BCE 控制；
+- `robotwin2_relative_action_critic_adapter_v1.py` 对 N4/N8 的所有无序候选对逐一打分，再用
+  soft-Copeland 与五成员 epistemic LCB 选择候选，避免 tournament bracket 顺序成为混杂因素；
+- checkpoint 加载器校验 held-out body、actor protocol、binding、成员数、step 和文件 SHA，且保持
+  `heldout_rows_used=0`。
+
+该实现已经形成可训练、可加载和可重放的基线主体，但代码回归通过不等于 RAC 已得到闭环效果。
+正式结果仍需五折 checkpoint、nested runner 的显式 `critic_kind=relative_action_critic` 接入，以及
+与 ETSF 完全相同的 N1/N4/N8 schedule；在这些产物完成前不得填入 RAC 的成功率数字。
+
 ### 6.6 WCM / World Value Model
 
 [WCM][wcm-paper]指出单帧 value 回归在部分可观测控制中缺少时序状态，并以轻量未来 latent
