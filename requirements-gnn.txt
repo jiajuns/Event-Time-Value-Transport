@@ -1,0 +1,8 @@
+h5py
+huggingface_hub
+numpy
+opencv-python
+pillow
+pyyaml
+torch
+ultralytics==8.4.142

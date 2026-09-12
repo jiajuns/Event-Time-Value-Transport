@@ -1,0 +1,424 @@
+{
+  "format": "etsf_robotwin2_universal_event_dataset_audit_v1",
+  "schema_sha256": "212420f6e05646578494b131bb848c7b4649466241a858d90c9bf2784216b754",
+  "root": "/home/chefmate/EKSF/data/robotwin2_universal_event_small_sim_final_20260909",
+  "file_count": 24,
+  "valid_episodes": 24,
+  "invalid": [],
+  "expected_clean_pairs": 54,
+  "minimum_clean_per_pair": 40,
+  "insufficient_clean_pairs": [
+    {
+      "task": "move_can_pot",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "move_can_pot",
+      "body": "arx-x5",
+      "count": 1
+    },
+    {
+      "task": "move_can_pot",
+      "body": "franka",
+      "count": 1
+    },
+    {
+      "task": "move_can_pot",
+      "body": "piper",
+      "count": 1
+    },
+    {
+      "task": "move_can_pot",
+      "body": "ur5",
+      "count": 1
+    },
+    {
+      "task": "place_container_plate",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "place_container_plate",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "place_container_plate",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "place_container_plate",
+      "body": "piper",
+      "count": 0
+    },
+    {
+      "task": "place_container_plate",
+      "body": "ur5",
+      "count": 0
+    },
+    {
+      "task": "place_can_basket",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "place_can_basket",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "place_can_basket",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "place_can_basket",
+      "body": "ur5",
+      "count": 0
+    },
+    {
+      "task": "place_empty_cup",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "place_empty_cup",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "place_empty_cup",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "place_empty_cup",
+      "body": "piper",
+      "count": 0
+    },
+    {
+      "task": "place_empty_cup",
+      "body": "ur5",
+      "count": 0
+    },
+    {
+      "task": "put_object_cabinet",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "put_object_cabinet",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "put_object_cabinet",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "stack_blocks_two",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "stack_blocks_two",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "stack_blocks_two",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "stack_blocks_two",
+      "body": "piper",
+      "count": 0
+    },
+    {
+      "task": "stack_blocks_two",
+      "body": "ur5",
+      "count": 0
+    },
+    {
+      "task": "hanging_mug",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "hanging_mug",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "hanging_mug",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "hanging_mug",
+      "body": "ur5",
+      "count": 0
+    },
+    {
+      "task": "open_laptop",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "open_laptop",
+      "body": "arx-x5",
+      "count": 1
+    },
+    {
+      "task": "open_laptop",
+      "body": "franka",
+      "count": 1
+    },
+    {
+      "task": "open_laptop",
+      "body": "piper",
+      "count": 1
+    },
+    {
+      "task": "open_laptop",
+      "body": "ur5",
+      "count": 1
+    },
+    {
+      "task": "open_microwave",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "open_microwave",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "open_microwave",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "open_microwave",
+      "body": "piper",
+      "count": 0
+    },
+    {
+      "task": "open_microwave",
+      "body": "ur5",
+      "count": 0
+    },
+    {
+      "task": "press_stapler",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "press_stapler",
+      "body": "arx-x5",
+      "count": 1
+    },
+    {
+      "task": "press_stapler",
+      "body": "franka",
+      "count": 1
+    },
+    {
+      "task": "press_stapler",
+      "body": "piper",
+      "count": 1
+    },
+    {
+      "task": "press_stapler",
+      "body": "ur5",
+      "count": 1
+    },
+    {
+      "task": "click_bell",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "click_bell",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "click_bell",
+      "body": "franka",
+      "count": 0
+    },
+    {
+      "task": "click_bell",
+      "body": "piper",
+      "count": 0
+    },
+    {
+      "task": "click_bell",
+      "body": "ur5",
+      "count": 0
+    },
+    {
+      "task": "handover_block",
+      "body": "aloha-agilex",
+      "count": 1
+    },
+    {
+      "task": "handover_block",
+      "body": "arx-x5",
+      "count": 0
+    },
+    {
+      "task": "handover_block",
+      "body": "piper",
+      "count": 0
+    }
+  ],
+  "per_task": {
+    "click_bell": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "handover_block": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "hanging_mug": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "move_can_pot": {
+      "episodes": 5,
+      "success": 4,
+      "bodies": [
+        "aloha-agilex",
+        "arx-x5",
+        "franka",
+        "piper",
+        "ur5"
+      ]
+    },
+    "open_laptop": {
+      "episodes": 5,
+      "success": 5,
+      "bodies": [
+        "aloha-agilex",
+        "arx-x5",
+        "franka",
+        "piper",
+        "ur5"
+      ]
+    },
+    "open_microwave": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "place_can_basket": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "place_container_plate": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "place_empty_cup": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "press_stapler": {
+      "episodes": 5,
+      "success": 5,
+      "bodies": [
+        "aloha-agilex",
+        "arx-x5",
+        "franka",
+        "piper",
+        "ur5"
+      ]
+    },
+    "put_object_cabinet": {
+      "episodes": 1,
+      "success": 0,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    },
+    "stack_blocks_two": {
+      "episodes": 1,
+      "success": 1,
+      "bodies": [
+        "aloha-agilex"
+      ]
+    }
+  },
+  "relation_positive": {
+    "near": 3440,
+    "held_by": 741,
+    "supported_by": 252,
+    "inside": 252,
+    "on_top_of": 237,
+    "open": 388,
+    "pressed": 107,
+    "activated": 13,
+    "released": 363,
+    "dropped": 37,
+    "lifted": 598,
+    "away_from": 1349
+  },
+  "relation_known": {
+    "near": 30966,
+    "held_by": 3596,
+    "supported_by": 1798,
+    "inside": 1798,
+    "on_top_of": 1798,
+    "open": 1269,
+    "pressed": 391,
+    "activated": 65,
+    "released": 1798,
+    "dropped": 1798,
+    "lifted": 1798,
+    "away_from": 1798
+  },
+  "event_positive": {
+    "approach": 36,
+    "grasp": 14,
+    "transport": 384,
+    "place": 11,
+    "release": 11,
+    "drop": 1,
+    "regrasp": 0,
+    "open": 7,
+    "activate": 6,
+    "idle": 2913
+  },
+  "has_success": true,
+  "has_failure": true,
+  "has_drop": true,
+  "has_regrasp": false
+}

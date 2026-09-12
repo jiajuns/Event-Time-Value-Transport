@@ -1,5 +1,7 @@
 # Event-Time Value Transport (ETSF)
 
+> 本分支 `gnn-cfc-event-world-model` 是 **GNN+CfC 实验扩展**，不替代论文正式 V8 主线。已发布的 ICRA V8 结果与三任务 CfC-AWR 策略仍以 [`main`](https://github.com/jiajuns/Event-Time-Value-Transport/tree/main) 和 `v8.0.0-icra` 为准。本分支的模型范围、真实训练状态与局限见 [GNN 分支说明](docs/GNN_CFC_BRANCH.md)。
+
 Official artifact repository for **Cross-Embodiment Value Transport via Event Semantics, Reachability, and Execution Time**.
 
 ETSF transfers the *value side* of a manipulation policy across robot embodiments. Instead of forcing different robots to share joint coordinates or action semantics, it represents a task as a canonical event chain, learns a shared continuous-time event-successor critic in simulation, and adapts that critic to a target robot using only compact reachability and execution-clock statistics. The resulting value signal is injected into a VLA through Event-AWR during post-training; deployment remains a plain SmolVLA policy.
