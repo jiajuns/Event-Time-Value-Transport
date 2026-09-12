@@ -1,0 +1,4 @@
+method,model,stage,seeds,bellman_mse_target_mean,bellman_mse_target_std,ranking_auc_mean,ranking_auc_std,sign_consistency_mean,sign_consistency_std,success_rate_mae_mean,success_rate_mae_std,success_brier_mean,success_brier_std,adaptation_wall_s_mean,adaptation_wall_s_std,updated_params,formal_step,best_bellman_mse_target_mean,best_ranking_auc_mean,best_sign_consistency_mean,best_success_rate_mae_mean
+e2_base_gru_fixed,base-gru-fixed (A),A,5,,,0.626834,0.027086,0.646809,0.036988,0.483215,0.003134,0.368242,0.00243,0.0,0.0,0,3000,False,False,False,True
+e2_gru_event_fixed,GRU-EVENT-fixed (A+B),AB,5,0.09182,0.00113,0.643855,0.033133,0.597163,0.018528,0.490748,0.0,0.294253,0.0,0.000278,1.6e-05,0,3000,False,False,False,False
+e2_cfc_event_fixed,ETSF-CfC-optimized (A+B+C),ABC,5,0.03683,0.000815,0.740012,0.025581,0.816312,0.001586,0.490748,0.0,0.294253,0.0,0.151631,0.057925,0,3000,True,True,True,False

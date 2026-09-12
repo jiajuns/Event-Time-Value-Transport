@@ -1,0 +1,49 @@
+{
+  "format": "pot_lid_event_v4_cfc_awr_submission_v1",
+  "task_text": "pick up the pot lid and place it beside the pot",
+  "source_actor": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot_20260909_right_wrist_70000_seed1000/checkpoints/050000/pretrained_model",
+  "source_actor_sha256": "b93dcb7e8f83fd6a22a8dcfab46ffe66d8a25c7f6617b5a658fb83c15d3ea4ce",
+  "event_v4_base_sha256": "bfbc05ddad3e5c771e2b6dabb70edcbbb6edd6ddaaae8ebe55e14933d2b07294",
+  "event_v4_adapter_sha256": "769fa2e1a7eb6bf9b57448999b361d68806934d0562cf74ebabbcee34260eabb",
+  "original_cfc_sha256": "0b9638af3dd39a39d2f6fe61c6f671c08176e4316f424c1233d4a59f86bb8b89",
+  "umi": {
+    "episodes": 98,
+    "observations_10hz": 9908,
+    "counts": {"success_beside_pot": 30, "grasp_failure": 31, "drop_regrasp_success": 37},
+    "missing_classes_synthesized": false,
+    "train_episodes": 77,
+    "validation_episodes": 21,
+    "validation_outcome_accuracy": 0.9523809523809523
+  },
+  "robot_data": {"episodes": 100, "frames": 24754, "actor_view": "right wrist", "critic_view": "head"},
+  "jobs": {"alignment": 610137, "event_score": 610142, "cfc_score": 610143, "event_smoke": 610147, "event_10000": 610148, "cfc_smoke": 610149, "cfc_10000": 610150},
+  "scoring": {
+    "event_v4": {"weight_mean": 1.0261591672897339, "weight_std": 0.03192584961652756, "weight_min": 0.9694195985794067, "weight_max": 1.100000023841858},
+    "original_cfc": {"weight_mean": 1.0131093263626099, "weight_std": 0.09192085266113281, "weight_min": 0.8999999761581421, "weight_max": 1.100000023841858},
+    "robot_yolo_coverage": {"object": 0.7974897417330437, "target": 0.0065170166545981175, "gripper": 0.9377262853005068},
+    "robot_yolo_ambiguity": {"object": 0.26949070721699253, "target": 0.0, "gripper": 0.8257301472363022}
+  },
+  "training": {"additional_steps": 10000, "save_freq": 1000, "learning_rate": 0.000001, "weight_bounds": [0.9, 1.1], "fresh_optimizer": true},
+  "outputs": {
+    "event_v4": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot050000_eventv4_umi_awr_10000_20260910",
+    "original_cfc": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot050000_original_cfc_awr_10000_20260910"
+  },
+  "final_status": {
+    "checked_at": "2026-09-10T01:41:50+08:00",
+    "alignment_job": {"job_id": 610137, "state": "COMPLETED", "exit_code": "0:0"},
+    "event_score_job": {"job_id": 610142, "state": "COMPLETED", "exit_code": "0:0"},
+    "cfc_score_job": {"job_id": 610143, "state": "COMPLETED", "exit_code": "0:0"},
+    "event_smoke_job": {"job_id": 610147, "state": "COMPLETED", "exit_code": "0:0"},
+    "event_actor_job": {"job_id": 610148, "state": "COMPLETED", "exit_code": "0:0", "elapsed": "00:28:45"},
+    "cfc_smoke_job": {"job_id": 610149, "state": "COMPLETED", "exit_code": "0:0"},
+    "cfc_actor_job": {"job_id": 610150, "state": "COMPLETED", "exit_code": "0:0", "elapsed": "00:27:33"},
+    "checkpoint_count_each": 10,
+    "event_v4_final": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot050000_eventv4_umi_awr_10000_20260910/checkpoints/010000/pretrained_model",
+    "event_v4_model_sha256": "d3e9677ae525b3bc4c8806e05bb8bf463db9a338d3d83e356e7d407a21f0bde4",
+    "original_cfc_final": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot050000_original_cfc_awr_10000_20260910/checkpoints/010000/pretrained_model",
+    "original_cfc_model_sha256": "ca32b385903c007691fc870593135d9d0118f7709b27ceb52ad3664bfcef2249",
+    "processor_files_byte_exact_to_source": true,
+    "deployment_contract_verified": true,
+    "real_robot_effect_verified": false
+  }
+}

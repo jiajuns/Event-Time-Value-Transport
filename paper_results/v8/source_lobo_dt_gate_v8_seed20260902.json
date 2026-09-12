@@ -1,0 +1,51 @@
+{
+  "aggregate": {
+    "bellman_mse_target": {
+      "full_mean": 0.039438344605280194,
+      "full_minus_zero": 0.0005874687738387785,
+      "zero_dt_mean": 0.038850875831441416
+    },
+    "ranking_auc": {
+      "full_mean": 0.6884315647370585,
+      "full_minus_zero": 0.02012154039966374,
+      "zero_dt_mean": 0.6683100243373947
+    },
+    "sign_consistency": {
+      "full_mean": 0.8395252990423996,
+      "full_minus_zero": -0.007207854317695883,
+      "zero_dt_mean": 0.8467331533600955
+    }
+  },
+  "dt_gate_pass_auc": true,
+  "dt_gate_pass_mse": false,
+  "folds": [
+    {
+      "full": {
+        "bellman_mse_target": 0.041756712227006616,
+        "ranking_auc": 0.6832174386522213,
+        "sign_consistency": 0.8330975954738331
+      },
+      "holdout_body": "aloha-agilex",
+      "zero_dt": {
+        "bellman_mse_target": 0.04103193293767277,
+        "ranking_auc": 0.6652199335623249,
+        "sign_consistency": 0.8422913719943423
+      }
+    },
+    {
+      "full": {
+        "bellman_mse_target": 0.03711997698355377,
+        "ranking_auc": 0.6936456908218956,
+        "sign_consistency": 0.8459530026109661
+      },
+      "holdout_body": "arx-x5",
+      "zero_dt": {
+        "bellman_mse_target": 0.03666981872521006,
+        "ranking_auc": 0.6714001151124644,
+        "sign_consistency": 0.8511749347258486
+      }
+    }
+  ],
+  "scope": "source_lobo_only_no_piper_or_ur5_test_evaluation",
+  "seed": 20260902
+}

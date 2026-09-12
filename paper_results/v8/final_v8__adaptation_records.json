@@ -1,0 +1,737 @@
+[
+  {
+    "adaptation": {
+      "beta": {},
+      "mode": "zero_shot",
+      "rho": {}
+    },
+    "method": "e2_base_gru_fixed",
+    "seed": 20260901
+  },
+  {
+    "adaptation": {
+      "beta": {},
+      "mode": "zero_shot",
+      "rho": {}
+    },
+    "method": "e2_base_gru_fixed",
+    "seed": 20260902
+  },
+  {
+    "adaptation": {
+      "beta": {},
+      "mode": "zero_shot",
+      "rho": {}
+    },
+    "method": "e2_base_gru_fixed",
+    "seed": 20260903
+  },
+  {
+    "adaptation": {
+      "beta": {},
+      "mode": "zero_shot",
+      "rho": {}
+    },
+    "method": "e2_base_gru_fixed",
+    "seed": 20260904
+  },
+  {
+    "adaptation": {
+      "beta": {},
+      "mode": "zero_shot",
+      "rho": {}
+    },
+    "method": "e2_base_gru_fixed",
+    "seed": 20260905
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 1.0,
+        "ur5": 1.0
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_gru_event_fixed",
+    "seed": 20260901
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 1.0,
+        "ur5": 1.0
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_gru_event_fixed",
+    "seed": 20260902
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 1.0,
+        "ur5": 1.0
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_gru_event_fixed",
+    "seed": 20260903
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 1.0,
+        "ur5": 1.0
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_gru_event_fixed",
+    "seed": 20260904
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 1.0,
+        "ur5": 1.0
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_gru_event_fixed",
+    "seed": 20260905
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 0.35,
+        "ur5": 0.5
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_cfc_event_fixed",
+    "seed": 20260901
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 0.35,
+        "ur5": 0.35
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_cfc_event_fixed",
+    "seed": 20260902
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 0.35,
+        "ur5": 0.35
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_cfc_event_fixed",
+    "seed": 20260903
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 0.35,
+        "ur5": 0.35
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_cfc_event_fixed",
+    "seed": 20260904
+  },
+  {
+    "adaptation": {
+      "beta": {
+        "piper": 0.35,
+        "ur5": 0.5
+      },
+      "mode": "statistics_only_zero_target_td",
+      "rho": {
+        "piper": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        },
+        "ur5": {
+          "e0": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e12": {
+            "alpha": 6.0,
+            "beta": 1.0,
+            "mean": 0.8571428571428571
+          },
+          "e3": {
+            "alpha": 4.0,
+            "beta": 3.0,
+            "mean": 0.5714285714285714
+          },
+          "e4": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          },
+          "eK": {
+            "alpha": 4.0,
+            "beta": 1.0,
+            "mean": 0.8
+          }
+        }
+      },
+      "target_td_steps": 0,
+      "updated_params": 0
+    },
+    "method": "e2_cfc_event_fixed",
+    "seed": 20260905
+  }
+]

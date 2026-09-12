@@ -1,3 +1,4 @@
+# Generated Python/test files
 tests/
 test/
 test_*.py
@@ -5,18 +6,40 @@ test_*.py
 *_tests.py
 *_probe.py
 .pytest_cache/
+.ruff_cache/
 __pycache__/
 *.py[cod]
 
+# Datasets, caches and training outputs are distributed as Release assets.
 data/
 features/
 results/
 logs/
 rollouts/
 checkpoints/
+artifacts/
+backups/
 *.hdf5
 *.npz
 *.pkl
 *.pt
 *.pth
 *.zip
+*.zst
+*.tar
+
+# The local UMI workspace contains ~10 GB of videos, labels and caches.  A
+# curated code subset is force-added to Git; the working data remain local.
+/umi_cfc/
+
+# Historical local workspaces.  The paper release force-adds only the audited
+# V8 experiment and selected documentation; unrelated generations stay local.
+/experiments/
+/configs/
+/scripts/
+/docs/*.md
+
+# Local/editor outputs
+start.txt
+.DS_Store
+*.partial

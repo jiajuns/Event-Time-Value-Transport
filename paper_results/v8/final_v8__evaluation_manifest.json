@@ -1,0 +1,47 @@
+{
+  "adapt_rollouts": 10,
+  "checkpoint_identity": {
+    "20260901": {
+      "e2_base_gru_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260901/formal/step_3000.pt",
+      "e2_cfc_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260901/formal/step_3000.pt",
+      "e2_gru_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260901/formal/step_3000.pt"
+    },
+    "20260902": {
+      "e2_base_gru_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260902/formal/step_3000.pt",
+      "e2_cfc_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260902/formal/step_3000.pt",
+      "e2_gru_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260902/formal/step_3000.pt"
+    },
+    "20260903": {
+      "e2_base_gru_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260903/formal/step_3000.pt",
+      "e2_cfc_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260903/formal/step_3000.pt",
+      "e2_gru_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260903/formal/step_3000.pt"
+    },
+    "20260904": {
+      "e2_base_gru_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260904/formal/step_3000.pt",
+      "e2_cfc_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260904/formal/step_3000.pt",
+      "e2_gru_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260904/formal/step_3000.pt"
+    },
+    "20260905": {
+      "e2_base_gru_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260905/formal/step_3000.pt",
+      "e2_cfc_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260905/formal/step_3000.pt",
+      "e2_gru_event_fixed": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260905/formal/step_3000.pt"
+    }
+  },
+  "data": {
+    "by_body": {
+      "aloha-agilex": 270,
+      "arx-x5": 270,
+      "piper": 30,
+      "ur5": 30
+    },
+    "source": 540,
+    "target": 60,
+    "total": 600
+  },
+  "data_manifest_sha256": "a71666e8297c1b3919c2ec76de3e6b4e2a022adba0889d861f7435895b89d971",
+  "formal_step": 3000,
+  "same_abc_checkpoint_used_in_ablation_and_horizontal": true,
+  "stats_sha256": "f84434f276e8a4f118e76b35c061e72af04a662a58df613503ebfb04041f5d14",
+  "target_used_for_training_selection_or_calibration": false,
+  "test_rollouts": 50
+}

@@ -1,0 +1,72 @@
+{
+  "format": "s1_near_static_normalization_repair_v1",
+  "repair": {
+    "action": [
+      {
+        "index": 1,
+        "old_mean": 1.726344635244459e-05,
+        "old_std": 5.273349031748031e-12,
+        "old_max_abs_normalized": 3450.8665977027035,
+        "mean": -1.7263417248614132e-05,
+        "std": 0.0010000000474974513,
+        "new_max_abs_normalized": 0.0
+      },
+      {
+        "index": 23,
+        "old_mean": 0.003685712581500411,
+        "old_std": 4.0103350329445675e-06,
+        "old_max_abs_normalized": 3700.5172407759346,
+        "mean": -0.011191606521606445,
+        "std": 0.0010000000474974513,
+        "new_max_abs_normalized": 0.0
+      },
+      {
+        "index": 24,
+        "old_mean": 0.8920391201972961,
+        "old_std": 0.0008287031669169664,
+        "old_max_abs_normalized": 28.424353981942943,
+        "mean": 0.915594756603241,
+        "std": 0.0010000000474974513,
+        "new_max_abs_normalized": 0.0
+      }
+    ],
+    "observation.state": [
+      {
+        "index": 14,
+        "old_mean": -0.013727248646318913,
+        "old_std": 1.5472642189706676e-05,
+        "old_max_abs_normalized": 2362.4388488455647,
+        "mean": 0.00848511140793562,
+        "std": 0.011397485621273518,
+        "new_max_abs_normalized": 2.7513624584128342
+      },
+      {
+        "index": 23,
+        "old_mean": 0.0014738751342520118,
+        "old_std": 0.00025088919210247695,
+        "old_max_abs_normalized": 60.096955873049275,
+        "mean": -0.012330672703683376,
+        "std": 0.0010000000474974513,
+        "new_max_abs_normalized": 1.2737170407621607
+      },
+      {
+        "index": 24,
+        "old_mean": 0.8649361729621887,
+        "old_std": 0.000311601790599525,
+        "old_max_abs_normalized": 88.90434727085722,
+        "mean": 0.8908766508102417,
+        "std": 0.0010000000474974513,
+        "new_max_abs_normalized": 1.7631472818830092
+      }
+    ]
+  },
+  "source_normalizer_sha256": "1812c5e03e5fac2e24000558e89cc555bd6da029b0e352ff2f34b86c48de8b1e",
+  "source_data_hashes": {
+    "data/chunk-000/file-000.parquet": "9eba497aee2ebdd92014fa954cbb0328fa3917727b6b6ff9e1eb8f0591bf77ae"
+  },
+  "rule": "only base_std<1e-3 AND max_abs_new_z>20; new mean and max(newstd,1e-3)",
+  "all_other_mean_std_scalars_preserved": true,
+  "raw_data_modified": false,
+  "policy_weights_modified_before_finetune": false,
+  "reason": "smoke599323 loss1.03e6: nearly-static old axes amplified small new fixed-pose offsets"
+}

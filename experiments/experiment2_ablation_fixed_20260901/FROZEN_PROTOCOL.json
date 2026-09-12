@@ -1,0 +1,23 @@
+{
+  "format": "etsf_progressive_event_time_ablation_v8",
+  "data_root_hpc3": "/data/user/leviccdong/EKSF/data/exp1_rollouts",
+  "data_manifest_relative_path_size_sha256": "a71666e8297c1b3919c2ec76de3e6b4e2a022adba0889d861f7435895b89d971",
+  "source_zscore_sha256": "f84434f276e8a4f118e76b35c061e72af04a662a58df613503ebfb04041f5d14",
+  "counts": {
+    "aloha-agilex": 270,
+    "arx-x5": 270,
+    "piper": 30,
+    "ur5": 30
+  },
+  "source_bodies": ["aloha-agilex", "arx-x5"],
+  "target_bodies": ["piper", "ur5"],
+  "target_adaptation_per_body": {"success": 3, "failure": 2},
+  "target_test_per_body": 25,
+  "seeds": [20260901, 20260902, 20260903, 20260904, 20260905],
+  "optimizer_steps_per_model": 3000,
+  "event_pretrain_steps": 2000,
+  "ranking_finetune_steps": 1000,
+  "formal_checkpoint_step": 3000,
+  "target_td_steps": 0,
+  "same_abc_checkpoint_for_ablation_and_horizontal": true
+}

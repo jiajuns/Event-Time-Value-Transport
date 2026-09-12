@@ -1,0 +1,23 @@
+{
+  "status": "passed",
+  "method": "original_cfc_awr_three_camera",
+  "task_text": "pick up the pot lid and place it beside the pot",
+  "additional_steps": 10000,
+  "save_freq": 1000,
+  "source_actor": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot_20260909_three_camera_70000_seed1000/checkpoints/050000/pretrained_model",
+  "source_model_sha256": "2160bd127ec03fde74d95be795b40a47099fff6316d4d9b09fbcf806bf834291",
+  "actor_output": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot050000_three_camera_cfcawr_10000_20260911",
+  "final_checkpoint": "/data/user/leviccdong/EKSF/outputs/smolvla_pick_up_pot050000_three_camera_cfcawr_10000_20260911/checkpoints/010000/pretrained_model",
+  "final_model_sha256": "0be5efe0b21a5293644ae973e600d1d213621bf549bc91c24d5679aaa0cf4dc4",
+  "processor_sha256": {
+    "policy_preprocessor.json": "eca65ac772c1d0d1fd550d9a3e44627b2cc3ce373fe192a41844371db1d5a788",
+    "policy_preprocessor_step_5_normalizer_processor.safetensors": "8fdf305f077b04e28c0fddb334808538303773dbec9c4028b5849d9e9824644a",
+    "policy_postprocessor.json": "e8b10654b1a5d9161d46661b5acff22644d00353e57776c7361012d9df552404",
+    "policy_postprocessor_step_0_unnormalizer_processor.safetensors": "844f5800de8a913b11ab6d9b1ccbe3331542ae1e4ecb7335707f0f6791617c4b"
+  },
+  "preflight_sha256": "495cf61d4d0eaeb9267d17778c2098830bc9b0d5bb3da2c242d8b70102da2186",
+  "sidecar_sha256": "a438c25c174147cef2d3611c2f4e4392bcb5ff7028d9564faba858ec1450625f",
+  "training_semantics": "offline original-CfC advantage-weighted regression on logged chunks",
+  "three_camera_policy": true,
+  "deployment_requires_critic": false
+}

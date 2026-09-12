@@ -1,0 +1,110 @@
+{
+  "format": "rl_fruit_event_v4_cfc_awr_submission_v1",
+  "submitted_at": "2026-09-09 20:33:00 CST",
+  "hpc_run": "/data/user/leviccdong/EKSF/experiments/rl_fruit_event_v4_cfc_awr_10000_20260909",
+  "task_text": "put the fruit to the plate",
+  "source_actor": "/data/user/leviccdong/EKSF/outputs/smolvla_put_fruit_plate_20260908_right_wrist_50000_seed1000/checkpoints/050000/pretrained_model",
+  "source_actor_sha256": "2618d4625882ddf974137d9d32bf9c20fa99d794362c46945cdd7389296e22cc",
+  "data": {
+    "raw": "/data/user/leviccdong/EKSF/data/rl_fruit_20260909/raw",
+    "episodes": 52,
+    "frames": 9649,
+    "actor_view": "right wrist only; raw camera key left",
+    "observer_view": "head only"
+  },
+  "jobs": {
+    "prepare": 609139,
+    "event_v4_score": 609140,
+    "original_cfc_fit": 609141,
+    "event_v4_smoke5": 609142,
+    "original_cfc_smoke5": 609143,
+    "event_v4_train10000": 609144,
+    "original_cfc_train10000": 609145,
+    "event_v4_smoke5_repaired": 609290,
+    "original_cfc_smoke5_repaired": 609291
+  },
+  "outputs": {
+    "event_v4": "/data/user/leviccdong/EKSF/outputs/smolvla_put_fruit_plate050000_rlfruit_eventv4_awr_10000_20260909",
+    "original_cfc": "/data/user/leviccdong/EKSF/outputs/smolvla_put_fruit_plate050000_rlfruit_cfcawr_10000_20260909"
+  },
+  "training": {
+    "additional_steps": 10000,
+    "save_freq": 1000,
+    "learning_rate": 1e-06,
+    "weight_bounds": [0.9, 1.1],
+    "fresh_optimizer": true,
+    "resume": false,
+    "source_processor_stats_preserved": true
+  },
+  "offline_scoring": {
+    "completed_at": "2026-09-09 20:59:07 CST",
+    "compute_host": "A6000",
+    "copied_back_to_hpc": true,
+    "hpc_preflight_passed": true,
+    "event_v4": {
+      "frames": 9649,
+      "sidecar_sha256": "07c385a745d32e4e6f95a46d069c02311dfaf8677e007e20117d9dce4b380235",
+      "weight_mean": 1.0230237245559692,
+      "weight_std": 0.05863529071211815,
+      "object_coverage": 0.3170429941231055,
+      "target_coverage": 0.9087534797401794,
+      "gripper_coverage": 0.30467058459635016
+    },
+    "original_cfc": {
+      "frames": 9649,
+      "feature_shape": [9649, 111],
+      "feature_sha256": "5e57c0df78b5d83ee65f22b4e5b7ba48b41883df87f16e69ebe3006943a9f72d",
+      "sidecar_sha256": "e8dd1be46b4bb8e664524ce122d0f10cd49e87140830fdda0a11cc5b5fac2fa7",
+      "weight_mean": 1.0053770542144775,
+      "weight_std": 0.09158363938331604,
+      "crossfit_folds": 5
+    }
+  },
+  "job_status_at_2026_09_09_2059_cst": {
+    "609139": "FAILED_BY_REFUSE_OVERWRITE_AFTER_DATA_WAS_ALREADY_PREPARED",
+    "609140": "FAILED_BY_MISSING_SCHEMA_SNAPSHOT_REPLACED_WITH_VERIFIED_A6000_SCORE",
+    "609141": "FAILED_BY_MISSING_SCHEMA_SNAPSHOT_REPLACED_WITH_VERIFIED_A6000_SCORE",
+    "609142": "PENDING_PRIORITY_NO_DEPENDENCY",
+    "609143": "PENDING_PRIORITY_NO_DEPENDENCY",
+    "609144": "PENDING_AFTEROK_609142",
+    "609145": "PENDING_AFTEROK_609143"
+  },
+  "job_status_at_2026_09_09_2106_cst": {
+    "609142": "FAILED_STRICT_PROCESSOR_BYTE_CHECK_AFTER_SUCCESSFUL_5_STEP_TRAIN",
+    "609143": "FAILED_STRICT_PROCESSOR_BYTE_CHECK_AFTER_SUCCESSFUL_5_STEP_TRAIN",
+    "609290": "COMPLETED_FULL_VERIFICATION_PASSED",
+    "609291": "COMPLETED_FULL_VERIFICATION_PASSED",
+    "609144": "RUNNING_EVENT_V4_FORMAL_10000",
+    "609145": "RUNNING_ORIGINAL_CFC_FORMAL_10000"
+  },
+  "first_checkpoint_observed": {
+    "step": 1000,
+    "event_v4_job": 609144,
+    "original_cfc_job": 609145,
+    "both_model_safetensors_saved": true
+  },
+  "processor_serialization_fix": {
+    "reason": "LeRobot 0.6.2 reshaped equal singleton statistic tensors while saving checkpoints",
+    "policy": "after successful training and before final verification, restore all four source pre/postprocessor artifacts in every saved checkpoint and verify SHA256 byte-exact",
+    "source_preprocessor_sha256": "1632dee73234d6ad614d8a667a58cefb684475e3434d73939364cd8068daa4b5",
+    "source_postprocessor_sha256": "c2e603e0d456c04dd239c0362662af77c6195267b9dc2c3161ed1925d66c0410"
+  },
+  "final_status": {
+    "event_v4_job_609144": {
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:28:29",
+      "finished_at": "2026-09-09 21:34:13 CST",
+      "verification": "passed",
+      "final_model_sha256": "5073937f0fc4e93a79740809a341cca1e780f7acddc387e517cdac39e1bf866f"
+    },
+    "original_cfc_job_609145": {
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:30:49",
+      "finished_at": "2026-09-09 21:36:03 CST",
+      "verification": "passed",
+      "final_model_sha256": "cb3f39730a17bc764ec86904c7c4ae4697e649c826cecee5f59f704aedc9baf4"
+    }
+  }
+}

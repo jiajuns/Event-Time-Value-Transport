@@ -1,0 +1,23 @@
+{
+  "status": "passed",
+  "method": "original_cfc_awr_three_camera",
+  "task_text": "put the fruit to the plate",
+  "additional_steps": 10000,
+  "save_freq": 1000,
+  "source_actor": "/data/user/leviccdong/EKSF/outputs/smolvla_put_fruit_plate_20260908_three_camera_50000_seed1000/checkpoints/050000/pretrained_model",
+  "source_model_sha256": "12aad179d4a9f4a648a5a1ba2fe6ab583146828a1999d77a30f686bfc7198243",
+  "actor_output": "/data/user/leviccdong/EKSF/outputs/smolvla_put_fruit_plate050000_three_camera_cfcawr_10000_20260911",
+  "final_checkpoint": "/data/user/leviccdong/EKSF/outputs/smolvla_put_fruit_plate050000_three_camera_cfcawr_10000_20260911/checkpoints/010000/pretrained_model",
+  "final_model_sha256": "fea590f488359d3ad7eabf3861f46fd54160cb69c3e152d7088260ae55169fd1",
+  "processor_sha256": {
+    "policy_preprocessor.json": "fb941bab6eb28eadc5117fe65762b042294153225c03e92953b6e73aa82175df",
+    "policy_preprocessor_step_5_normalizer_processor.safetensors": "80cfa2d561fe44a603600933062ec7a9d598b0407d8a02c5c40d8ac8d15af770",
+    "policy_postprocessor.json": "e8b10654b1a5d9161d46661b5acff22644d00353e57776c7361012d9df552404",
+    "policy_postprocessor_step_0_unnormalizer_processor.safetensors": "673c7b13f6a5c076e25d6ac472902fef050db51e9eed22304e510011d0ab13a4"
+  },
+  "preflight_sha256": "a2177baeb042642e88eb9daeebe621cfc7064f789191c4d855770ed292dbed0c",
+  "sidecar_sha256": "e8dd1be46b4bb8e664524ce122d0f10cd49e87140830fdda0a11cc5b5fac2fa7",
+  "training_semantics": "offline original-CfC advantage-weighted regression on logged chunks",
+  "three_camera_policy": true,
+  "deployment_requires_critic": false
+}

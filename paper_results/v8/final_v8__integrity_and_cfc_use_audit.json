@@ -1,0 +1,557 @@
+{
+  "all_15_runs_verified": true,
+  "all_formal_snapshots_verified": true,
+  "cfc_counterfactual_dt": [
+    {
+      "full": {
+        "bellman_mse_target": 0.0365123456414501,
+        "ranking_auc": 0.7341656838173867,
+        "sign_consistency": 0.8156028368794326
+      },
+      "mean_abs_value_change_beta1_vs_zero": 0.004408554174005985,
+      "seed": 20260901,
+      "zero_dt": {
+        "bellman_mse_target": 0.03634971491254105,
+        "ranking_auc": 0.7268971448228415,
+        "sign_consistency": 0.8475177304964538
+      }
+    },
+    {
+      "full": {
+        "bellman_mse_target": 0.03691840436565544,
+        "ranking_auc": 0.7512578013661605,
+        "sign_consistency": 0.8156028368794326
+      },
+      "mean_abs_value_change_beta1_vs_zero": 0.004996712319552898,
+      "seed": 20260902,
+      "zero_dt": {
+        "bellman_mse_target": 0.03679933725445562,
+        "ranking_auc": 0.7332212885154061,
+        "sign_consistency": 0.8617021276595744
+      }
+    },
+    {
+      "full": {
+        "bellman_mse_target": 0.03778024078334542,
+        "ranking_auc": 0.7180243500909136,
+        "sign_consistency": 0.8156028368794326
+      },
+      "mean_abs_value_change_beta1_vs_zero": 0.004588119685649872,
+      "seed": 20260903,
+      "zero_dt": {
+        "bellman_mse_target": 0.03767776547817596,
+        "ranking_auc": 0.733141063442921,
+        "sign_consistency": 0.8581560283687943
+      }
+    },
+    {
+      "full": {
+        "bellman_mse_target": 0.0356384909466005,
+        "ranking_auc": 0.7786043540223107,
+        "sign_consistency": 0.8156028368794326
+      },
+      "mean_abs_value_change_beta1_vs_zero": 0.004722297191619873,
+      "seed": 20260904,
+      "zero_dt": {
+        "bellman_mse_target": 0.035604910961114775,
+        "ranking_auc": 0.7560837141874293,
+        "sign_consistency": 0.8546099290780141
+      }
+    },
+    {
+      "full": {
+        "bellman_mse_target": 0.037302342838447154,
+        "ranking_auc": 0.7180102216325126,
+        "sign_consistency": 0.8191489361702128
+      },
+      "mean_abs_value_change_beta1_vs_zero": 0.004624519497156143,
+      "seed": 20260905,
+      "zero_dt": {
+        "bellman_mse_target": 0.03724755775093468,
+        "ranking_auc": 0.7394107818566023,
+        "sign_consistency": 0.8652482269503546
+      }
+    }
+  ],
+  "data_manifest_sha256": "a71666e8297c1b3919c2ec76de3e6b4e2a022adba0889d861f7435895b89d971",
+  "protocol": {
+    "by_body": {
+      "aloha-agilex": 270,
+      "arx-x5": 270,
+      "piper": 30,
+      "ur5": 30
+    },
+    "source": 540,
+    "target": 60,
+    "total": 600
+  },
+  "runs": [
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260901/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_base_gru_fixed",
+      "seed": 20260901,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260902/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_base_gru_fixed",
+      "seed": 20260902,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260903/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_base_gru_fixed",
+      "seed": 20260903,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260904/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_base_gru_fixed",
+      "seed": 20260904,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_base_gru_fixed/seed20260905/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_base_gru_fixed",
+      "seed": 20260905,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260901/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_gru_event_fixed",
+      "seed": 20260901,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260902/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_gru_event_fixed",
+      "seed": 20260902,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260903/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_gru_event_fixed",
+      "seed": 20260903,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260904/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_gru_event_fixed",
+      "seed": 20260904,
+      "target_leakage": false
+    },
+    {
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v5/e2_gru_event_fixed/seed20260905/formal/step_3000.pt",
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_gru_event_fixed",
+      "seed": 20260905,
+      "target_leakage": false
+    },
+    {
+      "cfc_parameter_updates": {
+        "duration_head": {
+          "l2_delta": 0.4749777109279465,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.7727702842978189
+        },
+        "elapsed_head": {
+          "l2_delta": 0.48945546952144287,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.907847837176442
+        },
+        "time_input": {
+          "l2_delta": 6.246367454496121,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.362289840019203
+        },
+        "time_output": {
+          "l2_delta": 3.951578357886446,
+          "parameter_tensors": 4,
+          "relative_l2_delta": 0.34941305380282184
+        },
+        "time_sequence": {
+          "l2_delta": 13.490934301875079,
+          "parameter_tensors": 8,
+          "relative_l2_delta": 0.7307239383331152
+        },
+        "time_state_head": {
+          "l2_delta": 10.521542583139569,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 3.4721557222565163
+        },
+        "time_value_head": {
+          "l2_delta": 1.9134815774750453,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.5067337417137527
+        }
+      },
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260901/formal/step_3000.pt",
+      "dynamics_loss_windows": {
+        "loss_duration": {
+          "decreased": true,
+          "first100_mean": 0.149029922503978,
+          "last100_mean": 0.019064735746942462,
+          "last_over_first": 0.12792555633539682
+        },
+        "loss_elapsed": {
+          "decreased": true,
+          "first100_mean": 0.19530341845937074,
+          "last100_mean": 0.001299649373977445,
+          "last_over_first": 0.006654514212959427
+        },
+        "loss_state_transport": {
+          "decreased": true,
+          "first100_mean": 0.7433413177728653,
+          "last100_mean": 0.11181990280747414,
+          "last_over_first": 0.15042874670615541
+        },
+        "loss_temporal_alignment": {
+          "decreased": false,
+          "first100_mean": 0.010180787122808397,
+          "last100_mean": 0.040609150973614304,
+          "last_over_first": 3.9888026813404345
+        },
+        "loss_temporal_mc": {
+          "decreased": true,
+          "first100_mean": 0.15714253254234792,
+          "last100_mean": 0.087179039940238,
+          "last_over_first": 0.554776854679648
+        }
+      },
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_cfc_event_fixed",
+      "seed": 20260901,
+      "target_leakage": false
+    },
+    {
+      "cfc_parameter_updates": {
+        "duration_head": {
+          "l2_delta": 0.43578228233840194,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.698384894671132
+        },
+        "elapsed_head": {
+          "l2_delta": 0.5169613753354102,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.897277994642624
+        },
+        "time_input": {
+          "l2_delta": 6.5239355371146885,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.4202436429068532
+        },
+        "time_output": {
+          "l2_delta": 3.9762503711309924,
+          "parameter_tensors": 4,
+          "relative_l2_delta": 0.3502597584177786
+        },
+        "time_sequence": {
+          "l2_delta": 13.638796952985302,
+          "parameter_tensors": 8,
+          "relative_l2_delta": 0.7373941770467531
+        },
+        "time_state_head": {
+          "l2_delta": 10.510314785274831,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 3.493762855417679
+        },
+        "time_value_head": {
+          "l2_delta": 1.8400369733031858,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.4282814092859557
+        }
+      },
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260902/formal/step_3000.pt",
+      "dynamics_loss_windows": {
+        "loss_duration": {
+          "decreased": true,
+          "first100_mean": 0.1442233217228204,
+          "last100_mean": 0.021210542181506753,
+          "last_over_first": 0.1470673531030635
+        },
+        "loss_elapsed": {
+          "decreased": true,
+          "first100_mean": 0.1475180780608207,
+          "last100_mean": 0.0017965219676261768,
+          "last_over_first": 0.01217831733738751
+        },
+        "loss_state_transport": {
+          "decreased": true,
+          "first100_mean": 0.7360723000764847,
+          "last100_mean": 0.11540233377367258,
+          "last_over_first": 0.15678124793132578
+        },
+        "loss_temporal_alignment": {
+          "decreased": false,
+          "first100_mean": 0.010564286162843928,
+          "last100_mean": 0.04181501472834498,
+          "last_over_first": 3.9581486229911333
+        },
+        "loss_temporal_mc": {
+          "decreased": true,
+          "first100_mean": 0.13669433131814002,
+          "last100_mean": 0.0875097268074751,
+          "last_over_first": 0.6401854851157396
+        }
+      },
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_cfc_event_fixed",
+      "seed": 20260902,
+      "target_leakage": false
+    },
+    {
+      "cfc_parameter_updates": {
+        "duration_head": {
+          "l2_delta": 0.5340992805578263,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.9228161123743908
+        },
+        "elapsed_head": {
+          "l2_delta": 0.4700383268973669,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.8124796238720944
+        },
+        "time_input": {
+          "l2_delta": 6.6557823708637605,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.4225062982553092
+        },
+        "time_output": {
+          "l2_delta": 3.890239391022984,
+          "parameter_tensors": 4,
+          "relative_l2_delta": 0.34352934842933514
+        },
+        "time_sequence": {
+          "l2_delta": 14.377549823566621,
+          "parameter_tensors": 8,
+          "relative_l2_delta": 0.776968941393308
+        },
+        "time_state_head": {
+          "l2_delta": 10.285948894134567,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 3.422931095634099
+        },
+        "time_value_head": {
+          "l2_delta": 1.8556261256886837,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.4415892152240053
+        }
+      },
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260903/formal/step_3000.pt",
+      "dynamics_loss_windows": {
+        "loss_duration": {
+          "decreased": true,
+          "first100_mean": 0.13025814205408096,
+          "last100_mean": 0.019520397204905747,
+          "last_over_first": 0.14985932470003457
+        },
+        "loss_elapsed": {
+          "decreased": true,
+          "first100_mean": 0.1594625554047525,
+          "last100_mean": 0.0022958950081374495,
+          "last_over_first": 0.014397706109186212
+        },
+        "loss_state_transport": {
+          "decreased": true,
+          "first100_mean": 0.7366473746299743,
+          "last100_mean": 0.1134041229262948,
+          "last_over_first": 0.15394627990530596
+        },
+        "loss_temporal_alignment": {
+          "decreased": false,
+          "first100_mean": 0.011371983158169315,
+          "last100_mean": 0.04281313089828473,
+          "last_over_first": 3.7647902131765796
+        },
+        "loss_temporal_mc": {
+          "decreased": true,
+          "first100_mean": 0.1475192519277334,
+          "last100_mean": 0.0858081179112196,
+          "last_over_first": 0.5816740309478738
+        }
+      },
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_cfc_event_fixed",
+      "seed": 20260903,
+      "target_leakage": false
+    },
+    {
+      "cfc_parameter_updates": {
+        "duration_head": {
+          "l2_delta": 0.44203143054114696,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.8239130068334232
+        },
+        "elapsed_head": {
+          "l2_delta": 0.4098375940271855,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.6283397398830413
+        },
+        "time_input": {
+          "l2_delta": 6.749403326718862,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.453617873722515
+        },
+        "time_output": {
+          "l2_delta": 4.017839123320287,
+          "parameter_tensors": 4,
+          "relative_l2_delta": 0.35411555265766925
+        },
+        "time_sequence": {
+          "l2_delta": 14.05806841535191,
+          "parameter_tensors": 8,
+          "relative_l2_delta": 0.7579484298358211
+        },
+        "time_state_head": {
+          "l2_delta": 10.150775073435726,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 3.3553599177269366
+        },
+        "time_value_head": {
+          "l2_delta": 1.9239768711426577,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.462176591982214
+        }
+      },
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260904/formal/step_3000.pt",
+      "dynamics_loss_windows": {
+        "loss_duration": {
+          "decreased": true,
+          "first100_mean": 0.1313653632439673,
+          "last100_mean": 0.020172583111561834,
+          "last_over_first": 0.1535608977390638
+        },
+        "loss_elapsed": {
+          "decreased": true,
+          "first100_mean": 0.14535900552757083,
+          "last100_mean": 0.0020763692079344763,
+          "last_over_first": 0.01428442084065196
+        },
+        "loss_state_transport": {
+          "decreased": true,
+          "first100_mean": 0.7146905666589737,
+          "last100_mean": 0.10929395131766796,
+          "last_over_first": 0.15292485505803433
+        },
+        "loss_temporal_alignment": {
+          "decreased": false,
+          "first100_mean": 0.01031258539063856,
+          "last100_mean": 0.0452303074602969,
+          "last_over_first": 4.385932891412036
+        },
+        "loss_temporal_mc": {
+          "decreased": true,
+          "first100_mean": 0.1516160511225462,
+          "last100_mean": 0.08206359073519706,
+          "last_over_first": 0.5412592540671555
+        }
+      },
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_cfc_event_fixed",
+      "seed": 20260904,
+      "target_leakage": false
+    },
+    {
+      "cfc_parameter_updates": {
+        "duration_head": {
+          "l2_delta": 0.4612591668462409,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.7621347063005997
+        },
+        "elapsed_head": {
+          "l2_delta": 0.49598755777036047,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 0.8607885000770736
+        },
+        "time_input": {
+          "l2_delta": 6.536848375884613,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.4216869251256652
+        },
+        "time_output": {
+          "l2_delta": 3.905777453450345,
+          "parameter_tensors": 4,
+          "relative_l2_delta": 0.3438361352858057
+        },
+        "time_sequence": {
+          "l2_delta": 14.365747817722703,
+          "parameter_tensors": 8,
+          "relative_l2_delta": 0.772137875262008
+        },
+        "time_state_head": {
+          "l2_delta": 10.239698752176086,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 3.429443158800447
+        },
+        "time_value_head": {
+          "l2_delta": 2.0020346704017804,
+          "parameter_tensors": 2,
+          "relative_l2_delta": 1.5708989753707985
+        }
+      },
+      "checkpoint": "/data/user/leviccdong/EKSF/experiments/current/experiment2_ablation_fixed_20260901/results/train_v8/e2_cfc_event_fixed/seed20260905/formal/step_3000.pt",
+      "dynamics_loss_windows": {
+        "loss_duration": {
+          "decreased": true,
+          "first100_mean": 0.15043714424595236,
+          "last100_mean": 0.021196893160231413,
+          "last_over_first": 0.14090199110384757
+        },
+        "loss_elapsed": {
+          "decreased": true,
+          "first100_mean": 0.1709203120600432,
+          "last100_mean": 0.001900847963988781,
+          "last_over_first": 0.011121252594723938
+        },
+        "loss_state_transport": {
+          "decreased": true,
+          "first100_mean": 0.735042836368084,
+          "last100_mean": 0.1103485955670476,
+          "last_over_first": 0.1501253942046295
+        },
+        "loss_temporal_alignment": {
+          "decreased": false,
+          "first100_mean": 0.010072500746464357,
+          "last100_mean": 0.043002117916475985,
+          "last_over_first": 4.269259342727828
+        },
+        "loss_temporal_mc": {
+          "decreased": true,
+          "first100_mean": 0.14410653606057167,
+          "last100_mean": 0.08696830738335848,
+          "last_over_first": 0.6035000893145018
+        }
+      },
+      "formal_snapshot_count": 3001,
+      "formal_step": 3000,
+      "method": "e2_cfc_event_fixed",
+      "seed": 20260905,
+      "target_leakage": false
+    }
+  ],
+  "stats_sha256": "f84434f276e8a4f118e76b35c061e72af04a662a58df613503ebfb04041f5d14",
+  "target_test_used_for_training_or_selection": false
+}

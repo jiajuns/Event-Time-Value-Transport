@@ -1,0 +1,9 @@
+baseline,seeds,bellman_mse_target_mean,ranking_auc_mean,sign_consistency_mean,success_rate_mae_mean,updated_params,wall_clock_s_mean,checkpoint_source
+b1,5,0.072582,0.6108,0.4583,0.4989,12097,8.17,legacy_frozen_table_ii
+b2,5,0.059374,0.5503,0.5652,0.5007,0,0.0,legacy_frozen_table_ii
+b4,5,0.092389,0.5667,0.4958,0.4858,0,0.0,legacy_frozen_table_ii
+b5,5,0.060571,0.6217,0.5678,0.5004,0,0.0,legacy_frozen_table_ii
+b7,5,0.074016,0.6266,0.4031,0.512,12097,7.29,legacy_frozen_table_ii
+b9,5,0.339852,0.6383,0.5061,0.4907,0,0.06,legacy_frozen_table_ii
+b9b,5,0.147758,0.5592,0.6693,0.4907,0,0.01,legacy_frozen_table_ii
+b9_fixed_full_abc,5,0.03683,0.740012,0.816312,0.490748,0,0.151631,same_step3000_as_ablation_abc
