@@ -38,6 +38,8 @@ backups/
 /configs/
 /scripts/
 /docs/*.md
+!/docs/YOLOE_GNN_CFC_CROSS_VLA_COMPLETE_ARCHITECTURE_ZH.md
+!/docs/PIRL_EVENT_SMDP_IMPLEMENTATION_ZH.md
 
 # Local/editor outputs
 start.txt

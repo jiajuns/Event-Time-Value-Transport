@@ -2,6 +2,10 @@
 
 分支：[`gnn-cfc-event-world-model`](https://github.com/jiajuns/Event-Time-Value-Transport/tree/gnn-cfc-event-world-model)。它保存两条相关但不同的实现，不应与正式 ICRA V8 critic 和 CfC-AWR 三任务策略混为一谈。
 
+> 2026-09-17 当前方向：YOLOE 实视频观察器已改为 GNN-only，删除 CfC observation network，使用最后有效图表示与掩码历史均值融合。旧 V3/V4 checkpoint 和下列指标仅作历史对照；新模型必须重新训练，尚无新结果。
+
+YOLOE 冻结检测、角色图、GNN、CfC、动作条件世界模型和跨 VLA loss 调制的完整数据流，见[《YOLOE + GNN + CfC 事件世界模型与跨 VLA 调制完整架构》](YOLOE_GNN_CFC_CROSS_VLA_COMPLETE_ARCHITECTURE_ZH.md)。
+
 | 模块 | 输入与结构 | 已完成的训练/验证 | 不能据此声称 |
 |---|---|---|---|
 | UMI 关系观察器 V3 | 腕部 RGB + YOLO 辅助框 → 角色图、两层共享消息传递 GNN → CfC → 关系/事件/目标谓词 | 106 段 origin，85 train/21 validation，4,000-step 预算，选中 step 2,200 | 独立测试准确率、跨任务/跨本体迁移、校准 RL value |

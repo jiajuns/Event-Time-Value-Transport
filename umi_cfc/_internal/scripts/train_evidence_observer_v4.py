@@ -279,9 +279,9 @@ def train(data, graph, visual, annotations, evidence, output, config=Config(), d
     report = evaluate_fields(fields, arrays, indices, config.use_evidence)
     updates = {prefix: sum(float((value.detach().cpu() - initial[name]).square().sum())
                            for name, value in selected_model.named_parameters() if name.startswith(prefix)) ** .5
-               for prefix in ("cfc.", "messages.", "updates.", "relation_heads.", "goal_head.",
+               for prefix in ("messages.", "updates.", "relation_heads.", "goal_head.",
                               "pair_encoder.", "surface_encoder.", "surface_head.", "current_heads.", "evidence_head.", "prior_transition.")}
-    required = ("cfc.", "relation_heads.", "goal_head.", "pair_encoder.", "surface_encoder.", "surface_head.", "current_heads.", "prior_transition.") + (("messages.", "updates.") if config.use_graph else ()) + (("evidence_head.",) if config.use_evidence else ())
+    required = ("relation_heads.", "goal_head.", "pair_encoder.", "surface_encoder.", "surface_head.", "current_heads.", "prior_transition.") + (("messages.", "updates.") if config.use_graph else ()) + (("evidence_head.",) if config.use_evidence else ())
     if any(updates[name] <= 0 for name in required):
         raise ValueError("a required network component was not updated")
     with (output / "validation_predictions.npz").open("xb") as stream:

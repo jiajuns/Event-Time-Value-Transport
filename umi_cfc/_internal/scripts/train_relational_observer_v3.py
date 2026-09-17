@@ -1,4 +1,4 @@
-"""Train the graph/CfC relation observer on origin train/validation ONLY."""
+"""Train the YOLO-assisted GNN relation observer on train/validation only."""
 from __future__ import annotations
 
 import argparse
@@ -66,6 +66,15 @@ def forward_all(model, dataset, device, batch_size):
             fields.update({f"forecast_{name}": value.softmax(-1) for name, value in prediction["forecast"].items()})
             fields["goal_probabilities"] = prediction["goals"].softmax(-1)
             fields["history_features"] = prediction["history_features"]
+            # Persist event-sidecar outputs for audit and future πRL joins. The
+            # current UMI labels supervise only auxiliary phase/transition
+            # heads; no unreviewed labels are fabricated for these outputs.
+            fields["event_state"] = prediction["event_state"]
+            fields["event_posterior"] = prediction["event_posterior"].softmax(-1)
+            fields["event_progress"] = prediction["event_progress"]
+            fields["event_boundary_probability"] = prediction["event_boundary_logit"].sigmoid()
+            fields["event_uncertainty"] = prediction["event_uncertainty"]
+            fields["event_value"] = prediction["event_value"]
             for name, value in fields.items():
                 collected.setdefault(name, []).append(value.cpu().numpy())
             indices.extend(batch["index"].tolist())
@@ -236,8 +245,8 @@ def train(data, graph, annotations, output, config=Config(), device="cpu"):
     report = evaluate_fields(fields, arrays, indices)
     updates = {prefix: sum(float((value.detach().cpu() - initial[name]).square().sum())
                            for name, value in selected_model.named_parameters() if name.startswith(prefix)) ** .5
-               for prefix in ("cfc.", "messages.", "updates.", "relation_heads.", "goal_head.")}
-    required = ("cfc.", "relation_heads.", "goal_head.") + (("messages.", "updates.") if config.use_graph else ())
+               for prefix in ("history_fusion.", "messages.", "updates.", "relation_heads.", "goal_head.")}
+    required = ("history_fusion.", "relation_heads.", "goal_head.") + (("messages.", "updates.") if config.use_graph else ())
     if any(updates[name] <= 0 for name in required):
         raise ValueError("a required network component was not updated")
     with (output / "validation_predictions.npz").open("xb") as stream:
@@ -259,6 +268,7 @@ def train(data, graph, annotations, output, config=Config(), device="cpu"):
                                 "RGB and bounding-box graph; no depth/contact sensor or segmentation mask input.",
                                 "Region membership is not general 3D containment.",
                                 "Task goals are predicate compositions, not unrestricted natural language.",
+                                "Event-State/Event-Value heads require reviewed event labels and online SMDP returns before use in RL.",
                                 "Goal satisfaction/forecast are not calibrated RL value or chunk advantage."])
     (output / "training_receipt.json").write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
     return receipt

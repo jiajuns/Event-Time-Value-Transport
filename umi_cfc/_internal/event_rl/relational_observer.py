@@ -1,4 +1,4 @@
-"""Role-typed object graph -> causal CfC -> relations -> goal-conditioned evaluation.
+"""YOLO-assisted role graph -> GNN -> relations -> goal-conditioned evaluation.
 
 No joint/action vectors, frame ordinal, video identity, task outcome, or labels enter
 the network. Goal predicates are task inputs, not observed relations. This is an
@@ -15,13 +15,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .cfc import VideoEventCfCCell
 from .factorized_events import HEADS
 from .factorized_observer import CausalWindows, load_dataset
 from .semantic_cues import sha256
 from .relational_graph import GRAPH_VERSION, NODE_FEATURES, EDGE_FEATURES
 
-FORMAT = "umi_relational_graph_cfc_v3"
+# A format bump is deliberate: the Event-State and Event-Value heads below are
+# freshly initialized and therefore no CfC-era or relation-only checkpoint can
+# be presented as an Event Observer result.
+FORMAT = "umi_role_graph_event_observer_v2"
 RELATIONS = {
     "held_by_actor": ("unheld", "held", "unknown"),
     "supported_by_target": ("unsupported", "supported", "unknown"),
@@ -35,6 +37,25 @@ GOALS = {
     "release_outside": (0, 0, 0),
 }
 GRAPH_INPUTS = ("node_features", "node_images_uint8", "node_mask", "edge_features", "bindings")
+EVENT_STATES = ("approach", "grasp", "lift", "transport", "align", "place", "unknown")
+
+
+class EventValueCritic(nn.Module):
+    """Value sidecar for semi-Markov event targets.
+
+    It intentionally receives an Event-State representation rather than a
+    simulator reward, task outcome, action, or future frame.  The πRL adapter
+    owns the SMDP target and optimizer; keeping this module in the observer
+    makes the visual contract explicit and keeps YOLOE frozen.
+    """
+
+    def __init__(self, hidden):
+        super().__init__()
+        self.network = nn.Sequential(nn.Linear(hidden, hidden), nn.LayerNorm(hidden),
+                                     nn.SiLU(), nn.Linear(hidden, 1))
+
+    def forward(self, event_state):
+        return self.network(event_state).squeeze(-1)
 
 
 def goal_vector(name_or_values):
@@ -184,8 +205,19 @@ class RelationalObserver(nn.Module):
             for _ in range(graph_layers)])
         self.missing_role = nn.Parameter(torch.zeros(3, graph_hidden))
         self.fusion = nn.Sequential(nn.Linear(64 + graph_hidden * 4 + 3, hidden), nn.LayerNorm(hidden), nn.Tanh())
-        self.initial = nn.Linear(hidden, hidden)
-        self.cfc = VideoEventCfCCell(hidden)
+        # The observer is intentionally GNN-only.  A masked mean summarizes the
+        # causal graph history and the last valid graph preserves the current
+        # relation state; this MLP fuses the two without a recurrent/CfC cell.
+        self.history_fusion = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.LayerNorm(hidden), nn.Tanh())
+        # Role-Graph Event Observer outputs. Relation/event heads below remain
+        # auxiliary supervision; they are not declared to be causal evidence.
+        self.event_state_encoder = nn.Sequential(nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.Tanh())
+        self.event_state_head = nn.Linear(hidden, len(EVENT_STATES))
+        self.event_progress_head = nn.Linear(hidden, 1)
+        self.event_boundary_head = nn.Linear(hidden, 1)
+        self.event_uncertainty_head = nn.Linear(hidden, 1)
+        self.event_value_critic = EventValueCritic(hidden)
         self.event_heads = nn.ModuleDict({name: nn.Linear(hidden, len(HEADS[name])) for name in ("phase", "transition")})
         self.relation_heads = nn.ModuleDict({name: nn.Linear(hidden, 3) for name in RELATIONS})
         self.forecast_heads = nn.ModuleDict({f"h{k}_{name}": nn.Linear(hidden, 3)
@@ -225,7 +257,8 @@ class RelationalObserver(nn.Module):
             raise ValueError("invalid causal history mask")
         if dt.shape != mask.shape or not bool(torch.isfinite(dt[mask]).all()) or bool((dt[mask] < 0).any()):
             raise ValueError("invalid time intervals")
-        # Invalid/padded times never update CfC, and never affect normalization.
+        # Time intervals remain validated for dataset/ABI auditing, but are not
+        # consumed by a temporal network. Invalid frames are excluded by mask.
         rgb = torch.where(mask[..., None, None, None, None], images.float(), 0.)
         global_features = self.global_encoder(rgb.reshape(batch * length, 3, *images.shape[-2:]) / 255.)
         graph = self.encode_graph(
@@ -234,13 +267,12 @@ class RelationalObserver(nn.Module):
         if not self.model_spec["use_graph"]:
             graph = torch.zeros_like(graph)
         inputs = self.fusion(torch.cat((global_features, graph), -1)).reshape(batch, length, -1)
-        hidden = inputs.new_zeros(batch, self.model_spec["hidden"])
-        seen = torch.zeros(batch, dtype=torch.bool, device=images.device)
-        for t in range(length):
-            current = self.cfc(inputs[:, t], hidden, torch.where(mask[:, t], dt[:, t], 0.))
-            current = torch.where(seen[:, None], current, torch.tanh(self.initial(inputs[:, t])))
-            hidden = torch.where(mask[:, t, None], current, hidden)
-            seen = seen | mask[:, t]
+        valid = mask[..., None]
+        pooled = (inputs * valid).sum(1) / mask.sum(1).clamp_min(1)[:, None]
+        last_index = torch.where(mask, torch.arange(length, device=mask.device)[None], -1).max(1).values
+        last = inputs[torch.arange(batch, device=images.device), last_index]
+        hidden = self.history_fusion(torch.cat((last, pooled), -1))
+        event_state = self.event_state_encoder(hidden)
         relations = {name: head(hidden) for name, head in self.relation_heads.items()}
         probabilities = torch.cat([relations[name].softmax(-1) for name in RELATIONS], -1)
         goals = torch.as_tensor(list(GOALS.values()) if goals is None else goals, device=hidden.device, dtype=torch.long)
@@ -253,7 +285,13 @@ class RelationalObserver(nn.Module):
                                                 goal_features[None].expand(batch, -1, -1)), -1))
         result = dict(events={name: head(hidden) for name, head in self.event_heads.items()},
                       relations=relations, goals=goal_logits,
-                      forecast={key: head(hidden) for key, head in self.forecast_heads.items()})
+                      forecast={key: head(hidden) for key, head in self.forecast_heads.items()},
+                      event_state=event_state,
+                      event_posterior=self.event_state_head(event_state),
+                      event_progress=self.event_progress_head(event_state).squeeze(-1).sigmoid(),
+                      event_boundary_logit=self.event_boundary_head(event_state).squeeze(-1),
+                      event_uncertainty=F.softplus(self.event_uncertainty_head(event_state).squeeze(-1)),
+                      event_value=self.event_value_critic(event_state))
         if return_features:
             result["history_features"] = hidden
         return result
@@ -262,7 +300,7 @@ class RelationalObserver(nn.Module):
 def load_observer(path, device="cpu"):
     saved = torch.load(path, map_location="cpu", weights_only=False)
     if saved.get("format") != FORMAT or saved.get("labels_are_model_inputs") is not False:
-        raise ValueError("not a versioned graph CfC checkpoint")
+        raise ValueError("not a versioned YOLO-assisted GNN checkpoint")
     if saved.get("relation_schema") != {key: list(value) for key, value in RELATIONS.items()}:
         raise ValueError("relation schema mismatch")
     model = RelationalObserver(**saved["model_spec"])

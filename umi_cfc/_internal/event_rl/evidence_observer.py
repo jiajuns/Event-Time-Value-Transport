@@ -21,7 +21,7 @@ from .relational_observer import (
 from .relational_visual import VISUAL_VERSION, PAIR_FEATURE_NAMES as PAIR_FEATURES
 from .semantic_cues import sha256
 
-FORMAT = 'umi_relational_evidence_cfc_v4'
+FORMAT = 'umi_yolo_relational_evidence_gnn_v1'
 VISUAL_INPUTS = ('pair_images_uint8', 'pair_features')
 
 
@@ -124,6 +124,9 @@ class EvidenceObserver(RelationalObserver):
     def __init__(self, node_dim, edge_dim, hidden=96, graph_hidden=48, graph_layers=2,
                  forecast_horizons_s=(.3, .6), use_graph=True, use_evidence=True):
         super().__init__(node_dim, edge_dim, hidden, graph_hidden, graph_layers, forecast_horizons_s, use_graph)
+        # This variant performs explicit evidence/prior updates below and does
+        # not use the base observer's non-recurrent history pooling module.
+        del self.history_fusion
         self.model_spec['use_evidence'] = use_evidence
         self.pair_encoder = nn.Sequential(
             nn.Conv2d(3, 12, 5, 2, 2), nn.GroupNorm(3, 12), nn.SiLU(),
@@ -174,13 +177,14 @@ class EvidenceObserver(RelationalObserver):
         evidence_sequence = self.evidence_head(inputs)
         hidden = inputs.new_zeros(b, self.model_spec['hidden'])
         prior = hidden
-        seen = torch.zeros(b, dtype=torch.bool, device=images.device)
         last_motion = motion.new_zeros(b, motion.shape[-1])
         for k in range(t):
             delta = torch.where(mask[:, k], dt[:, k], 0.).clamp(max=1.)
             prior_k = hidden + delta[:, None] * self.prior_transition(torch.cat((hidden, last_motion), -1))
-            candidate = self.cfc(inputs[:, k], hidden, delta)
-            candidate = torch.where(seen[:, None], candidate, torch.tanh(self.initial(inputs[:, k])))
+            # A visible observation is already a graph-conditioned state.  It
+            # directly corrects the motion prior; no CfC/recurrent observation
+            # update is used in the GNN-only observer.
+            candidate = inputs[:, k]
             reliability = evidence_sequence[:, k].sigmoid().mean(-1)
             if not self.model_spec['use_evidence']:
                 reliability = torch.ones_like(reliability)
@@ -189,7 +193,6 @@ class EvidenceObserver(RelationalObserver):
             hidden = torch.where(mask[:, k, None], combined, hidden)
             prior = torch.where(mask[:, k, None], prior_k, prior)
             last_motion = torch.where(visible[:, k, None], motion[:, k], last_motion)
-            seen = seen | visible[:, k]
         last = torch.where(mask, torch.arange(t, device=mask.device)[None], -1).max(1).values
         row = torch.arange(b, device=mask.device)
         current = inputs[row, last]
@@ -202,9 +205,20 @@ class EvidenceObserver(RelationalObserver):
         count = len(specs)
         goal_logits = self.goal_head(torch.cat((hidden[:, None].expand(-1, count, -1),
             probabilities[:, None].expand(-1, count, -1), gf[None].expand(b, -1, -1)), -1))
+        event_state = self.event_state_encoder(hidden)
         result = dict(relations=relations, goals=goal_logits,
             events={name: head(hidden) for name, head in self.event_heads.items()},
             forecast={name: head(hidden) for name, head in self.forecast_heads.items()},
+            # The visual evidence branch exposes the same Event Observer ABI
+            # as the GNN-only branch. These heads are trained only after event
+            # labels and Event-SMDP returns are supplied; legacy V4 weights are
+            # deliberately incompatible with this format.
+            event_state=event_state,
+            event_posterior=self.event_state_head(event_state),
+            event_progress=self.event_progress_head(event_state).squeeze(-1).sigmoid(),
+            event_boundary_logit=self.event_boundary_head(event_state).squeeze(-1),
+            event_uncertainty=F.softplus(self.event_uncertainty_head(event_state).squeeze(-1)),
+            event_value=self.event_value_critic(event_state),
             current_relations={name: head(current) for name, head in self.current_heads.items()},
             prior_relations={name: head(prior) for name, head in self.relation_heads.items()},
             observability=evidence_sequence[row, last],

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render real CfC predictions + exact cached YOLO boxes, never training labels."""
+"""Render observer predictions plus exact cached YOLO boxes, never labels."""
 import argparse
 import bisect
 import html
@@ -48,7 +48,7 @@ def render(raw,predictions,detections,annotation_receipt,output,font):
         a={key:archive[key] for key in archive.files}
     contract=json.loads(str(a.pop('contract_json').item()))
     relational = bool(contract.get('relation_schema'))
-    evidence_v4 = contract.get('format', '').startswith('umi_relational_evidence_cfc_v4')
+    evidence_v4 = contract.get('format', '').startswith('umi_yolo_relational_evidence_gnn_v1')
     relation_names = list(contract.get('relation_schema', {}))
     goal_names = list(contract.get('goal_schema', {}))
     requested_goal = contract.get('requested_goal', 'place_on')
@@ -75,7 +75,7 @@ def render(raw,predictions,detections,annotation_receipt,output,font):
         stream=[]
         for i in indices:
             record=dict(attempt_uid=uid,elapsed_s=float(a['elapsed_s'][i]),query_id=int(a['query_id'][i]),
-                        split=str(a['split'][i]),event_source='trained_cfc_causal_predictions_not_annotation',
+                        split=str(a['split'][i]),event_source='trained_gnn_causal_predictions_not_annotation',
                         yolo=lookup[(uid,int(a['query_id'][i]))]['detections']['umi'],events={},forecast={})
             for name,classes in HEADS.items():
                 if f'{name}_id' not in a:
@@ -118,12 +118,12 @@ def render(raw,predictions,detections,annotation_receipt,output,font):
                             prior_imagination=dict(probabilities=prior.tolist(), is_observed_fact=False),
                             observability=dict(probability=float(a['observability_probabilities'][i,j]),
                                 is_calibrated=False),
-                            source='graph_visual_cfc_causal_prediction_not_annotation')
+                            source='graph_visual_gnn_causal_prediction_not_annotation')
                     else:
                         record['relations'][name] = dict(probabilities=probability.tolist(),
                             confirmed=classes[int(a['relation_stable_ids'][i,j])],
                             raw_prediction=classes[int(probability.argmax())],
-                            source='graph_cfc_causal_prediction_not_annotation')
+                            source='graph_role_gnn_prediction_not_annotation')
                 g = goal_names.index(requested_goal)
                 if evidence_v4:
                     record['task_goal'] = dict(name=requested_goal, predicates=contract['goal_schema'][requested_goal],
@@ -149,8 +149,8 @@ def render(raw,predictions,detections,annotation_receipt,output,font):
         timeline_y=326 if evidence_v4 else 292 if relational else 180
         panel=Image.new('RGB',(width,height-720),(20,25,35))
         draw=ImageDraw.Draw(panel)
-        heading=('对象关系证据 + CfC 时序推断（预测非真值）' if evidence_v4 else
-                 '对象关系图 GNN + CfC 时序预测（不是事件真值）') if relational else 'CfC 时序预测 + YOLO 辅助线索（不是事件真值）'
+        heading=('对象关系证据 + Role-Graph Event Observer（预测非真值）' if evidence_v4 else
+                 '对象关系图 GNN Event Observer（不是事件真值）') if relational else 'Event Observer + YOLO 辅助线索（不是事件真值）'
         draw.text((18,8),heading,font=title_font,fill='white')
         draw.text((18,timeline_y-30),'事件演变（离线全程展示，不作为模型输入）',font=small,fill=(190,195,205))
         duration=info['duration_s']
@@ -200,7 +200,7 @@ def render(raw,predictions,detections,annotation_receipt,output,font):
                     d.rectangle((tx,ty,min(1280,tx+180),ty+26),fill=(15,20,25))
                     d.text((tx,ty),text,font=small,fill=color)
                 d.rectangle((0,0,1280,34),fill=(15,20,25))
-                d.text((12,3),f"{source.stem} | {t:.2f}s | {info['split']} | YOLO/CfC 10Hz，上次更新 {times[j]:.1f}s",font=small,fill='white')
+                d.text((12,3),f"{source.stem} | {t:.2f}s | {info['split']} | YOLO/Role-GNN 10Hz，上次更新 {times[j]:.1f}s",font=small,fill='white')
                 bottom=panel.copy(); d=ImageDraw.Draw(bottom)
                 for k,name in enumerate(HEADS):
                     e=r['events'][name]; label=e['confirmed']
@@ -253,7 +253,7 @@ def render(raw,predictions,detections,annotation_receipt,output,font):
         outputs.append(dict(source=source.name,video=target.name,predictions=json_path.name,frames=frame,
                             sha256=sha256(target),split=info['split']))
         print(json.dumps(outputs[-1]),flush=True)
-    receipt=dict(format='eksf_umi_prediction_video_export_v1',event_source='trained_cfc_predictions',
+    receipt=dict(format='eksf_umi_prediction_video_export_v1',event_source='trained_role_graph_event_observer_predictions',
         checkpoint_sha256=contract['checkpoint_sha256'],predictions_sha256=sha256(predictions),
         detections_sha256=sha256(detections),source_fps=30,model_and_detector_hz=10,
         display_alignment='causal_asof_no_future_boxes',training_labels_displayed=False,
@@ -267,7 +267,7 @@ def render(raw,predictions,detections,annotation_receipt,output,font):
                            observability_is_calibrated=False)
     with (output/'export_receipt.json').open('x') as f:json.dump(receipt,f,ensure_ascii=False,indent=2)
     with (output/'index.html').open('x',encoding='utf-8') as f:
-        f.write('<!doctype html><meta charset="utf-8"><title>UMI 事件预测</title><h1>CfC 时序预测＋YOLO 辅助框</h1><p>预测非真值；train 视频是训练集回放，不是独立验证。</p>')
+        f.write('<!doctype html><meta charset="utf-8"><title>UMI 事件预测</title><h1>Role-Graph Event Observer＋YOLO 辅助框</h1><p>预测非真值；train 视频是训练集回放，不是独立验证。</p>')
         for r in outputs:
             f.write(f'<h3>{html.escape(r["source"])} ({r["split"]})</h3><video controls preload="none" width="800" src="{html.escape(r["video"])}"></video>')
     return receipt

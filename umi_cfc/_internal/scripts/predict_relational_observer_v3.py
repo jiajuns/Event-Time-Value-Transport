@@ -43,6 +43,9 @@ def predict(data, graph, checkpoint, output, *, device="cpu", batch_size=16, con
     predicted, indices = forward_all(model, dataset, torch.device(device), batch_size)
     result = {key: arrays[key][indices] for key in ("attempt_uid", "query_id", "elapsed_s", "split", "group_uid")}
     result["history_features"] = predicted["history_features"]
+    for key in ("event_state", "event_posterior", "event_progress", "event_boundary_probability",
+                "event_uncertainty", "event_value"):
+        result[key] = predicted[key]
     result["relation_stable_ids"] = np.full((len(indices), 3), 2, np.int64)
     for name in RELATIONS:
         result[f"relation_{name}_probabilities"] = predicted[f"relation_{name}"]
@@ -95,6 +98,9 @@ def predict(data, graph, checkpoint, output, *, device="cpu", batch_size=16, con
                    stable_confirmation=dict(frames=3, includes_current=True),
                    placement_semantics="place_on_goal_requires_unheld_supported_inside_and_confident_goal_head",
                    goal_score_is_calibrated_value=False, graph_signature=graph_signature(contract["relational_graph"]),
+                   event_observer_outputs=("event_state", "event_posterior", "event_progress",
+                                           "event_boundary_probability", "event_uncertainty", "event_value"),
+                   event_value_is_rl_trained=False,
                    fitting_group_uids=saved["fitting_group_uids"], selection_group_uids=saved["selection_group_uids"],
                    deployment_authorized=False, cross_task_validated=False, cross_embodiment_validated=False)
     result["contract_json"] = np.asarray(json.dumps(receipt, ensure_ascii=False))
