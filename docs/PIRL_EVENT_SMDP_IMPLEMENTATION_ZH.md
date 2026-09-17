@@ -20,6 +20,8 @@ RLinf 中的 `event_smdp_interventional` advantage 对每个连续事件计算
 
 受控 branch 必须使用无损 `get_state` / `set_state`。先在 ManiSkill3 完成 oracle event 实验；当前 RobotWin 适配器没有该状态快照契约，不能以 reset 伪造干预。
 
+`umi_cfc/_internal/event_rl/event_smdp.py` 还提供 Event Value Critic 的 Huber SMDP target：仅在 event 起点拟合 `R_j + gamma**D_j * V_E(e_{j+1})`，终止事件不 bootstrap。该训练接口必须接收在线 rollout 的 reward/done 与 oracle 或审核过的 event ID；不从最终成功标签或未来图像伪造价值监督。
+
 ## 实验顺序
 
 1. 原样复现官方 π₀.₅ + πRL benchmark；Flow-Noise 与 Flow-SDE 使用独立配置，不混称。
